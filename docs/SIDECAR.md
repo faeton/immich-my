@@ -70,82 +70,66 @@ Engine is source of truth. Both fronts are views on top. CLI for HIGH +
 terminal-friendly y/n MEDIUM. Web for LOW-confidence questions that need maps
 or thumb grids. Never a web-only tool — cron / watcher needs the CLI forever.
 
-### Rule YAML schema
+### Rules engine (as shipped)
 
-Rules are data, not code. Engine is generic (~300 LoC Python); new rules
-are YAML entries under `immy/rules/*.yml`.
+Rules are Python callables registered into `immy.rules.registry`. Each
+rule produces a list of `Finding`s from `(rows, folder)`:
+
+```python
+@dataclass
+class Finding:
+    rule: str                       # unique name, e.g. "dji-gps-from-srt"
+    confidence: Literal["high", "medium", "low"]
+    path: Path                      # media file the finding targets
+    action: Literal["write_xmp", "pair", "note"]
+    patch: dict[str, str | list]    # exiftool tag → value (list for XMP lists)
+    pair_with: Path | None = None   # for action="pair"
+    reason: str = ""
+```
+
+Shipped rule set (in registration order — earlier entries are "more specific"
+and win the per-field dedup):
+
+1. `dji-gps-from-srt` — GPS from a sibling `{stem}.SRT`.
+2. `dji-date-from-srt` — `DateTimeOriginal` from the SRT's first timestamp line.
+3. `date-from-filename-vid-img` — `VID_/IMG_/DJI_/MVI_/PXL_YYYYMMDD_HHMMSS`.
+4. `insta360-pair-by-ts-serial` — `.insv` ↔ `.lrv` grouped by `(timestamp, serial)` in the filename; recorded in `state.yml` (Immich stack API call lands in 2a.4).
+5. `trip-gps-anchor` — `location.coords` from the folder notes file; fires on every GPS-less media.
+6. `trip-tags-from-notes` — `tags:` list from notes → `XMP:HierarchicalSubject` + flat `XMP:Subject`.
+7. `trip-timezone` — `timezone:` IANA zone from notes → `XMP:DateTimeOriginal` rewritten with `±HH:MM` suffix at each file's capture instant.
+
+**Per-field dedup.** After all rules propose, the CLI keeps the first finding
+that writes each `(path, xmp_field)`. So dji-gps-from-srt's GPS on a DJI file
+beats trip-gps-anchor's fallback for that same file, even when both fire.
+
+**Two-pass apply.** Some rules depend on fields another rule writes in the
+same audit (trip-timezone needs the date that dji-date-from-srt produces).
+After applying HIGH findings, `immy` re-reads EXIF + merges adjacent `.xmp`
+sidecars into each row, re-evaluates rules, and applies any new findings.
+Capped at 3 passes; stops at a fixed point.
+
+**YAML rules, later.** The declarative schema below is the planned public
+surface for user-defined rules in a future iteration (likely 2a.6 or
+later). Several shipped rules (insta360 pairing, trip-timezone's
+compute-offset-at-date, the interactive coords prompt) are stateful
+enough that "data-only YAML" would obscure more than it reveals — they'll
+stay in Python. Simpler rules (has-sibling + missing-field → copy) will
+migrate when it's cheap.
 
 ```yaml
-# immy/rules/dji-gps-from-srt.yml
+# Target schema, not yet implemented
 id: dji-gps-from-srt
-description: DJI clips carry GPS in the SRT sidecar, not the MP4 header.
-confidence: high                # high | medium | low
-priority: 10                    # lower runs first
+confidence: high
+priority: 10
 match:
-  ext: [.MP4, .MOV]
-  filename_prefix: "DJI_"
   has_sibling: "{stem}.SRT"
   missing: [GPSLatitude]
 fix:
-  parse: srt                    # built-in parser name
+  parse: srt
   write:
-    - target: xmp               # XMP sidecar next to the file
-      fields: [GPSLatitude, GPSLongitude, GPSAltitude]
-    - target: exif              # also bake into container if safe
-      fields: [GPSLatitude, GPSLongitude, GPSAltitude]
+    target: xmp
+    fields: [GPSLatitude, GPSLongitude, GPSAltitude]
 ```
-
-```yaml
-# immy/rules/clock-drift-vs-reference.yml
-id: clock-drift-vs-reference
-description: Shift a camera's clock to match a trusted reference.
-confidence: medium
-priority: 50
-match:
-  camera_median_offset_vs_reference: ">10m"
-reference_priority:              # first that exists in the trip wins
-  - iphone
-  - gopro
-  - camera_with_most_files
-fix:
-  shift_all_dates: "{offset}"    # engine computes {offset} from the match
-  write:
-    - target: [exif, xmp]
-      fields: [DateTimeOriginal, CreateDate, ModifyDate]
-prompt: |
-  {camera} median is {offset} off vs {reference} on {pairs} overlapping
-  hour windows. Apply this shift to all {count} files?
-```
-
-```yaml
-# immy/rules/event-tag-from-folder.yml
-id: event-tag-from-folder
-description: Folder name becomes the event tag.
-confidence: high
-priority: 90
-match:
-  folder_depth: 1                # immediate child of Incoming/
-fix:
-  add_tag: "Events/{folder_name}"
-  write:
-    - target: xmp
-      fields: [HierarchicalSubject]
-```
-
-Rule fields:
-- `id` — unique, kebab-case, also the key in `state.yml`.
-- `confidence` — decides interaction: `high` auto-applies, `medium` prompts
-  y/n with `prompt`, `low` asks open-ended.
-- `priority` — ordering when multiple rules match; lower runs first. Two
-  rules writing the same field must have different priorities or the engine
-  fails the audit (no silent "last-rule-wins").
-- `match` — declarative filter. Built-ins: `ext`, `filename_prefix`,
-  `filename_regex`, `has_sibling`, `missing`, `present`, `folder_depth`,
-  `folder_name_regex`, `make`, `model`, `codec`, `camera_median_offset_vs_reference`.
-- `fix` — one of: `parse`, `copy_from_sibling`, `shift_all_dates`, `add_tag`,
-  `set`, plus `write` targets (`exif`, `xmp`, or both).
-- `prompt` — Jinja template, rendered with match context. Required for
-  `confidence: medium | low`.
 
 ### Folder notes file (`README.md` / `TRIP.md` / `IMMY.md`)
 
@@ -169,6 +153,15 @@ front-matter wins.
 
 User can pin a project-wide preference in `~/.immy/config.yml`:
 `notes_filename: IMMY.md`.
+
+**Scaffold on first audit (as shipped):** when none of the three files
+exist, `immy audit` creates `README.md` with detected identity (trip
+name from folder, detected capture dates, detected cameras, detected
+filename prefixes), a `location: { name: null, coords: null }` stub,
+`timezone: null`, and a suggested `tags:` list built from
+`Events/<folder>`, `Gear/Camera/<detected-camera>`, `Source/<prefix>`.
+Editing any of these fields and re-running `immy audit --write` applies
+the new values on the next pass.
 
 **Schema (any of the three filenames):**
 
@@ -220,41 +213,54 @@ trip-level data; `state.yml` is canonical for rule-level decisions.
 become the Immich album description (via `PUT /api/albums/:id`) — search
 "safari at Casela" and the album with that prose comes up.
 
-### `state.yml` schema
+### `state.yml` schema (as shipped)
 
-Per-trip decision memory. Lives at `<trip>/.audit/state.yml`. Answers persist
-so re-runs don't re-ask.
+Per-trip idempotency. Lives at `<trip>/.audit/state.yml`. Each entry is a
+short patch-hash so a re-run with the same proposed fix is a no-op:
 
 ```yaml
-# ~/Documents/Incoming/Iceland-Volcano-25/.audit/state.yml
-trip_name: Iceland-Volcano-25
-schema_version: 1
-reference_camera: iphone
-timezone: Atlantic/Reykjavik
+# ~/Documents/Incoming/Mau-Lions-1/.audit/state.yml
+applied:
+  DSC_4182.JPG:
+    trip-gps-anchor: 159e21de107b06ab
+    trip-tags-from-notes: 8ae412fb92c1f0dd
+    trip-timezone: 3df9a01bc7e20a14
+  DSC_4381.JPG:
+    trip-gps-anchor: 159e21de107b06ab
+    ...
+```
+
+This shipped schema is intentionally flat — it answers "was this exact
+patch applied already?" and nothing more. Rule-level memory that does
+need richer shape (a chosen reference camera, a chosen clock offset, a
+user-declined rule list) lands with 2a.2 in a `decisions:` sibling key:
+
+```yaml
+# Target for 2a.2+
+applied: { ... }
 decisions:
   clock-drift-vs-reference:
     fuji:
       offset: "+3:02:00"
       applied_at: 2026-04-18T10:32:14+01:00
       pairs: 14
-  event-tag-from-folder:
-    tag: "Events/Iceland-Volcano-25"
-    applied_at: 2026-04-18T10:32:14+01:00
-rules_skipped: []                # rules the user explicitly declined
+rules_skipped: []                # user explicitly declined
 last_audit_at: 2026-04-18T10:32:14+01:00
 last_audit_status: clean         # clean | needs_review | error
 ```
 
 ### JSONL audit log
 
-`<trip>/.audit/log.jsonl` — append-only, one line per action. Replayable,
-greppable.
+`<trip>/.audit/audit.jsonl` — append-only, one line per applied action.
+Replayable, greppable. Unix-timestamp `ts` keeps the format simple:
 
 ```json
-{"ts":"2026-04-18T10:32:10Z","rule":"dji-gps-from-srt","file":"dji/DJI_0042.MP4","action":"apply","fields":["GPSLatitude","GPSLongitude"],"confidence":"high"}
-{"ts":"2026-04-18T10:32:11Z","rule":"clock-drift-vs-reference","camera":"fuji","action":"prompt","confidence":"medium"}
-{"ts":"2026-04-18T10:32:14Z","rule":"clock-drift-vs-reference","camera":"fuji","action":"apply","offset":"+3:02:00","answer":"y"}
+{"ts":1776450709.642,"event":"applied","rule":"trip-gps-anchor","file":"DSC_4381.JPG","action":"write_xmp","patch":{"GPSLatitude":"-20.296270","GPSLatitudeRef":"S","GPSLongitude":"57.407940","GPSLongitudeRef":"E"},"pair_with":null}
+{"ts":1776450710.104,"event":"applied","rule":"trip-tags-from-notes","file":"DSC_4381.JPG","action":"write_xmp","patch":{"HierarchicalSubject":["Events/Mau-Lions-1","Gear/Camera/Nikon Z50_2","Source/Nikon"],"Subject":["Mau-Lions-1","Nikon","Nikon Z50_2"]},"pair_with":null}
 ```
+
+Only `event: applied` entries are written today. Future iterations will
+add `event: prompt`, `event: skipped`, `event: contradiction`.
 
 ### XMP tag write contract
 
@@ -276,29 +282,57 @@ Immich's sidecar import reads these on scan; the flat-subject fallback means
 digiKam / Lightroom / Photo Mechanic see the same tags without us having to
 teach them about the hierarchy separator.
 
-Writing order per file:
-1. Engine computes the final set of `(field, value)` pairs to write.
-2. One `exiftool -overwrite_original -tagsFromFile @ -all:all` call to stamp
-   the file and emit the `.xmp` sibling — single subprocess per file, not one
-   per field.
-3. Re-read, diff, assert success before logging the action.
+Writing order per file (as shipped):
+1. Engine computes the final set of `(field, value)` pairs to write for one
+   finding.
+2. One `exiftool -overwrite_original -XMP:<tag>=<value> ... <sidecar>` call
+   per finding. Sidecar path is Adobe standard: `basename.xmp` (e.g.
+   `DSC_4182.xmp` for `DSC_4182.JPG`). List-valued fields are emitted as
+   repeated `-XMP:<tag>=<value>` assignments — first `=` clears the list,
+   each subsequent `=` appends an entry, so re-applying the same list
+   overwrites cleanly and is idempotent.
+3. State is updated with the patch-hash before the next finding runs. The
+   CLI's two-pass apply re-reads EXIF + sidecars between passes.
 
-### `immy` CLI surface
+**Why `basename.xmp` and not `basename.ext.xmp`:** Adobe/Bridge convention.
+Stream-pairs that share a stem (Live Photo HEIC+MOV) collapse to one
+sidecar, which is correct — they share capture metadata. Cross-type
+collisions inside a single folder are rare in practice; a future
+iteration can add a fallback to `basename.ext.xmp` if they ever show up.
+
+### Sidecar read merge
+
+`exiftool` does *not* auto-pair a media file with its adjacent `.xmp`
+sidecar on read. `immy` does that itself: `read_folder` reads both media
+and any `.xmp` siblings in one exiftool batch, then merges each sidecar's
+`XMP:*` tags into the media row (sidecar keys only fill holes — the
+media's own EXIF tags win where both are present). This is what lets a
+pass-N rule see fields written by a pass-N–1 rule in the same audit.
+
+### `immy` CLI surface (as shipped)
 
 ```
-immy audit   <trip-folder>        # default: interactive, prompts MEDIUM/LOW
-immy audit   --yes-high  <path>   # auto-apply HIGH only, skip and report others
-immy audit   --yes-medium <path>  # auto-apply HIGH + MEDIUM using cached answers
-immy audit   --dry-run  <path>    # nothing touched, just prints planned actions
-immy promote <trip-folder>        # rsync to NAS + trigger Immich scan
-immy promote --dry-run <path>     # print rsync cmd + API call, do neither
-immy status  <trip-folder>        # show last audit summary + pending issues
-immy rules   list                 # catalogue; `--explain <rule-id>` prints the YAML
+immy audit   <trip-folder>                # read-only: print per-file table + pending/applied counts
+immy audit   --write   <trip-folder>      # apply HIGH findings; interactive for LOW (coords prompt)
+immy audit   --auto    <trip-folder>      # non-interactive: no prompts, LOW stays pending
+immy audit   --dry-run <trip-folder>      # with --write: report but don't modify
+immy audit   --verbose <trip-folder>      # per-file EXIF dump
+immy promote <trip-folder>                # STUB: rsync + scan (lands 2a.4)
 ```
 
-Exit codes: `0` clean / no pending issues. `1` user aborted. `2` pending
-MEDIUM/LOW. `3` rule contradiction or configuration error. Watcher mode uses
-`0`-only as the auto-promote signal.
+Combining flags is fine: `--write --auto` is the recipe for the
+watcher / cron / non-TTY path.
+
+Target for later iterations:
+
+```
+immy status  <trip-folder>                # last audit summary + pending issues
+immy rules   list [--explain <rule-id>]   # catalogue
+```
+
+Exit codes today: `0` on any completed audit (prompt-declined included),
+non-zero on exiftool/file errors. Rule-contradiction and "pending
+MEDIUM/LOW" exit codes land with 2a.2.
 
 ### Insta360 `.insv` handling
 
