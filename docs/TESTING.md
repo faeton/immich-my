@@ -1,0 +1,198 @@
+# Testing
+
+Per-phase acceptance tests. A phase is "done" only when its tests pass. Each
+test is a **golden path** (happy case) plus at least one **failure mode** that
+exercises the thing the phase was supposed to protect against.
+
+Conventions:
+- `vv` = the DS923+ over Tailscale.
+- `mac` = the MacBook.
+- Commands run on the NAS use the full docker path (`/usr/local/bin/docker`)
+  because DSM's default shell `$PATH` doesn't include it.
+
+## Phase 0 — Base stack
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 0.1 | Containers healthy after host reboot | `docker compose ps` from `/volume1/faeton-immi/docker/` shows all four containers `healthy` after a full DSM reboot, without manual intervention. |
+| 0.2 | Web UI reachable over Tailscale | `https://vv.<tailnet>:2283/` (or whatever tailnet name we pick) loads the Immich login in < 3 s from the Mac and iPhone. |
+| 0.3 | Admin account sign-in works | Can log in with the account created at first boot; no banner warnings in Admin → Server Stats. |
+| 0.4 | iOS app round-trip | From the Immich iOS app, point at the Tailscale URL, log in, take one photo, trigger backup. Photo appears in web UI timeline within 60 s. |
+| 0.5 | Storage template applied | After 0.4, the file lives at `/volume1/faeton-immi/library/library/<user>/2026/2026-04-16/HHMMSS-<origname>.<ext>`. |
+| 0.6 | External library visible | Admin → Libraries shows `/mnt/external/originals` as an external library. Scan completes with 0 assets (empty tree) and no errors. |
+| 0.7 | External library picks up a dropped file | Copy one `.jpg` into `/volume1/faeton-immi/originals/2026/2026-04-16/test.jpg`, re-run the scan, the asset appears read-only in the timeline. |
+| 0.8 | Postgres dump + restore | Run the `pg_dumpall` from DEPLOY.md, verify gzip opens and contains `CREATE DATABASE immich`. (Full restore rehearsal deferred until we have a second test NAS or a VM.) |
+| 0.9 | Graceful degradation: Mac offline | With the Mac asleep, browsing + search-by-filename still work. (CLIP/face jobs may queue — expected. Nothing should *break*.) |
+| 0.10 | Port 2283 not exposed to WAN | From an off-tailnet device with only the NAS's public IP, `curl` to port 2283 fails/times out. (Sanity: we never opened the router.) |
+
+**Regressions to watch for:**
+- `immich_postgres` logs growing because `DB_STORAGE_TYPE: HDD` is uncommented
+  accidentally (we're on SSD-cached btrfs — leave it commented).
+- `model-cache` bind mount permissions: a failed pull leaves the dir root-owned
+  and ML container sits in a loop. Symptom: ML jobs stuck in "active" forever.
+
+## Phase 1 — Mac as burst ML node
+
+Operating constraint: Mac is mobile, often on 5–10 Mbps uplink, sometimes
+off-tailnet entirely. All tests assume Mac-unreachable is a normal state,
+not a failure.
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 1.1 | `immich-ml-metal` reachable from NAS | From `vv`: `curl -sf http://<mac-tailscale>:3003/ping` returns 200 with the Mac awake and on tailnet. |
+| 1.2 | Immich prefers Mac when available | With both URLs configured, a 100-photo face backfill shows ML jobs hitting the Mac (check process list / container logs). |
+| 1.3 | Fallback when Mac sleeps / off-tailnet | Put the Mac to sleep (or disable Tailscale on it) mid-backfill. Jobs drain on Syno fallback within the configured timeout (2–3 s per attempt). No job stuck in "active" > 10 min. |
+| 1.4 | 50k backfill budget (stable link) | With Mac awake on mains + reliable Tailscale, full face backfill on 50k assets completes in ≈ 1 h wall clock. (Fails loudly if we regressed to CPU path.) |
+| 1.5 | 50k backfill budget (Mac offline) | Same backfill with Mac never reachable: completes on Syno CPU alone, finishes, no wedged jobs. Wall clock is hours, not minutes — that's fine. |
+| 1.6 | Captive-portal / flaky link survival | Simulate with `pfctl`-throttled tailnet + periodic drops during a backfill. Progress is monotonic; no duplicated work on reconnect (idempotent on `(checksum, worker, version)`). |
+| 1.7 | Mac reboot / lid-close is a no-op | Reboot the Mac or close the lid mid-queue; on return, queue resumes where it left off. |
+
+## Phase 1b — Mount adapter framework
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 1b.1 | SMB mount health check | Wrapper reports `healthy=true` for a live SMB share, `healthy=false` after the provider goes down (simulate with `ifconfig` down on the source). |
+| 1b.2 | Unplug-mid-scan doesn't wedge | Start an external-library scan against a USB drive, yank the drive. Scan returns an error within 60 s; Immich server process stays up; UI stays responsive. |
+| 1b.3 | Thumbs keep rendering offline | After 1b.2, timeline thumbs for offline assets render from tier-0 derivatives. Only "open original" fails, with the friendly message. |
+| 1b.4 | `rclone` VFS cache capped | Fill-up simulation: cache dir on NVMe never exceeds the configured cap; oldest blocks evicted first. |
+| 1b.5 | Catalog-only toggle | For a source marked catalog-only, ingest reads header + preview but never pulls full bytes (verify via `rclone mount --vfs-read-chunk-size` counters or SMB byte counters). |
+
+## Phase 2a — `immy` metadata forensics
+
+### Test pyramid
+
+| Level | What it tests | How |
+|---|---|---|
+| **Unit** | Each rule's `match()` + `fix()` in isolation | Dict inputs, no file IO, golden outputs. Fast (ms). |
+| **Exif roundtrip** | pyexiftool reads/writes are correct | Write EXIF → re-read → assert. Catches library drift. |
+| **Rule on fixture** | One rule applied to a realistic mini-folder | Snapshot XMP sidecars + `state.yml` → compare to goldens. |
+| **End-to-end, mocked** | Full `audit → promote` against a fake Immich | `respx` mocks the REST API. Runs in CI, zero network. |
+| **End-to-end, staging** | Full run against real `nas-media` Immich, dedicated test external library | Nightly / on tag. Catches environment drift. |
+| **Idempotency** | Re-running is a no-op | Run audit twice; second run diffs clean. |
+| **State persistence** | Decisions survive re-runs | Answer once, re-run, ensure no prompt fires. |
+
+### Fixtures (committed to `tests/fixtures/`)
+
+- `dji-srt-pair/` — `DJI_0001.MP4` + `.SRT` with known GPS.
+- `insta360-pair/` — `.insv` + `.lrv` with known GPS on the `.lrv`.
+- `fuji-clock-drift/` — 3 RAFs dated +3h vs an iPhone anchor JPG in the same tree.
+- `timezone-naive/` — `DateTimeOriginal` present, `OffsetTimeOriginal` missing.
+- `export-date-trap/` — `ModifyDate` ≫ `DateTimeOriginal` (edited export).
+- `multi-camera-clean/` — all cameras aligned, expected output is zero prompts.
+- `golden/` — expected XMP sidecar outputs + `state.yml` per fixture.
+
+Files are tiny — synthetic JPEGs or truncated MP4 headers are fine as long as `exiftool` reads them cleanly.
+
+### Per-iteration acceptance
+
+| # | Iteration | Pass criteria |
+|---|---|---|
+| 2a.0 | Skeleton | `immy --help` works; `immy audit ./fixtures/dji-srt-pair` prints table, exits 0; one passing pytest. |
+| 2a.1 | Two HIGH rules + XMP + state | Running `immy audit ./fixtures/dji-srt-pair` writes a `DJI_0001.MP4.xmp` sidecar whose GPS matches the SRT fixture. Second run: zero writes. `tests/fixtures/golden/dji-srt-pair/` diff is clean. |
+| 2a.2 | Clock drift + MEDIUM prompter | `immy audit ./fixtures/fuji-clock-drift` under `--yes-medium` applies the +3:02:00 shift; re-audit shows drift = 0. `state.yml` records the offset. A third run of the same fixture *without* `--yes-*` does not re-prompt (cached decision). |
+| 2a.3 | Tagging | After promotion, each fixture asset in Immich has the expected `Events/`, `Gear/Camera/`, `Source/` tag hierarchy (assert via `GET /api/assets/:id`). |
+| 2a.4 | Promote + scan trigger | `immy promote ./fixtures/dji-srt-pair` rsyncs to `vv:/volume1/faeton-immi/originals-test/` (dedicated test library path), calls `POST /api/libraries/:id/scan`, assets appear within 30 s. `--dry-run` performs zero writes and zero API calls. |
+| 2a.5 | Real-trip coverage | Two actual Incoming trips (e.g. `La Manga`, `Mau-Lions-1`) audit with <10 % of files flagged LOW-confidence; no rule throws. |
+| 2a.6 | Watcher | Drop a fresh fixture folder into `~/Documents/Incoming/` — within one debounce cycle, `launchd`-run `immy` audits non-interactively; if all rules are HIGH it promotes, otherwise writes `NEEDS_REVIEW.md` at the folder root with open questions. |
+| 2a.7 | Web answers | For every rule with `confidence: low`, there is either a terminal-readable prompt or a web form at `/audit/...` that resolves it. |
+
+### Failure modes to cover
+
+- **exiftool version drift** — fixture test that fails loudly when exiftool's output schema changes shape (so we catch it in CI, not at 3 am).
+- **Partial write** — power cut mid-XMP: the next audit recovers, no orphan lock files, no corrupted sidecars.
+- **Network flap during promote** — rsync or the API call fails → state rolls back, nothing half-promoted, re-run is safe.
+- **Rule contradiction** — two rules match the same field with different fixes: fail the audit with a clear error naming both rules. No silent "last-rule-wins" behaviour.
+- **`state.yml` corruption** — malformed file → `immy audit` refuses to run, points at a backup. Never silently re-asks questions.
+
+### What **not** to test
+
+- Full 760 GB library — that's theatre, not testing. Use representative fixtures + real pilot trips.
+- Performance on huge trees — defer until a real audit feels slow in practice.
+- Every `exiftool` edge case — we trust the tool; we test our wrapper.
+- The Immich API itself — we trust upstream; we test our client.
+
+## Phase 2 — Ingest funnel
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 2.1 | Inbox → originals move is atomic | Drop a 5 GB MP4 into `/library/inbox/…`. File appears in `/library/originals/…` only after normalisation finishes; no half-written file ever lives in `originals/`. |
+| 2.2 | EXIF read is header-only | Drop a 20 GB ProRes clip. exiftool byte counter reports < 1 MB read; Immich asset metadata is complete within 10 s. |
+| 2.3 | `osxphotos --update` is idempotent | Run twice back-to-back with no new Photos.app changes; second run creates zero new assets, zero DB writes. |
+| 2.4 | People names survive the pull | A named person in Apple Photos → matching `faces` entry in Immich (or at least a consistent XMP sidecar ready for Phase 5). |
+| 2.5 | Duplicate path, same file, noop | Re-rsync the same SD card into the same per-camera folder; no duplicate assets created. |
+
+## Phase 2b — Lazy preview extractor
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 2b.1 | RAW thumb is the embedded JPEG | CR3/ARW/NEF/DNG: generated thumb's SHA matches the embedded preview extracted by exiftool, proving we didn't decode the RAW. |
+| 2b.2 | HEIC thumb is the embedded one | Same — no decode-and-re-encode round-trip. |
+| 2b.3 | MP4 poster from moov only | A 20 GB ProRes ingest completes in < 5 s to "has-thumbnail" state; background proxy job follows. |
+| 2b.4 | `.insv` pairs with `.lrv` | Dropping both files into inbox produces one Immich asset with the `.lrv` used as preview, original `.insv` linked. |
+| 2b.5 | DJI `.SRT` → XMP GPS | After ingest, the asset has GPS + altitude set from the SRT; visible on the Immich map. |
+
+## Phase 2c — Bloat detector + batch re-encode
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 2c.1 | Allowlist respected | All Insta360 `.mp4` exports (5.7K, 7.7K, equirect 2:1) are never flagged — even at "obscene" bits/pixel. Ditto `DJI_`, `GX`, `GH`, `GOPR`, `MVI_`, `.dng`, `.braw`, `prores`, `dnxhd`, anything in `*raw*`/`*source*`/`*edit*`/`*project*` folders. |
+| 2c.2 | Never auto-transcodes | With only scan configured (no user confirmation), transcode count is zero, regardless of how many candidates exist. |
+| 2c.3 | Grouped-by-folder UI | Report for a test tree shows one row per parent folder with aggregate size + savings, not one row per file. |
+| 2c.4 | Sample before commit | "Sample" button transcodes first 10 s only; side-by-side preview renders; nothing on disk is replaced. |
+| 2c.5 | Idempotent replace | After accepting a transcode: `.optimized.mp4` is created, duration + stream count verified against source, then atomic rename. `pre_transcode_sha256` + original size stored on the asset row. |
+| 2c.6 | Asset identity preserved | After transcode, face matches, album memberships, and description/AI caption on the asset are unchanged. |
+| 2c.7 | `preserve=true` XMP honoured | An asset tagged `preserve=true` in its XMP sidecar is never listed as a candidate. |
+
+## Phase 3 — Proxy-first AI enrichment
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 3.1 | Whisper writes `.srt` sidecar | A 2-minute test video produces a sidecar SRT next to the proxy; asset description contains first line(s). |
+| 3.2 | CLIP / transcript search hits | Searching for a unique phrase spoken in 3.1's video returns that asset. |
+| 3.3 | Caption appended, not replaced | Captioner output is prefixed `AI:` so hand-written descriptions aren't clobbered. |
+| 3.4 | Workers never open originals | During a full enrichment pass, audit byte reads of `/library/originals/`: zero bytes from the enrichment workers. |
+| 3.5 | Resume after crash | Kill the Whisper worker mid-queue; restart; it picks up the next un-done `(checksum, worker, version)` row — no duplicated work, no skipped asset. |
+
+## Phase 4 — Event clustering
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 4.1 | Trip becomes one album | A known travel week from last year forms exactly one album (not fragmented into multiple), named like `2025-07 Porto`. |
+| 4.2 | No album for singletons | A one-off photo from a random day produces no album. |
+| 4.3 | Re-run is stable | Running the job twice produces the same album set; no `2025-07 Porto (2)` duplicates. |
+| 4.4 | Nominatim failures are soft | With Nominatim down, albums still form but get placeholder names; re-run later fills the real name. |
+
+## Phase 5 — Metadata gap-fill UI
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 5.1 | Missing-GPS grouping | A 200-photo trip with no GPS shows as one group with a suggested location from nearest neighbour. |
+| 5.2 | Apply-to-group writes XMP + API | After "apply", EXIF on disk and Immich API both reflect the new GPS; moving the file preserves the tag. |
+| 5.3 | Nothing gets tagged until click | Until the user clicks apply, zero writes happen — pure read-only dry-run. |
+
+## Phase 6 — Ghost assets
+
+| # | Test | Pass criteria |
+|---|---|---|
+| 6.1 | Offline ≠ gone | Unplug an archive drive. Affected assets show status `offline`; thumbnails, CLIP search, face search, transcripts still work. |
+| 6.2 | Open original: friendly error | Clicking "download original" on an offline asset shows "volume X is offline" — not a 500. |
+| 6.3 | Remount auto-resurrects | Plug the drive back in. Within one sidecar poll cycle, assets flip back to `online`. No re-scan, no re-hashing. |
+| 6.4 | State transitions are logged | `online → offline → resurrecting → online` transitions appear in the sidecar log with asset counts. |
+
+## Ad-hoc smoke checks (any time)
+
+- `docker compose ps` on `vv` — all 4 containers `healthy`.
+- `df -h /volume1` — headroom left (flag at < 20 %).
+- `/volume1/faeton-immi/library/` free-space trend (graph in DSM Resource
+  Monitor) — not growing unexpectedly fast.
+- `docker compose logs immich-server --since 1h | grep -i error` — empty.
+- One manual photo upload round-trip, then delete.
+
+## Failure drills (run at least twice a year)
+
+- **Cold restore.** Spin up a scratch NAS/VM, restore the latest `pg_dumpall`
+  + `library/` tarball, confirm Immich comes up with faces + albums intact.
+- **Mac died, buy new one.** Pretend the Mac is gone. Confirm the Syno-only
+  path still serves browsing, search, upload. (Phase 1 fallback path.)
+- **Ransomware-ish.** Delete a day's folder under `library/`. Confirm Hyper
+  Backup / external snapshot can restore just that folder.
