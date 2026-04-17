@@ -1,0 +1,29 @@
+[project]
+name = "immy"
+version = "0.0.1"
+description = "Pre-ingest metadata forensics for trip folders bound for Immich."
+requires-python = ">=3.11"
+dependencies = [
+    "typer>=0.12",
+    "pyexiftool>=0.5",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+]
+
+[project.scripts]
+immy = "immy.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/immy"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

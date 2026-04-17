@@ -1,0 +1,5 @@
+1
+00:00:00,000 --> 00:00:01,000
+<font size="28">FrameCnt : 1, DiffTime : 33ms
+2026-03-05 09:49:01,000,000
+[iso : 100] [shutter : 1/500.0] [fnum : 280] [ev : 0] [ct : 5500] [color_md : default] [focal_len : 240] [latitude: -20.296270] [longitude: 57.407940] [altitude: 120.000000]</font>
