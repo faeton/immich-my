@@ -106,7 +106,7 @@ def _prefix(path: Path) -> str | None:
     return head
 
 
-def _detect_identity(folder: Path, rows: list[ExifRow]) -> TripIdentity:
+def detect_identity(folder: Path, rows: list[ExifRow]) -> TripIdentity:
     dates: set[str] = set()
     cameras: set[str] = set()
     prefixes: set[str] = set()
@@ -132,7 +132,7 @@ def _detect_identity(folder: Path, rows: list[ExifRow]) -> TripIdentity:
     )
 
 
-def _suggested_tags(identity: TripIdentity) -> list[str]:
+def suggested_tags(identity: TripIdentity) -> list[str]:
     tags: list[str] = [f"Events/{identity.name}"]
     for cam in identity.cameras:
         tags.append(f"Gear/Camera/{cam}")
@@ -146,14 +146,14 @@ def ensure_notes(folder: Path, rows: list[ExifRow]) -> Path | None:
     if created, else None."""
     if resolve(folder) is not None:
         return None
-    identity = _detect_identity(folder, rows)
+    identity = detect_identity(folder, rows)
     front = {
         "trip": identity.name,
         "dates": identity.dates,
         "cameras": identity.cameras,
         "location": {"name": None, "coords": None},
         "timezone": None,
-        "tags": _suggested_tags(identity),
+        "tags": suggested_tags(identity),
     }
     body = [
         "---",

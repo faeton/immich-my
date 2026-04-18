@@ -98,6 +98,7 @@ and win the per-field dedup):
 6. `trip-tags-from-notes` (HIGH) — `tags:` list from notes → `XMP:HierarchicalSubject` + flat `XMP:Subject`.
 7. `trip-timezone` (HIGH) — `timezone:` IANA zone from notes → `XMP:DateTimeOriginal` rewritten with `±HH:MM` suffix at each file's capture instant.
 8. `clock-drift` (MEDIUM) — folder-median coherence check over resolved capture dates; flags files >24 h from the median with source + delta, proposes `DateTimeOriginal = median` as the patch. Needs ≥3 samples; ignores `mtime`-sourced dates as too noisy.
+9. `tag-suggest-missing` (MEDIUM, `write_notes`) — diffs existing notes `tags:` against what the scaffold would produce from the *current* folder contents; proposes any tag whose category (prefix before the last `/`) is entirely absent from the user's list. Opt-out: `tag_suggestions: off` (YAML bool `off/false/no` or any string matching). Accepted patches go through the `write_notes` action: the CLI merges the `add_tags` list into notes front-matter (unique, order-preserving), and the next apply pass picks them up via `trip-tags-from-notes` (which writes to XMP).
 
 **Per-tier, per-field dedup.** Rules dedup within their confidence tier.
 A HIGH rule claims `(path, xmp_field)` and later HIGH rules lose; a
@@ -313,6 +314,16 @@ Writing order per file (as shipped):
    overwrites cleanly and is idempotent.
 3. State is updated with the patch-hash before the next finding runs. The
    CLI's two-pass apply re-reads EXIF + sidecars between passes.
+
+**`write_notes` action.** Used by `tag-suggest-missing`. The finding's
+`path` is the notes file (`TRIP.md`/`IMMY.md`/`README.md`) and the
+`patch` carries a `{"add_tags": [...]}` list. The CLI merges the list
+into the front-matter `tags:` (unique, order-preserving via
+`notes.update_frontmatter`) and writes the file. State records the
+patch-hash on the notes path's relative string so a repeat proposal is
+a no-op. After a `write_notes` apply, the two-pass loop re-reads EXIF +
+re-evaluates, which lets `trip-tags-from-notes` see the new tags and
+cascade them into each media's XMP sidecar without a separate trigger.
 
 **Why `basename.xmp` and not `basename.ext.xmp`:** Adobe/Bridge convention.
 Stream-pairs that share a stem (Live Photo HEIC+MOV) collapse to one

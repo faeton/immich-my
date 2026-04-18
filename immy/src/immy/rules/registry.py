@@ -15,7 +15,7 @@ from ..exif import ExifRow
 
 
 Confidence = Literal["high", "medium", "low"]
-Action = Literal["write_xmp", "pair", "note"]
+Action = Literal["write_xmp", "write_notes", "pair", "note"]
 
 
 @dataclass

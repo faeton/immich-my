@@ -51,6 +51,13 @@ def clock_drift_fixture(tmp_path: Path) -> Path:
     return target
 
 
+@pytest.fixture
+def tag_suggest_fixture(tmp_path: Path) -> Path:
+    target = tmp_path / "tag-suggest-missing"
+    shutil.copytree(FIXTURES / "tag-suggest-missing", target)
+    return target
+
+
 def test_help_exits_zero():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -310,6 +317,65 @@ def test_clock_drift_skipped_below_min_samples(trip_anchor_fixture: Path):
     assert result.exit_code == 0
     assert "review clock-drift" not in result.stdout
     assert "MEDIUM findings" not in result.stdout
+
+
+def test_tag_suggest_flags_missing_categories(tag_suggest_fixture: Path):
+    result = runner.invoke(app, ["audit", str(tag_suggest_fixture), "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "review tag-suggest-missing: 1 file(s)" in result.stdout
+    # No write without --write: notes unchanged.
+    import yaml
+    fm = yaml.safe_load(
+        (tag_suggest_fixture / "TRIP.md").read_text().split("---", 2)[1]
+    )
+    assert fm["tags"] == ["Events/CustomEventLabel"]
+
+
+def test_tag_suggest_yes_medium_merges_into_notes_and_cascades_to_xmp(tag_suggest_fixture: Path):
+    result = runner.invoke(
+        app, ["audit", str(tag_suggest_fixture), "--write", "--auto", "--yes-medium"],
+    )
+    assert result.exit_code == 0, result.stdout
+
+    import yaml
+    fm = yaml.safe_load(
+        (tag_suggest_fixture / "TRIP.md").read_text().split("---", 2)[1]
+    )
+    assert "Events/CustomEventLabel" in fm["tags"]  # user's existing tag preserved
+    assert "Gear/Camera/NIKON CORPORATION NIKON Z50_2" in fm["tags"]
+    assert "Source/DSC" in fm["tags"]
+
+    # Cascade: trip-tags-from-notes re-fires after the notes write and
+    # lands the full set in the XMP sidecar.
+    tags = _xmp_tags(tag_suggest_fixture / "DSC_0001.xmp")
+    h = tags.get("XMP:HierarchicalSubject")
+    assert isinstance(h, list)
+    assert "Gear/Camera/NIKON CORPORATION NIKON Z50_2" in h
+    assert "Source/DSC" in h
+
+
+def test_tag_suggest_respects_opt_out(tag_suggest_fixture: Path):
+    notes = tag_suggest_fixture / "TRIP.md"
+    notes.write_text(
+        "---\ntrip: x\ntag_suggestions: off\ntags:\n  - Events/Keep\n---\n# x\n"
+    )
+    result = runner.invoke(app, ["audit", str(tag_suggest_fixture), "--auto"])
+    assert result.exit_code == 0
+    assert "review tag-suggest-missing" not in result.stdout
+    assert "MEDIUM findings" not in result.stdout
+
+
+def test_tag_suggest_idempotent_after_accept(tag_suggest_fixture: Path):
+    runner.invoke(
+        app, ["audit", str(tag_suggest_fixture), "--write", "--auto", "--yes-medium"],
+    )
+    # Second run: no MEDIUM pending, re-audit clean.
+    result = runner.invoke(
+        app, ["audit", str(tag_suggest_fixture), "--write", "--auto", "--yes-medium"],
+    )
+    assert result.exit_code == 0
+    assert "review tag-suggest-missing" not in result.stdout
+    assert "0 pending" in result.stdout
 
 
 def test_notes_file_not_overwritten(dji_fixture: Path):

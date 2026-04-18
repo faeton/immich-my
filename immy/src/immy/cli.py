@@ -66,6 +66,8 @@ def _apply_once(folder: Path, state: State, pending: list[Finding]) -> int:
         rel = f.path.relative_to(folder).as_posix()
         if f.action == "write_xmp":
             write_xmp(f.path, f.patch)
+        elif f.action == "write_notes":
+            _apply_write_notes(f)
         state.mark_applied(rel, f.rule, _finding_patch_hash(f))
         log_event(folder, {
             "event": "applied",
@@ -77,6 +79,23 @@ def _apply_once(folder: Path, state: State, pending: list[Finding]) -> int:
         })
     state.save()
     return len(pending)
+
+
+def _apply_write_notes(f: Finding) -> None:
+    """Apply a note-edit patch. Today supports `add_tags` (append unique,
+    preserve order). More keys can join here as write_notes rules grow."""
+    add_tags = f.patch.get("add_tags") or []
+    if not add_tags:
+        return
+    fm = parse_frontmatter(f.path)
+    existing = fm.get("tags")
+    merged: list = list(existing) if isinstance(existing, list) else []
+    seen = set(merged)
+    for t in add_tags:
+        if t not in seen:
+            merged.append(t)
+            seen.add(t)
+    update_frontmatter(f.path, {"tags": merged})
 
 
 def _apply_loop(folder: Path, state: State, initial_pending: list[Finding]) -> int:
@@ -326,7 +345,7 @@ def audit(
             )
             if accepted:
                 total_med = _apply_loop(folder, state, accepted)
-                console.print(f"[green]✓[/green] wrote {total_med} MEDIUM finding(s)")
+                console.print(f"[green]✓[/green] wrote {total_med} finding(s) (MEDIUM + cascade)")
 
     if verbose:
         for r in rows:
