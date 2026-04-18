@@ -44,6 +44,13 @@ def trip_anchor_fixture(tmp_path: Path) -> Path:
     return target
 
 
+@pytest.fixture
+def clock_drift_fixture(tmp_path: Path) -> Path:
+    target = tmp_path / "clock-drift-simple"
+    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+    return target
+
+
 def test_help_exits_zero():
     result = runner.invoke(app, ["--help"])
     assert result.exit_code == 0
@@ -233,6 +240,76 @@ def test_trip_timezone_noop_when_no_date(tmp_path: Path):
     tags = _xmp_tags(target / "IMG_A.xmp")
     assert "XMP:GPSLatitude" in tags
     assert "XMP:DateTimeOriginal" not in tags
+
+
+def test_clock_drift_flags_outlier_but_read_only_does_not_write(clock_drift_fixture: Path):
+    result = runner.invoke(app, ["audit", str(clock_drift_fixture), "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "MEDIUM findings: 1 pending review" in result.stdout
+    assert "clock-drift" in result.stdout
+    assert not (clock_drift_fixture / "DSC_0004.xmp").exists()
+
+
+def test_clock_drift_yes_medium_writes_median_and_reaudit_clean(clock_drift_fixture: Path):
+    result = runner.invoke(
+        app, ["audit", str(clock_drift_fixture), "--write", "--auto", "--yes-medium"],
+    )
+    assert result.exit_code == 0, result.stdout
+    xmp = clock_drift_fixture / "DSC_0004.xmp"
+    assert xmp.is_file()
+    tags = _xmp_tags(xmp)
+    # Median of 10:00, 10:05, 10:10, 12:00(+4d) on 4 samples is the avg of
+    # the middle two sorted timestamps: (10:05 + 10:10)/2 = 10:07:30 on apr 1.
+    assert tags["XMP:DateTimeOriginal"] == "2026:04:01 10:07:30"
+
+    # Re-audit is a no-op: MEDIUM finding disappears (XMP override now puts
+    # DSC_0004 within 24h of the new median).
+    result2 = runner.invoke(
+        app, ["audit", str(clock_drift_fixture), "--write", "--auto", "--yes-medium"],
+    )
+    assert result2.exit_code == 0
+    assert "MEDIUM findings" not in result2.stdout
+    assert "review clock-drift" not in result2.stdout
+
+
+def test_clock_drift_interactive_y_applies_n_skips(clock_drift_fixture: Path):
+    # LOW coords prompt fires first (no GPS); send empty to skip, then "y"
+    # to accept the single MEDIUM clock-drift finding.
+    result = runner.invoke(
+        app, ["audit", str(clock_drift_fixture), "--write"],
+        input="\ny\n",
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "apply? [y/N]" in result.stdout
+    assert (clock_drift_fixture / "DSC_0004.xmp").is_file()
+
+
+def test_clock_drift_interactive_n_leaves_pending(tmp_path: Path):
+    target = tmp_path / "clock-drift-simple"
+    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+    result = runner.invoke(
+        app, ["audit", str(target), "--write"],
+        input="\nn\n",
+    )
+    assert result.exit_code == 0, result.stdout
+    assert not (target / "DSC_0004.xmp").exists()
+
+
+def test_clock_drift_skipped_without_yes_medium_in_auto(clock_drift_fixture: Path):
+    # --auto without --yes-medium: report but do not apply.
+    result = runner.invoke(app, ["audit", str(clock_drift_fixture), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "MEDIUM findings: 1 pending review" in result.stdout
+    assert not (clock_drift_fixture / "DSC_0004.xmp").exists()
+
+
+def test_clock_drift_skipped_below_min_samples(trip_anchor_fixture: Path):
+    # trip-anchor-simple has 2 media files — under MIN_SAMPLES=3, clock-drift
+    # must not propose anything even if the files have no EXIF dates.
+    result = runner.invoke(app, ["audit", str(trip_anchor_fixture), "--auto"])
+    assert result.exit_code == 0
+    assert "review clock-drift" not in result.stdout
+    assert "MEDIUM findings" not in result.stdout
 
 
 def test_notes_file_not_overwritten(dji_fixture: Path):

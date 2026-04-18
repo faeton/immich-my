@@ -77,9 +77,9 @@ Shipped:
 - `dji-srt-pair/` — `DJI_0001.JPG` + `DJI_0001.SRT` carrying Casela GPS + wall-clock date. Drives `dji-gps-from-srt`, `dji-date-from-srt`.
 - `insta360-pair/` — `VID_20240101_120000_00_001.insv` + `LRV_20240101_120000_01_001.lrv`, timestamp+serial match. Drives `insta360-pair-by-ts-serial` + `date-from-filename-vid-img`.
 - `trip-anchor-simple/` — two GPS-less JPGs + `TRIP.md` with explicit `location.coords`. Drives `trip-gps-anchor` and the `sibling SRT beats anchor` precedence test.
+- `clock-drift-simple/` — four JPGs with EXIF `DateTimeOriginal`, three clustered on 2026-04-01 and one four days later. Drives `clock-drift` (MEDIUM) + the interactive y/n prompter + `--yes-medium` flag.
 
 Pending (for later iterations):
-- `fuji-clock-drift/` — 3 RAFs dated +3h vs an iPhone anchor JPG in the same tree (2a.2).
 - `timezone-naive/` — `DateTimeOriginal` present, offset missing (already exercised indirectly via 2a.1+; may need its own fixture for mixed-timezone trips).
 - `export-date-trap/` — `ModifyDate` ≫ `DateTimeOriginal` (2a.5).
 - `multi-camera-clean/` — all cameras aligned, expected output is zero prompts.
@@ -94,14 +94,14 @@ Files are tiny — a real 1×1 JPEG + a hand-written SRT is plenty; empty `.insv
 | 2a.0 | Skeleton | `immy --help` works; `immy audit ./fixtures/dji-srt-pair` prints table, exits 0; one passing pytest. | ✅ |
 | 2a.1 | Four HIGH rules + XMP + state | `immy audit --write ./fixtures/dji-srt-pair` creates `DJI_0001.xmp` with GPS+date from SRT. Second run: zero writes (state.yml idempotency, `audit.jsonl` doesn't grow). Insta360 pair recorded. | ✅ |
 | 2a.1+ | Folder-notes-driven rules | `trip-gps-anchor` applies coords from front-matter; interactive prompt writes user input back to notes; `trip-tags-from-notes` lands `HierarchicalSubject`+`Subject`; `trip-timezone` suffixes `XMP:DateTimeOriginal` with `±HH:MM`. Sibling-SRT GPS beats trip anchor per per-field dedup. Two-pass apply converges at fixed point. | ✅ |
-| 2a.2 | Clock drift + MEDIUM prompter | `immy audit ./fixtures/fuji-clock-drift` under `--yes-medium` applies the +3:02:00 shift; re-audit shows drift = 0. `state.yml` records the offset. A third run of the same fixture *without* `--yes-*` does not re-prompt (cached decision). | pending |
+| 2a.2 | Clock drift + MEDIUM prompter | `clock-drift-simple` fixture (3+1 outlier) surfaces one MEDIUM finding with source+delta reason. `--yes-medium` applies XMP `DateTimeOriginal` = folder median; re-audit is clean (outlier now within 24 h of new median). Interactive y applies, n skips without writing, `--auto` alone reports without applying. Under `MIN_SAMPLES=3`, small folders (trip-anchor-simple) never see the rule fire. | ✅ |
 | 2a.3 | Tagging | After promotion, each fixture asset in Immich has the expected `Events/`, `Gear/Camera/`, `Source/` tag hierarchy (assert via `GET /api/assets/:id`). The XMP side is covered by `test_tags_from_notes_written_to_xmp`; the Immich-round-trip side lands with 2a.4. | partial |
 | 2a.4 | Promote + scan trigger | `immy promote ./fixtures/dji-srt-pair` rsyncs to `vv:/volume1/faeton-immi/originals-test/`, calls `POST /api/libraries/:id/scan`, assets appear within 30 s. `--dry-run` performs zero writes and zero API calls. Post-scan stack API call for `.insv` ↔ `.lrv` pairs. | pending |
 | 2a.5 | Real-trip coverage | Two actual Incoming trips (e.g. `La Manga`, `Mau-Lions-1`) audit with <10 % of files flagged LOW-confidence; no rule throws. Already demo'd on `Mau-Lions-1`: 197 HIGH findings apply cleanly, 0 LOW pending. | partial |
 | 2a.6 | Watcher | Drop a fresh fixture folder into `~/Documents/Incoming/` — within one debounce cycle, `launchd`-run `immy` audits non-interactively; if all rules are HIGH it promotes, otherwise writes `NEEDS_REVIEW.md` at the folder root. | pending |
 | 2a.7 | Web answers | For every rule with `confidence: low`, there is either a terminal-readable prompt or a web form at `/audit/...` that resolves it. | pending |
 
-Current smoke suite: 14 tests in `immy/tests/test_smoke.py`, 14/14 green under `uv run pytest`. Covers help, empty folder, read-only audit, write+idempotency, SRT-vs-anchor precedence, insta360 pair recorded, notes scaffold, tags written to XMP, interactive coords prompt with piped stdin, timezone suffix, timezone no-op when no date, notes-not-overwritten.
+Current smoke suite: 20 tests in `immy/tests/test_smoke.py`, 20/20 green under `uv run pytest`. Covers help, empty folder, read-only audit, write+idempotency, SRT-vs-anchor precedence, insta360 pair recorded, notes scaffold, tags written to XMP, interactive coords prompt with piped stdin, timezone suffix, timezone no-op when no date, notes-not-overwritten, clock-drift flag-only in read mode, `--yes-medium` median write + re-audit clean, interactive y/n for MEDIUM, `--auto` without `--yes-medium` reports but skips, `MIN_SAMPLES=3` gate.
 
 ### Failure modes to cover
 

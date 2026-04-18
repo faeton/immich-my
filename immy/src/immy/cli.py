@@ -33,20 +33,31 @@ def _finding_patch_hash(f: Finding) -> str:
     return patch_hash({"action": f.action, "patch": f.patch, "pair_with": str(f.pair_with)})
 
 
-def _compute_pending(rows, folder: Path, state: State) -> tuple[list[Finding], list[Finding], list[Finding]]:
-    """Return (all_findings, pending_high, already_applied_high)."""
+def _compute_pending(
+    rows, folder: Path, state: State
+) -> tuple[list[Finding], list[Finding], list[Finding], list[Finding]]:
+    """Return (all_findings, pending_high, pending_medium, already_applied).
+
+    HIGH and MEDIUM dedup in separate pools — a MEDIUM finding is still
+    surfaced for user review even if a HIGH rule also claims the same
+    XMP field (the MEDIUM tier's patch only wins if the user accepts it
+    AND applies after HIGH has converged).
+    """
     all_findings = _dedup_by_field(evaluate(rows, folder))
-    pending: list[Finding] = []
+    pending_high: list[Finding] = []
+    pending_medium: list[Finding] = []
     already: list[Finding] = []
     for f in all_findings:
-        if f.confidence != "high":
+        if f.confidence not in ("high", "medium"):
             continue
         rel = f.path.relative_to(folder).as_posix()
         if state.is_applied(rel, f.rule, _finding_patch_hash(f)):
             already.append(f)
+        elif f.confidence == "high":
+            pending_high.append(f)
         else:
-            pending.append(f)
-    return all_findings, pending, already
+            pending_medium.append(f)
+    return all_findings, pending_high, pending_medium, already
 
 
 def _apply_once(folder: Path, state: State, pending: list[Finding]) -> int:
@@ -78,7 +89,7 @@ def _apply_loop(folder: Path, state: State, initial_pending: list[Finding]) -> i
     total = _apply_once(folder, state, initial_pending)
     for pass_n in range(2, MAX_APPLY_PASSES + 1):
         rows = read_folder(folder)
-        _, pending, _ = _compute_pending(rows, folder, state)
+        _, pending, _, _ = _compute_pending(rows, folder, state)
         if not pending:
             break
         console.print(f"[dim]pass {pass_n}: {len(pending)} new finding(s) after re-read[/dim]")
@@ -87,25 +98,33 @@ def _apply_loop(folder: Path, state: State, initial_pending: list[Finding]) -> i
 
 
 def _dedup_by_field(findings: list[Finding]) -> list[Finding]:
-    """For each (path, xmp_field), keep the first finding that writes it.
-    Rules registered earlier win (more specific > more general)."""
-    claimed: set[tuple] = set()
+    """Per-tier, per-(path, xmp_field) dedup. Within a confidence tier the
+    first-registered rule wins (specific > general). Tiers are independent
+    so a MEDIUM finding still surfaces when a HIGH rule claims the same
+    field — the user decides whether MEDIUM overrides after HIGH lands."""
     out: list[Finding] = []
-    for f in findings:
-        if f.action != "write_xmp":
-            out.append(f)
-            continue
-        remaining = {k: v for k, v in f.patch.items() if (f.path, k) not in claimed}
-        if not remaining:
-            continue
-        for k in remaining:
-            claimed.add((f.path, k))
-        out.append(f if remaining == f.patch else replace(f, patch=remaining))
+    for tier in ("high", "medium", "low"):
+        claimed: set[tuple] = set()
+        for f in findings:
+            if f.confidence != tier:
+                continue
+            if f.action != "write_xmp":
+                out.append(f)
+                continue
+            remaining = {k: v for k, v in f.patch.items() if (f.path, k) not in claimed}
+            if not remaining:
+                continue
+            for k in remaining:
+                claimed.add((f.path, k))
+            out.append(f if remaining == f.patch else replace(f, patch=remaining))
     return out
 
 
 def _fmt_date(row) -> str:
-    v = row.get("EXIF:DateTimeOriginal", "QuickTime:CreateDate", "EXIF:CreateDate")
+    v = row.get(
+        "XMP:DateTimeOriginal", "EXIF:DateTimeOriginal",
+        "QuickTime:CreateDate", "EXIF:CreateDate",
+    )
     return str(v) if v else "—"
 
 
@@ -154,6 +173,45 @@ def _parse_coords(raw: str) -> tuple[float, float] | None:
         return None
 
 
+def _prompt_medium_findings(
+    findings: list[Finding],
+    *,
+    yes_medium: bool,
+    interactive: bool,
+) -> list[Finding]:
+    """Return the MEDIUM findings the user (implicitly or explicitly) accepts.
+
+    - yes_medium → auto-accept all
+    - interactive → y/n/skip per finding
+    - else → accept none (they stay pending for a later run)
+    """
+    if not findings:
+        return []
+    if yes_medium:
+        return list(findings)
+    if not interactive:
+        return []
+    accepted: list[Finding] = []
+    console.print(f"\n[bold]{len(findings)} MEDIUM finding(s) need review[/bold]")
+    for f in findings:
+        rel = f.path.name
+        console.print(
+            f"\n[yellow]?[/yellow] [bold]{f.rule}[/bold] on [cyan]{rel}[/cyan]"
+        )
+        if f.reason:
+            console.print(f"  reason: {f.reason}")
+        if f.patch:
+            patch_str = ", ".join(f"{k}={v}" for k, v in f.patch.items())
+            console.print(f"  would write: {patch_str}")
+        answer = typer.prompt("  apply? [y/N]", default="n", show_default=False).strip().lower()
+        if answer in ("y", "yes"):
+            accepted.append(f)
+            console.print("  [green]✓[/green] accepted")
+        else:
+            console.print("  [dim]skipped[/dim]")
+    return accepted
+
+
 def _prompt_trip_coords(folder: Path, rows, notes: Path | None, interactive: bool) -> bool:
     """Ask the user for trip-wide GPS anchor when notes has no coords and
     some media lack GPS. Writes answer back to notes front-matter. Returns
@@ -195,6 +253,7 @@ def audit(
     write: bool = typer.Option(False, "--write", help="Apply HIGH-confidence findings (default: read-only)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="With --write, report but don't modify anything."),
     auto: bool = typer.Option(False, "--auto", help="Non-interactive: skip LOW prompts, never ask."),
+    yes_medium: bool = typer.Option(False, "--yes-medium", help="Auto-accept MEDIUM findings (no per-finding prompt)."),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Per-file EXIF dump."),
 ) -> None:
     """Read EXIF, propose corrections, optionally write XMP sidecars."""
@@ -222,7 +281,7 @@ def audit(
         pass  # notes updated; evaluate below will see the new coords
 
     state = State.load(folder)
-    all_findings, pending, already = _compute_pending(rows, folder, state)
+    all_findings, pending_high, pending_medium, already = _compute_pending(rows, folder, state)
     by_path: dict[str, list[Finding]] = {}
     for f in all_findings:
         by_path.setdefault(str(f.path), []).append(f)
@@ -233,19 +292,41 @@ def audit(
         return
 
     console.print(
-        f"\nHIGH findings: [green]{len(pending)}[/green] pending, "
+        f"\nHIGH findings: [green]{len(pending_high)}[/green] pending, "
         f"[dim]{len(already)}[/dim] already applied"
     )
     per_rule: dict[str, int] = {}
-    for f in pending:
+    for f in pending_high:
         per_rule[f.rule] = per_rule.get(f.rule, 0) + 1
     for rule, count in sorted(per_rule.items()):
         marker = "[yellow]would[/yellow]" if (dry_run or not write) else "[green]apply[/green]"
         console.print(f"  {marker} {rule}: {count} file(s)")
 
+    if pending_medium:
+        console.print(f"\nMEDIUM findings: [yellow]{len(pending_medium)}[/yellow] pending review")
+        per_rule_m: dict[str, int] = {}
+        for f in pending_medium:
+            per_rule_m[f.rule] = per_rule_m.get(f.rule, 0) + 1
+        for rule, count in sorted(per_rule_m.items()):
+            console.print(f"  [yellow]review[/yellow] {rule}: {count} file(s)")
+
     if write and not dry_run:
-        total = _apply_loop(folder, state, pending)
-        console.print(f"[green]✓[/green] wrote {total} finding(s) across all passes")
+        total_high = _apply_loop(folder, state, pending_high)
+        console.print(f"[green]✓[/green] wrote {total_high} HIGH finding(s)")
+
+        # Re-evaluate MEDIUM now that HIGH has converged — a HIGH write
+        # (e.g. dji-date-from-srt) may have resolved what looked like drift.
+        if pending_medium:
+            rows = read_folder(folder)
+            _, _, pending_medium, _ = _compute_pending(rows, folder, state)
+            accepted = _prompt_medium_findings(
+                pending_medium,
+                yes_medium=yes_medium,
+                interactive=not auto,
+            )
+            if accepted:
+                total_med = _apply_loop(folder, state, accepted)
+                console.print(f"[green]✓[/green] wrote {total_med} MEDIUM finding(s)")
 
     if verbose:
         for r in rows:

@@ -10,5 +10,6 @@ from . import insta360  # noqa: F401
 from . import trip_gps  # noqa: F401
 from . import trip_tags  # noqa: F401
 from . import trip_timezone  # noqa: F401
+from . import clock_drift  # noqa: F401
 
 __all__ = ["Rule", "Finding", "registry", "evaluate", "register"]

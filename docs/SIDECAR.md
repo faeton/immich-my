@@ -90,17 +90,32 @@ class Finding:
 Shipped rule set (in registration order — earlier entries are "more specific"
 and win the per-field dedup):
 
-1. `dji-gps-from-srt` — GPS from a sibling `{stem}.SRT`.
-2. `dji-date-from-srt` — `DateTimeOriginal` from the SRT's first timestamp line.
-3. `date-from-filename-vid-img` — `VID_/IMG_/DJI_/MVI_/PXL_YYYYMMDD_HHMMSS`.
-4. `insta360-pair-by-ts-serial` — `.insv` ↔ `.lrv` grouped by `(timestamp, serial)` in the filename; recorded in `state.yml` (Immich stack API call lands in 2a.4).
-5. `trip-gps-anchor` — `location.coords` from the folder notes file; fires on every GPS-less media.
-6. `trip-tags-from-notes` — `tags:` list from notes → `XMP:HierarchicalSubject` + flat `XMP:Subject`.
-7. `trip-timezone` — `timezone:` IANA zone from notes → `XMP:DateTimeOriginal` rewritten with `±HH:MM` suffix at each file's capture instant.
+1. `dji-gps-from-srt` (HIGH) — GPS from a sibling `{stem}.SRT`.
+2. `dji-date-from-srt` (HIGH) — `DateTimeOriginal` from the SRT's first timestamp line.
+3. `date-from-filename-vid-img` (HIGH) — `VID_/IMG_/DJI_/MVI_/PXL_YYYYMMDD_HHMMSS`.
+4. `insta360-pair-by-ts-serial` (HIGH) — `.insv` ↔ `.lrv` grouped by `(timestamp, serial)` in the filename; recorded in `state.yml` (Immich stack API call lands in 2a.4).
+5. `trip-gps-anchor` (HIGH) — `location.coords` from the folder notes file; fires on every GPS-less media.
+6. `trip-tags-from-notes` (HIGH) — `tags:` list from notes → `XMP:HierarchicalSubject` + flat `XMP:Subject`.
+7. `trip-timezone` (HIGH) — `timezone:` IANA zone from notes → `XMP:DateTimeOriginal` rewritten with `±HH:MM` suffix at each file's capture instant.
+8. `clock-drift` (MEDIUM) — folder-median coherence check over resolved capture dates; flags files >24 h from the median with source + delta, proposes `DateTimeOriginal = median` as the patch. Needs ≥3 samples; ignores `mtime`-sourced dates as too noisy.
 
-**Per-field dedup.** After all rules propose, the CLI keeps the first finding
-that writes each `(path, xmp_field)`. So dji-gps-from-srt's GPS on a DJI file
-beats trip-gps-anchor's fallback for that same file, even when both fire.
+**Per-tier, per-field dedup.** Rules dedup within their confidence tier.
+A HIGH rule claims `(path, xmp_field)` and later HIGH rules lose; a
+MEDIUM rule with the same field is still surfaced because the user must
+explicitly override HIGH. That's the whole point of the tier split —
+`clock-drift` MEDIUM survives even when `trip-timezone` HIGH also wrote
+`DateTimeOriginal`, so the user gets the chance to say "no, the camera
+clock was wrong, apply the median instead". Within a tier, earlier-
+registered wins (specific > general).
+
+**Date authority.** `immy.dates.resolve(row)` returns a `DateAuthority`
+= `(dt, source, raw)` where `source ∈ {exif, companion, filename, mtime}`
+with a rank score. Lookup order: `XMP:DateTimeOriginal` (sidecar override
+wins — that's how accepted clock-drift writes persist across audits),
+`EXIF:DateTimeOriginal`, `QuickTime:CreateDate`, `EXIF:CreateDate`,
+`EXIF:ModifyDate`, then companion `.SRT`, then filename pattern, then
+`st_mtime`. `clock-drift` is the first consumer; other rules will adopt
+it as the date contract grows.
 
 **Two-pass apply.** Some rules depend on fields another rule writes in the
 same audit (trip-timezone needs the date that dji-date-from-srt produces).
@@ -225,15 +240,20 @@ applied:
     trip-gps-anchor: 159e21de107b06ab
     trip-tags-from-notes: 8ae412fb92c1f0dd
     trip-timezone: 3df9a01bc7e20a14
+    clock-drift: 6c1b80e43ae7fa9b     # MEDIUM, accepted 2a.2
   DSC_4381.JPG:
     trip-gps-anchor: 159e21de107b06ab
     ...
 ```
 
 This shipped schema is intentionally flat — it answers "was this exact
-patch applied already?" and nothing more. Rule-level memory that does
-need richer shape (a chosen reference camera, a chosen clock offset, a
-user-declined rule list) lands with 2a.2 in a `decisions:` sibling key:
+patch applied already?" and nothing more. Both HIGH and MEDIUM
+acceptances land in the same map (MEDIUM only after the user accepted
+via the prompter or `--yes-medium`). A declined MEDIUM finding stays
+out of `applied` and re-surfaces on the next audit — today there's no
+`rules_skipped` opt-out list. Richer shape (a chosen reference camera,
+a chosen clock offset for group drift, an explicit `rules_skipped`
+list) is the target schema below:
 
 ```yaml
 # Target for 2a.2+
@@ -312,16 +332,33 @@ pass-N rule see fields written by a pass-N–1 rule in the same audit.
 ### `immy` CLI surface (as shipped)
 
 ```
-immy audit   <trip-folder>                # read-only: print per-file table + pending/applied counts
-immy audit   --write   <trip-folder>      # apply HIGH findings; interactive for LOW (coords prompt)
-immy audit   --auto    <trip-folder>      # non-interactive: no prompts, LOW stays pending
-immy audit   --dry-run <trip-folder>      # with --write: report but don't modify
-immy audit   --verbose <trip-folder>      # per-file EXIF dump
-immy promote <trip-folder>                # STUB: rsync + scan (lands 2a.4)
+immy audit   <trip-folder>                     # read-only: print per-file table + pending/applied counts
+immy audit   --write <trip-folder>             # apply HIGH findings; interactive for LOW + MEDIUM
+immy audit   --write --yes-medium <trip-folder># also auto-accept every MEDIUM finding (no per-prompt)
+immy audit   --auto <trip-folder>              # non-interactive: no LOW coords prompt, no MEDIUM prompt
+immy audit   --dry-run <trip-folder>           # with --write: report but don't modify
+immy audit   --verbose <trip-folder>           # per-file EXIF dump
+immy promote <trip-folder>                     # STUB: rsync + scan (lands 2a.4)
 ```
 
-Combining flags is fine: `--write --auto` is the recipe for the
-watcher / cron / non-TTY path.
+Combining flags is fine: `--write --auto` is a pure-HIGH automated pass
+(MEDIUM stays pending for a later interactive run), while
+`--write --auto --yes-medium` is the watcher recipe — no prompts, HIGH +
+MEDIUM both apply.
+
+**MEDIUM prompter flow.** After the HIGH apply loop converges, if any
+MEDIUM findings are pending `immy` re-reads EXIF, re-evaluates, and
+surfaces each remaining MEDIUM finding with its `reason` line (e.g.
+`+4.0d off folder median (source=exif, this=2026-04-05 12:00:00,
+median=2026-04-01 10:07:30)`) and the proposed `DateTimeOriginal` value.
+User answers `y`/`n` per finding. Accepted findings go through the same
+apply loop (state + JSONL log same as HIGH). `--yes-medium` short-
+circuits the prompt and accepts them all.
+
+**`--yes-high` is intentionally not shipped yet.** Under `--write` today,
+HIGH findings apply unconditionally — there's no prompt to opt out of.
+The flag name is reserved for 2a.6 (watcher) when HIGH findings gain a
+confirm step outside the declarative coords/tz/etc. prompts.
 
 Target for later iterations:
 
@@ -332,7 +369,12 @@ immy rules   list [--explain <rule-id>]   # catalogue
 
 Exit codes today: `0` on any completed audit (prompt-declined included),
 non-zero on exiftool/file errors. Rule-contradiction and "pending
-MEDIUM/LOW" exit codes land with 2a.2.
+MEDIUM/LOW" exit codes are still TODO — the 2a.2 MEDIUM prompter landed
+without differentiated exit codes so that CI-style non-interactive runs
+under `--auto` don't fail just because a MEDIUM finding is pending
+review. Distinguishing pending-MEDIUM from clean will land with 2a.6
+(watcher mode needs an exit code to drive the `NEEDS_REVIEW.md`
+generation).
 
 ### Insta360 `.insv` handling
 
