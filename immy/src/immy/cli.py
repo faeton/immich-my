@@ -204,7 +204,8 @@ def _prompt_medium_findings(
     """Return the MEDIUM findings the user (implicitly or explicitly) accepts.
 
     - yes_medium → auto-accept all
-    - interactive → y/n/skip per finding
+    - interactive → one y/n per finding, except findings sharing a `group`
+      key collapse into a single "apply to N file(s)?" prompt
     - else → accept none (they stay pending for a later run)
     """
     if not findings:
@@ -213,9 +214,35 @@ def _prompt_medium_findings(
         return list(findings)
     if not interactive:
         return []
-    accepted: list[Finding] = []
-    console.print(f"\n[bold]{len(findings)} MEDIUM finding(s) need review[/bold]")
+
+    groups: dict[str, list[Finding]] = {}
+    singletons: list[Finding] = []
     for f in findings:
+        if f.group:
+            groups.setdefault(f.group, []).append(f)
+        else:
+            singletons.append(f)
+
+    accepted: list[Finding] = []
+    total_prompts = len(groups) + len(singletons)
+    console.print(f"\n[bold]{total_prompts} MEDIUM finding(s) need review[/bold]")
+
+    for gkey, gfindings in groups.items():
+        sample = gfindings[0]
+        console.print(
+            f"\n[yellow]?[/yellow] [bold]{sample.rule}[/bold] — "
+            f"[cyan]{len(gfindings)} file(s)[/cyan]  ({gkey})"
+        )
+        if sample.reason:
+            console.print(f"  reason: {sample.reason}")
+        answer = typer.prompt("  apply to all? [y/N]", default="n", show_default=False).strip().lower()
+        if answer in ("y", "yes"):
+            accepted.extend(gfindings)
+            console.print(f"  [green]✓[/green] accepted {len(gfindings)} file(s)")
+        else:
+            console.print("  [dim]skipped[/dim]")
+
+    for f in singletons:
         rel = f.path.name
         console.print(
             f"\n[yellow]?[/yellow] [bold]{f.rule}[/bold] on [cyan]{rel}[/cyan]"

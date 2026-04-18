@@ -464,6 +464,106 @@ def test_export_date_trap_not_flagged_when_dto_present(dji_fixture: Path):
     assert "export-date-trap" not in result.stdout
 
 
+def _build_two_camera_folder(
+    root: Path, *,
+    cam_a: tuple[str, str] = ("NIKON", "Z50_2"),
+    cam_b: tuple[str, str] = ("SONY", "ILCE-7M4"),
+    offset_seconds: int = 3 * 3600,
+    count: int = 4,
+) -> Path:
+    """Stamp `count` JPGs per camera with matching EXIF. Camera B's dates
+    are shifted by `offset_seconds` (camera B is "behind" when positive)."""
+    target = root / "two-cam"
+    target.mkdir()
+    src = FIXTURES / "trip-anchor-simple" / "IMG_A.JPG"
+    base_ts = "2026:04:01 10:00:00"
+    from datetime import datetime, timedelta
+    base_dt = datetime.strptime(base_ts, "%Y:%m:%d %H:%M:%S")
+
+    def stamp(path: Path, make: str, model: str, dt: datetime) -> None:
+        path.write_bytes(src.read_bytes())
+        subprocess.run([
+            "exiftool", "-overwrite_original",
+            f"-EXIF:Make={make}",
+            f"-EXIF:Model={model}",
+            f"-EXIF:DateTimeOriginal={dt.strftime('%Y:%m:%d %H:%M:%S')}",
+            str(path),
+        ], check=True, capture_output=True)
+
+    for i in range(count):
+        ts = base_dt + timedelta(minutes=5 * i)
+        stamp(target / f"A_{i:04d}.JPG", cam_a[0], cam_a[1], ts)
+        ts_b = ts - timedelta(seconds=offset_seconds)
+        stamp(target / f"B_{i:04d}.JPG", cam_b[0], cam_b[1], ts_b)
+
+    (target / "TRIP.md").write_text("---\ntrip: two-cam\n---\n# x\n")
+    return target
+
+
+def test_clock_drift_by_camera_flags_offset_group(tmp_path: Path):
+    folder = _build_two_camera_folder(tmp_path)
+    result = runner.invoke(app, ["audit", str(folder), "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "clock-drift-by-camera" in result.stdout
+    # Singleton clock-drift stays quiet (multi-camera folder).
+    assert "review clock-drift:" not in result.stdout
+
+
+def test_clock_drift_by_camera_yes_medium_applies_delta(tmp_path: Path):
+    folder = _build_two_camera_folder(tmp_path, offset_seconds=3 * 3600)
+    result = runner.invoke(
+        app, ["audit", str(folder), "--write", "--auto", "--yes-medium"],
+    )
+    assert result.exit_code == 0, result.stdout
+    # A_ files untouched (they're the reference); B_ files shifted +3h.
+    # B_0000 original was 07:00:00 → should now read 10:00:00.
+    tags = _xmp_tags(folder / "B_0000.xmp")
+    assert tags["XMP:DateTimeOriginal"] == "2026:04:01 10:00:00"
+    # A_0000 gets no XMP sidecar from this rule.
+    assert not (folder / "A_0000.xmp").exists()
+
+
+def test_clock_drift_by_camera_batch_prompt_is_single(tmp_path: Path):
+    folder = _build_two_camera_folder(tmp_path, count=5)
+    # 5 Sony files would produce 5 findings; they should collapse to ONE
+    # prompt with "apply to all".
+    result = runner.invoke(
+        app, ["audit", str(folder), "--write"],
+        input="\n\ny\n",  # skip coords, skip tz, accept the single batch prompt
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "apply to all?" in result.stdout
+    assert "accepted 5 file(s)" in result.stdout
+
+
+def test_clock_drift_by_camera_skips_noise(tmp_path: Path):
+    # 2 min offset — below MIN_DRIFT_SECONDS (5 min).
+    folder = _build_two_camera_folder(tmp_path, offset_seconds=120)
+    result = runner.invoke(app, ["audit", str(folder), "--auto"])
+    assert result.exit_code == 0
+    assert "clock-drift-by-camera" not in result.stdout
+
+
+def test_clock_drift_by_camera_skips_sanity_max(tmp_path: Path):
+    # 30 day offset — above MAX_DRIFT_SECONDS (14 days).
+    folder = _build_two_camera_folder(tmp_path, offset_seconds=30 * 86400)
+    result = runner.invoke(app, ["audit", str(folder), "--auto"])
+    assert result.exit_code == 0
+    assert "clock-drift-by-camera" not in result.stdout
+
+
+def test_clock_drift_single_camera_unaffected(tmp_path: Path):
+    # Single-camera folder with one outlier still goes through folder-median
+    # clock-drift (shipped 2a.2), not clock-drift-by-camera.
+    src = FIXTURES / "clock-drift-simple"
+    folder = tmp_path / "clock-single"
+    shutil.copytree(src, folder)
+    result = runner.invoke(app, ["audit", str(folder), "--auto"])
+    assert result.exit_code == 0
+    assert "review clock-drift:" in result.stdout
+    assert "clock-drift-by-camera" not in result.stdout
+
+
 def test_notes_file_not_overwritten(dji_fixture: Path):
     existing = dji_fixture / "TRIP.md"
     existing.write_text("# Pre-existing trip notes\n")

@@ -23,8 +23,11 @@ from __future__ import annotations
 from pathlib import Path
 from statistics import median
 
+from collections import defaultdict
+
 from ..dates import resolve as resolve_date
 from ..exif import ExifRow
+from .clock_drift_by_camera import MIN_GROUP, camera_key
 from .registry import Finding, Rule, register
 
 
@@ -32,7 +35,22 @@ DRIFT_THRESHOLD_SECONDS = 24 * 3600
 MIN_SAMPLES = 3
 
 
+def _multi_camera_folder(rows: list[ExifRow]) -> bool:
+    """True when ≥2 camera groups are each big enough to have their own
+    median. Hands off to `clock-drift-by-camera` in that case — snapping
+    a whole camera's worth of files to the folder median would collapse
+    them to one instant, which is wrong."""
+    counts: dict[str, int] = defaultdict(int)
+    for r in rows:
+        cam = camera_key(r)
+        if cam is not None:
+            counts[cam] += 1
+    return sum(1 for n in counts.values() if n >= MIN_GROUP) >= 2
+
+
 def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
+    if _multi_camera_folder(rows):
+        return []
     authorities = [(r, resolve_date(r)) for r in rows]
     authorities = [(r, a) for r, a in authorities if a is not None and a.source != "mtime"]
     if len(authorities) < MIN_SAMPLES:

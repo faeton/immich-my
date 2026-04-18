@@ -27,6 +27,10 @@ class Finding:
     patch: dict[str, str] = field(default_factory=dict)
     pair_with: Path | None = None
     reason: str = ""
+    # Batch key: findings sharing a non-empty `group` are collapsed into a
+    # single y/n prompt (e.g. "Sony A7 is -3h vs Nikon Z50 — apply to 42
+    # file(s)?") instead of asking per-file. Empty string = per-file prompt.
+    group: str = ""
 
 
 Propose = Callable[[list[ExifRow], Path], list[Finding]]

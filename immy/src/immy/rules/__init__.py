@@ -11,6 +11,7 @@ from . import trip_gps  # noqa: F401
 from . import trip_tags  # noqa: F401
 from . import trip_timezone  # noqa: F401
 from . import clock_drift  # noqa: F401
+from . import clock_drift_by_camera  # noqa: F401
 from . import tag_suggest  # noqa: F401
 from . import export_date_trap  # noqa: F401
 

@@ -100,6 +100,12 @@ and win the per-field dedup):
 8. `clock-drift` (MEDIUM) — folder-median coherence check over resolved capture dates; flags files >24 h from the median with source + delta, proposes `DateTimeOriginal = median` as the patch. Needs ≥3 samples; ignores `mtime`-sourced dates as too noisy.
 9. `tag-suggest-missing` (MEDIUM, `write_notes`) — diffs existing notes `tags:` against what the scaffold would produce from the *current* folder contents; proposes any tag whose category (prefix before the last `/`) is entirely absent from the user's list. Opt-out: `tag_suggestions: off` (YAML bool `off/false/no` or any string matching). Accepted patches go through the `write_notes` action: the CLI merges the `add_tags` list into notes front-matter (unique, order-preserving), and the next apply pass picks them up via `trip-tags-from-notes` (which writes to XMP).
 10. `export-date-trap` (LOW, `note`) — flags files with `ModifyDate` present but no `DateTimeOriginal`/`CreateDate`. Canonical cause: Lightroom / Photos export preset that stamped modify-time but dropped capture-time. Such files sort on the Immich timeline at export instant (months/years after capture). No auto-fix — surfaces in the per-file flags column so the user can re-export or delete.
+11. `clock-drift-by-camera` (MEDIUM) — cross-camera group drift. Groups rows by `(Make, Model)`; when ≥2 groups each have ≥3 samples, picks the camera with the most GPS-tagged files as the reference (tie-breaks on group size), and proposes `DateTimeOriginal = original + delta` for every file in each off-group. Thresholds are conservative: ignores drift <5 min (sync noise) and >14 days (probably "different trip"). Findings share a `group` key so the MEDIUM prompter asks once per camera, not once per file. Stands in complement to `clock-drift` (folder-median): that one handles single-file outliers; this one handles "camera B was 3 h behind for the whole trip". `clock-drift` defers to this rule when it detects ≥2 camera groups.
+
+**Batch prompting.** Findings with a non-empty `group` field collapse
+into a single y/n prompt under the MEDIUM prompter (e.g. *"Sony ILCE-7M4
+(80 files) is -3h00m vs Nikon Z50 (120 ref files) — apply to all?"*).
+Per-file prompts remain the default when no group is set.
 
 **Interactive pre-flight prompts.** Before rule evaluation, `immy audit`
 (unless `--auto` or `--dry-run`) can ask the user two questions whose
