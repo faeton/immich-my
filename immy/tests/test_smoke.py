@@ -280,11 +280,11 @@ def test_clock_drift_yes_medium_writes_median_and_reaudit_clean(clock_drift_fixt
 
 
 def test_clock_drift_interactive_y_applies_n_skips(clock_drift_fixture: Path):
-    # LOW coords prompt fires first (no GPS); send empty to skip, then "y"
+    # LOW coords + tz prompts fire first; send empty to skip both, then "y"
     # to accept the single MEDIUM clock-drift finding.
     result = runner.invoke(
         app, ["audit", str(clock_drift_fixture), "--write"],
-        input="\ny\n",
+        input="\n\ny\n",
     )
     assert result.exit_code == 0, result.stdout
     assert "apply? [y/N]" in result.stdout
@@ -296,7 +296,7 @@ def test_clock_drift_interactive_n_leaves_pending(tmp_path: Path):
     shutil.copytree(FIXTURES / "clock-drift-simple", target)
     result = runner.invoke(
         app, ["audit", str(target), "--write"],
-        input="\nn\n",
+        input="\n\nn\n",
     )
     assert result.exit_code == 0, result.stdout
     assert not (target / "DSC_0004.xmp").exists()
@@ -376,6 +376,92 @@ def test_tag_suggest_idempotent_after_accept(tag_suggest_fixture: Path):
     assert result.exit_code == 0
     assert "review tag-suggest-missing" not in result.stdout
     assert "0 pending" in result.stdout
+
+
+def _seed_clock_drift_with_coords(folder: Path) -> None:
+    """clock-drift-simple has EXIF dates but a minimal TRIP.md. Prefill
+    location.coords so the tz prompt is the only one that fires."""
+    import yaml
+    notes = folder / "TRIP.md"
+    fm = yaml.safe_load(notes.read_text().split("---", 2)[1]) or {}
+    fm["location"] = {"coords": [-20.3, 57.4]}
+    notes.write_text("---\n" + yaml.safe_dump(fm) + "---\n# x\n")
+
+
+def test_interactive_tz_prompt_writes_zone_to_notes(clock_drift_fixture: Path):
+    import yaml
+    _seed_clock_drift_with_coords(clock_drift_fixture)
+    # Tz prompt fires (EXIF dates are naive); pipe zone + 'n' to skip MEDIUM.
+    result = runner.invoke(
+        app,
+        ["audit", str(clock_drift_fixture), "--write"],
+        input="Indian/Mauritius\nn\n",
+    )
+    assert result.exit_code == 0, result.stdout
+    fm = yaml.safe_load(
+        (clock_drift_fixture / "TRIP.md").read_text().split("---", 2)[1]
+    )
+    assert fm["timezone"] == "Indian/Mauritius"
+    # Cascade: trip-timezone HIGH rule rewrites XMP dates with +04:00.
+    tags = _xmp_tags(clock_drift_fixture / "DSC_0001.xmp")
+    assert tags["XMP:DateTimeOriginal"].endswith("+04:00")
+
+
+def test_interactive_tz_prompt_rejects_unknown_zone(clock_drift_fixture: Path):
+    import yaml
+    _seed_clock_drift_with_coords(clock_drift_fixture)
+    result = runner.invoke(
+        app,
+        ["audit", str(clock_drift_fixture), "--write"],
+        input="Not/A/Real/Zone\nn\n",
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "unknown zone" in result.stdout
+    fm = yaml.safe_load(
+        (clock_drift_fixture / "TRIP.md").read_text().split("---", 2)[1]
+    )
+    assert fm.get("timezone") in (None, "")
+
+
+def test_tz_prompt_skipped_when_already_set(clock_drift_fixture: Path):
+    import yaml
+    notes = clock_drift_fixture / "TRIP.md"
+    fm = yaml.safe_load(notes.read_text().split("---", 2)[1]) or {}
+    fm["timezone"] = "UTC"
+    fm["location"] = {"coords": [0.0, 0.0]}
+    notes.write_text("---\n" + yaml.safe_dump(fm) + "---\n# x\n")
+    result = runner.invoke(app, ["audit", str(clock_drift_fixture), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "has no timezone" not in result.stdout
+
+
+def test_export_date_trap_flags_file_missing_dto(tmp_path: Path):
+    # Fresh folder: copy one IMG_A.JPG, strip DateTimeOriginal, set ModifyDate.
+    target = tmp_path / "export-trap"
+    target.mkdir()
+    src = FIXTURES / "trip-anchor-simple" / "IMG_A.JPG"
+    dst = target / "edit_2025.jpg"
+    dst.write_bytes(src.read_bytes())
+    subprocess.run([
+        "exiftool", "-overwrite_original",
+        "-EXIF:DateTimeOriginal=",
+        "-EXIF:CreateDate=",
+        "-EXIF:ModifyDate=2026:04:10 15:00:00",
+        str(dst),
+    ], check=True, capture_output=True)
+
+    result = runner.invoke(app, ["audit", str(target), "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "export-date-trap" in result.stdout
+
+
+def test_export_date_trap_not_flagged_when_dto_present(dji_fixture: Path):
+    # DJI JPG has EXIF:DateTimeOriginal + ModifyDate after audit writes SRT
+    # date. Not a trap — don't flag it.
+    runner.invoke(app, ["audit", str(dji_fixture), "--write", "--auto"])
+    result = runner.invoke(app, ["audit", str(dji_fixture), "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "export-date-trap" not in result.stdout
 
 
 def test_notes_file_not_overwritten(dji_fixture: Path):

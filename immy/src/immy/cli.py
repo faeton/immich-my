@@ -234,6 +234,54 @@ def _prompt_medium_findings(
     return accepted
 
 
+def _has_tz_suffix(s: object) -> bool:
+    if not isinstance(s, str) or len(s) < 6:
+        return False
+    tail = s.strip()[-6:]
+    return tail[0] in "+-" and tail[3] == ":"
+
+
+def _prompt_trip_timezone(folder: Path, rows, notes: Path | None, interactive: bool) -> bool:
+    """Ask for an IANA timezone when notes has none and some media have
+    dates without a `±HH:MM` suffix. Validates via zoneinfo before writing.
+    Returns True if notes were modified (caller re-evaluates)."""
+    if not interactive or notes is None:
+        return False
+    fm = parse_frontmatter(notes)
+    tz = fm.get("timezone")
+    if isinstance(tz, str) and tz.strip():
+        return False
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    naive = 0
+    for r in rows:
+        raw = r.get("XMP:DateTimeOriginal", "EXIF:DateTimeOriginal", "QuickTime:CreateDate")
+        if raw and not _has_tz_suffix(raw):
+            naive += 1
+    if not naive:
+        return False
+    console.print(
+        f"\n[yellow]?[/yellow] {naive}/{len(rows)} file(s) have naive dates and "
+        f"[cyan]{notes.name}[/cyan] has no [b]timezone:[/b] set."
+    )
+    raw_in = typer.prompt(
+        "Enter IANA zone (e.g. Indian/Mauritius, Europe/Madrid, empty to skip)",
+        default="",
+        show_default=False,
+    ).strip()
+    if not raw_in:
+        console.print("[dim]skipped — dates will stay naive[/dim]")
+        return False
+    try:
+        ZoneInfo(raw_in)
+    except ZoneInfoNotFoundError:
+        console.print(f"[red]unknown zone '{raw_in}'; skipping[/red]")
+        return False
+    update_frontmatter(notes, {"timezone": raw_in})
+    console.print(f"[green]✓[/green] wrote timezone '{raw_in}' to {notes.name}")
+    return True
+
+
 def _prompt_trip_coords(folder: Path, rows, notes: Path | None, interactive: bool) -> bool:
     """Ask the user for trip-wide GPS anchor when notes has no coords and
     some media lack GPS. Writes answer back to notes front-matter. Returns
@@ -301,6 +349,8 @@ def audit(
     interactive = not auto and not dry_run
     if _prompt_trip_coords(folder, rows, notes, interactive):
         pass  # notes updated; evaluate below will see the new coords
+    if _prompt_trip_timezone(folder, rows, notes, interactive):
+        pass  # notes updated; trip-timezone HIGH rule will fire on evaluate
 
     state = State.load(folder)
     all_findings, pending_high, pending_medium, already = _compute_pending(rows, folder, state)

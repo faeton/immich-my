@@ -99,6 +99,15 @@ and win the per-field dedup):
 7. `trip-timezone` (HIGH) — `timezone:` IANA zone from notes → `XMP:DateTimeOriginal` rewritten with `±HH:MM` suffix at each file's capture instant.
 8. `clock-drift` (MEDIUM) — folder-median coherence check over resolved capture dates; flags files >24 h from the median with source + delta, proposes `DateTimeOriginal = median` as the patch. Needs ≥3 samples; ignores `mtime`-sourced dates as too noisy.
 9. `tag-suggest-missing` (MEDIUM, `write_notes`) — diffs existing notes `tags:` against what the scaffold would produce from the *current* folder contents; proposes any tag whose category (prefix before the last `/`) is entirely absent from the user's list. Opt-out: `tag_suggestions: off` (YAML bool `off/false/no` or any string matching). Accepted patches go through the `write_notes` action: the CLI merges the `add_tags` list into notes front-matter (unique, order-preserving), and the next apply pass picks them up via `trip-tags-from-notes` (which writes to XMP).
+10. `export-date-trap` (LOW, `note`) — flags files with `ModifyDate` present but no `DateTimeOriginal`/`CreateDate`. Canonical cause: Lightroom / Photos export preset that stamped modify-time but dropped capture-time. Such files sort on the Immich timeline at export instant (months/years after capture). No auto-fix — surfaces in the per-file flags column so the user can re-export or delete.
+
+**Interactive pre-flight prompts.** Before rule evaluation, `immy audit`
+(unless `--auto` or `--dry-run`) can ask the user two questions whose
+answers become front-matter in the notes file and thereby drive HIGH
+rules on the same run: (a) trip GPS anchor, when some media lack GPS
+and `location.coords` is unset; (b) trip IANA timezone, when some media
+dates are naive and `timezone:` is unset. Empty input skips; invalid
+zone names are rejected with a clear message and don't write.
 
 **Per-tier, per-field dedup.** Rules dedup within their confidence tier.
 A HIGH rule claims `(path, xmp_field)` and later HIGH rules lose; a
