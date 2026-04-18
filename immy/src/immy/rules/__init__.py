@@ -7,6 +7,7 @@ from .registry import Rule, Finding, registry, evaluate, register
 from . import dji_srt  # noqa: F401
 from . import filename_date  # noqa: F401
 from . import insta360  # noqa: F401
+from . import geotag_from_gpx  # noqa: F401
 from . import trip_gps  # noqa: F401
 from . import trip_tags  # noqa: F401
 from . import trip_timezone_guess  # noqa: F401
