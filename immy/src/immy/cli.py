@@ -8,7 +8,10 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import promote as promote_mod
+from .config import load as load_config
 from .exif import has_gps, read_folder
+from .immich import ImmichClient
 from .notes import (
     ensure_notes,
     parse_frontmatter,
@@ -357,13 +360,80 @@ def audit(
                 console.print(f"  {k}: {v}")
 
 
-@app.command()
-def promote(
-    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+def _promote_impl(
+    folder: Path,
+    dry_run: bool,
+    force: bool,
+    config_path: Path | None,
 ) -> None:
-    """Rsync + Immich library-scan. Stub until 2a.4."""
-    typer.echo(f"[promote] not implemented yet (iteration 2a.4). target: {folder}")
-    raise typer.Exit(code=0)
+    """Rsync + Immich library-scan + Insta360 stack calls.
+
+    Shared body for the `promote` / `push` / `pub` aliases.
+    """
+    config = load_config(config_path)
+    if config.originals_root is None:
+        console.print(
+            "[red]no originals_root configured[/red] — set `originals_root:` in "
+            "~/.immy/config.yml (or $IMMY_CONFIG), or pass --config <file>."
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        plan = promote_mod.build_plan(folder, config)
+    except RuntimeError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"[bold]promote[/bold] {folder}\n"
+        f"  → {plan.target}\n"
+        f"  pairs to stack: {len(plan.pairs)}\n"
+        f"  HIGH pending: {plan.pending_high}"
+    )
+
+    if plan.pending_high and not force:
+        console.print(
+            f"[red]refusing[/red] — {plan.pending_high} HIGH finding(s) pending. "
+            "Run `immy audit --write` first, or pass --force."
+        )
+        raise typer.Exit(code=1)
+
+    client: ImmichClient | None = None
+    if config.immich is not None and not dry_run:
+        client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key)
+    elif config.immich is None:
+        console.print("[dim]no immich creds — rsync only, no scan or stacks.[/dim]")
+
+    summary = promote_mod.execute(plan, config, dry_run=dry_run, client=client)
+
+    prefix = "[yellow]dry-run[/yellow] " if dry_run else ""
+    changed = len(summary["rsync_changes"])
+    console.print(f"{prefix}rsync: {changed} change(s) to {summary['target']}")
+    if "scan_error" in summary:
+        console.print(f"[red]scan failed:[/red] {summary['scan_error']}")
+    elif summary["scan_triggered"]:
+        console.print("[green]✓[/green] library scan triggered")
+    for status, detail in summary["stacks"]:
+        colour = {
+            "stacked": "green", "planned": "yellow", "skipped": "dim", "error": "red",
+        }.get(status, "")
+        console.print(f"  [{colour}]{status}[/{colour}] {detail}")
+
+
+def _promote(
+    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report the plan; no rsync, no API calls."),
+    force: bool = typer.Option(False, "--force", help="Promote even if HIGH findings are still pending."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+) -> None:
+    """Rsync trip into originals + trigger Immich scan + stack Insta360 pairs."""
+    _promote_impl(folder, dry_run=dry_run, force=force, config_path=config_path)
+
+
+# Register under three names — Typer has no native aliases, so we just
+# attach the same callback to each command name.
+for _name in ("promote", "push", "pub"):
+    app.command(name=_name)(_promote)
 
 
 if __name__ == "__main__":

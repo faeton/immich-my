@@ -349,7 +349,12 @@ immy audit   --write --yes-medium <trip-folder># also auto-accept every MEDIUM f
 immy audit   --auto <trip-folder>              # non-interactive: no LOW coords prompt, no MEDIUM prompt
 immy audit   --dry-run <trip-folder>           # with --write: report but don't modify
 immy audit   --verbose <trip-folder>           # per-file EXIF dump
-immy promote <trip-folder>                     # STUB: rsync + scan (lands 2a.4)
+immy promote <trip-folder>                     # rsync to originals_root + scan + stack Insta360 pairs
+immy push    <trip-folder>                     # alias of promote
+immy pub     <trip-folder>                     # alias of promote
+immy promote --dry-run <trip-folder>           # report plan; no rsync, no API calls
+immy promote --force <trip-folder>             # promote even if HIGH findings are still pending
+immy promote --config <path> <trip-folder>     # override ~/.immy/config.yml for one run
 ```
 
 Combining flags is fine: `--write --auto` is a pure-HIGH automated pass
@@ -386,6 +391,53 @@ under `--auto` don't fail just because a MEDIUM finding is pending
 review. Distinguishing pending-MEDIUM from clean will land with 2a.6
 (watcher mode needs an exit code to drive the `NEEDS_REVIEW.md`
 generation).
+
+### `immy promote` — rsync + scan + stack
+
+Shipped in 2a.4. Same engine as `audit` (so the same notes, state, and
+audit-log file stay authoritative), wrapped in three phases:
+
+1. **Guard rail.** Re-evaluate rules; if any HIGH finding is pending,
+   refuse with exit 1. Override with `--force`. This stops "promote what
+   you forgot to audit" mistakes — the whole contract is that
+   `originals/` only receives folders whose metadata has already been
+   fixed on disk.
+2. **Rsync.** `rsync -av --itemize-changes <folder>/ <originals_root>/<folder>/`.
+   `.audit/` is excluded (machine state stays on the Mac), along with
+   `.DS_Store`, Spotlight dirs, and similar OS noise. XMP sidecars and
+   the folder notes file travel with the media. Destination parent is
+   auto-created for local targets; remote `user@host:/path` is the
+   caller's setup problem.
+3. **Immich handoff.** `POST /api/libraries/{library_id}/scan` kicks the
+   scan. For each `.insv` ↔ `.lrv` pair that the
+   `insta360-pair-by-ts-serial` rule surfaced, `immy` polls
+   `POST /api/search/metadata?originalFileName=...` until both assets
+   are indexed (6 tries × 2 s), then `POST /api/stacks` with the
+   `.lrv` asset ID first (Immich 2.x treats the first element of
+   `assetIds` as the stack primary). Missing IDs → logged, not fatal.
+
+**Config** lives at `~/.immy/config.yml` (override with `--config` or
+`$IMMY_CONFIG`). Example:
+
+```yaml
+originals_root: /mnt/incoming/originals-test   # can be a remote rsync target
+immich:
+  url: http://vv.tailnet:2283
+  api_key: <key>
+  library_id: <uuid>                            # the External Library ID
+notes_filename: TRIP.md                         # optional
+```
+
+`immich:` is optional — when missing, promote is rsync-only (useful for
+local staging trees before the real External Library exists).
+`originals_root` is required; promote exits 2 with a clear message
+otherwise. The `--dry-run` flag skips both rsync writes and every API
+call; the CLI reports what *would* have happened (rsync itemised diff,
+"would stack X ↔ Y" per pair).
+
+The JSONL audit log on the source folder gets one extra event per run:
+`{"event": "promoted", "target": "...", "pair_count": N}` so a trip's
+full story (audit decisions → promote) is in one file.
 
 ### Insta360 `.insv` handling
 
