@@ -92,15 +92,17 @@ def test_dji_fixture_write_gps_and_date_from_srt(dji_fixture: Path):
     tags = _xmp_tags(xmp)
     assert float(tags["XMP:GPSLatitude"]) == pytest.approx(-20.29627, abs=1e-5)
     assert float(tags["XMP:GPSLongitude"]) == pytest.approx(57.40794, abs=1e-5)
-    assert tags["XMP:DateTimeOriginal"] == "2026:03:05 09:49:01"
+    # trip-timezone-guess-gps spots the Casela SRT coords → Indian/Mauritius
+    # → trip-timezone cascades +04:00 into the capture datetime.
+    assert tags["XMP:DateTimeOriginal"] == "2026:03:05 09:49:01+04:00"
 
     state = dji_fixture / ".audit" / "state.yml"
     assert state.is_file()
     log = dji_fixture / ".audit" / "audit.jsonl"
     assert log.is_file()
-    # Three rules fire: dji-gps-from-srt, dji-date-from-srt, trip-tags-from-notes
-    # (ensure_notes scaffolded README.md with auto-suggested tags).
-    assert len(log.read_text().splitlines()) == 3
+    # Five rules fire: dji-gps-from-srt, dji-date-from-srt,
+    # trip-tags-from-notes, trip-timezone-guess-gps, trip-timezone.
+    assert len(log.read_text().splitlines()) == 5
 
 
 def test_dji_fixture_idempotent(dji_fixture: Path):
@@ -389,31 +391,30 @@ def _seed_clock_drift_with_coords(folder: Path) -> None:
 
 
 def test_interactive_tz_prompt_writes_zone_to_notes(clock_drift_fixture: Path):
+    # No coords → tz-guess-gps stays silent; prompt is the only source.
+    # Pipe: empty coords, zone, n for clock-drift MEDIUM.
     import yaml
-    _seed_clock_drift_with_coords(clock_drift_fixture)
-    # Tz prompt fires (EXIF dates are naive); pipe zone + 'n' to skip MEDIUM.
     result = runner.invoke(
         app,
         ["audit", str(clock_drift_fixture), "--write"],
-        input="Indian/Mauritius\nn\n",
+        input="\nIndian/Mauritius\nn\n",
     )
     assert result.exit_code == 0, result.stdout
     fm = yaml.safe_load(
         (clock_drift_fixture / "TRIP.md").read_text().split("---", 2)[1]
     )
     assert fm["timezone"] == "Indian/Mauritius"
-    # Cascade: trip-timezone HIGH rule rewrites XMP dates with +04:00.
     tags = _xmp_tags(clock_drift_fixture / "DSC_0001.xmp")
     assert tags["XMP:DateTimeOriginal"].endswith("+04:00")
 
 
 def test_interactive_tz_prompt_rejects_unknown_zone(clock_drift_fixture: Path):
+    # No coords → no guess-gps path; rejection must leave notes empty.
     import yaml
-    _seed_clock_drift_with_coords(clock_drift_fixture)
     result = runner.invoke(
         app,
         ["audit", str(clock_drift_fixture), "--write"],
-        input="Not/A/Real/Zone\nn\n",
+        input="\nNot/A/Real/Zone\nn\n",
     )
     assert result.exit_code == 0, result.stdout
     assert "unknown zone" in result.stdout
@@ -433,6 +434,85 @@ def test_tz_prompt_skipped_when_already_set(clock_drift_fixture: Path):
     result = runner.invoke(app, ["audit", str(clock_drift_fixture), "--write", "--auto"])
     assert result.exit_code == 0, result.stdout
     assert "has no timezone" not in result.stdout
+
+
+def test_tz_guess_from_gps_writes_zone_to_notes(tmp_path: Path):
+    # A fixture with EXIF GPS but no `timezone:` in notes. tz-guess-gps
+    # should reverse-lookup the zone and write it to notes; trip-timezone
+    # then cascades the offset into XMP.
+    import yaml
+    target = tmp_path / "tz-gps"
+    target.mkdir()
+    src = FIXTURES / "trip-anchor-simple" / "IMG_A.JPG"
+    dst = target / "IMG_0001.JPG"
+    dst.write_bytes(src.read_bytes())
+    # Mauritius: -20.3, 57.4
+    subprocess.run([
+        "exiftool", "-overwrite_original",
+        "-EXIF:GPSLatitudeRef=S", "-EXIF:GPSLatitude=20.3",
+        "-EXIF:GPSLongitudeRef=E", "-EXIF:GPSLongitude=57.4",
+        "-EXIF:DateTimeOriginal=2026:04:01 10:00:00",
+        str(dst),
+    ], check=True, capture_output=True)
+    (target / "TRIP.md").write_text("---\ntrip: tz-gps\n---\n")
+
+    result = runner.invoke(app, ["audit", str(target), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+
+    fm = yaml.safe_load((target / "TRIP.md").read_text().split("---", 2)[1])
+    assert fm["timezone"] == "Indian/Mauritius"
+    tags = _xmp_tags(target / "IMG_0001.xmp")
+    assert tags["XMP:DateTimeOriginal"].endswith("+04:00")
+
+
+def test_tz_guess_respects_existing_timezone(tmp_path: Path):
+    # Pre-set timezone in notes → guess-gps must stand down even with GPS.
+    import yaml
+    target = tmp_path / "tz-keep"
+    target.mkdir()
+    src = FIXTURES / "trip-anchor-simple" / "IMG_A.JPG"
+    dst = target / "IMG_0001.JPG"
+    dst.write_bytes(src.read_bytes())
+    subprocess.run([
+        "exiftool", "-overwrite_original",
+        "-EXIF:GPSLatitudeRef=S", "-EXIF:GPSLatitude=20.3",
+        "-EXIF:GPSLongitudeRef=E", "-EXIF:GPSLongitude=57.4",
+        "-EXIF:DateTimeOriginal=2026:04:01 10:00:00",
+        str(dst),
+    ], check=True, capture_output=True)
+    (target / "TRIP.md").write_text(
+        "---\ntimezone: Europe/Madrid\n---\n"
+    )
+    result = runner.invoke(app, ["audit", str(target), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+    fm = yaml.safe_load((target / "TRIP.md").read_text().split("---", 2)[1])
+    assert fm["timezone"] == "Europe/Madrid"
+
+
+def test_trip_timezone_respects_per_file_offset(tmp_path: Path):
+    # iPhone-style EXIF: OffsetTimeOriginal present. trip-timezone HIGH
+    # must skip these files so the camera's offset wins over the trip zone.
+    target = tmp_path / "per-file-offset"
+    target.mkdir()
+    src = FIXTURES / "trip-anchor-simple" / "IMG_A.JPG"
+    dst = target / "IMG_0001.JPG"
+    dst.write_bytes(src.read_bytes())
+    subprocess.run([
+        "exiftool", "-overwrite_original",
+        "-EXIF:DateTimeOriginal=2026:04:01 10:00:00",
+        "-EXIF:OffsetTimeOriginal=-05:00",   # file claims New York offset
+        str(dst),
+    ], check=True, capture_output=True)
+    (target / "TRIP.md").write_text(
+        "---\ntimezone: Indian/Mauritius\n---\n"   # trip zone would be +04:00
+    )
+    result = runner.invoke(app, ["audit", str(target), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+    # trip-timezone must have stood down — no XMP:DateTimeOriginal written.
+    xmp = target / "IMG_0001.xmp"
+    if xmp.exists():
+        tags = _xmp_tags(xmp)
+        assert "XMP:DateTimeOriginal" not in tags, tags
 
 
 def test_export_date_trap_flags_file_missing_dto(tmp_path: Path):

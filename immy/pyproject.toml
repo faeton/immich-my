@@ -8,6 +8,7 @@ dependencies = [
     "pyexiftool>=0.5",
     "pyyaml>=6.0",
     "rich>=13.7",
+    "timezonefinder>=6.5",
 ]
 
 [project.scripts]

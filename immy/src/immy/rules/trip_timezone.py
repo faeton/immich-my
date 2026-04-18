@@ -70,6 +70,12 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
         # Already tz-annotated in XMP sidecar → skip.
         if isinstance(raw, str) and _has_offset_suffix(raw):
             continue
+        # Per-file EXIF offset wins over the trip-wide zone — iPhones and
+        # modern mirrorless stamp OffsetTimeOriginal at capture, which is
+        # more reliable than looking up the zone at `dt` (a device that
+        # crossed a border mid-trip still has the right offset per file).
+        if row.get("EXIF:OffsetTimeOriginal", "XMP:OffsetTimeOriginal"):
+            continue
         offset = dt.replace(tzinfo=zone).utcoffset()
         if offset is None:
             continue

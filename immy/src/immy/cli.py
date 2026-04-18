@@ -85,20 +85,29 @@ def _apply_once(folder: Path, state: State, pending: list[Finding]) -> int:
 
 
 def _apply_write_notes(f: Finding) -> None:
-    """Apply a note-edit patch. Today supports `add_tags` (append unique,
-    preserve order). More keys can join here as write_notes rules grow."""
+    """Apply a note-edit patch. Supported keys:
+    - `add_tags`: list → merge unique into front-matter `tags:`
+    - `timezone`: string → set front-matter `timezone:` (used by
+      trip-timezone-guess-gps)
+    More keys can join here as write_notes rules grow."""
+    updates: dict = {}
     add_tags = f.patch.get("add_tags") or []
-    if not add_tags:
+    if add_tags:
+        fm = parse_frontmatter(f.path)
+        existing = fm.get("tags")
+        merged: list = list(existing) if isinstance(existing, list) else []
+        seen = set(merged)
+        for t in add_tags:
+            if t not in seen:
+                merged.append(t)
+                seen.add(t)
+        updates["tags"] = merged
+    tz = f.patch.get("timezone")
+    if isinstance(tz, str) and tz.strip():
+        updates["timezone"] = tz.strip()
+    if not updates:
         return
-    fm = parse_frontmatter(f.path)
-    existing = fm.get("tags")
-    merged: list = list(existing) if isinstance(existing, list) else []
-    seen = set(merged)
-    for t in add_tags:
-        if t not in seen:
-            merged.append(t)
-            seen.add(t)
-    update_frontmatter(f.path, {"tags": merged})
+    update_frontmatter(f.path, updates)
 
 
 def _apply_loop(folder: Path, state: State, initial_pending: list[Finding]) -> int:
