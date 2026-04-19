@@ -9,7 +9,9 @@ from rich.console import Console
 from rich.table import Table
 
 from . import bloat as bloat_mod
+from . import process as process_mod
 from . import promote as promote_mod
+from . import pg as pg_mod
 from .config import load as load_config
 from .exif import has_gps, read_folder
 from .immich import ImmichClient
@@ -510,6 +512,8 @@ def _promote_impl(
         console.print(f"[red]scan failed:[/red] {summary['scan_error']}")
     elif summary["scan_triggered"]:
         console.print("[green]✓[/green] library scan triggered")
+    elif summary.get("scan_skipped_reason") == "y_processed":
+        console.print("[dim]scan skipped: y_processed.yml present[/dim]")
     for status, detail in summary["stacks"]:
         colour = {
             "stacked": "green", "planned": "yellow", "skipped": "dim", "error": "red",
@@ -683,6 +687,93 @@ def bloat_transcode(
 
 
 app.add_typer(bloat_app, name="bloat")
+
+
+# --- `immy process` (Phase Y.1) -------------------------------------------
+
+
+@app.command()
+def process(
+    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report would-insert rows; no DB writes."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+) -> None:
+    """Phase Y.1 — insert asset + asset_exif rows for every media file
+    under <folder> directly into the Immich Postgres.
+
+    Requires `pg:` and `immich.library_id` in ~/.immy/config.yml.
+    Idempotent via `checksum = sha1("path:" + originalPath)`.
+    Drops `.audit/y_processed.yml` so `immy promote` skips the scan POST.
+    """
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print(
+            "[red]no pg: block in immy config[/red] — add host/port/user/password/database "
+            "to ~/.immy/config.yml."
+        )
+        raise typer.Exit(code=2)
+    if config.immich is None:
+        console.print(
+            "[red]no immich: block in immy config[/red] — process needs "
+            "`immich.library_id` to pick which library to write into."
+        )
+        raise typer.Exit(code=2)
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:  # psycopg.OperationalError etc.
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    try:
+        library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+    except LookupError as e:
+        console.print(f"[red]{e}[/red]")
+        conn.close()
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"[bold]process[/bold] {folder}\n"
+        f"  library: {library.id} owner={library.owner_id}\n"
+        f"  container root: {library.container_root}\n"
+        f"  target prefix: {library.container_root}/{folder.name}/..."
+    )
+
+    if dry_run:
+        from .exif import read_folder as _read
+        rows = _read(folder)
+        console.print(f"[yellow]dry-run[/yellow] would process {len(rows)} file(s)")
+        for r in rows[:5]:
+            asset, _ = process_mod.build_rows(r.path, folder, r, library)
+            console.print(
+                f"  {asset.asset_type:<5} {asset.original_path} "
+                f"[dim]cs={asset.checksum.hex()[:12]}…[/dim]"
+            )
+        if len(rows) > 5:
+            console.print(f"  [dim]… and {len(rows) - 5} more[/dim]")
+        conn.close()
+        return
+
+    try:
+        results = process_mod.process_trip(folder, conn, library)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        conn.close()
+        console.print(f"[red]insert failed, rolled back:[/red] {e}")
+        raise typer.Exit(code=1)
+    finally:
+        if not conn.closed:
+            conn.close()
+
+    new_count = sum(1 for r in results if r.inserted)
+    existed = len(results) - new_count
+    process_mod.write_marker(folder, results)
+    console.print(
+        f"[green]✓[/green] {new_count} new asset(s), "
+        f"[dim]{existed} already present[/dim]  "
+        f"(marker: .audit/{process_mod.Y_MARKER_FILENAME})"
+    )
 
 
 if __name__ == "__main__":

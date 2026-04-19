@@ -9,6 +9,7 @@ dependencies = [
     "pyyaml>=6.0",
     "rich>=13.7",
     "timezonefinder>=6.5",
+    "psycopg[binary]>=3.2",
 ]
 
 [project.scripts]

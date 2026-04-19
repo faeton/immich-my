@@ -13,6 +13,12 @@ Shape:
       url: http://vv.tailnet:2283
       api_key: xxx
       library_id: <uuid>
+    pg:                              # optional; `immy process` needs it
+      host: 100.64.0.10
+      port: 15432
+      user: postgres
+      password: xxx
+      database: immich
 
 Missing config file is not an error for `audit`; `promote` checks what it
 needs and raises a clear message if `originals_root` is absent.
@@ -38,9 +44,19 @@ class ImmichConfig:
 
 
 @dataclass(frozen=True)
+class PgConfig:
+    host: str
+    port: int
+    user: str
+    password: str
+    database: str
+
+
+@dataclass(frozen=True)
 class Config:
     originals_root: Path | None
     immich: ImmichConfig | None
+    pg: PgConfig | None
     notes_filename: str | None
     source: Path | None  # which file this came from, for error messages
 
@@ -59,7 +75,10 @@ def _resolve_path(explicit: Path | None) -> Path | None:
 def load(path: Path | None = None) -> Config:
     resolved = _resolve_path(path)
     if resolved is None or not resolved.is_file():
-        return Config(originals_root=None, immich=None, notes_filename=None, source=None)
+        return Config(
+            originals_root=None, immich=None, pg=None,
+            notes_filename=None, source=None,
+        )
     data = yaml.safe_load(resolved.read_text()) or {}
 
     root_raw = data.get("originals_root")
@@ -74,9 +93,21 @@ def load(path: Path | None = None) -> Config:
             library_id=str(imm["library_id"]),
         )
 
+    pg_raw = data.get("pg") or {}
+    pg = None
+    if all(pg_raw.get(k) for k in ("host", "user", "password", "database")):
+        pg = PgConfig(
+            host=str(pg_raw["host"]),
+            port=int(pg_raw.get("port", 5432)),
+            user=str(pg_raw["user"]),
+            password=str(pg_raw["password"]),
+            database=str(pg_raw["database"]),
+        )
+
     return Config(
         originals_root=root,
         immich=immich,
+        pg=pg,
         notes_filename=data.get("notes_filename"),
         source=resolved,
     )

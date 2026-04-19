@@ -1,0 +1,405 @@
+"""Tests for `immy process` (Phase Y.1): asset + asset_exif direct insert.
+
+DB is mocked — we assert on the SQL/parameter shape, not on real writes.
+A manual end-to-end against the NAS lives outside the unit tests.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import shutil
+from datetime import datetime, timezone
+from pathlib import Path
+from unittest.mock import MagicMock
+
+import pytest
+import yaml
+from typer.testing import CliRunner
+
+from immy import process as process_mod
+from immy import pg as pg_mod
+from immy.cli import app
+from immy.exif import read_folder
+from immy.pg import LibraryInfo
+
+
+FIXTURES = Path(__file__).parent / "fixtures"
+runner = CliRunner()
+
+LIB = LibraryInfo(
+    id="lib-1",
+    owner_id="owner-1",
+    container_root="/mnt/external/originals",
+)
+
+
+# --- Pure helpers ---------------------------------------------------------
+
+
+def test_path_checksum_matches_spec():
+    # sha1("path:" + path) — 20 raw bytes, not hex.
+    p = "/mnt/external/originals/trip/DSC_4182.JPG"
+    expected = hashlib.sha1(f"path:{p}".encode()).digest()
+    got = process_mod.path_checksum(p)
+    assert got == expected
+    assert len(got) == 20
+    assert isinstance(got, bytes)
+
+
+def test_path_checksum_deterministic_for_same_path():
+    p = "/mnt/external/originals/x.jpg"
+    assert process_mod.path_checksum(p) == process_mod.path_checksum(p)
+
+
+def test_path_checksum_differs_for_different_paths():
+    a = process_mod.path_checksum("/a/b.jpg")
+    b = process_mod.path_checksum("/a/c.jpg")
+    assert a != b
+
+
+def test_container_path_for_anchors_under_root(tmp_path: Path):
+    trip = tmp_path / "mauritius-2026"
+    trip.mkdir()
+    f = trip / "DJI_0001.JPG"
+    f.write_bytes(b"x")
+    cp = process_mod.container_path_for(f, trip, "/mnt/external/originals")
+    assert cp == "/mnt/external/originals/mauritius-2026/DJI_0001.JPG"
+
+
+def test_container_path_for_strips_trailing_slash(tmp_path: Path):
+    trip = tmp_path / "t"
+    trip.mkdir()
+    f = trip / "a.jpg"
+    f.write_bytes(b"x")
+    cp = process_mod.container_path_for(f, trip, "/mnt/external/originals/")
+    assert cp == "/mnt/external/originals/t/a.jpg"
+
+
+def test_container_path_for_nested(tmp_path: Path):
+    trip = tmp_path / "t"
+    (trip / "sub").mkdir(parents=True)
+    f = trip / "sub" / "a.jpg"
+    f.write_bytes(b"x")
+    cp = process_mod.container_path_for(f, trip, "/mnt/root")
+    assert cp == "/mnt/root/t/sub/a.jpg"
+
+
+def test_asset_type_for_image_vs_video():
+    assert process_mod.asset_type_for(".JPG") == "IMAGE"
+    assert process_mod.asset_type_for(".heic") == "IMAGE"
+    assert process_mod.asset_type_for(".DNG") == "IMAGE"
+    assert process_mod.asset_type_for(".mp4") == "VIDEO"
+    assert process_mod.asset_type_for(".MOV") == "VIDEO"
+    assert process_mod.asset_type_for(".insv") == "VIDEO"
+    assert process_mod.asset_type_for(".lrv") == "VIDEO"
+
+
+# --- build_rows -----------------------------------------------------------
+
+
+def test_build_rows_dji_fixture_populates_exif(tmp_path: Path):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    rows = read_folder(target)
+    jpg_row = next(r for r in rows if r.path.suffix.upper() == ".JPG")
+
+    asset, exif = process_mod.build_rows(jpg_row.path, target, jpg_row, LIB)
+
+    assert asset.owner_id == "owner-1"
+    assert asset.library_id == "lib-1"
+    assert asset.device_id == "Library Import"
+    assert asset.asset_type == "IMAGE"
+    assert asset.original_path == f"/mnt/external/originals/{target.name}/DJI_0001.JPG"
+    assert asset.original_file_name == "DJI_0001.JPG"
+    assert asset.device_asset_id == "DJI_0001.JPG"
+    assert len(asset.checksum) == 20
+    assert asset.checksum == hashlib.sha1(
+        f"path:{asset.original_path}".encode()
+    ).digest()
+    assert asset.duration is None  # image
+    # Dates are populated & tz-aware UTC-anchored.
+    assert asset.file_created_at.tzinfo is not None
+    assert asset.file_modified_at.tzinfo is not None
+    assert asset.local_date_time == asset.file_created_at
+
+    assert exif.asset_id == asset.id
+    assert exif.description == ""
+    assert exif.file_size_in_byte == jpg_row.path.stat().st_size
+    # Fixture JPEG is 1x1; width/height come from File group when EXIF-less.
+    assert exif.exif_image_width == 1
+    assert exif.exif_image_height == 1
+
+
+def test_build_rows_deviceassetid_strips_spaces(tmp_path: Path):
+    trip = tmp_path / "t"
+    trip.mkdir()
+    f = trip / "GP Temp Download.jpg"
+    f.write_bytes(b"x")
+    rows = read_folder(trip)
+    asset, _ = process_mod.build_rows(f, trip, rows[0], LIB)
+    assert asset.device_asset_id == "GPTempDownload.jpg"
+    assert asset.original_file_name == "GP Temp Download.jpg"
+
+
+def test_build_rows_uuid_is_unique(tmp_path: Path):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    rows = read_folder(target)
+    jpg_row = next(r for r in rows if r.path.suffix.upper() == ".JPG")
+    a1, _ = process_mod.build_rows(jpg_row.path, target, jpg_row, LIB)
+    a2, _ = process_mod.build_rows(jpg_row.path, target, jpg_row, LIB)
+    # Each build_rows call mints a fresh UUID; dedupe happens in DB via checksum.
+    assert a1.id != a2.id
+    assert a1.checksum == a2.checksum
+
+
+# --- _parse_exif_datetime ------------------------------------------------
+
+
+def test_parse_exif_datetime_naive():
+    dt = process_mod._parse_exif_datetime("2026:03:07 12:34:56")
+    assert dt == datetime(2026, 3, 7, 12, 34, 56)
+    assert dt.tzinfo is None
+
+
+def test_parse_exif_datetime_with_offset():
+    dt = process_mod._parse_exif_datetime("2026:03:07 12:34:56+04:00")
+    assert dt.tzinfo is not None
+    assert dt.utcoffset().total_seconds() == 4 * 3600
+
+
+def test_parse_exif_datetime_garbage_returns_none():
+    assert process_mod._parse_exif_datetime("not a date") is None
+    assert process_mod._parse_exif_datetime(None) is None
+    assert process_mod._parse_exif_datetime(123) is None
+
+
+# --- insert_asset --------------------------------------------------------
+
+
+def _fake_conn(asset_returning_id: str | None = "new-id") -> MagicMock:
+    """Mock psycopg connection: tracks execute calls, returns given id from
+    first fetchone() (the INSERT ... RETURNING id on the asset table).
+    """
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = (asset_returning_id,) if asset_returning_id else None
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def _make_rows(tmp_path: Path) -> tuple[process_mod.AssetRow, process_mod.AssetExifRow, Path]:
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    rows = read_folder(target)
+    jpg_row = next(r for r in rows if r.path.suffix.upper() == ".JPG")
+    asset, exif = process_mod.build_rows(jpg_row.path, target, jpg_row, LIB)
+    return asset, exif, target
+
+
+def test_insert_asset_executes_two_inserts_and_returns_true(tmp_path: Path):
+    asset, exif, _ = _make_rows(tmp_path)
+    conn, cur = _fake_conn("uuid-1")
+
+    inserted = process_mod.insert_asset(conn, asset, exif)
+
+    assert inserted is True
+    # First call is asset INSERT, second is exif INSERT.
+    assert cur.execute.call_count == 2
+    sql_asset, params_asset = cur.execute.call_args_list[0].args
+    sql_exif, params_exif = cur.execute.call_args_list[1].args
+    assert "INSERT INTO asset" in sql_asset
+    assert "'sha1-path'" in sql_asset
+    assert "INSERT INTO asset_exif" in sql_exif
+    assert params_asset["owner_id"] == "owner-1"
+    assert params_asset["library_id"] == "lib-1"
+    assert params_asset["asset_type"] == "IMAGE"
+    assert params_exif["asset_id"] == asset.id
+    assert params_exif["description"] == ""
+
+
+def test_insert_asset_conflict_skips_exif(tmp_path: Path):
+    asset, exif, _ = _make_rows(tmp_path)
+    # RETURNING returns no row → checksum conflict on the asset insert;
+    # we must NOT issue the exif INSERT (it'd dangle without a parent).
+    conn, cur = _fake_conn(None)
+
+    inserted = process_mod.insert_asset(conn, asset, exif)
+
+    assert inserted is False
+    assert cur.execute.call_count == 1  # only the asset attempt
+    assert "INSERT INTO asset" in cur.execute.call_args_list[0].args[0]
+
+
+# --- process_trip + marker -----------------------------------------------
+
+
+def test_process_trip_builds_one_result_per_media_file(tmp_path: Path):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+
+    results = process_mod.process_trip(target, conn, LIB)
+
+    assert len(results) == 1  # only DJI_0001.JPG is media; .SRT isn't
+    assert results[0].inserted is True
+    assert results[0].container_path.endswith("/DJI_0001.JPG")
+
+
+def test_write_marker_drops_expected_yaml(tmp_path: Path):
+    results = [
+        process_mod.ProcessResult(asset_id="id-1", container_path="/x/a.jpg", inserted=True),
+        process_mod.ProcessResult(asset_id="id-2", container_path="/x/b.jpg", inserted=False),
+    ]
+    marker = process_mod.write_marker(tmp_path, results)
+
+    assert marker == tmp_path / ".audit" / "y_processed.yml"
+    payload = yaml.safe_load(marker.read_text())
+    assert payload["inserted"] == 1
+    assert payload["already_present"] == 1
+    assert len(payload["assets"]) == 2
+    assert payload["assets"][0]["id"] == "id-1"
+
+
+def test_is_processed_false_without_marker(tmp_path: Path):
+    assert process_mod.is_processed(tmp_path) is False
+
+
+def test_is_processed_true_with_marker(tmp_path: Path):
+    process_mod.write_marker(tmp_path, [])
+    assert process_mod.is_processed(tmp_path) is True
+
+
+# --- CLI driver -----------------------------------------------------------
+
+
+@pytest.fixture
+def config_full(tmp_path: Path, monkeypatch) -> Path:
+    originals = tmp_path / "originals"
+    originals.mkdir()
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        yaml.safe_dump({
+            "originals_root": str(originals),
+            "immich": {"url": "http://fake", "api_key": "k", "library_id": "lib-1"},
+            "pg": {
+                "host": "127.0.0.1", "port": 15432,
+                "user": "postgres", "password": "x", "database": "immich",
+            },
+        })
+    )
+    monkeypatch.setenv("IMMY_CONFIG", str(cfg))
+    return cfg
+
+
+def test_process_cli_dry_run_no_pg_connect(config_full, tmp_path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    # Stub connect + fetch so dry-run doesn't hit real DB.
+    fake_conn = MagicMock()
+    monkeypatch.setattr(pg_mod, "connect", lambda cfg: fake_conn)
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: fake_conn)
+    monkeypatch.setattr(
+        "immy.cli.pg_mod.fetch_library_info",
+        lambda conn, lib_id: LIB,
+    )
+
+    result = runner.invoke(app, ["process", str(target), "--dry-run"])
+    assert result.exit_code == 0, result.stdout
+    assert "dry-run" in result.stdout
+    assert "would process" in result.stdout
+    # No INSERT attempted.
+    fake_conn.cursor.assert_not_called()
+    # No marker written on dry-run.
+    assert not (target / ".audit" / "y_processed.yml").exists()
+
+
+def test_process_cli_inserts_and_drops_marker(config_full, tmp_path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    fake_conn = MagicMock()
+    fake_conn.closed = False
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    fake_conn.cursor.return_value = cur
+
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: fake_conn)
+    monkeypatch.setattr(
+        "immy.cli.pg_mod.fetch_library_info",
+        lambda conn, lib_id: LIB,
+    )
+
+    result = runner.invoke(app, ["process", str(target)])
+    assert result.exit_code == 0, result.stdout
+    assert "1 new asset" in result.stdout
+    assert (target / ".audit" / "y_processed.yml").is_file()
+    fake_conn.commit.assert_called_once()
+
+
+def test_process_cli_errors_without_pg_config(tmp_path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    # Config without pg:
+    cfg = tmp_path / "no-pg.yml"
+    cfg.write_text(
+        yaml.safe_dump({
+            "originals_root": str(tmp_path),
+            "immich": {"url": "http://fake", "api_key": "k", "library_id": "lib-1"},
+        })
+    )
+    monkeypatch.setenv("IMMY_CONFIG", str(cfg))
+    result = runner.invoke(app, ["process", str(target)])
+    assert result.exit_code == 2
+    assert "no pg:" in result.stdout
+
+
+def test_promote_skips_scan_when_marker_present(config_full, tmp_path, monkeypatch):
+    """With `.audit/y_processed.yml`, promote must NOT POST to /scan."""
+    from immy import immich as immich_mod
+    from immy import promote as promote_mod
+
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    # Audit first so no HIGH pending, then drop the Y marker.
+    runner.invoke(app, ["audit", str(target), "--write", "--auto"])
+    process_mod.write_marker(target, [process_mod.ProcessResult(
+        asset_id="id-1", container_path="/x/a.jpg", inserted=True,
+    )])
+
+    class FakeClient:
+        def __init__(self, **kw):
+            self.scans: list[str] = []
+        def scan_library(self, library_id):
+            self.scans.append(library_id)
+        def find_asset_id(self, name):
+            return None
+        def create_stack(self, *a, **kw):
+            return None
+        def find_album_by_name(self, name):
+            return None
+        def create_album(self, *a, **kw):
+            return "alb-1"
+        def update_album(self, *a, **kw):
+            pass
+        def add_assets_to_album(self, album_id, asset_ids):
+            return []
+
+    fake = FakeClient()
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: None)
+
+    result = runner.invoke(app, ["promote", str(target)])
+    assert result.exit_code == 0, result.stdout
+    assert fake.scans == []  # the whole point
+    assert "scan skipped" in result.stdout

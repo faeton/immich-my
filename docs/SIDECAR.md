@@ -547,6 +547,41 @@ preserve codecs (ProRes / DNxHR / CineForm / FFV1 / RAW), Insta360 content
 (any extension), and folders whose segment contains `raw` / `source` /
 `edit` / `project` / `insta360`.
 
+### `immy process` — Phase Y.1 direct-to-DB insert
+
+Writes `asset` + `asset_exif` rows directly into Immich's Postgres over the
+tailnet, so the library scan becomes a no-op for Mac-handled trips. See
+[IMMICH-INGEST.md](IMMICH-INGEST.md) §1 + §8 for the exact schema; the
+rest of Phase Y builds derivatives on top of this.
+
+```
+immy process <folder>            # connect, INSERT asset+exif, drop marker
+immy process <folder> --dry-run  # report would-insert; no DB writes
+```
+
+**Config.** Reads a `pg:` block from `~/.immy/config.yml` (host/port/user/
+password/database) plus the existing `immich.library_id`. Owner UUID and
+container-path prefix come from the `library` row at runtime — no
+duplication with what Immich already knows.
+
+**Checksum = `sha1("path:" + container_path)`**, 20 raw bytes, stored with
+`checksumAlgorithm='sha1-path'`. Matches the value Immich's own scanner
+computes for external-library files, so `ON CONFLICT DO NOTHING` on
+`(ownerId, libraryId, checksum)` makes the insert idempotent — scan and
+process cannot double-insert the same path.
+
+**Marker file.** On success, `.audit/y_processed.yml` lists every inserted
+asset (uuid + container path + `new: true|false`). `immy promote` checks
+for this marker; when present, it skips the `POST /api/libraries/:id/scan`
+call — the rows are already there. Marker path is stable
+(`immy.process.marker_path(folder)`), so later Y phases can extend it with
+derivative-path records without breaking the skip logic.
+
+**Y.1 scope = metadata only.** No thumbnails, no smart_search, no faces —
+those are Y.2/Y.3/Y.4. A Y.1-processed trip shows up in the Immich UI with
+placeholder thumbs and full EXIF detail; the library scan still won't try
+to re-process it.
+
 ### Insta360 `.insv` handling
 
 Immich v2.7 has no native 360 player and can't use a "preview file" out of

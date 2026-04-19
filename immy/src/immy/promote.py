@@ -26,6 +26,7 @@ from .config import Config
 from .exif import iter_media, read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
+from .process import is_processed as y_is_processed
 from .rules import evaluate
 from .state import State, log_event, patch_hash
 
@@ -174,12 +175,17 @@ def execute(
     if client is None or config.immich is None:
         return summary
 
-    try:
-        client.scan_library(config.immich.library_id)
-        summary["scan_triggered"] = True
-    except ImmichError as e:
-        summary["scan_error"] = str(e)
-        return summary
+    # Phase Y.1: if `immy process` already inserted rows for this trip, the
+    # scan POST is pure wasted work — skip it. The marker is our signal.
+    if y_is_processed(plan.folder):
+        summary["scan_skipped_reason"] = "y_processed"
+    else:
+        try:
+            client.scan_library(config.immich.library_id)
+            summary["scan_triggered"] = True
+        except ImmichError as e:
+            summary["scan_error"] = str(e)
+            return summary
 
     for pair in plan.pairs:
         summary["stacks"].append(_stack_pair(client, pair))
