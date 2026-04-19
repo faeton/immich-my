@@ -143,7 +143,44 @@ sudo /usr/local/bin/tailscale serve --bg --https=<service-port> http://127.0.0.1
 
 Tailnet peers we care about:
 - `nas-media` (this NAS, Linux) — always on.
-- `mac-ml` (the MacBook) — our Phase 1 ML box.
+- `mac-ml` (the MacBook) — our Phase Y compute box.
+
+## Postgres exposed on tailnet (Phase Y)
+
+2026-04-19: published `immich_postgres` on the NAS at host port **15432**
+(container port 5432 internally). Bound to `0.0.0.0:15432` so the
+tailnet IP `100.64.0.10:15432` is reachable from Mac without
+Tailscale Serve's TLS wrap (Synology's `tailscaled` runs in **userspace
+networking mode** — `TUN: false` — so Docker's userland proxy can't
+bind directly to the tailnet IP).
+
+Why port **15432** and not 5432: DSM's own Postgres (Note Station etc.)
+already owns `5432` on the NAS host.
+
+Compose fragment:
+```yaml
+# docker-compose.yml, service: database
+ports:
+  - "15432:5432"
+```
+
+Connect from Mac:
+```sh
+PGPASSWORD=<DB_PASSWORD from .env> psql -h 100.64.0.10 -p 15432 \
+  -U postgres -d immich -c 'SELECT count(*) FROM asset;'
+```
+
+**Security note**: the port is also reachable on LAN (bound to
+`0.0.0.0`, not tailnet-only). For our home NAS behind NAT with a strong
+DB password this is acceptable for now. To harden later: add a DSM
+Firewall rule (`Control Panel → Security → Firewall`) allowing `15432`
+only from `100.64.0.0/10` (tailnet range) and blocking from all other
+sources. Track as a Phase Y follow-up — not urgent.
+
+Rollback (if needed): edit compose to remove the `ports:` block on
+`database`, `docker compose up -d`. PG goes back to docker-network-only.
+Backup of pre-change compose lives at
+`/volume1/faeton-immi/docker/docker-compose.yml.bak-<timestamp>`.
 
 ## Backup
 

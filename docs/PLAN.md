@@ -92,7 +92,7 @@ only supported maintenance path — no "gracefully handle unknown schema".
 
 | # | Scope | Done when | Status |
 |---|---|---|---|
-| **Y.0** | **Research** — read accelerator's bundled server code, document: exact SQL for new asset ingest, derivative path conventions, ML model invocation surface, checksum algo, scan-vs-direct-insert behaviour, Immich version pinned. | Single internal doc under `docs/` maps every call Immich makes on ingest to the exact table rows + file paths it produces. | in progress |
+| **Y.0** | **Research** — read accelerator's bundled server code, document: exact SQL for new asset ingest, derivative path conventions, ML model invocation surface, checksum algo, scan-vs-direct-insert behaviour, Immich version pinned. | Single internal doc under `docs/` maps every call Immich makes on ingest to the exact table rows + file paths it produces. | ✅ 2026-04-19 → [IMMICH-INGEST.md](IMMICH-INGEST.md) (1037 lines, cited) |
 | **Y.1** | `immy process <trip>` computes checksum + EXIF rows, writes asset+exif to PG. No derivatives yet. `promote` stops triggering scan for Y-processed trips. | One trip lands in Immich UI with metadata-only entries, no timeline thumb, no errors on NAS logs. | pending |
 | **Y.2** | Thumbnail + preview generation via vips (Sharp). Written to NAS `library/thumbs/` via rsync, paths recorded in PG. | Same trip now renders timeline thumbs. | pending |
 | **Y.3** | CLIP embedding via mlx-clip. `smart_search` row per asset. | Text search finds Y-processed assets. | pending |
