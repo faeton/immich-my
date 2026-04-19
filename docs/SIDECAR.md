@@ -249,9 +249,13 @@ re-ask), then re-writes the file preserving the user's body. Anything
 below the front-matter is untouched. The front-matter is canonical for
 trip-level data; `state.yml` is canonical for rule-level decisions.
 
-**Nice side-effect**: on `immy promote`, the body of the notes file can
-become the Immich album description (via `PUT /api/albums/:id`) — search
-"safari at Casela" and the album with that prose comes up.
+**Nice side-effect** *(shipped)*: `immy promote` creates or updates an
+Immich album named after the trip folder, sets its description from the
+notes body (front-matter + `# Title` + scaffold-hint paragraph stripped),
+and adds every media asset in the trip to it. Idempotent — re-running
+promote leaves the album alone except for newly-indexed assets and a
+description patch when the body changed. The notes body becomes
+searchable prose in Immich without any separate sync.
 
 ### `state.yml` schema (as shipped)
 
@@ -416,10 +420,11 @@ review. Distinguishing pending-MEDIUM from clean will land with 2a.6
 (watcher mode needs an exit code to drive the `NEEDS_REVIEW.md`
 generation).
 
-### `immy promote` — rsync + scan + stack
+### `immy promote` — rsync + scan + stack + album
 
-Shipped in 2a.4. Same engine as `audit` (so the same notes, state, and
-audit-log file stay authoritative), wrapped in three phases:
+Shipped in 2a.4; album sync added post-2c. Same engine as `audit` (so
+the same notes, state, and audit-log file stay authoritative), wrapped
+in four phases:
 
 1. **Guard rail.** Re-evaluate rules; if any HIGH finding is pending,
    refuse with exit 1. Override with `--force`. This stops "promote what
@@ -439,6 +444,16 @@ audit-log file stay authoritative), wrapped in three phases:
    are indexed (6 tries × 2 s), then `POST /api/stacks` with the
    `.lrv` asset ID first (Immich 2.x treats the first element of
    `assetIds` as the stack primary). Missing IDs → logged, not fatal.
+4. **Album sync.** `GET /api/albums` → find an album whose `albumName`
+   matches the trip folder name, else `POST /api/albums` with the
+   notes body as description. Every local media file in the trip gets
+   its asset ID looked up (first file polls until it's indexed — scan
+   is async; subsequent files use one-shot lookups so large trips don't
+   spend minutes per file) and bulk-added via `PUT /api/albums/{id}/assets`
+   (the endpoint reports already-present assets as duplicates, so re-runs
+   are safe). Description gets `PATCH`ed only when the notes body
+   changed. Errors are caught and surface as `album error …` without
+   failing the promote — the photos are on disk and in Immich regardless.
 
 **Config** lives at `~/.immy/config.yml` (override with `--config` or
 `$IMMY_CONFIG`). Example:

@@ -4,11 +4,15 @@ Uses `urllib` to avoid a new dependency. Short timeouts because the Mac is
 often on a 5–10 Mbps uplink; a hung API call should fail fast and let the
 caller retry, not block for 60 s on connect.
 
-Three endpoints:
+Endpoints used:
 
 - `POST /api/libraries/{id}/scan`   — kick off an external-library scan.
 - `POST /api/search/metadata`       — find an asset by original filename.
 - `POST /api/stacks`                — collapse `.insv` + `.lrv` into one tile.
+- `GET  /api/albums`                — list albums (used to find-by-name).
+- `POST /api/albums`                — create an album with name/description.
+- `PATCH /api/albums/{id}`          — update name/description.
+- `PUT  /api/albums/{id}/assets`    — add assets to an existing album.
 
 The Immich API surface shifts between minor versions; keep the touched
 surface small and version-pin when it matters.
@@ -78,6 +82,69 @@ class ImmichClient:
         payload = {"assetIds": [primary_asset_id, *other_asset_ids]}
         resp = self._request("POST", "/api/stacks", body=payload)
         return (resp or {}).get("id") if isinstance(resp, dict) else None
+
+    # --- albums ------------------------------------------------------------
+
+    def find_album_by_name(self, name: str) -> dict | None:
+        """Return the first album matching `name` exactly, or None.
+
+        Immich's `GET /api/albums` returns all albums owned by the caller;
+        for personal use the list is small enough that client-side filter
+        is fine. If multiple albums share a name we pick the first — the
+        promote flow is creating/updating, so the deterministic choice
+        beats a ranked heuristic.
+        """
+        resp = self._request("GET", "/api/albums")
+        if not isinstance(resp, list):
+            return None
+        for album in resp:
+            if isinstance(album, dict) and album.get("albumName") == name:
+                return album
+        return None
+
+    def create_album(
+        self,
+        name: str,
+        *,
+        description: str | None = None,
+        asset_ids: list[str] | None = None,
+    ) -> str | None:
+        body: dict = {"albumName": name}
+        if description is not None:
+            body["description"] = description
+        if asset_ids:
+            body["assetIds"] = asset_ids
+        resp = self._request("POST", "/api/albums", body=body)
+        return (resp or {}).get("id") if isinstance(resp, dict) else None
+
+    def update_album(
+        self,
+        album_id: str,
+        *,
+        description: str | None = None,
+    ) -> None:
+        """Patch album fields. Today: description only (album name is the
+        identity key — renaming isn't part of the promote flow)."""
+        body: dict = {}
+        if description is not None:
+            body["description"] = description
+        if not body:
+            return
+        self._request("PATCH", f"/api/albums/{album_id}", body=body)
+
+    def add_assets_to_album(
+        self, album_id: str, asset_ids: list[str]
+    ) -> list[dict]:
+        """`PUT /api/albums/{id}/assets` is idempotent: already-member assets
+        come back with `success=false, error='duplicate'`, never fails hard.
+
+        Returns the per-asset result list (may be empty on no-op)."""
+        if not asset_ids:
+            return []
+        resp = self._request(
+            "PUT", f"/api/albums/{album_id}/assets", body={"ids": asset_ids}
+        )
+        return resp if isinstance(resp, list) else []
 
 
 def wait_for_asset(

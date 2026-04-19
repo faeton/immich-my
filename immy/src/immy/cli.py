@@ -515,6 +515,17 @@ def _promote_impl(
             "stacked": "green", "planned": "yellow", "skipped": "dim", "error": "red",
         }.get(status, "")
         console.print(f"  [{colour}]{status}[/{colour}] {detail}")
+    album = summary.get("album") or {}
+    if album and album.get("status") != "skipped":
+        colour = {
+            "created": "green", "updated": "green", "error": "red",
+        }.get(album.get("status", ""), "")
+        console.print(
+            f"album [{colour}]{album['status']}[/{colour}] "
+            f"{album['name']}: {album['detail']}"
+            + (f" [dim]({album['missing']} asset(s) not yet indexed)[/dim]"
+               if album.get("missing") else "")
+        )
 
 
 def _promote(

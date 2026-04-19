@@ -19,10 +19,21 @@ runner = CliRunner()
 class FakeClient:
     """Records every call; no HTTP. Tests inject via monkeypatch of ImmichClient."""
 
-    def __init__(self, *, indexed: set[str] | None = None, url: str = "", api_key: str = ""):
+    def __init__(
+        self,
+        *,
+        indexed: set[str] | None = None,
+        existing_albums: list[dict] | None = None,
+        url: str = "",
+        api_key: str = "",
+    ):
         self.indexed = indexed if indexed is not None else set()
         self.scans: list[str] = []
         self.stacks: list[tuple[str, list[str]]] = []
+        self.existing_albums = list(existing_albums or [])
+        self.albums_created: list[dict] = []
+        self.albums_updated: list[tuple[str, dict]] = []
+        self.album_assets: list[tuple[str, list[str]]] = []
 
     def scan_library(self, library_id: str) -> None:
         self.scans.append(library_id)
@@ -33,6 +44,30 @@ class FakeClient:
     def create_stack(self, primary_asset_id: str, other_asset_ids: list[str]) -> str | None:
         self.stacks.append((primary_asset_id, other_asset_ids))
         return "stack-1"
+
+    # Album surface ---------------------------------------------------------
+
+    def find_album_by_name(self, name: str) -> dict | None:
+        for album in self.existing_albums:
+            if album.get("albumName") == name:
+                return album
+        return None
+
+    def create_album(self, name, *, description=None, asset_ids=None):
+        record = {
+            "name": name,
+            "description": description,
+            "asset_ids": list(asset_ids or []),
+        }
+        self.albums_created.append(record)
+        return f"album-{name}"
+
+    def update_album(self, album_id, *, description=None):
+        self.albums_updated.append((album_id, {"description": description}))
+
+    def add_assets_to_album(self, album_id, asset_ids):
+        self.album_assets.append((album_id, list(asset_ids)))
+        return [{"id": aid, "success": True} for aid in asset_ids]
 
 
 @pytest.fixture
@@ -200,3 +235,72 @@ def test_promote_idempotent(config_file, dji_ready, monkeypatch):
     assert (originals / "dji-srt-pair" / "DJI_0001.JPG").stat().st_mtime == mtime
     # Scan still triggered (Immich needs to be told, even if no new files).
     assert len(fake.scans) == 2
+
+
+# --- album sync (new in 2a post-2c) ----------------------------------------
+
+
+def _indexed_set(folder: Path) -> set[str]:
+    from immy.exif import iter_media
+    return {p.name for p in iter_media(folder)}
+
+
+def test_promote_creates_album_with_description_from_notes(
+    config_file, dji_ready, monkeypatch
+):
+    _, originals = config_file
+    # Append a body to the notes file so `notes_body` returns something.
+    notes = dji_ready / "README.md"
+    text = notes.read_text()
+    notes.write_text(text + "\nDrone flyover at sunset.\n")
+
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+
+    assert len(fake.albums_created) == 1
+    created = fake.albums_created[0]
+    assert created["name"] == "dji-srt-pair"
+    assert "Drone flyover at sunset." in (created["description"] or "")
+    assert created["asset_ids"]  # at least one asset attached
+
+
+def test_promote_updates_existing_album(config_file, dji_ready, monkeypatch):
+    _, originals = config_file
+    notes = dji_ready / "README.md"
+    text = notes.read_text()
+    notes.write_text(text + "\nNew body text.\n")
+
+    existing = [{
+        "id": "album-existing",
+        "albumName": "dji-srt-pair",
+        "description": "old description",
+    }]
+    fake = FakeClient(indexed=_indexed_set(dji_ready), existing_albums=existing)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+
+    assert fake.albums_created == []  # no new album
+    assert fake.albums_updated  # description patched
+    updated_id, body = fake.albums_updated[0]
+    assert updated_id == "album-existing"
+    assert "New body text." in body["description"]
+    assert fake.album_assets  # assets added (idempotent on Immich side)
+
+
+def test_promote_skips_album_when_no_immich_creds(tmp_path, dji_ready, monkeypatch):
+    originals = tmp_path / "originals-noim"
+    cfg = tmp_path / "no-immich.yml"
+    cfg.write_text(yaml.safe_dump({"originals_root": str(originals)}))
+    monkeypatch.setenv("IMMY_CONFIG", str(cfg))
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0
+    assert "no immich creds" in result.stdout
+    # No album line in output (status "skipped" hidden by CLI).
+    assert "album " not in result.stdout

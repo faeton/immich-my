@@ -84,6 +84,57 @@ def target_for_write(folder: Path) -> Path:
     return existing if existing is not None else folder / DEFAULT_WRITE
 
 
+def notes_body(notes: Path) -> str:
+    """Return the body text below the front-matter, with a leading `# Title`
+    heading stripped if it matches the trip identity (so the Immich album
+    title isn't also repeated inside the description).
+
+    Also skips the scaffold hint block `immy audit` writes on first run —
+    those starting lines like *"Scaffold by `immy audit`..."* are noise in
+    an album description and disappear once the user edits the notes.
+    """
+    text = notes.read_text(errors="replace")
+    _, body = _split_frontmatter(text)
+    lines = body.splitlines()
+    # Drop leading blank lines.
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    # Drop a leading `# Heading` — the album already has the trip name.
+    if lines and lines[0].startswith("# "):
+        lines.pop(0)
+        while lines and not lines[0].strip():
+            lines.pop(0)
+    # Drop the scaffold hint block (it's wrapped in italics and always
+    # mentions `immy audit`). Match paragraph-by-paragraph.
+    paragraphs = _split_paragraphs(lines)
+    paragraphs = [
+        p for p in paragraphs
+        if not _is_scaffold_hint(p)
+    ]
+    return "\n\n".join(paragraphs).strip()
+
+
+def _split_paragraphs(lines: list[str]) -> list[str]:
+    out: list[str] = []
+    buf: list[str] = []
+    for ln in lines:
+        if ln.strip():
+            buf.append(ln)
+        elif buf:
+            out.append("\n".join(buf))
+            buf = []
+    if buf:
+        out.append("\n".join(buf))
+    return out
+
+
+def _is_scaffold_hint(paragraph: str) -> bool:
+    stripped = paragraph.strip()
+    if not stripped.startswith("_") or not stripped.rstrip().endswith("_"):
+        return False
+    return "immy audit" in stripped
+
+
 @dataclass
 class TripIdentity:
     name: str

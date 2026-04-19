@@ -23,8 +23,9 @@ from pathlib import Path
 import subprocess
 
 from .config import Config
-from .exif import read_folder
+from .exif import iter_media, read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
+from .notes import notes_body, resolve as resolve_notes
 from .rules import evaluate
 from .state import State, log_event, patch_hash
 
@@ -183,4 +184,102 @@ def execute(
     for pair in plan.pairs:
         summary["stacks"].append(_stack_pair(client, pair))
 
+    summary["album"] = _sync_album(client, plan)
+
+    return summary
+
+
+def _sync_album(client: ImmichClient, plan: Plan) -> dict:
+    """Create or update an Immich album named after the trip folder.
+
+    - Description comes from the notes body (below front-matter, with the
+      `# Title` and scaffold hint stripped). Empty body → no description
+      write.
+    - Assets = every media file under the trip folder, resolved to Immich
+      asset IDs via `POST /api/search/metadata?originalFileName=`. First
+      file is polled (scan is async); subsequent files use a single lookup
+      each, no wait, so large trips don't spend minutes per file.
+    - Idempotent: `PUT /api/albums/{id}/assets` reports already-present
+      assets as duplicates rather than failing.
+
+    Returns a summary dict the CLI formats. Never raises — album sync is
+    a nice-to-have, shouldn't block the rest of promote.
+    """
+    album_name = plan.folder.name
+    summary: dict = {
+        "name": album_name,
+        "status": "skipped",
+        "detail": "",
+        "added": 0,
+        "missing": 0,
+    }
+
+    notes = resolve_notes(plan.folder)
+    description: str | None = None
+    if notes is not None:
+        body = notes_body(notes)
+        description = body if body else None
+
+    # Find or create the album.
+    try:
+        existing = client.find_album_by_name(album_name)
+    except ImmichError as e:
+        summary.update(status="error", detail=f"find album: {e}")
+        return summary
+
+    # Resolve asset IDs for every local media file. First file polls (scan
+    # is async); the rest take one-shot lookups so the run doesn't spend
+    # ~12 s per missing asset on a big trip.
+    media_files = list(iter_media(plan.folder))
+    asset_ids: list[str] = []
+    missing = 0
+    first = True
+    for path in media_files:
+        if first:
+            aid = wait_for_asset(client, path.name)
+            first = False
+        else:
+            try:
+                aid = client.find_asset_id(path.name)
+            except ImmichError:
+                aid = None
+        if aid:
+            asset_ids.append(aid)
+        else:
+            missing += 1
+    summary["missing"] = missing
+
+    try:
+        if existing is None:
+            album_id = client.create_album(
+                album_name,
+                description=description,
+                asset_ids=asset_ids,
+            )
+            if album_id is None:
+                summary.update(status="error", detail="create returned no id")
+                return summary
+            summary.update(
+                status="created",
+                detail=f"id={album_id}; {len(asset_ids)} asset(s)",
+                added=len(asset_ids),
+            )
+            return summary
+
+        album_id = existing.get("id")
+        if album_id is None:
+            summary.update(status="error", detail="existing album has no id")
+            return summary
+
+        if description is not None and existing.get("description") != description:
+            client.update_album(album_id, description=description)
+        results = client.add_assets_to_album(album_id, asset_ids)
+        added = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
+        summary.update(
+            status="updated",
+            detail=f"id={album_id}; {added}/{len(asset_ids)} new",
+            added=added,
+        )
+    except ImmichError as e:
+        summary.update(status="error", detail=str(e))
     return summary
