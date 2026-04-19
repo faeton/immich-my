@@ -463,6 +463,75 @@ The JSONL audit log on the source folder gets one extra event per run:
 `{"event": "promoted", "target": "...", "pair_count": N}` so a trip's
 full story (audit decisions → promote) is in one file.
 
+### `immy bloat` — Phase 2c CLI
+
+CLI-first version of the bloat-detector + batch-transcode workflow. Reuses
+the `bloat-candidate` rule's preserve allowlist and bpp scoring (source of
+truth lives in `immy/rules/bloat_candidate.py`); adds candidate records
+with estimated post-transcode size, grouping, and the ffmpeg path.
+
+```
+immy bloat list <folder>               # scan + group-by-folder summary
+immy bloat transcode <folder>          # per-group y/n → .optimized.ext sidecar
+immy bloat transcode <folder> --apply  # after verify, atomic-replace originals
+immy bloat transcode <folder> --dry-run
+immy bloat transcode <folder> --yes    # non-interactive (still groups output)
+```
+
+**Target bitrate.** `target = w * h * fps * 0.05` (HEVC delivery bits-per-
+pixel-per-frame), rounded to nearest 0.5 Mbps. That's half the
+`bloat-candidate` rule's threshold (0.08) so a second scan after transcode
+comes back clean.
+
+**Savings gate.** Candidates where `(current - estimated) / current <
+0.20` are dropped before prompting — not worth CPU + quality hit.
+
+**Per-folder confirm (never auto).** The scan groups candidates by parent
+directory, and the CLI prompts once per group with the file count and
+total GB saved. Matches `feedback_transcode_confirm`: the user's call,
+never the machine's.
+
+**ffmpeg invocation.**
+```
+ffmpeg -y -hide_banner -loglevel warning \
+  -i <src> -c:v hevc_videotoolbox -tag:v hvc1 \
+  -b:v <target_bitrate> -c:a copy <stem>.optimized.<ext>.part
+```
+Writes to `.part` first, then renames to `.optimized.<ext>` after a
+verify pass: `ffprobe` duration match ±0.5 s and stream count match.
+
+**Non-destructive by default.** Transcodes land next to the source as
+`<stem>.optimized.<ext>`. `--apply` (separate flag) does the swap:
+`<src>` → `<src>.original`, `<src>.optimized.<ext>` → `<src>`. A
+`<src>.transcode.json` receipt lands alongside with:
+
+```json
+{
+  "pre_sha256": "...",
+  "pre_size": 1073741824,
+  "post_size": 268435456,
+  "pre_bitrate": 15000000,
+  "post_bitrate_target": 3000000,
+  "codec_before": "h264",
+  "codec_after": "hevc",
+  "width": 1920, "height": 1080, "fps": 30,
+  "original_name": "edit.mp4.original"
+}
+```
+
+The `.original` file is **not** auto-deleted — the user reviews visually
+and removes it when satisfied. No catalog DB involvement yet (that lands
+in the sidecar schema described below); the receipt JSON is the only
+persistence layer for now.
+
+**Preserve allowlist.** Identical to the `bloat-candidate` rule — camera-
+native prefixes (`DJI_`, `GX`, `GH`, `GOPR`, `MAH`, `MVI_`, `C0`, `LRV_`,
+`PRO_`, `DSC_`, date-stamped `VID_YYYYMMDD`/`IMG_YYYYMMDD`), preserve
+extensions (`.insv`, `.insp`, `.lrv`, `.lrf`, `.mts`, `.dng`, `.braw`),
+preserve codecs (ProRes / DNxHR / CineForm / FFV1 / RAW), Insta360 content
+(any extension), and folders whose segment contains `raw` / `source` /
+`edit` / `project` / `insta360`.
+
 ### Insta360 `.insv` handling
 
 Immich v2.7 has no native 360 player and can't use a "preview file" out of

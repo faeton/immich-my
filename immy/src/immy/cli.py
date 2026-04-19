@@ -8,6 +8,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import bloat as bloat_mod
 from . import promote as promote_mod
 from .config import load as load_config
 from .exif import has_gps, read_folder
@@ -530,6 +531,147 @@ def _promote(
 # attach the same callback to each command name.
 for _name in ("promote", "push", "pub"):
     app.command(name=_name)(_promote)
+
+
+# --- `immy bloat` subcommands ---------------------------------------------
+
+bloat_app = typer.Typer(
+    help="Phase 2c — detect oversized deliveries, batch-confirm, HEVC transcode.",
+    no_args_is_help=True,
+)
+
+
+def _print_bloat_groups(folder: Path, candidates: list[bloat_mod.BloatCandidate]) -> None:
+    if not candidates:
+        console.print("[dim]no bloat candidates.[/dim]")
+        return
+
+    groups = bloat_mod.group_by_folder(candidates, folder)
+    total_current = sum(c.current_size for c in candidates)
+    total_saved = sum(c.savings_bytes for c in candidates)
+
+    console.print(
+        f"\n[bold]{len(candidates)} candidate(s) across {len(groups)} folder(s)[/bold]  "
+        f"total: {bloat_mod.fmt_bytes(total_current)}  "
+        f"would save: [green]{bloat_mod.fmt_bytes(total_saved)}[/green] "
+        f"({100 * total_saved / max(total_current, 1):.0f} %)"
+    )
+
+    for group_path, items in groups.items():
+        g_size = sum(c.current_size for c in items)
+        g_save = sum(c.savings_bytes for c in items)
+        label = str(group_path) if str(group_path) != "." else "(root)"
+        console.print(
+            f"\n[bold]{label}[/bold] — {len(items)} file(s), "
+            f"{bloat_mod.fmt_bytes(g_size)} → "
+            f"save [green]{bloat_mod.fmt_bytes(g_save)}[/green] "
+            f"({100 * g_save / max(g_size, 1):.0f} %)"
+        )
+        for c in items:
+            console.print(
+                f"  {c.path.name}  {c.width}x{c.height}@{c.fps:g}  "
+                f"{c.codec_family} {bloat_mod.fmt_bitrate(c.current_bitrate)} → "
+                f"hevc {bloat_mod.fmt_bitrate(c.target_bitrate)}  "
+                f"[dim]({c.tier}, save {bloat_mod.fmt_bytes(c.savings_bytes)})[/dim]"
+            )
+
+
+@bloat_app.command("list")
+def bloat_list(
+    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+) -> None:
+    """Walk folder, group bloat candidates by parent dir, print savings summary."""
+    candidates = bloat_mod.scan(folder)
+    _print_bloat_groups(folder, candidates)
+
+
+@bloat_app.command("transcode")
+def bloat_transcode(
+    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="After verify, atomic-replace originals (keeps <name>.original + receipt JSON).",
+    ),
+    dry_run: bool = typer.Option(
+        False, "--dry-run",
+        help="Report groups + ffmpeg plan; run no ffmpeg, make no changes.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes", "-y",
+        help="Skip per-group confirmation (still groups by folder for progress output).",
+    ),
+) -> None:
+    """Per-folder y/n confirm, then `hevc_videotoolbox` to `.optimized.<ext>`.
+
+    Non-destructive by default — `--apply` does the atomic swap after verify.
+    """
+    candidates = bloat_mod.scan(folder)
+    if not candidates:
+        console.print("[dim]no bloat candidates.[/dim]")
+        return
+
+    _print_bloat_groups(folder, candidates)
+
+    groups = bloat_mod.group_by_folder(candidates, folder)
+    accepted: list[bloat_mod.BloatCandidate] = []
+    for group_path, items in groups.items():
+        if yes:
+            accepted.extend(items)
+            continue
+        label = str(group_path) if str(group_path) != "." else "(root)"
+        g_save = sum(c.savings_bytes for c in items)
+        answer = typer.prompt(
+            f"\ntranscode {label} ({len(items)} file(s), save "
+            f"{bloat_mod.fmt_bytes(g_save)})? [y/N]",
+            default="n",
+            show_default=False,
+        ).strip().lower()
+        if answer in ("y", "yes"):
+            accepted.extend(items)
+
+    if not accepted:
+        console.print("[dim]nothing accepted.[/dim]")
+        return
+
+    if dry_run:
+        console.print(
+            f"[yellow]dry-run[/yellow] would transcode {len(accepted)} file(s)"
+        )
+        return
+
+    done: list[tuple[bloat_mod.BloatCandidate, Path]] = []
+    for c in accepted:
+        console.print(f"→ {c.path.relative_to(folder).as_posix()}")
+        try:
+            out = bloat_mod.transcode_one(c)
+        except bloat_mod.TranscodeError as e:
+            console.print(f"  [red]failed:[/red] {e}")
+            continue
+        console.print(
+            f"  [green]✓[/green] {out.name}  "
+            f"({bloat_mod.fmt_bytes(out.stat().st_size)})"
+        )
+        done.append((c, out))
+
+    if apply:
+        for c, out in done:
+            try:
+                receipt = bloat_mod.apply_one(c, out)
+            except bloat_mod.TranscodeError as e:
+                console.print(f"  [red]apply failed:[/red] {e}")
+                continue
+            console.print(
+                f"  [green]applied[/green] {c.path.name}  "
+                f"(receipt {receipt.name})"
+            )
+    else:
+        console.print(
+            f"[dim]wrote {len(done)} .optimized file(s); "
+            f"re-run with --apply to atomic-replace originals.[/dim]"
+        )
+
+
+app.add_typer(bloat_app, name="bloat")
 
 
 if __name__ == "__main__":

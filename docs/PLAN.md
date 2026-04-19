@@ -95,7 +95,7 @@ aren't re-asked. See `SIDECAR.md` for the rule YAML schema and state format.
 | **2a.3** | MEDIUM auto-propose of missing "obvious" tags for folders where the notes `tags:` list was hand-edited. Rule = `tag-suggest-missing`: compares existing tags to what the scaffold *would* produce from current EXIF/filenames, proposes any tag whose category (everything before the last `/`) is entirely absent from the user's list. Opt-out via `tag_suggestions: off` front-matter. Introduces a new `write_notes` action: accepted patches merge into notes front-matter and cascade to XMP via `trip-tags-from-notes` on the next apply pass. Immich-round-trip assertion of the full hierarchy lands with 2a.4 (`promote`). | `tag-suggest-missing/` fixture (Nikon JPGs + TRIP.md with only `Events/CustomEventLabel`) surfaces one MEDIUM prompt. `--yes-medium` merges `Gear/Camera/...` + `Source/DSC` into notes, cascade re-fires `trip-tags-from-notes`, XMP sidecar carries the full set. Re-audit clean. | ✅ shipped |
 | **2a.4** | `immy promote` (aliases `push`, `pub`): rsync trip folder to `originals_root`, trigger Immich `POST /api/libraries/:id/scan`, then `POST /api/stacks` per `.insv` ↔ `.lrv` pair (`.lrv` primary). Config from `~/.immy/config.yml` (or `$IMMY_CONFIG` / `--config`). `.audit/` excluded from rsync. Guard rail: refuses with exit 1 if HIGH findings are pending (override via `--force`). `--dry-run` skips all writes and API calls. Immich section of config is optional — missing creds degrade to rsync-only. | `promote --dry-run` performs zero writes and zero API calls. `promote` on an audited trip rsyncs, calls scan once, and calls `/api/stacks` once per Insta360 pair with the `.lrv` asset ID as primary. Re-running is a no-op on disk; Immich gets re-notified (cheap). | ✅ shipped |
 | **2a.5** | LOW/HIGH advisory rules: ✅ interactive `trip-timezone` prompt; ✅ `export-date-trap`; ✅ `trip-timezone-guess-gps`; ✅ `trip-timezone` respects per-file `EXIF:OffsetTimeOriginal`; ✅ `bloat-candidate`; ✅ `geotag-from-gpx` (HIGH — nearest-time-within-5-min match against any `.gpx` track in the folder); ✅ `makernote-present` (LOW note — flags vendor MakerNote blocks, emits `exiftool -MakerNotes=` suggestion, never modifies originals); ✅ `geocode-place` (HIGH `write_notes` — `location.name` → `location.coords` via Nominatim with 5 s timeout, cached at `~/.immy/places.yml`, silent on offline). | Two real trips each go through with <10 % LOW-confidence prompts. | ✅ shipped |
-| **2a.6** | Watcher mode: `launchd` plist, debounced `watchdog` on `~/Documents/Incoming/`, non-interactive `--yes-high`. | Drop a folder in Incoming, walk away; return to either clean promotion or a `NEEDS_REVIEW` file listing open questions. | pending |
+| **2a.6** | Watcher mode: `launchd` plist, debounced `watchdog` on `~/Documents/Incoming/`, non-interactive `--yes-high`. | Drop a folder in Incoming, walk away; return to either clean promotion or a `NEEDS_REVIEW` file listing open questions. | deferred — build when actually needed; today's backlog is big enough that manual `immy audit` / `promote` per trip is the faster path. |
 | **2a.7** | Web routes for the LOW-confidence cases that don't fit a terminal: `/audit` on the sidecar web app, map picker, thumb grid. | Every rule class has either a terminal or web answer path. | pending |
 
 **Done when** (whole phase): dropping `~/Documents/Incoming/<TripName>/` yields
@@ -133,9 +133,28 @@ correct EXIF within a minute, without full-file reads.
 **Done when**: ingest of a 20 GB ProRes clip completes in seconds (embedded
 preview) and the full 1080p proxy generates asynchronously in the background.
 
-## Phase 2c — Bloat detector + batch re-encode (1–2 days)
+## Phase 2c — Bloat detector + batch re-encode (CLI-first — shipped 2026-04-19)
 
 **Find files that are uselessly huge, confirm in groups, transcode.**
+CLI-first (no sidecar web app yet). Lives in `immy` as `immy bloat list` /
+`immy bloat transcode`, reusing the Phase 2a detection logic from the
+`bloat-candidate` rule. The group-confirm UI is a terminal prompt; the
+web version lands later with the Phase 5 gap-fill UI.
+
+Shipped surface:
+- `immy bloat list <folder>` — scan, group by parent dir, show per-group
+  and total "would save" figures.
+- `immy bloat transcode <folder>` — per-group y/n, `ffmpeg -c:v
+  hevc_videotoolbox -tag:v hvc1 -b:v <target>` to `<stem>.optimized.<ext>`,
+  ffprobe verify (duration ±0.5s + stream count match).
+- `--apply` (off by default) — atomic replace: original → `<name>.original`,
+  optimized → source path, `.transcode.json` receipt with pre-sha256,
+  pre/post size, codec family, and dimensions.
+- `--dry-run`, `--yes` for non-interactive runs.
+- Target bitrate = `w * h * fps * 0.05` (HEVC delivery bpp), rounded to
+  nearest 0.5 Mbps.
+- `MIN_SAVINGS_FRACTION = 0.20` — candidates that'd save <20 % are dropped.
+
 
 A lot of incoming content is edited deliveries or 360 exports encoded at
 3–5× the bitrate they need. A 6 GB 4K24 recap becomes 1.2 GB with no
