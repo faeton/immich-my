@@ -33,33 +33,76 @@ Deviations from the original plan:
   [DEPLOY.md](DEPLOY.md#backup) (note: docker compose on DSM needs `sudo`).
   Off-NAS copy still manual until Hyper Backup is wired up.
 
-## Phase 1 — Mac as burst ML node (½ day)
+## Phase 1 — Mac as burst ML node — **abandoned**
 
-**Offload heavy ML to the MacBook.**
+Original scope: Mac exposes `MACHINE_LEARNING_URL` endpoint, Immich on
+NAS fails over to NAS ML when Mac unreachable. Explored 2026-04-19 and
+dropped because:
 
-Operating constraint: **Mac is mobile and often on bad uplink** (5–10 Mbps
-up, frequently captive-portal / hotel / tethered, sometimes off-tailnet).
-Plan the ML path around this — the Mac is an *opportunistic* worker, not
-a reliable one. NAS-side CPU ML must always be able to drain the queue
-alone; Mac-side is a speedup when available.
+1. The ML endpoint only speeds up the small part of Immich's pipeline
+   (CLIP/face), not the expensive part (thumbnail + proxy generation
+   on originals). For drone video — our biggest pain — it doesn't help.
+2. `immich-ml-metal` upstream is AI-authored alpha. The actively-
+   maintained `epheterson/immich-apple-silicon` wraps it but is a full
+   microservices replacement (needs PG + Redis exposure + SMB mount),
+   which breaks the "Mac offline = fine" contract from the original
+   Phase 1 scope.
+3. The real Mac-side wins we care about (pre-transcode big videos,
+   pre-compute ML for Mac-originated content, keep NAS-originated
+   iPhone uploads on NAS) push toward a different architecture — see
+   Phase Y below.
 
-- OrbStack or Docker Desktop on the Mac.
-- Run `immich-ml-metal` container on the Mac, exposed over Tailscale
-  (not LAN — we may not share a LAN with the NAS most days).
-- Set Immich's `MACHINE_LEARNING_URL` to Mac primary with Syno stock ML
-  as fallback via `immich_ml_balancer`. Short timeout (2–3 s) so Mac-
-  unreachable doesn't stall the queue.
-- ML traffic is proxy/preview-sized (thumbnails + embeddings), not
-  originals — budget in the tens of KB per asset, not MB. A 50k backfill
-  over a 5 Mbps link is still hours of pure transfer; factor that into
-  "done when" below rather than assuming LAN speeds.
-- All workers idempotent on `(checksum, worker, version)` so a flapping
-  link or a closed laptop lid never loses progress.
+`immy bloat transcode --apply` (Phase 2c, shipped) already solves the
+big-video-on-NAS problem at the pre-ingest layer, which was the main
+motivation for Phase 1. Phase Y extends the same pattern to ML.
 
-**Done when**: with Mac on stable Tailscale + mains power, a 50k backfill
-completes in ≈ 1 h; with Mac offline, the same backfill still drains on
-Syno CPU (slower, but nothing stuck). Mid-flight disconnect never leaves
-a job wedged > 10 min.
+## Phase Y — direct-to-Immich-DB pre-processing (Mac-native) — in design
+
+**Compute everything on the Mac, write directly to Immich's Postgres,
+skip Immich's own processing queue for Mac-originated content.**
+
+Model:
+
+```
+immy audit   — metadata fixes (XMP sidecars, shipped)
+immy bloat   — pre-ingest HEVC transcode (shipped)
+immy process — NEW: checksum + thumbnail + preview + CLIP + faces, all on Mac
+immy promote — rsync originals + derivatives to NAS + direct PG INSERTs,
+               no library scan triggered for Mac-handled trips
+```
+
+iPhone uploads (direct to NAS) keep running through Immich's own
+microservices on NAS — we don't touch them. No queue race, no coexistence
+problems, no PG/Redis port exposure.
+
+**Research input**: `epheterson/immich-apple-silicon` (brew-installed as
+`immich-accelerator`) packages everything we need — the extracted
+Immich server at `/opt/homebrew/Cellar/immich-accelerator/1.4.8/libexec/`
+gives us exact schema, path conventions, and reference implementations
+for every processor. We mine that code for knowledge, write our own
+Python equivalents integrated into `immy`, then uninstall the brew
+package once we're standing on our own.
+
+**Breakage contract**: when a Y workflow stops working, that's our
+signal Immich upgraded its schema / path conventions / ML model. We
+bump the pin, update the affected slice, re-test. Version-bump is the
+only supported maintenance path — no "gracefully handle unknown schema".
+
+### Iteration ladder
+
+| # | Scope | Done when | Status |
+|---|---|---|---|
+| **Y.0** | **Research** — read accelerator's bundled server code, document: exact SQL for new asset ingest, derivative path conventions, ML model invocation surface, checksum algo, scan-vs-direct-insert behaviour, Immich version pinned. | Single internal doc under `docs/` maps every call Immich makes on ingest to the exact table rows + file paths it produces. | in progress |
+| **Y.1** | `immy process <trip>` computes checksum + EXIF rows, writes asset+exif to PG. No derivatives yet. `promote` stops triggering scan for Y-processed trips. | One trip lands in Immich UI with metadata-only entries, no timeline thumb, no errors on NAS logs. | pending |
+| **Y.2** | Thumbnail + preview generation via vips (Sharp). Written to NAS `library/thumbs/` via rsync, paths recorded in PG. | Same trip now renders timeline thumbs. | pending |
+| **Y.3** | CLIP embedding via mlx-clip. `smart_search` row per asset. | Text search finds Y-processed assets. | pending |
+| **Y.4** | Faces via InsightFace + CoreML (detection + recognition). `asset_faces` + `faces` rows. | "People" panel shows Y-processed assets. | pending |
+| **Y.5** | Video transcode proxy (if needed beyond `immy bloat`): `encoded_video_path` + derivative. | Videos in Y-trips play smoothly in web UI. | pending |
+| **Y.6** | Uninstall `immich-accelerator`. Confirm all of Y.1-Y.5 still works from our own code. | `brew uninstall immich-accelerator` + re-process a test trip → full ingest works. | pending |
+
+**Done when** (whole phase): a Mac-audited trip runs `immy audit → bloat →
+process → promote` and appears in Immich fully processed, without
+Immich's NAS microservices having touched it. Acc-free, queue-free.
 
 ## Phase 1b — Mount adapter framework (1–2 days)
 
