@@ -17,5 +17,7 @@ from . import clock_drift_by_camera  # noqa: F401
 from . import tag_suggest  # noqa: F401
 from . import export_date_trap  # noqa: F401
 from . import bloat_candidate  # noqa: F401
+from . import makernote_present  # noqa: F401
+from . import geocode_place  # noqa: F401
 
 __all__ = ["Rule", "Finding", "registry", "evaluate", "register"]

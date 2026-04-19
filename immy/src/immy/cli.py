@@ -89,6 +89,8 @@ def _apply_write_notes(f: Finding) -> None:
     - `add_tags`: list → merge unique into front-matter `tags:`
     - `timezone`: string → set front-matter `timezone:` (used by
       trip-timezone-guess-gps)
+    - `location_coords`: [lat, lon] → set front-matter `location.coords`
+      (used by geocode-place)
     More keys can join here as write_notes rules grow."""
     updates: dict = {}
     add_tags = f.patch.get("add_tags") or []
@@ -105,6 +107,14 @@ def _apply_write_notes(f: Finding) -> None:
     tz = f.patch.get("timezone")
     if isinstance(tz, str) and tz.strip():
         updates["timezone"] = tz.strip()
+    coords = f.patch.get("location_coords")
+    if isinstance(coords, (list, tuple)) and len(coords) == 2:
+        try:
+            lat, lon = float(coords[0]), float(coords[1])
+        except (TypeError, ValueError):
+            lat = lon = None
+        if lat is not None and lon is not None:
+            updates["location"] = {"coords": [lat, lon]}
     if not updates:
         return
     update_frontmatter(f.path, updates)
