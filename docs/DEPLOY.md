@@ -151,15 +151,26 @@ Not automated yet. Until Hyper Backup is wired up, the minimum manual drill
 before anything risky (version upgrade, schema change, disk shuffle):
 
 ```sh
+mkdir -p /volume1/faeton-immi/backup
 cd /volume1/faeton-immi/docker
-/usr/local/bin/docker compose exec -T database \
+sudo -n /usr/local/bin/docker compose exec -T database \
   pg_dumpall --clean --if-exists -U postgres \
   | gzip > /volume1/faeton-immi/backup/immich-$(date +%F).sql.gz
+gunzip -t /volume1/faeton-immi/backup/immich-*.sql.gz && echo "dump OK"
 tar -C /volume1/faeton-immi -czf \
   /volume1/faeton-immi/backup/library-$(date +%F).tar.gz library
 ```
 
-(Create `/volume1/faeton-immi/backup/` first and point it at external storage.)
+`sudo` is required on DSM — the `faeton` user is not in the docker group,
+and without it `docker compose exec` dies with `permission denied while
+trying to connect to the Docker daemon socket` but the shell pipeline
+still produces a valid-looking 20-byte empty `.sql.gz`. **Always run
+`gunzip -t` after** to catch that silent fail.
+
+First-run drill on 2026-04-19 produced `immich-*.sql.gz` = 16 MB and
+`library-*.tar.gz` = 92 MB (an empty External Library + one test upload
+from the iOS round-trip). Copy both off-NAS (external drive, C2, etc.)
+after each run — files on the same volume aren't a backup.
 
 ## What Phase 0 deliberately did **not** install
 

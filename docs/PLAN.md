@@ -22,12 +22,16 @@ Deviations from the original plan:
 - Originals share mounted into the server container at `/mnt/external/originals`
   (read-only), ready for the Phase 1b mount adapters and Phase 2 ingest funnel.
 
-**Still to close out before moving on** (tracked in TESTING.md Phase 0):
-- Create the External Library in Admin → Libraries, point at
-  `/mnt/external/originals`, run a scan against an empty tree.
-- iOS Immich app login over Tailscale + one end-to-end upload.
-- First `pg_dump` + tarball of `library/` to an external destination, so a
-  lost DB doesn't lose face labels.
+**Closed 2026-04-19**:
+- ✅ External Library `IMMY-Sync` (`2dc3b5bd-30aa-49f1-bf78-1b91ccafc8be`)
+  created in Admin → Libraries with import path `/mnt/external/originals`;
+  scan runs clean against the empty tree (`assetCount: 0`).
+- ✅ iOS Immich app logs in over `https://nas-media.example.ts.net:2283`
+  and one end-to-end upload hit the Immich timeline.
+- ✅ First `pg_dumpall` (16 MB gzipped) + `library/` tarball (92 MB) landed in
+  `/volume1/faeton-immi/backup/`; `gunzip -t` passes. Drill documented in
+  [DEPLOY.md](DEPLOY.md#backup) (note: docker compose on DSM needs `sudo`).
+  Off-NAS copy still manual until Hyper Backup is wired up.
 
 ## Phase 1 — Mac as burst ML node (½ day)
 
