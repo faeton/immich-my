@@ -58,6 +58,23 @@ class DerivativeFile:
     is_transparent: bool
 
 
+@dataclass(frozen=True)
+class DerivativeResult:
+    """Per-asset output of `compute_for_asset`: staged files plus the
+    source-image dimensions we picked up from libvips.
+
+    Immich's own pipeline writes `asset.width`/`asset.height` from the
+    *decoded* image (respecting EXIF orientation), not from the EXIF
+    width/height tags — that's what the web viewer uses for layout and
+    fullscreen scaling. We surface those here so `process.py` can UPDATE
+    the `asset` row in the same transaction that creates the derivatives.
+    """
+
+    files: list[DerivativeFile]
+    width: int | None
+    height: int | None
+
+
 def _bucket(asset_id: str) -> tuple[str, str]:
     return asset_id[0:2], asset_id[2:4]
 
@@ -101,18 +118,30 @@ def compute_for_asset(
     owner_id: str,
     asset_type: str,
     trip_folder: Path,
-) -> list[DerivativeFile]:
+) -> DerivativeResult:
     """Write thumbnail + preview for one IMAGE asset.
 
-    Returns the list of staged derivatives (empty for VIDEO; Y.5 handles
-    video proxies separately). Raises `pyvips.Error` on decode failure —
+    Returns staged derivatives plus decoded dimensions (width/height
+    after EXIF-orientation auto-rotation — matching what Sharp reports
+    to Immich). For VIDEO we return an empty result (Y.5 handles video
+    proxies separately). Raises `pyvips.Error` on decode failure —
     caller decides whether to skip or abort.
     """
     if asset_type != "IMAGE":
-        return []
+        return DerivativeResult(files=[], width=None, height=None)
 
     base = staged_dir(trip_folder)
-    results: list[DerivativeFile] = []
+    files: list[DerivativeFile] = []
+
+    # Read original dimensions once, autorotating per EXIF:Orientation so
+    # the reported w/h matches what Immich's viewer expects after the
+    # preview gets rendered. libvips is lazy — autorot only rewrites
+    # metadata, not pixels, until a save forces evaluation, so this is
+    # cheap even for huge originals.
+    src_img = pyvips.Image.new_from_file(str(source_media), access="sequential")
+    src_img = src_img.autorot()
+    width = int(src_img.width)
+    height = int(src_img.height)
 
     for kind in ("thumbnail", "preview"):
         rel = relative_path_for(asset_id, owner_id, kind)
@@ -121,18 +150,18 @@ def compute_for_asset(
             _write_thumbnail(source_media, dst)
         else:
             _write_preview(source_media, dst)
-        results.append(DerivativeFile(
+        files.append(DerivativeFile(
             kind=kind,
             staged_path=dst,
             relative_path=rel,
             is_progressive=(kind == "preview"),
             is_transparent=False,
         ))
-    return results
+    return DerivativeResult(files=files, width=width, height=height)
 
 
 __all__ = [
-    "DerivativeFile",
+    "DerivativeFile", "DerivativeResult",
     "THUMBNAIL_WIDTH", "PREVIEW_WIDTH", "QUALITY",
     "DERIVATIVES_DIR", "THUMBS_SUBDIR",
     "compute_for_asset", "relative_path_for", "staged_dir",

@@ -68,16 +68,20 @@ def test_compute_writes_thumbnail_and_preview(tmp_path: Path):
     src = trip / "IMG_0001.png"
     _make_png(src)
 
-    derivs = derivatives_mod.compute_for_asset(
+    result = derivatives_mod.compute_for_asset(
         source_media=src,
         asset_id="abcd1234-ffff-4000-8000-000000000000",
         owner_id=LIB.owner_id,
         asset_type="IMAGE",
         trip_folder=trip,
     )
+    derivs = result.files
     assert len(derivs) == 2
     kinds = {d.kind for d in derivs}
     assert kinds == {"thumbnail", "preview"}
+    # Dimensions reported for asset.width/height population.
+    assert isinstance(result.width, int) and result.width > 0
+    assert isinstance(result.height, int) and result.height > 0
 
     for d in derivs:
         assert d.staged_path.is_file()
@@ -93,13 +97,14 @@ def test_compute_thumbnail_width_is_250(tmp_path: Path):
     src = trip / "a.png"
     _make_png(src, width=2000, height=1500)
 
-    derivs = derivatives_mod.compute_for_asset(
+    result = derivatives_mod.compute_for_asset(
         source_media=src,
         asset_id="abcd1234-ffff-4000-8000-000000000000",
         owner_id="u",
         asset_type="IMAGE",
         trip_folder=trip,
     )
+    derivs = result.files
     thumb = next(d for d in derivs if d.kind == "thumbnail")
     preview = next(d for d in derivs if d.kind == "preview")
     t_img = pyvips.Image.new_from_file(str(thumb.staged_path))
@@ -109,6 +114,8 @@ def test_compute_thumbnail_width_is_250(tmp_path: Path):
     # Preview marked progressive (matters for asset_file.isProgressive).
     assert preview.is_progressive is True
     assert thumb.is_progressive is False
+    # Source dims match the fixture, autorot doesn't flip a PNG w/o EXIF.
+    assert (result.width, result.height) == (2000, 1500)
 
 
 def test_compute_skips_videos(tmp_path: Path):
@@ -117,14 +124,16 @@ def test_compute_skips_videos(tmp_path: Path):
     src = trip / "v.mp4"
     src.write_bytes(b"not a real video")
 
-    derivs = derivatives_mod.compute_for_asset(
+    result = derivatives_mod.compute_for_asset(
         source_media=src,
         asset_id="id",
         owner_id="u",
         asset_type="VIDEO",
         trip_folder=trip,
     )
-    assert derivs == []
+    assert result.files == []
+    assert result.width is None
+    assert result.height is None
 
 
 # --- process_trip integration --------------------------------------------

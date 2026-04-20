@@ -10,14 +10,27 @@ from .registry import Finding, Rule, register
 
 
 def _has_date(row: ExifRow) -> bool:
-    return any(
-        row.get(k) is not None
-        for k in (
-            "EXIF:DateTimeOriginal",
-            "QuickTime:CreateDate",
-            "XMP:DateTimeOriginal",
-        )
-    )
+    """True when the row has at least one *real* date tag.
+
+    Cameras sometimes write sentinel placeholders (`0000:00:00 00:00:00`,
+    or Mac-epoch `1904:...`) that look present to a null-check but aren't
+    a real moment. We reject anything with year<1970 so the filename-date
+    rule still fires for files whose only date is garbage.
+    """
+    for k in (
+        "EXIF:DateTimeOriginal",
+        "QuickTime:CreateDate",
+        "XMP:DateTimeOriginal",
+    ):
+        v = row.get(k)
+        if not isinstance(v, str) or len(v) < 4:
+            continue
+        year_str = v.strip()[:4]
+        if not year_str.isdigit():
+            continue
+        if int(year_str) >= 1970:
+            return True
+    return False
 
 
 def _propose_gps(rows: list[ExifRow], folder: Path) -> list[Finding]:

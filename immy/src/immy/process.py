@@ -71,7 +71,14 @@ def asset_type_for(suffix: str) -> str:
 
 def _parse_exif_datetime(raw: Any) -> datetime | None:
     """Parse ExifTool-style `YYYY:MM:DD HH:MM:SS[±HH:MM]`. Returns tz-aware
-    datetime when a zone is present, else naive (caller anchors to UTC)."""
+    datetime when a zone is present, else naive (caller anchors to UTC).
+
+    Rejects plausibly-valid-but-nonsensical dates: cameras sometimes emit
+    `0000:00:00 00:00:00` (a literal placeholder, not a real moment), and
+    a few write "1904:01:01" as the Mac epoch. We treat anything before
+    1970 or after 2100 as missing so `_best_datetime` keeps looking and
+    the filename-date rule can fire cleanly.
+    """
     if not isinstance(raw, str) or len(raw) < 19:
         return None
     s = raw.strip()
@@ -90,6 +97,8 @@ def _parse_exif_datetime(raw: Any) -> datetime | None:
     try:
         dt = datetime.strptime(s.strip(), "%Y:%m:%d %H:%M:%S")
     except ValueError:
+        return None
+    if dt.year < 1970 or dt.year > 2100:
         return None
     return dt.replace(tzinfo=tz) if tz is not None else dt
 
@@ -157,6 +166,11 @@ class AssetRow:
     file_modified_at: datetime
     local_date_time: datetime
     duration: str | None
+    # Populated after derivative gen (Y.2). Written via UPDATE, not the
+    # initial INSERT, because we don't decode the image until derivatives
+    # run. Immich's viewer reads these for intrinsic fullscreen dims.
+    width: int | None = None
+    height: int | None = None
 
 
 @dataclass
@@ -305,6 +319,30 @@ INSERT INTO asset_exif (
 ON CONFLICT ("assetId") DO NOTHING
 """
 
+_UPDATE_ASSET_DIMS = """
+UPDATE asset
+SET width = %(width)s, height = %(height)s
+WHERE id = %(id)s
+"""
+
+
+def update_asset_dimensions(
+    conn: psycopg.Connection, asset_id: str, width: int, height: int,
+) -> None:
+    """Set `asset.width`/`asset.height` after derivative gen.
+
+    Immich's web viewer reads these for intrinsic layout dims; leaving
+    them NULL makes fullscreen render in a tiny letterboxed box. We
+    split this from the initial INSERT because dims require decoding
+    the image (via libvips in `derivatives.compute_for_asset`), and
+    we only want to pay that decode cost when `compute_derivatives=True`.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            _UPDATE_ASSET_DIMS,
+            {"id": asset_id, "width": width, "height": height},
+        )
+
 
 def insert_asset(conn: psycopg.Connection, asset: AssetRow, exif: AssetExifRow) -> bool:
     """Insert one asset+exif pair. Returns True if the asset row was newly
@@ -378,13 +416,19 @@ def process_trip(
         clip_embedded = False
         if compute_derivatives and inserted and asset.asset_type == "IMAGE":
             try:
-                derivs = derivatives_mod.compute_for_asset(
+                result = derivatives_mod.compute_for_asset(
                     source_media=exif_row.path,
                     asset_id=asset.id,
                     owner_id=library.owner_id,
                     asset_type=asset.asset_type,
                     trip_folder=trip_folder,
                 )
+                derivs = result.files
+                if result.width is not None and result.height is not None:
+                    update_asset_dimensions(
+                        conn, asset.id, result.width, result.height,
+                    )
+                    asset.width, asset.height = result.width, result.height
             except Exception:
                 if on_derivative_error == "raise":
                     raise

@@ -174,6 +174,33 @@ def test_parse_exif_datetime_garbage_returns_none():
     assert process_mod._parse_exif_datetime(123) is None
 
 
+def test_has_date_rejects_sentinel_dates():
+    """_has_date gates whether date-from-filename-vid-img fires. If a
+    camera wrote `0000:00:00 00:00:00` into QuickTime:CreateDate the
+    filename rule must still fire — otherwise process.py falls back to
+    mtime, which on a Mac that just rsync'd the file means "now".
+    """
+    from immy.exif import ExifRow
+    from immy.rules.dji_srt import _has_date
+    from pathlib import Path as _P
+
+    p = _P("/x/VID_20240219_133329.mp4")
+    assert _has_date(ExifRow(path=p, raw={"QuickTime:CreateDate": "0000:00:00 00:00:00"})) is False
+    assert _has_date(ExifRow(path=p, raw={"QuickTime:CreateDate": "1904:01:01 00:00:00"})) is False
+    assert _has_date(ExifRow(path=p, raw={"QuickTime:CreateDate": "2024:02:19 13:33:29"})) is True
+    assert _has_date(ExifRow(path=p, raw={})) is False
+
+
+def test_parse_exif_datetime_rejects_bogus_year_bounds():
+    # 0000:00:00 is strptime-invalid; 1969 is valid but pre-epoch; 2101 future.
+    assert process_mod._parse_exif_datetime("0000:00:00 00:00:00") is None
+    assert process_mod._parse_exif_datetime("1969:12:31 23:59:59") is None
+    assert process_mod._parse_exif_datetime("2101:01:01 00:00:00") is None
+    # Boundary accepts.
+    assert process_mod._parse_exif_datetime("1970:01:01 00:00:00") is not None
+    assert process_mod._parse_exif_datetime("2100:12:31 23:59:59") is not None
+
+
 # --- insert_asset --------------------------------------------------------
 
 
@@ -281,26 +308,77 @@ def test_is_processed_true_with_marker(tmp_path: Path):
 
 
 def _fake_derivative(preview_path: Path):
-    """Build a DerivativeFile pair (thumbnail + preview) whose preview
-    staged_path exists on disk (so `process_trip` treats CLIP as runnable)."""
-    from immy.derivatives import DerivativeFile
+    """Build a DerivativeResult (thumbnail + preview pair + dims) whose
+    preview staged_path exists on disk (so `process_trip` treats CLIP as
+    runnable and the asset.width/height UPDATE has dims to write)."""
+    from immy.derivatives import DerivativeFile, DerivativeResult
 
     preview_path.parent.mkdir(parents=True, exist_ok=True)
     preview_path.write_bytes(b"fake preview")
     thumb = preview_path.with_name(preview_path.name.replace("_preview.jpeg", "_thumbnail.webp"))
     thumb.write_bytes(b"fake thumb")
-    return [
-        DerivativeFile(
-            kind="thumbnail", staged_path=thumb,
-            relative_path="thumbs/owner-1/aa/bb/id_thumbnail.webp",
-            is_progressive=False, is_transparent=False,
+    return DerivativeResult(
+        files=[
+            DerivativeFile(
+                kind="thumbnail", staged_path=thumb,
+                relative_path="thumbs/owner-1/aa/bb/id_thumbnail.webp",
+                is_progressive=False, is_transparent=False,
+            ),
+            DerivativeFile(
+                kind="preview", staged_path=preview_path,
+                relative_path="thumbs/owner-1/aa/bb/id_preview.jpeg",
+                is_progressive=True, is_transparent=False,
+            ),
+        ],
+        width=4000, height=3000,
+    )
+
+
+def test_update_asset_dimensions_issues_single_update():
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    conn.cursor.return_value = cur
+
+    process_mod.update_asset_dimensions(conn, "asset-xyz", 4000, 3000)
+
+    cur.execute.assert_called_once()
+    sql, params = cur.execute.call_args.args
+    assert "UPDATE asset" in sql
+    assert "width" in sql and "height" in sql
+    assert params == {"id": "asset-xyz", "width": 4000, "height": 3000}
+
+
+def test_process_trip_writes_asset_width_height(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "out" / f"{kw['asset_id']}_preview.jpeg"
         ),
-        DerivativeFile(
-            kind="preview", staged_path=preview_path,
-            relative_path="thumbs/owner-1/aa/bb/id_preview.jpeg",
-            is_progressive=True, is_transparent=False,
-        ),
+    )
+
+    process_mod.process_trip(
+        target, conn, LIB, compute_derivatives=True, compute_clip=False,
+    )
+
+    update_sqls = [
+        c.args for c in cur.execute.call_args_list if "UPDATE asset" in c.args[0]
     ]
+    assert len(update_sqls) == 1
+    params = update_sqls[0][1]
+    # asset.id is a fresh uuid4 minted in build_rows — just sanity-check.
+    assert params["width"] == 4000 and params["height"] == 3000
+    assert isinstance(params["id"], str) and len(params["id"]) == 36
 
 
 def test_process_trip_with_clip_upserts_smart_search(tmp_path: Path, monkeypatch):
