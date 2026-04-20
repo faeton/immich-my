@@ -59,6 +59,18 @@ def _require_pyvips():
     return pyvips
 
 
+def _save_kwargs(vips_module) -> dict[str, object]:
+    """Metadata-stripping saver args across libvips versions.
+
+    libvips 8.15 deprecated `strip`; the replacement is `keep="none"`.
+    Keep the old flag for older libvips so the code still runs on machines
+    that haven't picked up the newer save API yet.
+    """
+    if hasattr(vips_module, "at_least_libvips") and vips_module.at_least_libvips(8, 15):
+        return {"keep": "none"}
+    return {"strip": True}
+
+
 @dataclass(frozen=True)
 class DerivativeFile:
     """One derivative output — what we staged and what the DB row should say.
@@ -136,7 +148,7 @@ def _write_thumbnail(src: Path, dst: Path) -> None:
     vips = _require_pyvips()
     image = vips.Image.thumbnail(str(src), THUMBNAIL_WIDTH)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    image.webpsave(str(dst), Q=QUALITY, strip=True)
+    image.webpsave(str(dst), Q=QUALITY, **_save_kwargs(vips))
 
 
 def _write_preview(src: Path, dst: Path) -> None:
@@ -144,7 +156,7 @@ def _write_preview(src: Path, dst: Path) -> None:
     vips = _require_pyvips()
     image = vips.Image.thumbnail(str(src), PREVIEW_WIDTH)
     dst.parent.mkdir(parents=True, exist_ok=True)
-    image.jpegsave(str(dst), Q=QUALITY, interlace=True, strip=True)
+    image.jpegsave(str(dst), Q=QUALITY, interlace=True, **_save_kwargs(vips))
 
 
 def _image_dims_and_stills(

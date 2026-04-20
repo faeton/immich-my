@@ -30,3 +30,22 @@ def test_compute_raises_clear_error_when_pyvips_unavailable(
             asset_type="IMAGE",
             trip_folder=trip,
         )
+
+
+def test_save_kwargs_uses_keep_none_on_newer_libvips():
+    class Vips:
+        @staticmethod
+        def at_least_libvips(major: int, minor: int) -> bool:
+            assert (major, minor) == (8, 15)
+            return True
+
+    assert derivatives_mod._save_kwargs(Vips) == {"keep": "none"}
+
+
+def test_save_kwargs_falls_back_to_strip_on_older_libvips():
+    class Vips:
+        @staticmethod
+        def at_least_libvips(major: int, minor: int) -> bool:
+            return False
+
+    assert derivatives_mod._save_kwargs(Vips) == {"strip": True}

@@ -253,6 +253,23 @@ def _find_arcface(pack_dir: Path) -> Path | None:
     return None
 
 
+def _use_per_face_inference(model: Any, batch_size: int) -> bool:
+    """Avoid noisy ORT/CoreML shape warnings on fixed-batch ArcFace models.
+
+    Some buffalo_* packs advertise output shape `[1, 512]`. onnxruntime's
+    CoreML EP can still execute larger batches, but it emits a
+    `VerifyOutputSizes` warning because the runtime output shape differs from
+    the model metadata. When we detect that fixed batch-1 shape and the caller
+    wants more than one face, run one inference per face instead.
+    """
+    if batch_size <= 1:
+        return False
+    shape = getattr(model, "output_shape", None)
+    if not isinstance(shape, (list, tuple)) or len(shape) != 2:
+        return False
+    return shape[0] == 1 and shape[1] == ARCFACE_EMBEDDING_DIM
+
+
 def embed_faces(
     image_bytes: bytes,
     faces: list[DetectedFace],
@@ -299,7 +316,16 @@ def embed_faces(
     model = _get_recognition_model(model_name)
     batch = [aligned[i] for i in valid]
     with _inference_lock:
-        raw = model.get_feat(batch)
+        if _use_per_face_inference(model, len(batch)):
+            raw = np.concatenate(
+                [
+                    np.asarray(model.get_feat(face_img), dtype=np.float32).reshape(1, -1)
+                    for face_img in batch
+                ],
+                axis=0,
+            )
+        else:
+            raw = model.get_feat(batch)
     if raw.ndim == 1:
         raw = raw.reshape(1, -1)
 

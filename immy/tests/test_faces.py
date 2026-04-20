@@ -44,3 +44,18 @@ def test_detected_face_dataclass_defaults():
     f = faces_mod.DetectedFace(x1=1, y1=2, x2=3, y2=4, score=0.9)
     assert f.landmarks is None
     assert f.score == 0.9
+
+
+def test_use_per_face_inference_only_for_fixed_batch_one_models():
+    class Model:
+        output_shape = [1, faces_mod.ARCFACE_EMBEDDING_DIM]
+
+    assert faces_mod._use_per_face_inference(Model(), 2) is True
+    assert faces_mod._use_per_face_inference(Model(), 1) is False
+
+
+def test_use_per_face_inference_skips_dynamic_shapes():
+    class Model:
+        output_shape = [None, faces_mod.ARCFACE_EMBEDDING_DIM]
+
+    assert faces_mod._use_per_face_inference(Model(), 2) is False
