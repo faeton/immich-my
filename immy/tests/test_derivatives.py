@@ -239,6 +239,7 @@ def _cfg(host_root: str, container_root: str = "/data") -> Config:
         immich=ImmichConfig(url="http://fake", api_key="k", library_id="lib-1"),
         pg=PgConfig(host="h", port=15432, user="u", password="p", database="d"),
         media=MediaConfig(host_root=host_root, container_root=container_root),
+        ml=None,
         notes_filename=None,
         source=None,
     )
@@ -328,7 +329,7 @@ def test_push_derivatives_skipped_without_media_config(tmp_path: Path):
     _marker_with_derivs(trip)
     cfg = Config(
         originals_root=Path("/tmp"),
-        immich=None, pg=None, media=None,
+        immich=None, pg=None, media=None, ml=None,
         notes_filename=None, source=None,
     )
     plan = promote_mod.Plan(folder=trip, target=Path("/tmp"), pairs=[], pending_high=0)

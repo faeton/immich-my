@@ -277,6 +277,183 @@ def test_is_processed_true_with_marker(tmp_path: Path):
     assert process_mod.is_processed(tmp_path) is True
 
 
+# --- Y.3 CLIP wiring -----------------------------------------------------
+
+
+def _fake_derivative(preview_path: Path):
+    """Build a DerivativeFile pair (thumbnail + preview) whose preview
+    staged_path exists on disk (so `process_trip` treats CLIP as runnable)."""
+    from immy.derivatives import DerivativeFile
+
+    preview_path.parent.mkdir(parents=True, exist_ok=True)
+    preview_path.write_bytes(b"fake preview")
+    thumb = preview_path.with_name(preview_path.name.replace("_preview.jpeg", "_thumbnail.webp"))
+    thumb.write_bytes(b"fake thumb")
+    return [
+        DerivativeFile(
+            kind="thumbnail", staged_path=thumb,
+            relative_path="thumbs/owner-1/aa/bb/id_thumbnail.webp",
+            is_progressive=False, is_transparent=False,
+        ),
+        DerivativeFile(
+            kind="preview", staged_path=preview_path,
+            relative_path="thumbs/owner-1/aa/bb/id_preview.jpeg",
+            is_progressive=True, is_transparent=False,
+        ),
+    ]
+
+
+def test_process_trip_with_clip_upserts_smart_search(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+    # fetch_smart_search_dim is a pg_mod function — stub at module level.
+    monkeypatch.setattr(
+        "immy.process.pg_mod.fetch_smart_search_dim",
+        lambda c: 4,
+    )
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+    monkeypatch.setattr(
+        "immy.process.clip_mod.embed_image",
+        lambda path, model: [0.1, 0.2, 0.3, 0.4],
+    )
+
+    results = process_mod.process_trip(
+        target, conn, LIB,
+        compute_derivatives=True, compute_clip=True,
+    )
+
+    assert len(results) == 1
+    assert results[0].clip_embedded is True
+    # One of the execute calls is the smart_search upsert.
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any("INSERT INTO smart_search" in s for s in sqls), sqls
+
+
+def test_process_trip_without_clip_never_queries_smart_search(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+
+    called = {"dim": 0, "embed": 0}
+    monkeypatch.setattr(
+        "immy.process.pg_mod.fetch_smart_search_dim",
+        lambda c: (called.__setitem__("dim", called["dim"] + 1), 512)[1],
+    )
+    monkeypatch.setattr(
+        "immy.process.clip_mod.embed_image",
+        lambda path, model: (called.__setitem__("embed", called["embed"] + 1), [0.0])[1],
+    )
+
+    results = process_mod.process_trip(target, conn, LIB, compute_clip=False)
+
+    assert results[0].clip_embedded is False
+    assert called == {"dim": 0, "embed": 0}
+
+
+def test_process_trip_clip_requires_derivatives(tmp_path: Path):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    conn = MagicMock()
+    with pytest.raises(ValueError, match="compute_derivatives"):
+        process_mod.process_trip(
+            target, conn, LIB,
+            compute_derivatives=False, compute_clip=True,
+        )
+
+
+def test_process_trip_clip_dim_mismatch_soft_skips_by_default(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+    monkeypatch.setattr("immy.process.pg_mod.fetch_smart_search_dim", lambda c: 512)
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+    # 3-dim embedding but PG expects 512 → dim mismatch.
+    monkeypatch.setattr("immy.process.clip_mod.embed_image", lambda p, m: [0.1, 0.2, 0.3])
+
+    results = process_mod.process_trip(
+        target, conn, LIB,
+        compute_derivatives=True, compute_clip=True,
+    )
+    assert results[0].clip_embedded is False  # soft skip
+    # upsert never ran
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert not any("INSERT INTO smart_search" in s for s in sqls)
+
+
+def test_process_trip_clip_dim_mismatch_raises_when_requested(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+    monkeypatch.setattr("immy.process.pg_mod.fetch_smart_search_dim", lambda c: 512)
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+    monkeypatch.setattr("immy.process.clip_mod.embed_image", lambda p, m: [0.1, 0.2])
+
+    with pytest.raises(RuntimeError, match="CLIP dim mismatch"):
+        process_mod.process_trip(
+            target, conn, LIB,
+            compute_derivatives=True, compute_clip=True,
+            on_clip_error="raise",
+        )
+
+
+def test_write_marker_records_clip_embedded_count(tmp_path: Path):
+    results = [
+        process_mod.ProcessResult(
+            asset_id="id-1", container_path="/x/a.jpg", inserted=True,
+            clip_embedded=True,
+        ),
+        process_mod.ProcessResult(
+            asset_id="id-2", container_path="/x/b.jpg", inserted=True,
+            clip_embedded=False,
+        ),
+    ]
+    marker = process_mod.write_marker(tmp_path, results)
+    payload = yaml.safe_load(marker.read_text())
+    assert payload["clip_embedded"] == 1
+    assert payload["assets"][0].get("clip_embedded") is True
+    assert "clip_embedded" not in payload["assets"][1]
+
+
 # --- CLI driver -----------------------------------------------------------
 
 

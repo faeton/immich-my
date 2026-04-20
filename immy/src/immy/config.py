@@ -22,6 +22,8 @@ Shape:
     media:                           # optional; Y.2 derivatives need it
       host_root: /volume1/faeton-immi/library    # rsync destination (NAS-side)
       container_root: /data                       # IMMICH_MEDIA_LOCATION in the container
+    ml:                              # optional; Y.3 CLIP defaults
+      clip_model: ViT-B-32__openai   # must match Immich's configured model
 
 Missing config file is not an error for `audit`; `promote` checks what it
 needs and raises a clear message if `originals_root` is absent.
@@ -72,11 +74,23 @@ class MediaConfig:
 
 
 @dataclass(frozen=True)
+class MLConfig:
+    """ML model selection for Y.3+. `clip_model` must match the model
+    Immich has configured (default `ViT-B-32__openai`, 512-dim) — a
+    mismatch would produce vectors that pgvector refuses to insert into
+    `smart_search.embedding`.
+    """
+
+    clip_model: str
+
+
+@dataclass(frozen=True)
 class Config:
     originals_root: Path | None
     immich: ImmichConfig | None
     pg: PgConfig | None
     media: MediaConfig | None
+    ml: MLConfig | None
     notes_filename: str | None
     source: Path | None  # which file this came from, for error messages
 
@@ -97,7 +111,7 @@ def load(path: Path | None = None) -> Config:
     if resolved is None or not resolved.is_file():
         return Config(
             originals_root=None, immich=None, pg=None, media=None,
-            notes_filename=None, source=None,
+            ml=None, notes_filename=None, source=None,
         )
     data = yaml.safe_load(resolved.read_text()) or {}
 
@@ -132,11 +146,17 @@ def load(path: Path | None = None) -> Config:
             container_root=str(media_raw["container_root"]).rstrip("/"),
         )
 
+    ml_raw = data.get("ml") or {}
+    ml = None
+    if ml_raw.get("clip_model"):
+        ml = MLConfig(clip_model=str(ml_raw["clip_model"]))
+
     return Config(
         originals_root=root,
         immich=immich,
         pg=pg,
         media=media,
+        ml=ml,
         notes_filename=data.get("notes_filename"),
         source=resolved,
     )

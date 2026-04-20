@@ -31,7 +31,9 @@ from typing import Any
 import psycopg
 import yaml
 
+from . import clip as clip_mod
 from . import derivatives as derivatives_mod
+from . import pg as pg_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
 from .pg import LibraryInfo
@@ -327,6 +329,7 @@ class ProcessResult:
     inserted: bool  # False → already existed (checksum conflict)
     asset_type: str = "IMAGE"  # 'IMAGE' | 'VIDEO'; drives derivatives skip
     derivatives: list[DerivativeFile] | None = None
+    clip_embedded: bool = False  # True → smart_search row upserted this run
 
 
 def process_trip(
@@ -335,7 +338,10 @@ def process_trip(
     library: LibraryInfo,
     *,
     compute_derivatives: bool = False,
+    compute_clip: bool = False,
+    clip_model: str = clip_mod.DEFAULT_MODEL,
     on_derivative_error: str = "skip",  # 'skip' | 'raise'
+    on_clip_error: str = "skip",        # 'skip' | 'raise'
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
     per-file results. Caller is responsible for transaction boundaries —
@@ -348,13 +354,28 @@ def process_trip(
     `asset_file` rows. Derivatives are computed for NEWLY inserted IMAGE
     rows; skip path for already-present rows (their thumbs already exist
     on the NAS) and for videos (Y.5).
+
+    When `compute_clip=True`, compute a CLIP embedding from the just-staged
+    preview (requires `compute_derivatives=True` — we feed the preview file,
+    matching Immich's own pipeline) and UPSERT the `smart_search` row in the
+    same transaction. Skipped for videos and for already-present assets
+    (Immich's own worker or a prior run owns that row). CLIP dim is verified
+    once up-front against `smart_search.embedding` typmod.
     """
     rows = read_folder(trip_folder)
     results: list[ProcessResult] = []
+
+    expected_dim: int | None = None
+    if compute_clip:
+        if not compute_derivatives:
+            raise ValueError("compute_clip requires compute_derivatives=True")
+        expected_dim = pg_mod.fetch_smart_search_dim(conn)
+
     for exif_row in rows:
         asset, exif = build_rows(exif_row.path, trip_folder, exif_row, library)
         inserted = insert_asset(conn, asset, exif)
         derivs: list[DerivativeFile] | None = None
+        clip_embedded = False
         if compute_derivatives and inserted and asset.asset_type == "IMAGE":
             try:
                 derivs = derivatives_mod.compute_for_asset(
@@ -368,12 +389,36 @@ def process_trip(
                 if on_derivative_error == "raise":
                     raise
                 derivs = None
+        if (
+            compute_clip and inserted and asset.asset_type == "IMAGE"
+            and derivs is not None
+        ):
+            preview = next(
+                (d.staged_path for d in derivs if d.kind == "preview"), None,
+            )
+            if preview is not None and preview.is_file():
+                try:
+                    embedding = clip_mod.embed_image(preview, clip_model)
+                    if expected_dim is not None and len(embedding) != expected_dim:
+                        raise RuntimeError(
+                            f"CLIP dim mismatch: model {clip_model!r} produced "
+                            f"{len(embedding)}, smart_search expects {expected_dim}"
+                        )
+                    pg_mod.upsert_smart_search(
+                        conn, asset.id, clip_mod.to_pgvector_literal(embedding),
+                    )
+                    clip_embedded = True
+                except Exception:
+                    if on_clip_error == "raise":
+                        raise
+                    clip_embedded = False
         results.append(ProcessResult(
             asset_id=asset.id,
             container_path=asset.original_path,
             inserted=inserted,
             asset_type=asset.asset_type,
             derivatives=derivs,
+            clip_embedded=clip_embedded,
         ))
     return results
 
@@ -407,6 +452,8 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
                 }
                 for d in r.derivatives
             ]
+        if r.clip_embedded:
+            entry["clip_embedded"] = True
         assets.append(entry)
     payload = {
         "processed_at": int(time.time()),
@@ -415,6 +462,7 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
         "derivatives_staged": sum(
             len(r.derivatives) for r in results if r.derivatives
         ),
+        "clip_embedded": sum(1 for r in results if r.clip_embedded),
         "assets": assets,
     }
     marker.write_text(yaml.safe_dump(payload, sort_keys=False))

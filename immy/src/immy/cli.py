@@ -9,6 +9,7 @@ from rich.console import Console
 from rich.table import Table
 
 from . import bloat as bloat_mod
+from . import clip as clip_mod
 from . import process as process_mod
 from . import promote as promote_mod
 from . import pg as pg_mod
@@ -710,6 +711,10 @@ def process(
         True, "--with-derivatives/--no-derivatives",
         help="Y.2 — stage thumbnail + preview under .audit/derivatives/ (default on).",
     ),
+    with_clip: bool = typer.Option(
+        True, "--with-clip/--no-clip",
+        help="Y.3 — compute CLIP embedding on the staged preview, upsert smart_search (default on, requires --with-derivatives).",
+    ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
 ) -> None:
     """Phase Y.1/Y.2 — insert asset + asset_exif rows for every media file
@@ -778,9 +783,21 @@ def process(
             "skipping derivative generation. Add media.host_root + "
             "media.container_root to enable Y.2."
         )
+    compute_clip = with_clip and compute
+    if with_clip and not compute:
+        console.print(
+            "[yellow]note:[/yellow] --with-clip needs derivatives (CLIP runs "
+            "on the preview file). Skipping CLIP this run."
+        )
+    clip_model = (
+        config.ml.clip_model if config.ml is not None else clip_mod.DEFAULT_MODEL
+    )
     try:
         results = process_mod.process_trip(
-            folder, conn, library, compute_derivatives=compute,
+            folder, conn, library,
+            compute_derivatives=compute,
+            compute_clip=compute_clip,
+            clip_model=clip_model,
         )
         conn.commit()
     except Exception as e:
@@ -795,8 +812,10 @@ def process(
     new_count = sum(1 for r in results if r.inserted)
     existed = len(results) - new_count
     derivs = sum(len(r.derivatives) for r in results if r.derivatives)
+    clipped = sum(1 for r in results if r.clip_embedded)
     process_mod.write_marker(folder, results)
     tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
+    tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
     console.print(
         f"[green]✓[/green] {new_count} new asset(s), "
         f"[dim]{existed} already present[/dim]{tail}  "
