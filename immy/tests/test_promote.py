@@ -39,7 +39,12 @@ class FakeClient:
     def scan_library(self, library_id: str) -> None:
         self.scans.append(library_id)
 
-    def find_asset_id(self, original_file_name: str) -> str | None:
+    def find_asset_id(
+        self,
+        original_file_name: str,
+        *,
+        original_path_suffix: str | None = None,
+    ) -> str | None:
         return f"id-{original_file_name}" if original_file_name in self.indexed else None
 
     def create_stack(self, primary_asset_id: str, other_asset_ids: list[str]) -> str | None:

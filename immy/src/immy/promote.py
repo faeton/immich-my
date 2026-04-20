@@ -186,11 +186,13 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
     )
 
 
-def _stack_pair(client: ImmichClient, pair: InstaPair) -> tuple[str, str] | None:
+def _stack_pair(client: ImmichClient, pair: InstaPair, folder_name: str) -> tuple[str, str] | None:
     """Resolve both assets via search; return (status, message). `status` in
     {'stacked', 'skipped', 'error'} — caller logs/prints."""
-    lrv_id = wait_for_asset(client, pair.lrv.name)
-    insv_id = wait_for_asset(client, pair.insv.name)
+    lrv_suffix = f"/{folder_name}/{pair.lrv.name}"
+    insv_suffix = f"/{folder_name}/{pair.insv.name}"
+    lrv_id = wait_for_asset(client, pair.lrv.name, original_path_suffix=lrv_suffix)
+    insv_id = wait_for_asset(client, pair.insv.name, original_path_suffix=insv_suffix)
     if not lrv_id or not insv_id:
         missing = []
         if not lrv_id: missing.append(pair.lrv.name)
@@ -258,7 +260,7 @@ def execute(
             return summary
 
     for pair in plan.pairs:
-        summary["stacks"].append(_stack_pair(client, pair))
+        summary["stacks"].append(_stack_pair(client, pair, plan.folder.name))
 
     summary["album"] = _sync_album(client, plan)
 
@@ -432,13 +434,18 @@ def _sync_album(client: ImmichClient, plan: Plan) -> dict:
     asset_ids: list[str] = []
     missing = 0
     first = True
+    folder_name = plan.folder.name
     for path in media_files:
+        # Disambiguate by path suffix — sibling trip folders can share
+        # filenames (e.g. a smoke-test dir with duplicates), and plain
+        # filename lookup would grab the wrong asset.
+        path_suffix = f"/{folder_name}/{path.name}"
         if first:
-            aid = wait_for_asset(client, path.name)
+            aid = wait_for_asset(client, path.name, original_path_suffix=path_suffix)
             first = False
         else:
             try:
-                aid = client.find_asset_id(path.name)
+                aid = client.find_asset_id(path.name, original_path_suffix=path_suffix)
             except ImmichError:
                 aid = None
         if aid:

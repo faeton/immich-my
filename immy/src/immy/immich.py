@@ -67,14 +67,28 @@ class ImmichClient:
         """Fire-and-forget. Immich returns 204 and scans async in the background."""
         self._request("POST", f"/api/libraries/{library_id}/scan", body={})
 
-    def find_asset_id(self, original_file_name: str) -> str | None:
-        """Return the first asset whose `originalFileName` matches, or None."""
+    def find_asset_id(
+        self,
+        original_file_name: str,
+        *,
+        original_path_suffix: str | None = None,
+    ) -> str | None:
+        """Return the first asset whose `originalFileName` matches, or None.
+
+        When `original_path_suffix` is given (e.g. `"/2026-04-foo/IMG_1.jpg"`),
+        filter results to assets whose `originalPath` ends with that suffix.
+        Needed when the same filename exists under multiple trip folders —
+        plain filename search returns an arbitrary collision and the album
+        gets assets from the wrong trip.
+        """
         resp = self._request(
             "POST",
             "/api/search/metadata",
             body={"originalFileName": original_file_name},
         )
         items = (resp or {}).get("assets", {}).get("items", []) or []
+        if original_path_suffix is not None:
+            items = [a for a in items if a.get("originalPath", "").endswith(original_path_suffix)]
         return items[0]["id"] if items else None
 
     def create_stack(self, primary_asset_id: str, other_asset_ids: list[str]) -> str | None:
@@ -153,15 +167,21 @@ def wait_for_asset(
     *,
     tries: int = 6,
     delay: float = 2.0,
+    original_path_suffix: str | None = None,
 ) -> str | None:
     """Poll search-by-filename until the newly-scanned asset appears. Returns
     the asset id or None if it never shows up within the budget.
 
     `immy promote` triggers a library scan, then looks up IDs for files it
     wants to stack. Scans are async so we give Immich a few seconds to index.
+
+    Pass `original_path_suffix` to disambiguate when multiple trip folders
+    carry the same filename (see `find_asset_id`).
     """
     for _ in range(tries):
-        aid = client.find_asset_id(original_file_name)
+        aid = client.find_asset_id(
+            original_file_name, original_path_suffix=original_path_suffix,
+        )
         if aid:
             return aid
         time.sleep(delay)
