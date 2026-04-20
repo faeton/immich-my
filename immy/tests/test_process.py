@@ -251,13 +251,24 @@ def test_insert_asset_conflict_skips_exif(tmp_path: Path):
     asset, exif, _ = _make_rows(tmp_path)
     # RETURNING returns no row → checksum conflict on the asset insert;
     # we must NOT issue the exif INSERT (it'd dangle without a parent).
-    conn, cur = _fake_conn(None)
+    # Follow-up SELECT resolves the existing id so caller code can key
+    # derivatives off the real asset, not the ghost UUID build_rows made.
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.side_effect = [None, ("real-existing-id",)]
+    conn.cursor.return_value = cur
 
+    ghost_id = asset.id
     inserted = process_mod.insert_asset(conn, asset, exif)
 
     assert inserted is False
-    assert cur.execute.call_count == 1  # only the asset attempt
+    assert cur.execute.call_count == 2  # asset INSERT + SELECT for real id
     assert "INSERT INTO asset" in cur.execute.call_args_list[0].args[0]
+    assert "SELECT id FROM asset" in cur.execute.call_args_list[1].args[0]
+    assert asset.id == "real-existing-id" != ghost_id
+    assert exif.asset_id == "real-existing-id"
 
 
 # --- process_trip + marker -----------------------------------------------

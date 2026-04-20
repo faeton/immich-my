@@ -320,6 +320,13 @@ INSERT INTO asset_exif (
 ON CONFLICT ("assetId") DO NOTHING
 """
 
+_SELECT_EXISTING_ASSET_ID = """
+SELECT id FROM asset
+WHERE "ownerId" = %(owner_id)s
+  AND "libraryId" = %(library_id)s
+  AND checksum = %(checksum)s
+"""
+
 _UPDATE_ASSET_DIMS = """
 UPDATE asset
 SET width = %(width)s, height = %(height)s
@@ -372,11 +379,29 @@ def update_asset_duration(
 def insert_asset(conn: psycopg.Connection, asset: AssetRow, exif: AssetExifRow) -> bool:
     """Insert one asset+exif pair. Returns True if the asset row was newly
     inserted, False on checksum conflict (already in DB).
+
+    On conflict, resolve the existing row's id and mutate `asset.id` and
+    `exif.asset_id` in place so downstream code (marker writes,
+    derivative `asset_file` inserts) references the real asset — not the
+    ghost UUID `build_rows` generated speculatively.
     """
     with conn.cursor() as cur:
         cur.execute(_INSERT_ASSET, asset.__dict__)
         row = cur.fetchone()
         if row is None:
+            cur.execute(_SELECT_EXISTING_ASSET_ID, {
+                "owner_id": asset.owner_id,
+                "library_id": asset.library_id,
+                "checksum": asset.checksum,
+            })
+            existing = cur.fetchone()
+            if existing is not None:
+                # psycopg returns `uuid.UUID` for uuid columns; downstream
+                # code (marker YAML serialization, path construction) needs
+                # a plain str.
+                existing_id = str(existing[0])
+                asset.id = existing_id
+                exif.asset_id = existing_id
             return False
         cur.execute(_INSERT_EXIF, exif.__dict__)
     return True
