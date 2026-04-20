@@ -5,6 +5,9 @@ bolted on in layers. Each phase has a "done when" so we don't drift.
 
 Rough effort estimates are evening-hours for a single person.
 
+Current not-yet-shipped backlog is summarized in [TODO.md](TODO.md).
+This file keeps the phase-by-phase rationale and acceptance criteria.
+
 ## Phase 0 — Base stack ✅ done
 
 **Stock Immich on the Syno, no custom code.** Running under Container Manager,

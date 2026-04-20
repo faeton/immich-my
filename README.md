@@ -134,6 +134,7 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 | [docs/SIDECAR.md](docs/SIDECAR.md) | Sidecar internals: DB choice, queue schema, worker-harness contract, process layout |
 | [docs/HARDWARE.md](docs/HARDWARE.md) | DS923+ + MacBook specifics, verified specs, performance expectations |
 | [docs/PLAN.md](docs/PLAN.md) | Phased build plan, milestones, what's custom vs stock |
+| [docs/TODO.md](docs/TODO.md) | Explicit backlog of not-yet-shipped work |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | As-deployed operating manual: paths, compose, onboarding choices |
 | [docs/TESTING.md](docs/TESTING.md) | Acceptance tests per phase + ad-hoc smoke checks |
 
@@ -150,9 +151,19 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
   MLX-CLIP and Apple Vision cover the rest. `immich-accelerator` removed
   2026-04-20 — `immy` is the sole ingestion path. See
   [docs/PLAN.md](docs/PLAN.md) for the Y.1–Y.6 ladder.
-- **Next up**: Phase 2c residuals (bloat re-encode QoL), Phase 3 enrichment
-  (Whisper transcripts, BLIP/moondream captions, pHash duplicates), Phase 4
-  DBSCAN event clustering.
+
+## TODO
+
+Not shipped yet:
+- Whisper transcripts
+- caption generation
+- transcript/caption search plumbing
+- event clustering
+- metadata gap-fill web UI
+- ghost/offline asset handling
+
+Tracked in [docs/TODO.md](docs/TODO.md). Detailed phased planning remains in
+[docs/PLAN.md](docs/PLAN.md).
 
 ## License / Publishing Note
 
