@@ -8,6 +8,7 @@ import yaml
 from typer.testing import CliRunner
 
 from immy.cli import app
+from immy.config import Config
 from immy import immich as immich_mod
 from immy import promote as promote_mod
 
@@ -220,6 +221,36 @@ def test_promote_excludes_audit_dir(config_file, dji_ready, monkeypatch):
     assert (dji_ready / ".audit" / "state.yml").is_file()
     # Destination should NOT — machine state stays on the Mac.
     assert not (originals / "dji-srt-pair" / ".audit").exists()
+
+
+def test_build_plan_ignores_staged_derivatives_for_pending_high(
+    config_file, dji_ready, monkeypatch,
+):
+    cfg_path, originals = config_file
+    derived = (
+        dji_ready
+        / ".audit"
+        / "derivatives"
+        / "thumbs"
+        / "u"
+        / "ab"
+        / "cd"
+        / "generated_preview.jpeg"
+    )
+    derived.parent.mkdir(parents=True, exist_ok=True)
+    derived.write_bytes(b"x")
+
+    cfg = Config(
+        originals_root=originals,
+        immich=None,
+        pg=None,
+        media=None,
+        ml=None,
+        notes_filename=None,
+        source=cfg_path,
+    )
+    plan = promote_mod.build_plan(dji_ready, cfg)
+    assert plan.pending_high == 0
 
 
 def test_promote_idempotent(config_file, dji_ready, monkeypatch):

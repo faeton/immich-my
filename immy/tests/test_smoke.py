@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from immy.cli import _fmt_date, _fmt_gps, _fmt_make_model, app
-from immy.exif import ExifRow
+from immy.exif import ExifRow, iter_media
 
 FIXTURES = Path(__file__).parent / "fixtures"
 runner = CliRunner()
@@ -117,6 +117,19 @@ def test_audit_empty_folder_exits_zero(tmp_path):
     result = runner.invoke(app, ["audit", str(tmp_path)])
     assert result.exit_code == 0
     assert "0 media file" in result.stdout
+
+
+def test_iter_media_skips_audit_derivatives(tmp_path: Path):
+    trip = tmp_path / "trip"
+    trip.mkdir()
+    source = trip / "IMG_0001.JPG"
+    source.write_bytes(b"x")
+    derived = trip / ".audit" / "derivatives" / "thumbs" / "u" / "ab" / "cd" / "generated_preview.jpeg"
+    derived.parent.mkdir(parents=True)
+    derived.write_bytes(b"x")
+
+    found = [p.relative_to(trip).as_posix() for p in iter_media(trip)]
+    assert found == ["IMG_0001.JPG"]
 
 
 def test_dji_fixture_read_only_no_writes(dji_fixture: Path):

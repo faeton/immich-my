@@ -12,6 +12,8 @@ from typing import Any, Iterable
 
 import exiftool
 
+from .state import AUDIT_DIR
+
 
 MEDIA_EXTS = {
     ".jpg", ".jpeg", ".heic", ".heif", ".png", ".tif", ".tiff",
@@ -39,8 +41,18 @@ def has_gps(row: "ExifRow") -> bool:
     return lat is not None and lon is not None
 
 
+def _is_under_audit_dir(folder: Path, path: Path) -> bool:
+    try:
+        rel = path.relative_to(folder)
+    except ValueError:
+        return False
+    return AUDIT_DIR in rel.parts
+
+
 def iter_media(folder: Path) -> Iterable[Path]:
     for p in sorted(folder.rglob("*")):
+        if _is_under_audit_dir(folder, p):
+            continue
         if p.is_file() and p.suffix.lower() in MEDIA_EXTS:
             yield p
 
