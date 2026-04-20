@@ -10,6 +10,7 @@ dependencies = [
     "rich>=13.7",
     "timezonefinder>=6.5",
     "psycopg[binary]>=3.2",
+    "pyvips>=2.2",
 ]
 
 [project.scripts]

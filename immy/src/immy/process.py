@@ -31,6 +31,8 @@ from typing import Any
 import psycopg
 import yaml
 
+from . import derivatives as derivatives_mod
+from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
 from .pg import LibraryInfo
 from .state import AUDIT_DIR
@@ -323,46 +325,108 @@ class ProcessResult:
     asset_id: str
     container_path: str
     inserted: bool  # False → already existed (checksum conflict)
+    asset_type: str = "IMAGE"  # 'IMAGE' | 'VIDEO'; drives derivatives skip
+    derivatives: list[DerivativeFile] | None = None
 
 
 def process_trip(
     trip_folder: Path,
     conn: psycopg.Connection,
     library: LibraryInfo,
+    *,
+    compute_derivatives: bool = False,
+    on_derivative_error: str = "skip",  # 'skip' | 'raise'
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
     per-file results. Caller is responsible for transaction boundaries —
     we expect a single commit after the list.
+
+    When `compute_derivatives=True`, also generate thumbnail + preview via
+    pyvips and stage them under `.audit/derivatives/` using the same
+    `thumbs/<userId>/.../<id>_*` layout Immich expects. Staged files are
+    local-only — `immy promote` rsyncs them to the NAS and inserts the
+    `asset_file` rows. Derivatives are computed for NEWLY inserted IMAGE
+    rows; skip path for already-present rows (their thumbs already exist
+    on the NAS) and for videos (Y.5).
     """
     rows = read_folder(trip_folder)
     results: list[ProcessResult] = []
     for exif_row in rows:
         asset, exif = build_rows(exif_row.path, trip_folder, exif_row, library)
         inserted = insert_asset(conn, asset, exif)
+        derivs: list[DerivativeFile] | None = None
+        if compute_derivatives and inserted and asset.asset_type == "IMAGE":
+            try:
+                derivs = derivatives_mod.compute_for_asset(
+                    source_media=exif_row.path,
+                    asset_id=asset.id,
+                    owner_id=library.owner_id,
+                    asset_type=asset.asset_type,
+                    trip_folder=trip_folder,
+                )
+            except Exception:
+                if on_derivative_error == "raise":
+                    raise
+                derivs = None
         results.append(ProcessResult(
             asset_id=asset.id,
             container_path=asset.original_path,
             inserted=inserted,
+            asset_type=asset.asset_type,
+            derivatives=derivs,
         ))
     return results
 
 
 def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
     """Drop `.audit/y_processed.yml` so `immy promote` knows to skip the
-    library-scan POST (the rows are already there)."""
+    library-scan POST (the rows are already there) and to pick up any
+    staged derivatives for rsync + `asset_file` INSERTs.
+
+    Marker is the single source of truth between `immy process` (compute)
+    and `immy promote` (upload). Extending the schema is safe — promote
+    ignores keys it doesn't recognise.
+    """
     marker = trip_folder / AUDIT_DIR / Y_MARKER_FILENAME
     marker.parent.mkdir(parents=True, exist_ok=True)
+    assets = []
+    for r in results:
+        entry: dict = {
+            "file": r.container_path,
+            "id": r.asset_id,
+            "new": r.inserted,
+            "type": r.asset_type,
+        }
+        if r.derivatives:
+            entry["derivatives"] = [
+                {
+                    "kind": d.kind,
+                    "relative_path": d.relative_path,
+                    "is_progressive": d.is_progressive,
+                    "is_transparent": d.is_transparent,
+                }
+                for d in r.derivatives
+            ]
+        assets.append(entry)
     payload = {
         "processed_at": int(time.time()),
         "inserted": sum(1 for r in results if r.inserted),
         "already_present": sum(1 for r in results if not r.inserted),
-        "assets": [
-            {"file": r.container_path, "id": r.asset_id, "new": r.inserted}
-            for r in results
-        ],
+        "derivatives_staged": sum(
+            len(r.derivatives) for r in results if r.derivatives
+        ),
+        "assets": assets,
     }
     marker.write_text(yaml.safe_dump(payload, sort_keys=False))
     return marker
+
+
+def read_marker(trip_folder: Path) -> dict | None:
+    """Parse `.audit/y_processed.yml`. Returns None if marker is absent."""
+    path = marker_path(trip_folder)
+    if not path.is_file():
+        return None
+    return yaml.safe_load(path.read_text()) or {}
 
 
 def marker_path(trip_folder: Path) -> Path:
@@ -376,6 +440,6 @@ def is_processed(trip_folder: Path) -> bool:
 __all__ = [
     "AssetRow", "AssetExifRow", "ProcessResult",
     "build_rows", "path_checksum", "container_path_for", "asset_type_for",
-    "insert_asset", "process_trip", "write_marker", "is_processed",
-    "marker_path", "Y_MARKER_FILENAME",
+    "insert_asset", "process_trip", "write_marker", "read_marker",
+    "is_processed", "marker_path", "Y_MARKER_FILENAME",
 ]

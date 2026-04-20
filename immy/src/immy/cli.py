@@ -514,6 +514,16 @@ def _promote_impl(
         console.print("[green]✓[/green] library scan triggered")
     elif summary.get("scan_skipped_reason") == "y_processed":
         console.print("[dim]scan skipped: y_processed.yml present[/dim]")
+        derivs = summary.get("derivatives") or {}
+        if derivs:
+            colour = {
+                "pushed": "green", "empty": "dim",
+                "skipped": "dim", "error": "red",
+            }.get(derivs.get("status", ""), "")
+            console.print(
+                f"derivatives [{colour}]{derivs['status']}[/{colour}] "
+                f"{derivs['detail']}"
+            )
     for status, detail in summary["stacks"]:
         colour = {
             "stacked": "green", "planned": "yellow", "skipped": "dim", "error": "red",
@@ -696,12 +706,19 @@ app.add_typer(bloat_app, name="bloat")
 def process(
     folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report would-insert rows; no DB writes."),
+    with_derivatives: bool = typer.Option(
+        True, "--with-derivatives/--no-derivatives",
+        help="Y.2 — stage thumbnail + preview under .audit/derivatives/ (default on).",
+    ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
 ) -> None:
-    """Phase Y.1 — insert asset + asset_exif rows for every media file
-    under <folder> directly into the Immich Postgres.
+    """Phase Y.1/Y.2 — insert asset + asset_exif rows for every media file
+    under <folder> directly into the Immich Postgres, and optionally stage
+    thumbnail + preview derivatives for `immy promote` to upload.
 
     Requires `pg:` and `immich.library_id` in ~/.immy/config.yml.
+    `--with-derivatives` (default) additionally requires `media:` — pyvips
+    writes webp/jpeg under `.audit/derivatives/thumbs/<userId>/...`.
     Idempotent via `checksum = sha1("path:" + originalPath)`.
     Drops `.audit/y_processed.yml` so `immy promote` skips the scan POST.
     """
@@ -754,8 +771,17 @@ def process(
         conn.close()
         return
 
+    compute = with_derivatives and config.media is not None
+    if with_derivatives and config.media is None:
+        console.print(
+            "[yellow]note:[/yellow] `media:` block missing from config — "
+            "skipping derivative generation. Add media.host_root + "
+            "media.container_root to enable Y.2."
+        )
     try:
-        results = process_mod.process_trip(folder, conn, library)
+        results = process_mod.process_trip(
+            folder, conn, library, compute_derivatives=compute,
+        )
         conn.commit()
     except Exception as e:
         conn.rollback()
@@ -768,10 +794,12 @@ def process(
 
     new_count = sum(1 for r in results if r.inserted)
     existed = len(results) - new_count
+    derivs = sum(len(r.derivatives) for r in results if r.derivatives)
     process_mod.write_marker(folder, results)
+    tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
     console.print(
         f"[green]✓[/green] {new_count} new asset(s), "
-        f"[dim]{existed} already present[/dim]  "
+        f"[dim]{existed} already present[/dim]{tail}  "
         f"(marker: .audit/{process_mod.Y_MARKER_FILENAME})"
     )
 

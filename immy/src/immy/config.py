@@ -19,6 +19,9 @@ Shape:
       user: postgres
       password: xxx
       database: immich
+    media:                           # optional; Y.2 derivatives need it
+      host_root: /volume1/faeton-immi/library    # rsync destination (NAS-side)
+      container_root: /data                       # IMMICH_MEDIA_LOCATION in the container
 
 Missing config file is not an error for `audit`; `promote` checks what it
 needs and raises a clear message if `originals_root` is absent.
@@ -53,10 +56,27 @@ class PgConfig:
 
 
 @dataclass(frozen=True)
+class MediaConfig:
+    """Where Immich stores derivatives, on two sides of the container bind.
+
+    - `host_root` is what `rsync` pushes into (e.g. `/volume1/faeton-immi/library`
+      mounted over SMB, or `user@host:/volume1/...` when remote). The NAS
+      writes these files; the container reads them.
+    - `container_root` is the same tree as Immich's `IMMICH_MEDIA_LOCATION`
+      sees it (default `/data` in our compose). This is the prefix we bake
+      into `asset_file.path` so Immich's server can find what we wrote.
+    """
+
+    host_root: str
+    container_root: str
+
+
+@dataclass(frozen=True)
 class Config:
     originals_root: Path | None
     immich: ImmichConfig | None
     pg: PgConfig | None
+    media: MediaConfig | None
     notes_filename: str | None
     source: Path | None  # which file this came from, for error messages
 
@@ -76,7 +96,7 @@ def load(path: Path | None = None) -> Config:
     resolved = _resolve_path(path)
     if resolved is None or not resolved.is_file():
         return Config(
-            originals_root=None, immich=None, pg=None,
+            originals_root=None, immich=None, pg=None, media=None,
             notes_filename=None, source=None,
         )
     data = yaml.safe_load(resolved.read_text()) or {}
@@ -104,10 +124,19 @@ def load(path: Path | None = None) -> Config:
             database=str(pg_raw["database"]),
         )
 
+    media_raw = data.get("media") or {}
+    media = None
+    if media_raw.get("host_root") and media_raw.get("container_root"):
+        media = MediaConfig(
+            host_root=str(media_raw["host_root"]).rstrip("/"),
+            container_root=str(media_raw["container_root"]).rstrip("/"),
+        )
+
     return Config(
         originals_root=root,
         immich=immich,
         pg=pg,
+        media=media,
         notes_filename=data.get("notes_filename"),
         source=resolved,
     )

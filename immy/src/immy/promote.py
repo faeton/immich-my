@@ -22,13 +22,15 @@ from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 
+from . import pg as pg_mod
 from .config import Config
+from .derivatives import DERIVATIVES_DIR, THUMBS_SUBDIR
 from .exif import iter_media, read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
-from .process import is_processed as y_is_processed
+from .process import is_processed as y_is_processed, read_marker as y_read_marker
 from .rules import evaluate
-from .state import State, log_event, patch_hash
+from .state import AUDIT_DIR, State, log_event, patch_hash
 
 
 RSYNC_EXCLUDES = (
@@ -179,6 +181,9 @@ def execute(
     # scan POST is pure wasted work — skip it. The marker is our signal.
     if y_is_processed(plan.folder):
         summary["scan_skipped_reason"] = "y_processed"
+        derivatives_summary = _push_derivatives(plan, config)
+        if derivatives_summary is not None:
+            summary["derivatives"] = derivatives_summary
     else:
         try:
             client.scan_library(config.immich.library_id)
@@ -193,6 +198,115 @@ def execute(
     summary["album"] = _sync_album(client, plan)
 
     return summary
+
+
+# --- Phase Y.2: derivative rsync + asset_file INSERT ----------------------
+
+
+_INSERT_ASSET_FILE = """
+INSERT INTO asset_file (
+  "assetId", type, path, "isEdited", "isProgressive", "isTransparent"
+) VALUES (
+  %(asset_id)s, %(type)s, %(path)s, false,
+  %(is_progressive)s, %(is_transparent)s
+)
+ON CONFLICT ("assetId", type, "isEdited") DO UPDATE
+SET path = EXCLUDED.path,
+    "isProgressive" = EXCLUDED."isProgressive",
+    "isTransparent" = EXCLUDED."isTransparent"
+"""
+
+
+def _rsync_derivatives(src_root: Path, host_root: str) -> subprocess.CompletedProcess:
+    """Push the staged `thumbs/` tree into `<host_root>/thumbs/`.
+
+    `src_root` = `<trip>/.audit/derivatives/` (the `thumbs/` dir sits
+    directly inside it). `host_root` may be local (`/volume1/...` over
+    SMB) or remote (`user@host:/volume1/...`). Missing destination
+    parents are the caller's setup — matches `rsync()` above.
+    """
+    src = f"{str(src_root).rstrip('/')}/"
+    dst = host_root if ":" in host_root else f"{host_root.rstrip('/')}/"
+    args = ["rsync", "-a", "--itemize-changes", src, dst]
+    return subprocess.run(args, capture_output=True, text=True, check=True)
+
+
+def _push_derivatives(plan: Plan, config: Config) -> dict | None:
+    """Rsync `.audit/derivatives/` into NAS media root + INSERT `asset_file`
+    rows for every staged derivative the marker records.
+
+    Returns a summary dict, or None when nothing to do. Never raises —
+    failures are caught and surfaced via the returned `status`.
+    """
+    marker = y_read_marker(plan.folder)
+    if not marker:
+        return None
+    if config.media is None or config.pg is None:
+        return {
+            "status": "skipped",
+            "detail": "media: or pg: block missing in immy config",
+            "rows_written": 0,
+        }
+
+    staged = plan.folder / AUDIT_DIR / DERIVATIVES_DIR / THUMBS_SUBDIR
+    file_specs: list[dict] = []
+    for asset in marker.get("assets") or []:
+        derivs = asset.get("derivatives") or []
+        for d in derivs:
+            file_specs.append({
+                "asset_id": asset["id"],
+                "type": d["kind"],
+                "path": f"{config.media.container_root}/{d['relative_path']}",
+                "is_progressive": bool(d.get("is_progressive")),
+                "is_transparent": bool(d.get("is_transparent")),
+            })
+
+    if not file_specs:
+        return {"status": "empty", "detail": "no derivatives in marker", "rows_written": 0}
+    if not staged.is_dir():
+        return {
+            "status": "error",
+            "detail": f"marker lists derivatives but {staged} is missing",
+            "rows_written": 0,
+        }
+
+    try:
+        _rsync_derivatives(staged.parent, config.media.host_root)
+    except subprocess.CalledProcessError as e:
+        return {
+            "status": "error",
+            "detail": f"rsync derivatives failed: {e.stderr.strip() or e.stdout.strip()}",
+            "rows_written": 0,
+        }
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        return {
+            "status": "error",
+            "detail": f"pg connect failed: {e}",
+            "rows_written": 0,
+        }
+    try:
+        with conn.cursor() as cur:
+            for spec in file_specs:
+                cur.execute(_INSERT_ASSET_FILE, spec)
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        return {
+            "status": "error",
+            "detail": f"asset_file insert failed: {e}",
+            "rows_written": 0,
+        }
+    finally:
+        conn.close()
+
+    return {
+        "status": "pushed",
+        "detail": f"{len(file_specs)} asset_file row(s) upserted",
+        "rows_written": len(file_specs),
+    }
 
 
 def _sync_album(client: ImmichClient, plan: Plan) -> dict:

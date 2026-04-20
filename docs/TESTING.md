@@ -39,7 +39,7 @@ against the real NAS PG whenever a Y slice lands.
 | # | Test | Pass criteria |
 |---|---|---|
 | Y.1 | `immy process` inserts idempotent rows | ✅ Unit: `sha1("path:"+abs)` is 20 bytes and matches the handwritten spec; `build_rows` populates owner/library/type/checksum/dates from fixtures; `insert_asset` emits two `execute` calls (asset then exif) with the right params; on checksum conflict the exif INSERT is suppressed. CLI: `--dry-run` touches no cursor and writes no marker; real run commits, drops `.audit/y_processed.yml`, and re-run reports "0 new, 1 already present". Promote: with marker present, `fake.scan_library` is never called. Smoke-tested against the DS923+ PG with the DJI fixture — row + exif + GPS all landed as expected. |
-| Y.2 | Thumbnail + preview derivatives | pending |
+| Y.2 | Thumbnail + preview derivatives | ✅ Unit: `relative_path_for` produces Immich's 2+2 bucketed `thumbs/<userId>/<xx>/<yy>/<id>_{thumbnail.webp,preview.jpeg}`; `compute_for_asset` writes real pyvips output at 250 px (WebP) / 1440 px (JPEG progressive) and skips VIDEO types. `process_trip(compute_derivatives=True)` stages files only for newly-inserted IMAGE rows; checksum conflicts don't restage. Marker extension round-trips through `read_marker`. Promote: `_push_derivatives` rsyncs `.audit/derivatives/` into `media.host_root`, then UPSERTs `asset_file` with `path = media.container_root + /thumbs/...` via two execs per asset; rsync error propagates as `status=error`. 14 unit tests (133 total passing). |
 | Y.3 | CLIP `smart_search` row | pending |
 | Y.4 | Faces | pending |
 | Y.5 | Video proxy | pending |

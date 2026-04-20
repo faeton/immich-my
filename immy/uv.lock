@@ -152,6 +152,7 @@ source = { editable = "." }
 dependencies = [
     { name = "psycopg", extra = ["binary"] },
     { name = "pyexiftool" },
+    { name = "pyvips" },
     { name = "pyyaml" },
     { name = "rich" },
     { name = "timezonefinder" },
@@ -167,6 +168,7 @@ dev = [
 requires-dist = [
     { name = "psycopg", extras = ["binary"], specifier = ">=3.2" },
     { name = "pyexiftool", specifier = ">=0.5" },
+    { name = "pyvips", specifier = ">=2.2" },
     { name = "pyyaml", specifier = ">=6.0" },
     { name = "rich", specifier = ">=13.7" },
     { name = "timezonefinder", specifier = ">=6.5" },
@@ -414,6 +416,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/7d/0d/549bd94f1a0a402dc
 wheels = [
     { url = "https://files.pythonhosted.org/packages/d4/24/a372aaf5c9b7208e7112038812994107bc65a84cd00e0354a88c2c77a617/pytest-9.0.3-py3-none-any.whl", hash = "sha256:2c5efc453d45394fdd706ade797c0a81091eccd1d6e4bccfcd476e2b8e0ab5d9", size = 375249, upload-time = "2026-04-07T17:16:16.13Z" },
 ]
+
+[[package]]
+name = "pyvips"
+version = "3.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "cffi" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/2d/6a/282936de9faac6addf6bc8792c18e006489d0023ffd8856b8643f54d0558/pyvips-3.1.1.tar.gz", hash = "sha256:84fe744d023b1084ac2516bb17064cacd41c7f8aabf8e524dd383534941b9301", size = 56951, upload-time = "2025-12-09T18:38:06.355Z" }
 
 [[package]]
 name = "pyyaml"

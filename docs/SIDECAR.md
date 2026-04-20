@@ -582,6 +582,46 @@ those are Y.2/Y.3/Y.4. A Y.1-processed trip shows up in the Immich UI with
 placeholder thumbs and full EXIF detail; the library scan still won't try
 to re-process it.
 
+### `immy process --with-derivatives` — Phase Y.2
+
+Adds thumbnail (250 px WebP q80) + preview (1440 px JPEG q80 progressive)
+generation via `pyvips` (libvips), the same library Immich's `sharp`-based
+worker uses. Output matches §3 bucketing:
+
+```
+<trip>/.audit/derivatives/thumbs/<userId>/<id[0:2]>/<id[2:4]>/<id>_thumbnail.webp
+<trip>/.audit/derivatives/thumbs/<userId>/<id[0:2]>/<id[2:4]>/<id>_preview.jpeg
+```
+
+Staging is deliberately local — compute (Mac, Metal) and upload (NAS,
+bandwidth-bound) are split so a flaky uplink can resume the rsync without
+re-encoding. Only newly-inserted IMAGE assets get derivatives; checksum
+conflicts (already indexed) and VIDEO rows (Y.5) are skipped.
+
+**Config.** Requires a `media:` block alongside `pg:`:
+
+```yaml
+media:
+  host_root: /volume1/faeton-immi/library   # rsync destination (NAS-side)
+  container_root: /data                      # IMMICH_MEDIA_LOCATION in the container
+```
+
+`host_root` can be a remote rsync target (`user@host:/path`) when the Mac
+isn't SMB-mounting the share. `container_root` is the same tree as the
+server sees — it becomes the prefix in every `asset_file.path` we INSERT.
+
+**Marker extension.** Each asset entry in `.audit/y_processed.yml` gains
+a `derivatives:` list recording `kind` / `relative_path` / `is_progressive`
+/ `is_transparent`. `immy promote` reads the marker and, when the scan-skip
+branch fires, rsyncs `.audit/derivatives/` → `media.host_root` and
+`INSERT … ON CONFLICT (assetId, type, isEdited) DO UPDATE` one `asset_file`
+row per derivative. The rsync-then-DB order matters — a `preview.jpeg`
+row with no file on disk 404s the detail view.
+
+**Skipped when `media:` is absent.** `immy process --no-derivatives`
+disables staging explicitly; without `media:` the process command warns
+and continues Y.1-only.
+
 ### Insta360 `.insv` handling
 
 Immich v2.7 has no native 360 player and can't use a "preview file" out of
