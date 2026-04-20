@@ -7,7 +7,8 @@ from pathlib import Path
 import pytest
 from typer.testing import CliRunner
 
-from immy.cli import app
+from immy.cli import _fmt_date, _fmt_gps, _fmt_make_model, app
+from immy.exif import ExifRow
 
 FIXTURES = Path(__file__).parent / "fixtures"
 runner = CliRunner()
@@ -63,6 +64,53 @@ def test_help_exits_zero():
     assert result.exit_code == 0
     assert "audit" in result.stdout
     assert "promote" in result.stdout
+
+
+def test_fmt_date_marks_xmp_source():
+    row = ExifRow(
+        path=Path("IMG_0001.JPG"),
+        raw={
+            "EXIF:DateTimeOriginal": "2024:02:19 10:21:04",
+            "XMP:DateTimeOriginal": "2024:02:19 10:21:04-04:00",
+        },
+    )
+    assert _fmt_date(row) == "2024:02:19 10:21:04-04:00 (xmp)"
+
+
+def test_fmt_gps_shows_xmp_source():
+    row = ExifRow(
+        path=Path("IMG_0001.JPG"),
+        raw={
+            "XMP:GPSLatitude": -16.28930949421266,
+            "XMP:GPSLongitude": -67.82720498551421,
+        },
+    )
+    assert _fmt_gps(row) == "-16.2893,-67.8272 (xmp)"
+
+
+def test_fmt_make_model_uses_quicktime_android_fields():
+    row = ExifRow(
+        path=Path("VID_0001.mp4"),
+        raw={
+            "QuickTime:AndroidMake": "Xiaomi",
+            "QuickTime:AndroidModel": "2303ERA42L",
+        },
+    )
+    assert _fmt_make_model(row) == "Xiaomi 2303ERA42L"
+
+
+def test_fmt_make_model_falls_back_to_xmp_camera_tag():
+    row = ExifRow(
+        path=Path("VID_0001.mp4"),
+        raw={
+            "XMP:HierarchicalSubject": [
+                "Events/Trip",
+                "Gear/Camera/Xiaomi 2303ERA42L",
+                "Source/VID",
+            ],
+        },
+    )
+    assert _fmt_make_model(row) == "Xiaomi 2303ERA42L (xmp)"
 
 
 def test_audit_empty_folder_exits_zero(tmp_path):
@@ -424,6 +472,22 @@ def test_interactive_tz_prompt_rejects_unknown_zone(clock_drift_fixture: Path):
     assert fm.get("timezone") in (None, "")
 
 
+def test_interactive_tz_prompt_skipped_when_coords_resolve_zone(clock_drift_fixture: Path):
+    import yaml
+    _seed_clock_drift_with_coords(clock_drift_fixture)
+    result = runner.invoke(
+        app,
+        ["audit", str(clock_drift_fixture), "--write"],
+        input="n\n",
+    )
+    assert result.exit_code == 0, result.stdout
+    assert "Enter IANA zone" not in result.stdout
+    fm = yaml.safe_load(
+        (clock_drift_fixture / "TRIP.md").read_text().split("---", 2)[1]
+    )
+    assert fm["timezone"] == "Indian/Mauritius"
+
+
 def test_tz_prompt_skipped_when_already_set(clock_drift_fixture: Path):
     import yaml
     notes = clock_drift_fixture / "TRIP.md"
@@ -463,6 +527,35 @@ def test_tz_guess_from_gps_writes_zone_to_notes(tmp_path: Path):
     assert fm["timezone"] == "Indian/Mauritius"
     tags = _xmp_tags(target / "IMG_0001.xmp")
     assert tags["XMP:DateTimeOriginal"].endswith("+04:00")
+
+
+def test_tz_guess_from_notes_coords_writes_zone_to_notes(tmp_path: Path):
+    import yaml
+    target = tmp_path / "tz-notes-coords"
+    target.mkdir()
+    src = FIXTURES / "trip-anchor-simple" / "IMG_A.JPG"
+    dst = target / "IMG_0001.JPG"
+    dst.write_bytes(src.read_bytes())
+    subprocess.run([
+        "exiftool", "-overwrite_original",
+        "-EXIF:DateTimeOriginal=2026:04:01 10:00:00",
+        str(dst),
+    ], check=True, capture_output=True)
+    (target / "TRIP.md").write_text(
+        "---\n"
+        "trip: tz-notes-coords\n"
+        "location:\n"
+        "  coords: [-16.28930949421266, -67.82720498551421]\n"
+        "---\n"
+    )
+
+    result = runner.invoke(app, ["audit", str(target), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+
+    fm = yaml.safe_load((target / "TRIP.md").read_text().split("---", 2)[1])
+    assert fm["timezone"] == "America/La_Paz"
+    tags = _xmp_tags(target / "IMG_0001.xmp")
+    assert tags["XMP:DateTimeOriginal"].endswith("-04:00")
 
 
 def test_tz_guess_respects_existing_timezone(tmp_path: Path):

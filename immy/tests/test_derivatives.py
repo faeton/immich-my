@@ -16,8 +16,12 @@ from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
-import pyvips
 import yaml
+
+try:
+    import pyvips
+except Exception:
+    pytest.skip("pyvips/libvips unavailable", allow_module_level=True)
 
 from immy import derivatives as derivatives_mod
 from immy import process as process_mod

@@ -77,15 +77,44 @@ def _coord(row: ExifRow) -> tuple[float, float] | None:
         return None
 
 
-def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
+def _coord_from_notes(notes: Path | None) -> tuple[float, float] | None:
+    if notes is None:
+        return None
+    fm = parse_frontmatter(notes)
+    loc = fm.get("location") or {}
+    coords = loc.get("coords") if isinstance(loc, dict) else None
+    if not (isinstance(coords, (list, tuple)) and len(coords) == 2):
+        return None
+    try:
+        return float(coords[0]), float(coords[1])
+    except (TypeError, ValueError):
+        return None
+
+
+def guess_timezone(rows: list[ExifRow], folder: Path) -> tuple[str, str] | None:
+    """Best-effort trip timezone guess.
+
+    Priority:
+    1. `location.coords` in notes front-matter — explicit user-entered trip anchor
+    2. Majority vote across geotagged media already carrying GPS
+
+    Returns `(zone_name, reason)` or `None` when there is not enough signal.
+    """
     notes = resolve(folder)
     if notes is None:
-        return []
+        return None
     fm = parse_frontmatter(notes)
     if isinstance(fm.get("timezone"), str) and fm["timezone"].strip():
-        return []
+        return None
 
     finder = _tz_finder()
+    notes_coord = _coord_from_notes(notes)
+    if notes_coord is not None:
+        zone = finder.timezone_at(lat=notes_coord[0], lng=notes_coord[1])
+        if zone:
+            lat, lon = notes_coord
+            return zone, f"notes location.coords [{lat:.6f}, {lon:.6f}]"
+
     zones: Counter[str] = Counter()
     for row in rows:
         coord = _coord(row)
@@ -95,7 +124,7 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
         if zone:
             zones[zone] += 1
     if not zones:
-        return []
+        return None
 
     # Require a clear majority — if two zones run close, stay silent and
     # let the interactive prompt decide (border-crossing trip, user picks).
@@ -103,15 +132,25 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
     top_zone, top_n = top[0]
     rest_n = top[1][1] if len(top) > 1 else 0
     if rest_n and top_n < rest_n * 2:
+        return None
+
+    return top_zone, f"{top_n}/{sum(zones.values())} geotagged file(s) land in {top_zone}"
+
+
+def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
+    notes = resolve(folder)
+    guessed = guess_timezone(rows, folder)
+    if notes is None or guessed is None:
         return []
+    zone, reason = guessed
 
     return [Finding(
         rule="trip-timezone-guess-gps",
         confidence="high",
         path=notes,
         action="write_notes",
-        patch={"timezone": top_zone},
-        reason=f"{top_n}/{sum(zones.values())} geotagged file(s) land in {top_zone}",
+        patch={"timezone": zone},
+        reason=reason,
     )]
 
 

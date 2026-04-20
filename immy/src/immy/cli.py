@@ -23,6 +23,7 @@ from .notes import (
     update_frontmatter,
 )
 from .rules import Finding, evaluate
+from .rules.trip_timezone_guess import guess_timezone
 from .sidecar import write as write_xmp
 from .state import State, log_event, patch_hash
 
@@ -165,27 +166,80 @@ def _dedup_by_field(findings: list[Finding]) -> list[Finding]:
     return out
 
 
+def _first_present(row, *keys: str) -> tuple[object | None, str | None]:
+    for key in keys:
+        value = row.get(key)
+        if value is not None:
+            return value, key
+    return None, None
+
+
 def _fmt_date(row) -> str:
-    v = row.get(
+    value, source = _first_present(
+        row,
         "XMP:DateTimeOriginal", "EXIF:DateTimeOriginal",
         "QuickTime:CreateDate", "EXIF:CreateDate",
     )
-    return str(v) if v else "—"
+    if value is None:
+        return "—"
+    suffix = " (xmp)" if source and source.startswith("XMP:") else ""
+    return f"{value}{suffix}"
 
 
 def _fmt_gps(row) -> str:
-    lat = row.get("Composite:GPSLatitude", "EXIF:GPSLatitude")
-    lon = row.get("Composite:GPSLongitude", "EXIF:GPSLongitude")
+    lat, lat_source = _first_present(
+        row,
+        "Composite:GPSLatitude", "EXIF:GPSLatitude", "XMP:GPSLatitude",
+    )
+    lon, lon_source = _first_present(
+        row,
+        "Composite:GPSLongitude", "EXIF:GPSLongitude", "XMP:GPSLongitude",
+    )
     if lat is None or lon is None:
         return "—"
-    return f"{float(lat):+.4f},{float(lon):+.4f}"
+    suffix = ""
+    if (
+        lat_source and lon_source
+        and lat_source.startswith("XMP:")
+        and lon_source.startswith("XMP:")
+    ):
+        suffix = " (xmp)"
+    return f"{float(lat):+.4f},{float(lon):+.4f}{suffix}"
 
 
 def _fmt_make_model(row) -> str:
-    make = row.get("EXIF:Make", "QuickTime:Make") or ""
-    model = row.get("EXIF:Model", "QuickTime:Model") or ""
+    make, _ = _first_present(
+        row,
+        "EXIF:Make", "QuickTime:Make", "QuickTime:AndroidMake",
+    )
+    model, _ = _first_present(
+        row,
+        "EXIF:Model", "QuickTime:Model", "QuickTime:AndroidModel",
+    )
+    make = make or ""
+    model = model or ""
     s = f"{make} {model}".strip()
-    return s or "—"
+    if s:
+        return s
+
+    hier = row.get("XMP:HierarchicalSubject")
+    if isinstance(hier, list):
+        for item in hier:
+            if isinstance(item, str) and item.startswith("Gear/Camera/"):
+                camera = item.removeprefix("Gear/Camera/").strip()
+                if camera:
+                    return f"{camera} (xmp)"
+
+    subj = row.get("XMP:Subject")
+    if isinstance(subj, list):
+        for item in subj:
+            if isinstance(item, str) and item.strip():
+                text = item.strip()
+                # Avoid generic trip/source tags; keep this conservative.
+                if text not in {"IMG", "VID"} and "/" not in text:
+                    return f"{text} (xmp)"
+
+    return "—"
 
 
 def _render_table(folder: Path, rows, findings_by_path: dict[str, list[Finding]]) -> None:
@@ -310,6 +364,15 @@ def _prompt_trip_timezone(folder: Path, rows, notes: Path | None, interactive: b
             naive += 1
     if not naive:
         return False
+    guessed = guess_timezone(rows, folder)
+    if guessed is not None:
+        zone, reason = guessed
+        update_frontmatter(notes, {"timezone": zone})
+        console.print(
+            f"[green]✓[/green] inferred timezone '{zone}' from {reason} "
+            f"and wrote it to {notes.name}"
+        )
+        return True
     console.print(
         f"\n[yellow]?[/yellow] {naive}/{len(rows)} file(s) have naive dates and "
         f"[cyan]{notes.name}[/cyan] has no [b]timezone:[/b] set."

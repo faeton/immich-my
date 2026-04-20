@@ -26,7 +26,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
-import pyvips
+try:
+    import pyvips
+except (ImportError, OSError) as e:
+    pyvips = None
+    _PYVIPS_IMPORT_ERROR = e
+else:
+    _PYVIPS_IMPORT_ERROR = None
 
 from . import video as video_mod
 
@@ -40,6 +46,17 @@ THUMBS_SUBDIR = "thumbs"
 ENCODED_VIDEO_SUBDIR = "encoded-video"
 
 FileKind = Literal["thumbnail", "preview", "encoded_video"]
+
+
+def _require_pyvips():
+    if pyvips is None:
+        detail = f": {_PYVIPS_IMPORT_ERROR}" if _PYVIPS_IMPORT_ERROR else ""
+        raise RuntimeError(
+            "pyvips/libvips is unavailable; derivative generation requires "
+            "`brew install vips` on macOS"
+            f"{detail}"
+        )
+    return pyvips
 
 
 @dataclass(frozen=True)
@@ -116,14 +133,16 @@ def staged_dir(trip_folder: Path) -> Path:
 
 def _write_thumbnail(src: Path, dst: Path) -> None:
     """250 px WebP, quality 80 — Immich's `thumbnail.webp` spec."""
-    image = pyvips.Image.thumbnail(str(src), THUMBNAIL_WIDTH)
+    vips = _require_pyvips()
+    image = vips.Image.thumbnail(str(src), THUMBNAIL_WIDTH)
     dst.parent.mkdir(parents=True, exist_ok=True)
     image.webpsave(str(dst), Q=QUALITY, strip=True)
 
 
 def _write_preview(src: Path, dst: Path) -> None:
     """1440 px JPEG, quality 80, progressive — Immich's `preview.jpeg` spec."""
-    image = pyvips.Image.thumbnail(str(src), PREVIEW_WIDTH)
+    vips = _require_pyvips()
+    image = vips.Image.thumbnail(str(src), PREVIEW_WIDTH)
     dst.parent.mkdir(parents=True, exist_ok=True)
     image.jpegsave(str(dst), Q=QUALITY, interlace=True, strip=True)
 
@@ -139,7 +158,8 @@ def _image_dims_and_stills(
     rotation, which is why we surface the *rotated* dims for
     `asset.width`/`asset.height`.
     """
-    src_img = pyvips.Image.new_from_file(str(source_media), access="sequential")
+    vips = _require_pyvips()
+    src_img = vips.Image.new_from_file(str(source_media), access="sequential")
     src_img = src_img.autorot()
     width = int(src_img.width)
     height = int(src_img.height)
