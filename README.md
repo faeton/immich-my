@@ -1,12 +1,102 @@
 # immich-my
 
-A personal media catalog and curator built on top of [Immich](https://immich.app),
-tuned for a workflow with cameras, drones, 360 footage, iPhone and Apple Photos,
-and remote/offline storage. The Synology DS923+ is the always-on core; a MacBook
-(and optionally a future Mac mini / N100) does the heavy neural-engine work.
+A personal media catalog and ingest sidecar built around
+[Immich](https://immich.app).
 
-This repo is the **plan and operating manual**. Phase 0 (stock Immich on the
-Syno) is live; the sidecar layers described below are still ahead of us.
+The project is aimed at a photo/video workflow that mixes:
+- cameras and SD-card imports
+- phone media
+- DJI sidecars / telemetry
+- Insta360 pairs
+- trip-based curation
+- remote or occasionally-offline originals
+
+Immich stays upstream and unmodified. The custom logic lives beside it:
+- `immy audit` fixes metadata with XMP sidecars instead of rewriting originals
+- `immy process` computes derivatives, CLIP, and faces on the Mac
+- `immy promote` uploads a curated trip into an Immich external library
+
+This repo is both:
+- the code for the `immy` ingest tool
+- the design / operations docs for the broader setup
+
+## CLI
+
+The main operational interface is `immy`:
+- `audit` reads media, proposes metadata fixes, and writes XMP sidecars
+- `bloat` finds oversized video sources and helps transcode them
+- `process` computes derivatives, CLIP, and faces, then inserts directly into Immich Postgres
+- `promote` uploads a curated trip into the external library and syncs the album
+
+Typical development commands:
+
+```sh
+cd immy
+uv sync
+uv run immy --help
+uv run immy audit tests/fixtures/dji-srt-pair
+uv run pytest
+```
+
+Local prerequisites:
+- `exiftool`
+- `ffmpeg` / `ffprobe`
+- `vips` if you want derivative generation
+
+On macOS:
+
+```sh
+brew install exiftool ffmpeg vips
+```
+
+## What works today
+
+- Stock Immich deployment on a Synology NAS
+- Trip-folder metadata audit and XMP sidecar writes
+- GPS / timezone / tag inference for trips
+- Direct-to-Postgres ingest for curated trips
+- Thumbnail / preview / encoded-video derivative staging
+- CLIP embeddings and face embeddings during ingest
+- Album sync on promote
+
+## Local Setup
+
+This public repo uses placeholder names in docs and examples. Real local values
+stay out of git.
+
+Files and roles:
+- [`.env.example`](.env.example): public-safe placeholder names used in docs
+- `.env`: your real local values, gitignored
+- `.immy/config.yml`: your real local `immy` config, gitignored
+- `~/.immy/config.yml`: also supported; `immy` reads this by default
+
+Recommended local flow:
+
+```sh
+cd /path/to/immich-my
+cp .env.example .env
+mkdir -p .immy
+cp /path/to/your/immy-config.yml .immy/config.yml
+source .env
+```
+
+If you use a repo-local config, set:
+
+```sh
+export IMMY_CONFIG=/absolute/path/to/immich-my/.immy/config.yml
+```
+
+Notes:
+- `.env` is for your shell and local placeholders; `immy` does not auto-read it
+- `immy` runtime config comes from `--config`, `$IMMY_CONFIG`, or `~/.immy/config.yml`
+- `.env` and `.immy/` are gitignored
+
+## Public Placeholders
+
+Docs may use `${PLACEHOLDER}` values such as `${IMMICH_URL}` or
+`${DEPLOY_ROOT}`. These are documentation placeholders only. They make the
+public docs readable without exposing the original private hostnames, paths, or
+credentials from the live setup.
 
 ## Why this exists
 
@@ -23,76 +113,6 @@ releases. But it is missing pieces for this workflow:
 
 Everything above is built as a **sidecar** that speaks to Immich over its public
 REST API. No forking. Upgrades stay clean.
-
-## The two-box architecture in one picture
-
-```
-DS923+  (always on, 20 GB RAM, R1600, no iGPU)      MacBook Apple Silicon
-├── Immich server + web UI                          ├── immich-ml-metal
-├── Postgres (catalog, faces, embeddings)   ◀──API──┤   (ANE face detect,
-├── Redis                                           │    CoreML ArcFace,
-├── originals (HDD pool, read-only mount)           │    MLX CLIP)
-├── derivatives (NVMe pool: thumbs,                 ├── curator sidecar
-│   proxies, pgvector, captions, transcripts)       │   (osxphotos pull, 360/DJI
-├── nominatim (reverse geocoding)                   │    preprocess, whisper,
-└── SMB/NFS shares so the Mac can edit              │    captioner, events, gap-fill)
-    originals directly                              └── VideoToolbox proxy gen
-```
-
-State lives on the NAS. Compute is replaceable. The Mac can sleep; jobs queue
-up; draining is idempotent.
-
-## How it hypothetically works, day by day
-
-**Importing from a camera (SD card)**
-1. Plug SD card into the Mac or Syno. Rsync to `/library/inbox/<camera>/YYYY-MM-DD/`.
-2. Sidecar watches the inbox, normalises sidecar files (`.LRV`, `.SRT`, `.XMP`),
-   runs exiftool on the header only, extracts embedded JPEG previews for RAW.
-3. Moves the originals into `/library/originals/` and triggers Immich external-library scan.
-4. Thumbnail/proxy/embedding jobs queue up. Browsing works within seconds;
-   enrichment finishes in the background.
-
-**iPhone / Apple Photos**
-- Immich's iOS app auto-backs up the camera roll to the Syno on Wi-Fi.
-- Nightly `osxphotos export --update` pulls anything that lives in the macOS
-  Photos library (imports, edits, people names) into the same inbox pipeline.
-- iCloud-only items pulled by `icloudpd` on the Mac.
-
-**Drones and 360**
-- `.insv/.insp` pairs detected; LRV low-res proxies harvested so browsing never
-  touches the 20 GB original stitched file.
-- DJI `.SRT`/`.LRF` sidecars parsed for GPS and altitude; written as XMP so
-  Immich places the shot on its map.
-
-**Remote and offline drives**
-- Archive drives (2024 trips, etc.) mounted via SMB/NFS or `rclone mount`.
-- Catalog-only mode: ingest header + embedded preview + AI embeddings, then
-  unplug the drive. Search, browse, thumbnail view still work. Full-resolution
-  open shows "volume 'archive-2024' is offline; plug in or mount to retrieve."
-
-**Faces**
-- InsightFace `buffalo_l` (accuracy-first). First backfill runs on the MacBook
-  via `immich-ml-metal` (Neural Engine) — roughly an hour for 50k photos.
-  Steady state: as new photos land, embeddings compute in seconds.
-- Label the top ~20 clusters once; the rest auto-attach.
-
-**Search**
-- CLIP free-text: "sunset over water", "dog on a beach", "red tram".
-- By person: "Anna AND Lisbon AND 2024".
-- By transcript: video talk content indexed via Whisper, searchable like text.
-- By AI caption: descriptions from moondream/BLIP supplement CLIP for long-tail.
-
-**Metadata gap-fill**
-- Sidecar web app shows assets missing GPS or timestamp, grouped by nearest
-  date/location cluster. One click applies to the whole group.
-
-**Events**
-- Nightly DBSCAN on `(time, lat, lon)` creates albums like `2026-04 Lisbon`
-  with human-readable names from the reverse-geocoder.
-
-**Editing originals**
-- The Mac mounts the Syno's `originals` share via SMB. Editing apps open files
-  directly — no re-download. Proxies never leave the Syno's NVMe pool.
 
 ## Hardware snapshot
 
@@ -120,8 +140,9 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 ## Status
 
 - **Phase 0 — Base stack**: done. Stock Immich running on the DS923+ under
-  Container Manager, docker project `fnim`, data under `/volume1/faeton-immi/`,
-  reached over Tailscale. Details in [docs/DEPLOY.md](docs/DEPLOY.md).
+  Container Manager, docker project `${COMPOSE_PROJECT}`, data under
+  `${DEPLOY_ROOT}`, reached over Tailscale. Public docs use placeholders from
+  `.env.example`; details in [docs/DEPLOY.md](docs/DEPLOY.md).
 - **Phase Y — direct-to-Immich-DB pre-processing**: done. `immy process →
   promote` lands asset + EXIF + derivatives (thumbnail/preview/encoded_video)
   + CLIP + faces straight into Postgres without touching Immich's scan
@@ -132,3 +153,9 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 - **Next up**: Phase 2c residuals (bloat re-encode QoL), Phase 3 enrichment
   (Whisper transcripts, BLIP/moondream captions, pHash duplicates), Phase 4
   DBSCAN event clustering.
+
+## License / Publishing Note
+
+This repo is intended to be publishable. Real deployment-specific values should
+live only in local ignored files such as `.env` and `.immy/config.yml`, not in
+tracked docs or code examples.

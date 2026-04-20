@@ -461,7 +461,7 @@ in four phases:
 ```yaml
 originals_root: /mnt/incoming/originals-test   # can be a remote rsync target
 immich:
-  url: http://vv.tailnet:2283
+  url: ${IMMICH_URL}
   api_key: <key>
   library_id: <uuid>                            # the External Library ID
 notes_filename: TRIP.md                         # optional
@@ -602,7 +602,7 @@ conflicts (already indexed) and VIDEO rows (Y.5) are skipped.
 
 ```yaml
 media:
-  host_root: /volume1/faeton-immi/library   # rsync destination (NAS-side)
+  host_root: ${SHARED_LIBRARY}               # rsync destination (NAS-side)
   container_root: /data                      # IMMICH_MEDIA_LOCATION in the container
 ```
 
@@ -653,13 +653,13 @@ Optional later (Phase 2b, not 2a):
   an Immich modification. Only worth building if we shoot enough 360 that
   flat 2:1 previews feel limiting.
 
-**Editing flow** stays unchanged: Mac mounts `/volume1/faeton-immi/originals/`
+**Editing flow** stays unchanged: Mac mounts `${SHARED_ORIGINALS}`
 over SMB → open `.insv` in Insta360 Studio → re-export → drop result into
 `~/Documents/Incoming/<Trip>/insta360/` as a new asset.
 
 ### What `immy` does NOT do
 
-- **Does not touch originals that are already in `/volume1/faeton-immi/originals/`.**
+- **Does not touch originals that are already in `${SHARED_ORIGINALS}`.**
   Post-ingest fixes are the Phase 5 gap-fill UI's job.
 - **Does not decide AI stuff** (tags inferred from CLIP captions, faces, Whisper).
   Those arrive via the post-ingest workers described below.
@@ -824,7 +824,7 @@ points. Split by host along the Metal line:
 | `sidecar-web` | Syno | FastAPI: `/gap` + `/transcode` confirm UIs |
 
 Syno processes ship as a second docker-compose project alongside
-`fnim`. Mac processes start under `launchd` so they survive reboots
+`${COMPOSE_PROJECT}`. Mac processes start under `launchd` so they survive reboots
 and respect sleep/wake. All read the same `DATABASE_URL`.
 
 ## What the sidecar does NOT own

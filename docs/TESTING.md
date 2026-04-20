@@ -5,8 +5,8 @@ test is a **golden path** (happy case) plus at least one **failure mode** that
 exercises the thing the phase was supposed to protect against.
 
 Conventions:
-- `vv` = the DS923+ over Tailscale.
-- `mac` = the MacBook.
+- `${NAS_HOST}` = the DS923+ over Tailscale.
+- `${MAC_HOST}` = the MacBook / ML node.
 - Commands run on the NAS use the full docker path (`/usr/local/bin/docker`)
   because DSM's default shell `$PATH` doesn't include it.
 
@@ -14,13 +14,13 @@ Conventions:
 
 | # | Test | Pass criteria |
 |---|---|---|
-| 0.1 | Containers healthy after host reboot | `docker compose ps` from `/volume1/faeton-immi/docker/` shows all four containers `healthy` after a full DSM reboot, without manual intervention. |
-| 0.2 | Web UI reachable over Tailscale | `https://vv.<tailnet>:2283/` (or whatever tailnet name we pick) loads the Immich login in < 3 s from the Mac and iPhone. |
+| 0.1 | Containers healthy after host reboot | `docker compose ps` from `${DOCKER_ROOT}` shows all four containers `healthy` after a full DSM reboot, without manual intervention. |
+| 0.2 | Web UI reachable over Tailscale | `${IMMICH_URL}` loads the Immich login in < 3 s from the Mac and iPhone. |
 | 0.3 | Admin account sign-in works | Can log in with the account created at first boot; no banner warnings in Admin → Server Stats. |
 | 0.4 | iOS app round-trip | From the Immich iOS app, point at the Tailscale URL, log in, take one photo, trigger backup. Photo appears in web UI timeline within 60 s. |
-| 0.5 | Storage template applied | After 0.4, the file lives at `/volume1/faeton-immi/library/library/<user>/2026/2026-04-16/HHMMSS-<origname>.<ext>`. |
+| 0.5 | Storage template applied | After 0.4, the file lives at `${SHARED_LIBRARY}/library/<user>/2026/2026-04-16/HHMMSS-<origname>.<ext>`. |
 | 0.6 | External library visible | Admin → Libraries shows `/mnt/external/originals` as an external library. Scan completes with 0 assets (empty tree) and no errors. |
-| 0.7 | External library picks up a dropped file | Copy one `.jpg` into `/volume1/faeton-immi/originals/2026/2026-04-16/test.jpg`, re-run the scan, the asset appears read-only in the timeline. |
+| 0.7 | External library picks up a dropped file | Copy one `.jpg` into `${SHARED_ORIGINALS}/2026/2026-04-16/test.jpg`, re-run the scan, the asset appears read-only in the timeline. |
 | 0.8 | Postgres dump + restore | Run the `pg_dumpall` from DEPLOY.md, verify gzip opens and contains `CREATE DATABASE immich`. (Full restore rehearsal deferred until we have a second test NAS or a VM.) |
 | 0.9 | Graceful degradation: Mac offline | With the Mac asleep, browsing + search-by-filename still work. (CLIP/face jobs may queue — expected. Nothing should *break*.) |
 | 0.10 | Port 2283 not exposed to WAN | From an off-tailnet device with only the NAS's public IP, `curl` to port 2283 fails/times out. (Sanity: we never opened the router.) |
@@ -53,7 +53,7 @@ not a failure.
 
 | # | Test | Pass criteria |
 |---|---|---|
-| 1.1 | `immich-ml-metal` reachable from NAS | From `vv`: `curl -sf http://<mac-tailscale>:3003/ping` returns 200 with the Mac awake and on tailnet. |
+| 1.1 | `immich-ml-metal` reachable from NAS | From `${NAS_HOST}`: `curl -sf http://<mac-tailscale>:3003/ping` returns 200 with the Mac awake and on tailnet. |
 | 1.2 | Immich prefers Mac when available | With both URLs configured, a 100-photo face backfill shows ML jobs hitting the Mac (check process list / container logs). |
 | 1.3 | Fallback when Mac sleeps / off-tailnet | Put the Mac to sleep (or disable Tailscale on it) mid-backfill. Jobs drain on Syno fallback within the configured timeout (2–3 s per attempt). No job stuck in "active" > 10 min. |
 | 1.4 | 50k backfill budget (stable link) | With Mac awake on mains + reliable Tailscale, full face backfill on 50k assets completes in ≈ 1 h wall clock. (Fails loudly if we regressed to CPU path.) |
@@ -81,7 +81,7 @@ not a failure.
 | **Exif roundtrip** | pyexiftool reads/writes are correct | Write EXIF → re-read → assert. Catches library drift. |
 | **Rule on fixture** | One rule applied to a realistic mini-folder | Snapshot XMP sidecars + `state.yml` → compare to goldens. |
 | **End-to-end, mocked** | Full `audit → promote` against a fake Immich | `respx` mocks the REST API. Runs in CI, zero network. |
-| **End-to-end, staging** | Full run against real `nas-media` Immich, dedicated test external library | Nightly / on tag. Catches environment drift. |
+| **End-to-end, staging** | Full run against real `${NAS_HOST}` Immich, dedicated test external library | Nightly / on tag. Catches environment drift. |
 | **Idempotency** | Re-running is a no-op | Run audit twice; second run diffs clean. |
 | **State persistence** | Decisions survive re-runs | Answer once, re-run, ensure no prompt fires. |
 
@@ -203,9 +203,9 @@ Current smoke suite: 119 tests total (38 smoke + 13 promote + 12 bloat + 12 bloa
 
 ## Ad-hoc smoke checks (any time)
 
-- `docker compose ps` on `vv` — all 4 containers `healthy`.
+- `docker compose ps` on `${NAS_HOST}` — all 4 containers `healthy`.
 - `df -h /volume1` — headroom left (flag at < 20 %).
-- `/volume1/faeton-immi/library/` free-space trend (graph in DSM Resource
+- `${SHARED_LIBRARY}/` free-space trend (graph in DSM Resource
   Monitor) — not growing unexpectedly fast.
 - `docker compose logs immich-server --since 1h | grep -i error` — empty.
 - One manual photo upload round-trip, then delete.

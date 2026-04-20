@@ -8,7 +8,7 @@ Rough effort estimates are evening-hours for a single person.
 ## Phase 0 — Base stack ✅ done
 
 **Stock Immich on the Syno, no custom code.** Running under Container Manager,
-docker project `fnim`, all state under `/volume1/faeton-immi/`. Full as-built
+docker project `${COMPOSE_PROJECT}`, all state under `${DEPLOY_ROOT}`. Full as-built
 notes in [DEPLOY.md](DEPLOY.md); acceptance checks in [TESTING.md](TESTING.md).
 
 Deviations from the original plan:
@@ -23,13 +23,13 @@ Deviations from the original plan:
   (read-only), ready for the Phase 1b mount adapters and Phase 2 ingest funnel.
 
 **Closed 2026-04-19**:
-- ✅ External Library `IMMY-Sync` (`2dc3b5bd-30aa-49f1-bf78-1b91ccafc8be`)
-  created in Admin → Libraries with import path `/mnt/external/originals`;
+- ✅ External Library `<external-library-name>` (`<external-library-uuid>`)
+  created in Admin → Libraries with import path `${EXTERNAL_ORIGINALS_MOUNT}`;
   scan runs clean against the empty tree (`assetCount: 0`).
-- ✅ iOS Immich app logs in over `https://nas-media.example.ts.net:2283`
+- ✅ iOS Immich app logs in over `${IMMICH_URL}`
   and one end-to-end upload hit the Immich timeline.
 - ✅ First `pg_dumpall` (16 MB gzipped) + `library/` tarball (92 MB) landed in
-  `/volume1/faeton-immi/backup/`; `gunzip -t` passes. Drill documented in
+  `${BACKUP_ROOT}`; `gunzip -t` passes. Drill documented in
   [DEPLOY.md](DEPLOY.md#backup) (note: docker compose on DSM needs `sudo`).
   Off-NAS copy still manual until Hyper Backup is wired up.
 

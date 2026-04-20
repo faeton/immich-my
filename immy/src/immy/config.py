@@ -10,7 +10,7 @@ Shape:
     originals_root: /mnt/incoming/originals-test
     notes_filename: TRIP.md          # optional; used by notes.py too
     immich:                          # optional; promote skips API if missing
-      url: http://vv.tailnet:2283
+      url: https://nas-media.example.ts.net:2283
       api_key: xxx
       library_id: <uuid>
     pg:                              # optional; `immy process` needs it
@@ -20,7 +20,7 @@ Shape:
       password: xxx
       database: immich
     media:                           # optional; Y.2 derivatives need it
-      host_root: /volume1/faeton-immi/library    # rsync destination (NAS-side)
+      host_root: /volume1/media-catalog/library  # rsync destination (NAS-side)
       container_root: /data                       # IMMICH_MEDIA_LOCATION in the container
     ml:                              # optional; Y.3 CLIP defaults
       clip_model: ViT-B-32__openai   # must match Immich's configured model
@@ -61,7 +61,7 @@ class PgConfig:
 class MediaConfig:
     """Where Immich stores derivatives, on two sides of the container bind.
 
-    - `host_root` is what `rsync` pushes into (e.g. `/volume1/faeton-immi/library`
+    - `host_root` is what `rsync` pushes into (e.g. `/volume1/media-catalog/library`
       mounted over SMB, or `user@host:/volume1/...` when remote). The NAS
       writes these files; the container reads them.
     - `container_root` is the same tree as Immich's `IMMICH_MEDIA_LOCATION`
