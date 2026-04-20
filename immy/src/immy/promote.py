@@ -102,8 +102,17 @@ def build_plan(folder: Path, config: Config) -> Plan:
 
 def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedProcess:
     """Copy folder contents into target. `target` may be a local path or
-    an rsync-style `user@host:/path` string (handled transparently by rsync)."""
-    args = ["rsync", "-av", "--itemize-changes"]
+    an rsync-style `user@host:/path` string (handled transparently by rsync).
+
+    Uses `--progress` (not `--info=progress2`) because macOS ships
+    Apple's openrsync as `/usr/bin/rsync`, which rejects `--info=*`
+    entirely. `--progress` gives per-file progress lines that both
+    openrsync and GNU rsync understand. We stream stdout to the
+    terminal so the `\r`-animated progress line renders, and collect
+    the full output into `CompletedProcess.stdout` for the itemized-
+    changes parser downstream.
+    """
+    args = ["rsync", "-a", "--itemize-changes", "--progress"]
     if dry_run:
         args.append("--dry-run")
     for pat in RSYNC_EXCLUDES:
@@ -118,7 +127,52 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
     if ":" not in target_str:
         target.parent.mkdir(parents=True, exist_ok=True)
     args.extend([src, dst])
-    return subprocess.run(args, capture_output=True, text=True, check=True)
+    return _run_streaming(args)
+
+
+def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
+    """Spawn rsync, tee stdout to the terminal AND capture it.
+
+    rsync's `--progress` output uses `\r` to overwrite a single
+    progress line — piping through Python would lose that animation,
+    so we let the tty see raw bytes when attached. We still buffer the
+    full output so the returned `CompletedProcess.stdout` matches what
+    a `capture_output=True` call would have produced (callers parse
+    the itemized-changes tail from it). When stdout isn't a real tty
+    (e.g. Typer's CliRunner capture in tests), we fall back to plain
+    `subprocess.run` — no progress, but tests stay deterministic.
+    """
+    import sys
+
+    tty_out = getattr(sys.stdout, "buffer", None)
+    is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
+    if tty_out is None or not is_tty:
+        return subprocess.run(args, capture_output=True, text=True, check=True)
+
+    proc = subprocess.Popen(
+        args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=0,
+    )
+    buf = bytearray()
+    assert proc.stdout is not None
+    while True:
+        chunk = proc.stdout.read(1)
+        if not chunk:
+            break
+        buf.extend(chunk)
+        tty_out.write(chunk)
+        sys.stdout.flush()
+    stderr = proc.stderr.read() if proc.stderr else b""
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(
+            rc, args, output=bytes(buf), stderr=stderr,
+        )
+    return subprocess.CompletedProcess(
+        args, rc,
+        stdout=bytes(buf).decode("utf-8", errors="replace"),
+        stderr=stderr.decode("utf-8", errors="replace"),
+    )
 
 
 def _stack_pair(client: ImmichClient, pair: InstaPair) -> tuple[str, str] | None:
@@ -234,8 +288,8 @@ def _rsync_derivatives(src_root: Path, host_root: str) -> subprocess.CompletedPr
     """
     src = f"{str(src_root).rstrip('/')}/"
     dst = host_root if ":" in host_root else f"{host_root.rstrip('/')}/"
-    args = ["rsync", "-rt", "--itemize-changes", src, dst]
-    return subprocess.run(args, capture_output=True, text=True, check=True)
+    args = ["rsync", "-rt", "--itemize-changes", "--progress", src, dst]
+    return _run_streaming(args)
 
 
 def _push_derivatives(plan: Plan, config: Config) -> dict | None:

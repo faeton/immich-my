@@ -24,3 +24,8 @@ build/
 
 # Local scratch
 *.log
+
+# mlx-clip caches HF model weights under CWD. Keep these out of git —
+# a single checkpoint is ~600 MB.
+mlx-community/
+
