@@ -127,3 +127,65 @@ def upsert_smart_search(
             _UPSERT_SMART_SEARCH,
             {"asset_id": asset_id, "embedding": embedding_literal},
         )
+
+
+# --- asset_face + face_search (Y.4) --------------------------------------
+
+_DELETE_FACES_FOR_ASSET = """
+DELETE FROM asset_face
+WHERE "assetId" = %(asset_id)s AND "sourceType" = 'machine-learning'
+"""
+
+_INSERT_ASSET_FACE = """
+INSERT INTO asset_face (
+  id, "assetId", "imageWidth", "imageHeight",
+  "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
+  "sourceType", "isVisible"
+) VALUES (
+  %(id)s, %(asset_id)s, %(image_width)s, %(image_height)s,
+  %(x1)s, %(y1)s, %(x2)s, %(y2)s,
+  'machine-learning', true
+)
+"""
+
+_INSERT_FACE_SEARCH = """
+INSERT INTO face_search ("faceId", embedding)
+VALUES (%(face_id)s, %(embedding)s::vector)
+"""
+
+
+def replace_asset_faces(
+    conn: psycopg.Connection,
+    asset_id: str,
+    image_width: int,
+    image_height: int,
+    faces: list[dict],
+) -> int:
+    """Replace the ML-detected faces for one asset.
+
+    Any existing `asset_face` rows with `sourceType='machine-learning'`
+    for this asset are deleted (CASCADE wipes their `face_search` too),
+    then every face in `faces` is inserted fresh along with its 512-dim
+    ArcFace embedding. User-tagged faces (`sourceType='exif'`) are
+    untouched. Idempotent — re-running `immy process` with `--with-faces`
+    regenerates the rows.
+
+    Each face dict must carry: `id` (new uuid), `x1`, `y1`, `x2`, `y2`,
+    and `embedding` (pgvector text literal).
+    """
+    with conn.cursor() as cur:
+        cur.execute(_DELETE_FACES_FOR_ASSET, {"asset_id": asset_id})
+        for face in faces:
+            cur.execute(_INSERT_ASSET_FACE, {
+                "id": face["id"],
+                "asset_id": asset_id,
+                "image_width": image_width,
+                "image_height": image_height,
+                "x1": face["x1"], "y1": face["y1"],
+                "x2": face["x2"], "y2": face["y2"],
+            })
+            cur.execute(_INSERT_FACE_SEARCH, {
+                "face_id": face["id"],
+                "embedding": face["embedding"],
+            })
+    return len(faces)

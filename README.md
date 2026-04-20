@@ -122,5 +122,13 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 - **Phase 0 — Base stack**: done. Stock Immich running on the DS923+ under
   Container Manager, docker project `fnim`, data under `/volume1/faeton-immi/`,
   reached over Tailscale. Details in [docs/DEPLOY.md](docs/DEPLOY.md).
-- **Next up**: finish Phase 0 acceptance (external library, iOS round-trip,
-  Postgres backup), then Phase 1 — Mac as burst ML node.
+- **Phase Y — direct-to-Immich-DB pre-processing**: done. `immy process →
+  promote` lands asset + EXIF + derivatives (thumbnail/preview/encoded_video)
+  + CLIP + faces straight into Postgres without touching Immich's scan
+  pipeline. InsightFace `buffalo_l` runs on the ANE via onnxruntime-CoreML;
+  MLX-CLIP and Apple Vision cover the rest. `immich-accelerator` removed
+  2026-04-20 — `immy` is the sole ingestion path. See
+  [docs/PLAN.md](docs/PLAN.md) for the Y.1–Y.6 ladder.
+- **Next up**: Phase 2c residuals (bloat re-encode QoL), Phase 3 enrichment
+  (Whisper transcripts, BLIP/moondream captions, pHash duplicates), Phase 4
+  DBSCAN event clustering.

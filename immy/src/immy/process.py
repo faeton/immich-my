@@ -33,6 +33,7 @@ import yaml
 
 from . import clip as clip_mod
 from . import derivatives as derivatives_mod
+from . import faces as faces_mod
 from . import pg as pg_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
@@ -392,6 +393,7 @@ class ProcessResult:
     asset_type: str = "IMAGE"  # 'IMAGE' | 'VIDEO'; drives derivatives skip
     derivatives: list[DerivativeFile] | None = None
     clip_embedded: bool = False  # True → smart_search row upserted this run
+    faces_detected: int = 0  # count of asset_face rows written this run
 
 
 def process_trip(
@@ -401,10 +403,13 @@ def process_trip(
     *,
     compute_derivatives: bool = False,
     compute_clip: bool = False,
+    compute_faces: bool = False,
     transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
+    faces_model: str = faces_mod.DEFAULT_MODEL,
     on_derivative_error: str = "skip",  # 'skip' | 'raise'
     on_clip_error: str = "skip",        # 'skip' | 'raise'
+    on_faces_error: str = "skip",       # 'skip' | 'raise'
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
     per-file results. Caller is responsible for transaction boundaries —
@@ -485,6 +490,23 @@ def process_trip(
                     if on_clip_error == "raise":
                         raise
                     clip_embedded = False
+        faces_detected = 0
+        if (
+            compute_faces and inserted and asset.asset_type == "IMAGE"
+            and derivs is not None
+        ):
+            preview = next(
+                (d.staged_path for d in derivs if d.kind == "preview"), None,
+            )
+            if preview is not None and preview.is_file():
+                try:
+                    faces_detected = _process_faces(
+                        conn, asset.id, preview, faces_model,
+                    )
+                except Exception:
+                    if on_faces_error == "raise":
+                        raise
+                    faces_detected = 0
         results.append(ProcessResult(
             asset_id=asset.id,
             container_path=asset.original_path,
@@ -492,8 +514,41 @@ def process_trip(
             asset_type=asset.asset_type,
             derivatives=derivs,
             clip_embedded=clip_embedded,
+            faces_detected=faces_detected,
         ))
     return results
+
+
+def _process_faces(
+    conn: psycopg.Connection,
+    asset_id: str,
+    preview_path: Path,
+    model_name: str,
+) -> int:
+    """Detect + embed faces in the staged preview, write asset_face rows.
+
+    Feeds the *preview* JPEG (same input CLIP sees) rather than the
+    original — consistent with Immich's own pipeline, and the preview is
+    small enough that Vision + ArcFace stay fast on the ANE/CPU.
+    """
+    image_bytes = preview_path.read_bytes()
+    detected, width, height = faces_mod.detect(image_bytes)
+    if not detected:
+        return 0
+    embedded = faces_mod.embed_faces(image_bytes, detected, model_name)
+    if not embedded:
+        return 0
+    rows = [
+        {
+            "id": str(uuid.uuid4()),
+            "x1": ef.face.x1, "y1": ef.face.y1,
+            "x2": ef.face.x2, "y2": ef.face.y2,
+            "embedding": faces_mod.to_pgvector_literal(ef.embedding),
+        }
+        for ef in embedded
+    ]
+    pg_mod.replace_asset_faces(conn, asset_id, width, height, rows)
+    return len(rows)
 
 
 def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
@@ -527,6 +582,8 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
             ]
         if r.clip_embedded:
             entry["clip_embedded"] = True
+        if r.faces_detected:
+            entry["faces_detected"] = r.faces_detected
         assets.append(entry)
     payload = {
         "processed_at": int(time.time()),
@@ -536,6 +593,7 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
             len(r.derivatives) for r in results if r.derivatives
         ),
         "clip_embedded": sum(1 for r in results if r.clip_embedded),
+        "faces_detected": sum(r.faces_detected for r in results),
         "assets": assets,
     }
     marker.write_text(yaml.safe_dump(payload, sort_keys=False))

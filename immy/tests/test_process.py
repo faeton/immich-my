@@ -514,6 +514,170 @@ def test_process_trip_clip_dim_mismatch_raises_when_requested(tmp_path: Path, mo
         )
 
 
+# --- Y.4 faces wiring -----------------------------------------------------
+
+
+def _fake_detected(x1=10, y1=20, x2=60, y2=80, score=0.95):
+    from immy.faces import DetectedFace
+    return DetectedFace(x1=x1, y1=y1, x2=x2, y2=y2, score=score)
+
+
+def _fake_embedded(face):
+    from immy.faces import EmbeddedFace
+    import numpy as np
+    return EmbeddedFace(face=face, embedding=np.zeros(512, dtype=np.float32))
+
+
+def test_process_trip_with_faces_writes_asset_face_rows(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+    detected = [_fake_detected(), _fake_detected(x1=100, y1=110, x2=150, y2=160)]
+    monkeypatch.setattr(
+        "immy.process.faces_mod.detect",
+        lambda b: (detected, 1440, 960),
+    )
+    monkeypatch.setattr(
+        "immy.process.faces_mod.embed_faces",
+        lambda b, faces, model: [_fake_embedded(f) for f in faces],
+    )
+
+    results = process_mod.process_trip(
+        target, conn, LIB,
+        compute_derivatives=True, compute_clip=False, compute_faces=True,
+    )
+
+    assert results[0].faces_detected == 2
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert any("DELETE FROM asset_face" in s for s in sqls), sqls
+    assert sum("INSERT INTO asset_face" in s for s in sqls) == 2
+    assert sum("INSERT INTO face_search" in s for s in sqls) == 2
+
+
+def test_process_trip_without_faces_never_calls_detector(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+
+    called = {"detect": 0}
+    monkeypatch.setattr(
+        "immy.process.faces_mod.detect",
+        lambda b: (called.__setitem__("detect", called["detect"] + 1), ([], 0, 0))[1],
+    )
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+
+    results = process_mod.process_trip(
+        target, conn, LIB,
+        compute_derivatives=True, compute_clip=False, compute_faces=False,
+    )
+    assert results[0].faces_detected == 0
+    assert called["detect"] == 0
+
+
+def test_process_trip_faces_soft_skip_on_error(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+
+    def boom(_b):
+        raise RuntimeError("vision exploded")
+
+    monkeypatch.setattr("immy.process.faces_mod.detect", boom)
+
+    results = process_mod.process_trip(
+        target, conn, LIB,
+        compute_derivatives=True, compute_clip=False, compute_faces=True,
+    )
+    assert results[0].faces_detected == 0  # soft-skip
+
+
+def test_process_trip_faces_skips_when_no_detections(tmp_path: Path, monkeypatch):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: _fake_derivative(
+            tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
+        ),
+    )
+    monkeypatch.setattr("immy.process.faces_mod.detect", lambda b: ([], 1440, 960))
+    # embed must not be called when detect returns empty
+    monkeypatch.setattr(
+        "immy.process.faces_mod.embed_faces",
+        lambda *a, **kw: (_ for _ in ()).throw(AssertionError("should not run")),
+    )
+
+    results = process_mod.process_trip(
+        target, conn, LIB,
+        compute_derivatives=True, compute_clip=False, compute_faces=True,
+    )
+    assert results[0].faces_detected == 0
+    sqls = [c.args[0] for c in cur.execute.call_args_list]
+    assert not any("INSERT INTO asset_face" in s for s in sqls)
+
+
+def test_write_marker_records_faces_count(tmp_path: Path):
+    results = [
+        process_mod.ProcessResult(
+            asset_id="id-1", container_path="/x/a.jpg", inserted=True,
+            faces_detected=3,
+        ),
+        process_mod.ProcessResult(
+            asset_id="id-2", container_path="/x/b.jpg", inserted=True,
+        ),
+    ]
+    marker = process_mod.write_marker(tmp_path, results)
+    payload = yaml.safe_load(marker.read_text())
+    assert payload["faces_detected"] == 3
+    assert payload["assets"][0].get("faces_detected") == 3
+    assert "faces_detected" not in payload["assets"][1]
+
+
 def test_write_marker_records_clip_embedded_count(tmp_path: Path):
     results = [
         process_mod.ProcessResult(

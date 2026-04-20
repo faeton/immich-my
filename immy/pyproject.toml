@@ -13,6 +13,10 @@ dependencies = [
     "pyvips>=2.2",
     "numpy>=1.26",
     "mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c ; sys_platform == 'darwin' and platform_machine == 'arm64'",
+    "onnxruntime>=1.18",
+    "insightface>=0.7.3",
+    "opencv-python-headless>=4.9",
+    "pyobjc-framework-Vision>=10.0 ; sys_platform == 'darwin'",
 ]
 
 [project.scripts]

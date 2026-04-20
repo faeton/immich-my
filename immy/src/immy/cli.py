@@ -715,6 +715,10 @@ def process(
         True, "--with-clip/--no-clip",
         help="Y.3 — compute CLIP embedding on the staged preview, upsert smart_search (default on, requires --with-derivatives).",
     ),
+    with_faces: bool = typer.Option(
+        True, "--with-faces/--no-faces",
+        help="Y.4 — Vision face detection + ArcFace embeddings, write asset_face + face_search (default on, requires --with-derivatives).",
+    ),
     transcode_videos: bool = typer.Option(
         True, "--transcode/--no-transcode",
         help="Y.5 — emit a web-playable mp4 (libx264 720p, CRF 23) when the source isn't already h264/aac/mp4 ≤720p. Off → source plays only if the browser supports it.",
@@ -793,6 +797,12 @@ def process(
             "[yellow]note:[/yellow] --with-clip needs derivatives (CLIP runs "
             "on the preview file). Skipping CLIP this run."
         )
+    compute_faces = with_faces and compute
+    if with_faces and not compute:
+        console.print(
+            "[yellow]note:[/yellow] --with-faces needs derivatives (faces run "
+            "on the preview file). Skipping faces this run."
+        )
     clip_model = (
         config.ml.clip_model if config.ml is not None else clip_mod.DEFAULT_MODEL
     )
@@ -801,6 +811,7 @@ def process(
             folder, conn, library,
             compute_derivatives=compute,
             compute_clip=compute_clip,
+            compute_faces=compute_faces,
             transcode_videos=transcode_videos,
             clip_model=clip_model,
         )
@@ -818,9 +829,11 @@ def process(
     existed = len(results) - new_count
     derivs = sum(len(r.derivatives) for r in results if r.derivatives)
     clipped = sum(1 for r in results if r.clip_embedded)
+    face_count = sum(r.faces_detected for r in results)
     process_mod.write_marker(folder, results)
     tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
     tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
+    tail += f", [cyan]{face_count} face(s)[/cyan]" if face_count else ""
     console.print(
         f"[green]✓[/green] {new_count} new asset(s), "
         f"[dim]{existed} already present[/dim]{tail}  "

@@ -147,7 +147,18 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
     tty_out = getattr(sys.stdout, "buffer", None)
     is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
     if tty_out is None or not is_tty:
-        return subprocess.run(args, capture_output=True, text=True, check=True)
+        proc = subprocess.run(args, capture_output=True, text=True)
+        if proc.returncode != 0:
+            # Surface rsync's own complaint — otherwise callers see only the
+            # exit code and have to re-run manually to diagnose (we hit this
+            # during the bolivia promote: exit 255 with no visible reason).
+            sys.stderr.write(proc.stderr)
+            sys.stderr.flush()
+            raise subprocess.CalledProcessError(
+                proc.returncode, args,
+                output=proc.stdout, stderr=proc.stderr,
+            )
+        return proc
 
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
