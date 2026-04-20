@@ -224,10 +224,17 @@ def _rsync_derivatives(src_root: Path, host_root: str) -> subprocess.CompletedPr
     directly inside it). `host_root` may be local (`/volume1/...` over
     SMB) or remote (`user@host:/volume1/...`). Missing destination
     parents are the caller's setup — matches `rsync()` above.
+
+    Uses `-rt` instead of `-a` so we don't try to chmod/chown existing
+    destination dirs: Immich's container runs as root and pre-creates
+    `thumbs/<userId>/` as root:root with drwxrwxrwx. We just need new
+    files to land there; preserving source perms would ask the server
+    to chmod a root-owned dir and fail with EPERM. Modes for newly
+    created files fall back to the user's umask (fine — Immich reads).
     """
     src = f"{str(src_root).rstrip('/')}/"
     dst = host_root if ":" in host_root else f"{host_root.rstrip('/')}/"
-    args = ["rsync", "-a", "--itemize-changes", src, dst]
+    args = ["rsync", "-rt", "--itemize-changes", src, dst]
     return subprocess.run(args, capture_output=True, text=True, check=True)
 
 
