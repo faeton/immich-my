@@ -24,7 +24,7 @@ import subprocess
 
 from . import pg as pg_mod
 from .config import Config
-from .derivatives import DERIVATIVES_DIR, THUMBS_SUBDIR
+from .derivatives import DERIVATIVES_DIR
 from .exif import iter_media, read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
@@ -288,7 +288,13 @@ def _rsync_derivatives(src_root: Path, host_root: str) -> subprocess.CompletedPr
     """
     src = f"{str(src_root).rstrip('/')}/"
     dst = host_root if ":" in host_root else f"{host_root.rstrip('/')}/"
-    args = ["rsync", "-rt", "--itemize-changes", "--progress", src, dst]
+    args = [
+        "rsync", "-rt", "--itemize-changes", "--progress",
+        # `_posters/` is our local scratch (video poster JPEGs we feed
+        # to pyvips); Immich never reads it, so don't pollute the NAS.
+        "--exclude", "_posters/", "--exclude", "_posters/**",
+        src, dst,
+    ]
     return _run_streaming(args)
 
 
@@ -309,7 +315,7 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
             "rows_written": 0,
         }
 
-    staged = plan.folder / AUDIT_DIR / DERIVATIVES_DIR / THUMBS_SUBDIR
+    staged_root = plan.folder / AUDIT_DIR / DERIVATIVES_DIR
     file_specs: list[dict] = []
     for asset in marker.get("assets") or []:
         derivs = asset.get("derivatives") or []
@@ -324,15 +330,15 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
 
     if not file_specs:
         return {"status": "empty", "detail": "no derivatives in marker", "rows_written": 0}
-    if not staged.is_dir():
+    if not staged_root.is_dir():
         return {
             "status": "error",
-            "detail": f"marker lists derivatives but {staged} is missing",
+            "detail": f"marker lists derivatives but {staged_root} is missing",
             "rows_written": 0,
         }
 
     try:
-        _rsync_derivatives(staged.parent, config.media.host_root)
+        _rsync_derivatives(staged_root, config.media.host_root)
     except subprocess.CalledProcessError as e:
         return {
             "status": "error",

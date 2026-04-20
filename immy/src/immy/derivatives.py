@@ -1,22 +1,23 @@
-"""Phase Y.2 — thumbnail + preview generation via pyvips (libvips).
+"""Phase Y.2 / Y.5 — thumbnail + preview generation via pyvips (libvips),
+plus video poster + optional transcode via ffmpeg.
 
 Immich's Node worker uses Sharp; Sharp wraps libvips, so we get matching
-output by calling libvips directly. See docs/IMMICH-INGEST.md §4.2 for the
-parameters: 250 px WebP q80 (thumbnail), 1440 px JPEG q80 progressive
-(preview).
+output for stills by calling libvips directly. See docs/IMMICH-INGEST.md
+§4.2 / §4.5 for the parameters: 250 px WebP q80 (thumbnail), 1440 px
+JPEG q80 progressive (preview). For videos we extract a single-frame
+poster via ffmpeg and feed that through the exact same pyvips resize.
 
 Output layout mirrors what Immich writes so the push step is a plain
-rsync into `<media.host_root>/thumbs/`:
+rsync into `<media.host_root>/`:
 
     .audit/derivatives/thumbs/<userId>/<id[0:2]>/<id[2:4]>/<id>_thumbnail.webp
     .audit/derivatives/thumbs/<userId>/<id[0:2]>/<id[2:4]>/<id>_preview.jpeg
+    .audit/derivatives/encoded-video/<userId>/<id[0:2]>/<id[2:4]>/<id>.mp4
 
 After rsync, the `asset_file.path` we INSERT is
-`<media.container_root>/thumbs/<userId>/<...>/<id>_*` — same relative
-layout under a different root.
-
-Videos (Y.5) are out of scope here; `compute_for_asset` is a no-op for
-asset_type='VIDEO'.
+`<media.container_root>/thumbs/<userId>/<...>/<id>_*` (same relative
+layout under a different root). The transcoded mp4 lands at
+`<media.container_root>/encoded-video/<userId>/<...>/<id>.mp4`.
 """
 
 from __future__ import annotations
@@ -27,6 +28,8 @@ from typing import Literal
 
 import pyvips
 
+from . import video as video_mod
+
 
 THUMBNAIL_WIDTH = 250
 PREVIEW_WIDTH = 1440
@@ -34,20 +37,23 @@ QUALITY = 80
 
 DERIVATIVES_DIR = "derivatives"
 THUMBS_SUBDIR = "thumbs"
+ENCODED_VIDEO_SUBDIR = "encoded-video"
 
-FileKind = Literal["thumbnail", "preview"]
+FileKind = Literal["thumbnail", "preview", "encoded_video"]
 
 
 @dataclass(frozen=True)
 class DerivativeFile:
     """One derivative output — what we staged and what the DB row should say.
 
-    - `kind` — `asset_file.type` value.
+    - `kind` — `asset_file.type` value (`thumbnail` | `preview` |
+      `encoded_video`).
     - `staged_path` — absolute path on the Mac under `.audit/derivatives/`.
       Rsync source.
-    - `relative_path` — the `thumbs/<userId>/.../<id>_*` suffix. Stays
-      identical on both sides of the rsync; the push step builds the
-      container path by prepending `media.container_root`.
+    - `relative_path` — the `thumbs/<userId>/.../<id>_*` or
+      `encoded-video/<userId>/.../<id>.mp4` suffix. Stays identical on
+      both sides of the rsync; the push step builds the container path
+      by prepending `media.container_root`.
     - `is_progressive` / `is_transparent` — go straight into `asset_file`.
     """
 
@@ -61,18 +67,24 @@ class DerivativeFile:
 @dataclass(frozen=True)
 class DerivativeResult:
     """Per-asset output of `compute_for_asset`: staged files plus the
-    source-image dimensions we picked up from libvips.
+    source-image dimensions we picked up from libvips/ffprobe.
 
     Immich's own pipeline writes `asset.width`/`asset.height` from the
     *decoded* image (respecting EXIF orientation), not from the EXIF
     width/height tags — that's what the web viewer uses for layout and
-    fullscreen scaling. We surface those here so `process.py` can UPDATE
-    the `asset` row in the same transaction that creates the derivatives.
+    fullscreen scaling. For videos we use ffprobe + rotation side-data
+    so portrait iPhone clips report portrait dims.
+
+    `duration` is non-None only for videos; surfaced so `process.py`
+    can overwrite an EXIF-derived `asset.duration` with the ffprobe
+    value when they disagree (ffprobe wins — it reads the container
+    directly instead of guessing from QuickTime tags).
     """
 
     files: list[DerivativeFile]
     width: int | None
     height: int | None
+    duration: str | None = None
 
 
 def _bucket(asset_id: str) -> tuple[str, str]:
@@ -82,13 +94,18 @@ def _bucket(asset_id: str) -> tuple[str, str]:
 def relative_path_for(
     asset_id: str, owner_id: str, kind: FileKind,
 ) -> str:
-    """Return the `thumbs/<userId>/<xx>/<yy>/<id>_<kind>.<ext>` suffix.
+    """Return the staged-relative path for a given derivative kind.
+
+    - `thumbnail`/`preview` → `thumbs/<userId>/<xx>/<yy>/<id>_<kind>.<ext>`
+    - `encoded_video` → `encoded-video/<userId>/<xx>/<yy>/<id>.mp4`
 
     Same string on Mac (under `.audit/derivatives/`) and on NAS (under
     `<media.host_root>/` → container's `<media.container_root>/`).
     """
-    ext = "webp" if kind == "thumbnail" else "jpeg"
     a, b = _bucket(asset_id)
+    if kind == "encoded_video":
+        return f"{ENCODED_VIDEO_SUBDIR}/{owner_id}/{a}/{b}/{asset_id}.mp4"
+    ext = "webp" if kind == "thumbnail" else "jpeg"
     return f"{THUMBS_SUBDIR}/{owner_id}/{a}/{b}/{asset_id}_{kind}.{ext}"
 
 
@@ -111,38 +128,23 @@ def _write_preview(src: Path, dst: Path) -> None:
     image.jpegsave(str(dst), Q=QUALITY, interlace=True, strip=True)
 
 
-def compute_for_asset(
-    *,
-    source_media: Path,
-    asset_id: str,
-    owner_id: str,
-    asset_type: str,
-    trip_folder: Path,
-) -> DerivativeResult:
-    """Write thumbnail + preview for one IMAGE asset.
+def _image_dims_and_stills(
+    source_media: Path, asset_id: str, owner_id: str, base: Path,
+) -> tuple[list[DerivativeFile], int, int]:
+    """IMAGE branch: decode once via libvips (autorot), emit two stills.
 
-    Returns staged derivatives plus decoded dimensions (width/height
-    after EXIF-orientation auto-rotation — matching what Sharp reports
-    to Immich). For VIDEO we return an empty result (Y.5 handles video
-    proxies separately). Raises `pyvips.Error` on decode failure —
-    caller decides whether to skip or abort.
+    libvips is lazy — `autorot` only rewrites metadata until a save
+    forces evaluation, so reading `.width`/`.height` is cheap even for
+    huge originals. Sharp (Immich's stack) applies the same auto-
+    rotation, which is why we surface the *rotated* dims for
+    `asset.width`/`asset.height`.
     """
-    if asset_type != "IMAGE":
-        return DerivativeResult(files=[], width=None, height=None)
-
-    base = staged_dir(trip_folder)
-    files: list[DerivativeFile] = []
-
-    # Read original dimensions once, autorotating per EXIF:Orientation so
-    # the reported w/h matches what Immich's viewer expects after the
-    # preview gets rendered. libvips is lazy — autorot only rewrites
-    # metadata, not pixels, until a save forces evaluation, so this is
-    # cheap even for huge originals.
     src_img = pyvips.Image.new_from_file(str(source_media), access="sequential")
     src_img = src_img.autorot()
     width = int(src_img.width)
     height = int(src_img.height)
 
+    files: list[DerivativeFile] = []
     for kind in ("thumbnail", "preview"):
         rel = relative_path_for(asset_id, owner_id, kind)
         dst = base / rel
@@ -157,12 +159,101 @@ def compute_for_asset(
             is_progressive=(kind == "preview"),
             is_transparent=False,
         ))
-    return DerivativeResult(files=files, width=width, height=height)
+    return files, width, height
+
+
+def _video_stills_and_transcode(
+    source_media: Path, asset_id: str, owner_id: str, base: Path,
+    *, transcode: bool,
+) -> tuple[list[DerivativeFile], int, int, str | None]:
+    """VIDEO branch: ffprobe → poster → two stills via pyvips (+ optional
+    transcode). Returns (files, width, height, duration).
+
+    The poster is a temp JPEG inside `.audit/derivatives/` that we feed
+    to the same `_write_thumbnail` / `_write_preview` helpers used for
+    still assets — keeps the tile appearance identical regardless of
+    asset type. Poster itself is left on disk (cheap, aids debug) but
+    we don't insert an `asset_file` row for it.
+    """
+    info = video_mod.probe(source_media)
+    duration_str = (
+        video_mod.format_duration(info.duration_s)
+        if info.duration_s is not None else None
+    )
+
+    poster = base / "_posters" / f"{asset_id}.jpg"
+    video_mod.extract_poster(source_media, poster, duration_s=info.duration_s)
+
+    files: list[DerivativeFile] = []
+    for kind in ("thumbnail", "preview"):
+        rel = relative_path_for(asset_id, owner_id, kind)
+        dst = base / rel
+        if kind == "thumbnail":
+            _write_thumbnail(poster, dst)
+        else:
+            _write_preview(poster, dst)
+        files.append(DerivativeFile(
+            kind=kind,
+            staged_path=dst,
+            relative_path=rel,
+            is_progressive=(kind == "preview"),
+            is_transparent=False,
+        ))
+
+    if transcode and video_mod.needs_transcode(info):
+        rel = relative_path_for(asset_id, owner_id, "encoded_video")
+        dst = base / rel
+        video_mod.transcode(source_media, dst)
+        files.append(DerivativeFile(
+            kind="encoded_video",
+            staged_path=dst,
+            relative_path=rel,
+            is_progressive=False,
+            is_transparent=False,
+        ))
+
+    return files, info.width, info.height, duration_str
+
+
+def compute_for_asset(
+    *,
+    source_media: Path,
+    asset_id: str,
+    owner_id: str,
+    asset_type: str,
+    trip_folder: Path,
+    transcode_videos: bool = True,
+) -> DerivativeResult:
+    """Stage thumbnail + preview (and for videos, optional encoded_video)
+    for one asset.
+
+    Returns staged derivatives plus decoded dimensions (rotated per EXIF
+    orientation for stills, per ffprobe `side_data_list[].rotation` for
+    videos — matching what Immich's own pipeline reports). `duration`
+    is only set for videos. Raises on decode/probe/transcode failure —
+    caller decides whether to skip or abort.
+    """
+    base = staged_dir(trip_folder)
+
+    if asset_type == "IMAGE":
+        files, w, h = _image_dims_and_stills(
+            source_media, asset_id, owner_id, base,
+        )
+        return DerivativeResult(files=files, width=w, height=h, duration=None)
+
+    if asset_type == "VIDEO":
+        files, w, h, dur = _video_stills_and_transcode(
+            source_media, asset_id, owner_id, base,
+            transcode=transcode_videos,
+        )
+        return DerivativeResult(files=files, width=w, height=h, duration=dur)
+
+    return DerivativeResult(files=[], width=None, height=None, duration=None)
 
 
 __all__ = [
     "DerivativeFile", "DerivativeResult",
     "THUMBNAIL_WIDTH", "PREVIEW_WIDTH", "QUALITY",
-    "DERIVATIVES_DIR", "THUMBS_SUBDIR",
+    "DERIVATIVES_DIR", "THUMBS_SUBDIR", "ENCODED_VIDEO_SUBDIR",
     "compute_for_asset", "relative_path_for", "staged_dir",
 ]

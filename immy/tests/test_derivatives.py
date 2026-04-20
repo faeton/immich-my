@@ -118,22 +118,139 @@ def test_compute_thumbnail_width_is_250(tmp_path: Path):
     assert (result.width, result.height) == (2000, 1500)
 
 
-def test_compute_skips_videos(tmp_path: Path):
+def test_compute_skips_unknown_types(tmp_path: Path):
     trip = tmp_path / "trip"
     trip.mkdir()
-    src = trip / "v.mp4"
-    src.write_bytes(b"not a real video")
+    src = trip / "weird.xyz"
+    src.write_bytes(b"idk")
 
     result = derivatives_mod.compute_for_asset(
         source_media=src,
         asset_id="id",
         owner_id="u",
-        asset_type="VIDEO",
+        asset_type="OTHER",
         trip_folder=trip,
     )
     assert result.files == []
     assert result.width is None
     assert result.height is None
+
+
+def test_compute_video_stages_poster_stills_and_transcode(
+    tmp_path: Path, monkeypatch,
+):
+    """VIDEO branch: probe + poster + stills + optional transcode.
+
+    We stub `video.probe`, `video.extract_poster`, and `video.transcode`
+    so the test stays hermetic (no ffmpeg invoked). The poster stub
+    writes a real PNG so pyvips can resize it into thumb/preview."""
+    from immy import video as video_mod
+
+    trip = tmp_path / "trip"
+    trip.mkdir()
+    src = trip / "v.mp4"
+    src.write_bytes(b"placeholder")
+
+    fake_info = video_mod.VideoInfo(
+        width=1920, height=1080, duration_s=12.5,
+        video_codec="hevc", audio_codec="aac", container_ext=".mp4",
+    )
+    monkeypatch.setattr(video_mod, "probe", lambda p: fake_info)
+
+    def fake_poster(src_p: Path, dst_p: Path, *, duration_s):
+        dst_p.parent.mkdir(parents=True, exist_ok=True)
+        _make_png(dst_p, width=1920, height=1080)
+    monkeypatch.setattr(video_mod, "extract_poster", fake_poster)
+
+    transcode_calls: list[tuple[Path, Path]] = []
+    def fake_transcode(src_p: Path, dst_p: Path):
+        dst_p.parent.mkdir(parents=True, exist_ok=True)
+        dst_p.write_bytes(b"fake-mp4")
+        transcode_calls.append((src_p, dst_p))
+    monkeypatch.setattr(video_mod, "transcode", fake_transcode)
+
+    result = derivatives_mod.compute_for_asset(
+        source_media=src,
+        asset_id="abcd1234-ffff-4000-8000-000000000000",
+        owner_id="u",
+        asset_type="VIDEO",
+        trip_folder=trip,
+        transcode_videos=True,
+    )
+    kinds = {d.kind for d in result.files}
+    assert kinds == {"thumbnail", "preview", "encoded_video"}
+    assert result.width == 1920
+    assert result.height == 1080
+    assert result.duration == "00:00:12.500"
+    encoded = next(d for d in result.files if d.kind == "encoded_video")
+    assert encoded.staged_path.is_file()
+    assert encoded.relative_path.startswith("encoded-video/u/ab/cd/")
+    assert len(transcode_calls) == 1
+
+
+def test_compute_video_skips_transcode_for_web_safe_source(
+    tmp_path: Path, monkeypatch,
+):
+    from immy import video as video_mod
+
+    trip = tmp_path / "trip"; trip.mkdir()
+    src = trip / "v.mp4"; src.write_bytes(b"x")
+
+    fake_info = video_mod.VideoInfo(
+        width=1280, height=720, duration_s=3.0,
+        video_codec="h264", audio_codec="aac", container_ext=".mp4",
+    )
+    monkeypatch.setattr(video_mod, "probe", lambda p: fake_info)
+    def _poster(s, d, *, duration_s):
+        d.parent.mkdir(parents=True, exist_ok=True)
+        _make_png(d, 1280, 720)
+    monkeypatch.setattr(video_mod, "extract_poster", _poster)
+
+    called = []
+    monkeypatch.setattr(video_mod, "transcode",
+                        lambda s, d: called.append((s, d)))
+
+    result = derivatives_mod.compute_for_asset(
+        source_media=src,
+        asset_id="abcd1234-ffff-4000-8000-000000000001",
+        owner_id="u",
+        asset_type="VIDEO",
+        trip_folder=trip,
+        transcode_videos=True,
+    )
+    # Only the two stills — source is already web-safe.
+    assert {d.kind for d in result.files} == {"thumbnail", "preview"}
+    assert called == []
+
+
+def test_compute_video_no_transcode_flag_respected(
+    tmp_path: Path, monkeypatch,
+):
+    from immy import video as video_mod
+
+    trip = tmp_path / "trip"; trip.mkdir()
+    src = trip / "v.mkv"; src.write_bytes(b"x")
+
+    fake_info = video_mod.VideoInfo(
+        width=3840, height=2160, duration_s=5.0,
+        video_codec="hevc", audio_codec="aac", container_ext=".mkv",
+    )
+    monkeypatch.setattr(video_mod, "probe", lambda p: fake_info)
+    def _poster2(s, d, *, duration_s):
+        d.parent.mkdir(parents=True, exist_ok=True)
+        _make_png(d, 3840, 2160)
+    monkeypatch.setattr(video_mod, "extract_poster", _poster2)
+    calls = []
+    monkeypatch.setattr(video_mod, "transcode",
+                        lambda s, d: calls.append(d))
+
+    result = derivatives_mod.compute_for_asset(
+        source_media=src, asset_id="aa" + "0" * 34,
+        owner_id="u", asset_type="VIDEO", trip_folder=trip,
+        transcode_videos=False,
+    )
+    assert {d.kind for d in result.files} == {"thumbnail", "preview"}
+    assert calls == []
 
 
 # --- process_trip integration --------------------------------------------

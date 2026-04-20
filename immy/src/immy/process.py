@@ -325,6 +325,12 @@ SET width = %(width)s, height = %(height)s
 WHERE id = %(id)s
 """
 
+_UPDATE_ASSET_DURATION = """
+UPDATE asset
+SET duration = %(duration)s
+WHERE id = %(id)s
+"""
+
 
 def update_asset_dimensions(
     conn: psycopg.Connection, asset_id: str, width: int, height: int,
@@ -341,6 +347,24 @@ def update_asset_dimensions(
         cur.execute(
             _UPDATE_ASSET_DIMS,
             {"id": asset_id, "width": width, "height": height},
+        )
+
+
+def update_asset_duration(
+    conn: psycopg.Connection, asset_id: str, duration: str,
+) -> None:
+    """Overwrite `asset.duration` with the ffprobe value.
+
+    The initial INSERT guesses duration from `QuickTime:Duration` when
+    ExifTool surfaces it, but some containers (.mts, .avi, repaired
+    .mp4s, DJI `.lrv` proxies) either lack the tag or emit a wrong
+    one. ffprobe reads the actual container, so once derivatives run
+    we let it win.
+    """
+    with conn.cursor() as cur:
+        cur.execute(
+            _UPDATE_ASSET_DURATION,
+            {"id": asset_id, "duration": duration},
         )
 
 
@@ -377,6 +401,7 @@ def process_trip(
     *,
     compute_derivatives: bool = False,
     compute_clip: bool = False,
+    transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
     on_derivative_error: str = "skip",  # 'skip' | 'raise'
     on_clip_error: str = "skip",        # 'skip' | 'raise'
@@ -414,7 +439,7 @@ def process_trip(
         inserted = insert_asset(conn, asset, exif)
         derivs: list[DerivativeFile] | None = None
         clip_embedded = False
-        if compute_derivatives and inserted and asset.asset_type == "IMAGE":
+        if compute_derivatives and inserted and asset.asset_type in ("IMAGE", "VIDEO"):
             try:
                 result = derivatives_mod.compute_for_asset(
                     source_media=exif_row.path,
@@ -422,6 +447,7 @@ def process_trip(
                     owner_id=library.owner_id,
                     asset_type=asset.asset_type,
                     trip_folder=trip_folder,
+                    transcode_videos=transcode_videos,
                 )
                 derivs = result.files
                 if result.width is not None and result.height is not None:
@@ -429,6 +455,9 @@ def process_trip(
                         conn, asset.id, result.width, result.height,
                     )
                     asset.width, asset.height = result.width, result.height
+                if result.duration is not None and result.duration != asset.duration:
+                    update_asset_duration(conn, asset.id, result.duration)
+                    asset.duration = result.duration
             except Exception:
                 if on_derivative_error == "raise":
                     raise

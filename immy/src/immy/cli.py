@@ -715,6 +715,10 @@ def process(
         True, "--with-clip/--no-clip",
         help="Y.3 — compute CLIP embedding on the staged preview, upsert smart_search (default on, requires --with-derivatives).",
     ),
+    transcode_videos: bool = typer.Option(
+        True, "--transcode/--no-transcode",
+        help="Y.5 — emit a web-playable mp4 (libx264 720p, CRF 23) when the source isn't already h264/aac/mp4 ≤720p. Off → source plays only if the browser supports it.",
+    ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
 ) -> None:
     """Phase Y.1/Y.2 — insert asset + asset_exif rows for every media file
@@ -797,6 +801,7 @@ def process(
             folder, conn, library,
             compute_derivatives=compute,
             compute_clip=compute_clip,
+            transcode_videos=transcode_videos,
             clip_model=clip_model,
         )
         conn.commit()
