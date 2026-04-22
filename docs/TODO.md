@@ -69,6 +69,26 @@ Not shipped yet.
 - Album naming from reverse geocoding
 - Idempotent album create/update flow
 
+### Pipeline optimizations
+
+Shipped:
+- `immy process TRIP1 TRIP2 …` — MLX/InsightFace/Whisper load once per
+  batch instead of per-trip invocation. Per-trip commit boundary keeps
+  earlier trips durable through Ctrl-C / a later-trip failure.
+- Caption resume on the online path — skip the VLM when
+  `asset_exif.description` is already AI-prefixed. `--recaption` forces.
+- DNG embedded-preview fast path — `exiftool -b -JpgFromRaw` /
+  `-PreviewImage` into libvips. ~3.5× on DJI DNG derivatives vs going
+  through libraw's init on every call.
+
+Deferred:
+- Batched CLIP + face embeddings — collect previews trip-wide, run MLX
+  CLIP and ArcFace in batches of ~16. Would be 2–3× on CLIP/faces, but
+  those together are <5 % of overnight wall time once captions are on
+  (Gemma ≈ 9.5 s/image dominates). Worth revisiting if we move
+  captioning off-device (cloud VLMs are ~0.5 s/image) or run a
+  caption-off pipeline at scale.
+
 ## Planned
 
 ### Phase 5 — Metadata gap-fill UI
