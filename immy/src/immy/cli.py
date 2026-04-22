@@ -13,10 +13,12 @@ from . import bloat as bloat_mod
 from . import captions as captions_mod
 from . import clip as clip_mod
 from . import clustering as clustering_mod
+from . import duplicates as duplicates_mod
 from . import offline as offline_mod
 from . import process as process_mod
 from . import promote as promote_mod
 from . import pg as pg_mod
+from . import snapshot as snapshot_mod
 from . import transcripts as transcripts_mod
 from .config import load as load_config
 from .exif import has_gps, read_folder
@@ -1586,6 +1588,187 @@ def cluster(
     console.print(
         f"\n[green]✓[/green] {created} album(s) created, "
         f"{updated} updated, {added_assets_total} asset-link(s) added"
+    )
+
+
+@app.command("snapshot")
+def snapshot(
+    out: Path = typer.Option(
+        Path.home() / ".immy" / "library-snapshot.sqlite", "--out",
+        help="Where to write the SQLite snapshot.",
+    ),
+    library_id: str = typer.Option(
+        None, "--library",
+        help="Restrict snapshot to a single library UUID (default: all).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
+) -> None:
+    """Dump the Immich library index into a portable SQLite file.
+
+    One row per asset: `(asset_id, filename, size, checksum, taken_at,
+    type, library_id)`. Ships everything needed to answer "is this file
+    already in Immich?" from any other machine, with no network access.
+
+    Foundation for `immy find-duplicates` and (eventually) the Apple Photos
+    importer. Read-only on Immich — safe to run anytime, including against
+    a production DB during a scan.
+    """
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red]")
+        raise typer.Exit(code=2)
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"[bold]snapshot[/bold] {config.pg.host}:{config.pg.port}/{config.pg.database}"
+        f" → [cyan]{out}[/cyan]"
+    )
+    db = snapshot_mod.create(out)
+    try:
+        count = snapshot_mod.write_rows(
+            db, snapshot_mod.fetch_rows(conn, library_id),
+        )
+        snapshot_mod.write_meta(
+            db,
+            server_host=f"{config.pg.host}:{config.pg.port}",
+            library_id=library_id,
+            asset_count=count,
+        )
+    finally:
+        db.close()
+        conn.close()
+
+    size_mb = out.stat().st_size / (1024 * 1024)
+    console.print(
+        f"  [green]✓[/green] {count:,} asset(s) → "
+        f"{size_mb:.1f} MB at [cyan]{out}[/cyan]"
+    )
+
+
+@app.command("find-duplicates")
+def find_duplicates(
+    path: Path = typer.Argument(..., help="Directory to scan."),
+    snapshot_path: Path = typer.Option(
+        Path.home() / ".immy" / "library-snapshot.sqlite", "--snapshot",
+        help="SQLite snapshot produced by `immy snapshot`.",
+    ),
+    out: Path = typer.Option(
+        None, "--out",
+        help="Markdown report path (default: <path>/dupes.md). JSON lands next "
+             "to it with the same stem.",
+    ),
+    fast: bool = typer.Option(
+        False, "--fast",
+        help="Skip SHA1 verification; name+size match lands as `likely`.",
+    ),
+    thorough: bool = typer.Option(
+        False, "--thorough",
+        help="Hash every file, catching renames. Slow — reads the whole tree.",
+    ),
+    min_size: int = typer.Option(
+        duplicates_mod.DEFAULT_MIN_SIZE, "--min-size",
+        help="Skip files smaller than this many bytes (default: 0).",
+    ),
+    ignore: list[str] = typer.Option(
+        None, "--ignore",
+        help="Extra glob(s) to ignore (repeatable). Defaults already cover "
+             ".DS_Store, Thumbs.db, etc.",
+    ),
+    follow_symlinks: bool = typer.Option(
+        False, "--follow-symlinks",
+        help="Follow symlinks during the walk. Default off (loops + "
+             "Time Machine snapshots).",
+    ),
+    into_bundles: bool = typer.Option(
+        False, "--into-bundles",
+        help="Descend into macOS bundles (*.photoslibrary, *.app). Off by "
+             "default — usually slow and not useful.",
+    ),
+) -> None:
+    """Report which files under PATH are already in the Immich snapshot.
+
+    Tiers:
+      - exact      — name + size + SHA1 match  (safe to delete locally)
+      - likely     — name + size match, hash not checked / unavailable
+      - name-only  — filename matches but size differs  (investigate)
+      - no-match   — not in Immich  (candidates for ingest)
+
+    Defaults are biased for speed on big backup disks: we only read file
+    contents when `(name, size)` already matches. Pass `--thorough` to
+    also catch renames (slow: reads the whole tree).
+    """
+    if fast and thorough:
+        console.print("[red]--fast and --thorough are mutually exclusive[/red]")
+        raise typer.Exit(code=2)
+
+    if not snapshot_path.exists():
+        console.print(
+            f"[red]snapshot not found:[/red] {snapshot_path}\n"
+            "Run `immy snapshot` first (needs Immich DB access)."
+        )
+        raise typer.Exit(code=2)
+
+    if not path.exists() or not path.is_dir():
+        console.print(f"[red]not a directory:[/red] {path}")
+        raise typer.Exit(code=2)
+
+    hash_mode = (
+        duplicates_mod.HashMode.FAST if fast
+        else duplicates_mod.HashMode.THOROUGH if thorough
+        else duplicates_mod.HashMode.ON_MATCH
+    )
+
+    extra_ignore = tuple(ignore) if ignore else ()
+    ignore_globs = duplicates_mod.DEFAULT_IGNORE_GLOBS + extra_ignore
+
+    # Progress feedback. Rich's Live output would be nicer but a simple
+    # tick-every-500 keeps the scan loop tight and pipe-friendly.
+    counter = {"n": 0}
+
+    def _tick(p: Path, r: duplicates_mod.ScanResult) -> None:
+        counter["n"] += 1
+        if counter["n"] % 500 == 0:
+            console.print(
+                f"  [dim]…{counter['n']:,} files scanned[/dim]",
+                highlight=False,
+            )
+
+    console.print(
+        f"[bold]find-duplicates[/bold] {path} "
+        f"[dim](mode: {hash_mode.value}, snapshot: {snapshot_path})[/dim]"
+    )
+    summary = duplicates_mod.scan(
+        path, snapshot_path,
+        hash_mode=hash_mode,
+        ignore_globs=ignore_globs,
+        min_size=min_size,
+        follow_symlinks=follow_symlinks,
+        into_bundles=into_bundles,
+        progress=_tick,
+    )
+
+    report_md = out if out else (path / "dupes.md")
+    report_md.parent.mkdir(parents=True, exist_ok=True)
+    report_md.write_text(duplicates_mod.render_markdown(summary, path))
+    report_json = report_md.with_suffix(".json")
+    import json as _json
+    report_json.write_text(_json.dumps(
+        duplicates_mod.to_json_rows(summary), indent=2,
+    ))
+
+    console.print()
+    for v in duplicates_mod.Verdict:
+        console.print(
+            f"  {v.value:<10} {summary.count(v):>6,} files"
+        )
+    console.print(
+        f"\n[green]✓[/green] report: [cyan]{report_md}[/cyan] "
+        f"(+ {report_json.name})"
     )
 
 

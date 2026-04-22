@@ -89,6 +89,26 @@ Remaining:
   - version strings are `clip:<model>`, `caption:<model>`, etc., so
     bumping a model invalidates only that worker's entries
 
+### Phase 7 — External library matching
+
+- [x] `immy snapshot` — dump Immich library index (asset_id, filename,
+  size, SHA1, taken_at, type, library_id) to `~/.immy/library-snapshot.sqlite`.
+  Read-only on Immich; uses a server-side cursor so 100k+ libraries stream
+  without buffering. Checksum stored as raw 20-byte BLOB (~40% vs base64).
+- [x] `immy find-duplicates <path>` — walk any directory tree, classify
+  every file as `exact` / `likely` / `name-only` / `no-match` against the
+  snapshot. Default mode hashes only when `(name, size)` already matched —
+  keeps terabytes from being read for nothing. `--fast` skips hashing
+  entirely; `--thorough` hashes everything and catches pure renames via
+  checksum lookup. Skips macOS bundles by default; `--into-bundles`
+  descends. Writes `dupes.md` (human) + `dupes.json` (scripting).
+
+Not shipped yet (build spec in [/PLAN.md](../PLAN.md)):
+- `immy find-similar` — CLIP near-dup finder for re-exports / edits /
+  crops that broke byte-identity. Needs CLIP embeddings in the snapshot.
+- `immy import-apple-people` — read `Photos.sqlite`, seed Immich Person
+  rows with Apple-tagged names, attach face embeddings via snapshot match.
+
 ### Phase 4 — Event clustering
 
 - [x] `immy cluster` — sweep-based clustering on `(dateTimeOriginal,

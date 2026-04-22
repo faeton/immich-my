@@ -27,6 +27,9 @@ The main operational interface is `immy`:
 - `bloat` finds oversized video sources and helps transcode them
 - `process` computes derivatives, CLIP, and faces, then inserts directly into Immich Postgres
 - `promote` uploads a curated trip into the external library and syncs the album
+- `cluster` groups geo-dated assets into events and auto-creates Immich albums
+- `snapshot` dumps the Immich library index to a portable SQLite file
+- `find-duplicates` scans any disk/folder and reports what's already in Immich
 
 Typical development commands:
 
@@ -58,6 +61,9 @@ brew install exiftool ffmpeg vips
 - Thumbnail / preview / encoded-video derivative staging
 - CLIP embeddings and face embeddings during ingest
 - Album sync on promote
+- Event clustering into auto-named albums (`immy cluster`)
+- Portable Immich library snapshot + external-disk duplicate scan
+  (`immy snapshot`, `immy find-duplicates`)
 
 ## Local Setup
 
@@ -176,9 +182,21 @@ Shipped since last README update:
   photos on the cheap cloud tiers, $0 locally (overnight on Apple
   Silicon).
 
+- Event clustering via `immy cluster` — sweep-based `(time, lat, lon)`
+  grouping, auto-named albums from Immich's city/country, idempotent via a
+  marker line in each album's description.
+
+- External-disk matching. `immy snapshot` dumps the Immich library index
+  (filename, size, SHA1, taken-at) into a portable SQLite file. On any
+  other machine, `immy find-duplicates <path>` walks a tree and reports
+  each file as `exact` / `likely` / `name-only` / `no-match` against the
+  snapshot — tells you which backup drive content is already in Immich
+  (safe to delete) vs which is a candidate for ingest. Default mode
+  hashes only on name+size hits; `--thorough` catches pure renames.
+
 Not shipped yet:
-- transcript/caption search plumbing
-- event clustering
+- CLIP-based near-duplicate search (`find-similar`) — see [PLAN.md](PLAN.md)
+- Apple Photos people-name seeding (`import-apple-people`) — [PLAN.md](PLAN.md)
 - metadata gap-fill web UI
 - ghost/offline asset handling
 

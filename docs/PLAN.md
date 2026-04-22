@@ -292,11 +292,38 @@ thumbs, open transcripts and face matches — just not the original file.
 
 ## Phase 7 — Quality of life (ongoing)
 
-- Cross-device near-dup reporter (Immich pHash misses some camera+phone pairs).
+### External library matching — planned
+
+Four-tool bundle for finding "is this file already in Immich?" from any
+external disk, and seeding Immich people from Apple Photos. Full build spec
+in [`/PLAN.md`](../PLAN.md) at the repo root (short-horizon; folded back
+here once shipped).
+
+- `immy snapshot` — dump Immich library index (filename, size, SHA1,
+  optional CLIP embeddings) to a portable SQLite file. Foundation for all
+  three other tools.
+- `immy find-duplicates <path>` — scan a disk/folder, report exact matches
+  (filename + size + optional hash) against the snapshot. Three tiers:
+  `exact` / `likely` / `name-only`. Gives you "safe to delete" vs "needs
+  ingest" lists for backup drives.
+- `immy find-similar <path>` — CLIP near-dup finder for files that aren't
+  byte-identical but are the same photo (re-export, edit, crop). Deferred
+  until 1 + 2 have been in use for a while.
+- `immy import-apple-people` — read `Photos.sqlite`, create Immich Person
+  rows with Apple names, attach face embeddings via filename-matched asset
+  overlap. Assumes `--apply` against Immich REST + direct `asset_faces`
+  updates.
+
+Build order: `snapshot` → `find-duplicates` → `import-apple-people` →
+`find-similar`. First two share the most infra; the Apple importer jumps
+the queue over similarity search because tagging history is high-value and
+reuses the same snapshot.
+
+### Other QoL items
+
 - Export-to-edit: given a date range or album, symlink-package into a working
   dir on the Mac.
 - Hyper Backup job: originals + `pg_dump` of Immich DB to external drive / C2.
-- Face-name pre-seed from Apple Photos people (via `osxphotos` JSON).
 
 ## What's custom vs stock
 
