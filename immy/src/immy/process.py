@@ -36,11 +36,13 @@ from . import captions as captions_mod
 from . import clip as clip_mod
 from . import derivatives as derivatives_mod
 from . import faces as faces_mod
+from . import journal as journal_mod
 from . import offline as offline_mod
 from . import pg as pg_mod
 from . import transcripts as transcripts_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
+from .journal import Journal
 from .offline import Sink
 from .pg import LibraryInfo
 from .state import AUDIT_DIR
@@ -489,6 +491,8 @@ def process_trip(
     on_transcript_error: str = "skip",  # 'skip' | 'raise'
     on_caption_error: str = "skip",     # 'skip' | 'raise'
     progress: Callable[[str], None] | None = None,
+    journal: Journal | None = None,
+    commit_per_asset: bool = True,
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
     per-file results. Caller is responsible for transaction boundaries —
@@ -526,6 +530,24 @@ def process_trip(
         if not compute_derivatives:
             raise ValueError("compute_clip requires compute_derivatives=True")
         expected_dim = sink.clip_dim()
+
+    # Journal anchors per-phase resumability across crashes / Ctrl-C.
+    # On every successful asset insert we drop an "ingest" entry; that
+    # entry is what later runs use to know "we own this asset" once the
+    # ON CONFLICT path returns inserted=False on resume. Without it the
+    # enrichers would skip a half-finished asset because they currently
+    # gate on `inserted`.
+    if journal is None:
+        journal = Journal.load(trip_folder)
+    INGEST_VERSION = "v1"
+    DERIV_VERSION = journal_mod.DERIVATIVES_VERSION
+    CLIP_VERSION = journal_mod.clip_version(clip_model)
+    FACES_VERSION = journal_mod.faces_version(faces_model)
+    TRANSCRIPT_VERSION = journal_mod.transcript_version(transcript_model)
+    CAPTION_VERSION = (
+        journal_mod.caption_version(captioner_config.model)
+        if captioner_config is not None else "caption:none"
+    )
 
     # Per-file progress is opt-in via the `progress` callback. Callers
     # that want a live counter (CLI / batch scripts) pass `console.print`;
@@ -567,12 +589,61 @@ def process_trip(
             lambda: build_rows(exif_row.path, trip_folder, exif_row, library),
             "exif", timings,
         )
+        cs_hex = asset.checksum.hex()
         inserted = _phase(
             lambda: sink.insert_asset_and_exif(asset, exif), "insert", timings,
         )
+        if inserted:
+            journal.mark_done(
+                cs_hex, "ingest", INGEST_VERSION,
+                meta={"asset_id": asset.id},
+            )
+        # `we_own` says "this asset belongs to immy's pipeline." True if
+        # we just inserted, OR if a prior immy run inserted it (recorded
+        # in the journal). Without this, a Ctrl-C between insert-commit
+        # and an enricher would leave assets stranded — the resume run
+        # sees inserted=False and would skip every enricher.
+        we_own = inserted or journal.is_done(cs_hex, "ingest", INGEST_VERSION)
+        # If the journal recorded a prior asset_id from when we inserted
+        # this row in an earlier run, prefer it — `asset.id` is currently
+        # a fresh UUID from build_rows that won't match the DB row.
+        if not inserted and we_own:
+            prior_ingest = journal.get(cs_hex, "ingest")
+            if prior_ingest and prior_ingest.get("meta", {}).get("asset_id"):
+                asset.id = str(prior_ingest["meta"]["asset_id"])
+                exif.asset_id = asset.id
         derivs: list[DerivativeFile] | None = None
         clip_embedded = False
-        if compute_derivatives and inserted and asset.asset_type in ("IMAGE", "VIDEO"):
+        # Derivatives skip-because-already-done: rebuild DerivativeFile
+        # entries from the journal so downstream phases (CLIP/faces find
+        # the preview) and the marker payload are consistent with a
+        # first-run output. If any staged file is missing on disk
+        # (e.g. `.audit/derivatives/` was wiped), we fall through to
+        # recompute.
+        if (
+            compute_derivatives and we_own
+            and asset.asset_type in ("IMAGE", "VIDEO")
+            and journal.is_done(cs_hex, "derivatives", DERIV_VERSION)
+        ):
+            cached = journal.get(cs_hex, "derivatives") or {}
+            cached_files = (cached.get("meta") or {}).get("files") or []
+            try:
+                rebuilt = [
+                    DerivativeFile(
+                        kind=f["kind"],
+                        staged_path=Path(f["staged_path"]),
+                        relative_path=f["relative_path"],
+                        is_progressive=bool(f.get("is_progressive", False)),
+                        is_transparent=bool(f.get("is_transparent", False)),
+                    )
+                    for f in cached_files
+                ]
+            except (KeyError, TypeError):
+                rebuilt = []
+            if rebuilt and all(d.staged_path.is_file() for d in rebuilt):
+                derivs = rebuilt
+                _emit("    derivatives… [cached]")
+        if compute_derivatives and we_own and derivs is None and asset.asset_type in ("IMAGE", "VIDEO"):
             # Videos hit the expensive path here: full ffmpeg H.264
             # transcode of the encoded_video derivative. Images just do
             # pyvips thumb+preview, much cheaper.
@@ -602,26 +673,36 @@ def process_trip(
                     sink.update_asset_duration(asset.id, result.duration)
                     asset.duration = result.duration
                 if derivs is not None:
-                    sink.record_derivatives(
-                        asset.id,
-                        [
-                            {
-                                "kind": d.kind,
-                                "relative_path": d.relative_path,
-                                "staged_path": str(d.staged_path),
-                                "is_progressive": d.is_progressive,
-                                "is_transparent": d.is_transparent,
-                            }
-                            for d in derivs
-                        ],
+                    deriv_payload = [
+                        {
+                            "kind": d.kind,
+                            "relative_path": d.relative_path,
+                            "staged_path": str(d.staged_path),
+                            "is_progressive": d.is_progressive,
+                            "is_transparent": d.is_transparent,
+                        }
+                        for d in derivs
+                    ]
+                    sink.record_derivatives(asset.id, deriv_payload)
+                    journal.mark_done(
+                        cs_hex, "derivatives", DERIV_VERSION,
+                        meta={"files": deriv_payload},
                     )
             except Exception:
                 if on_derivative_error == "raise":
                     raise
                 derivs = None
+        # CLIP: skip if journal says done at the current model version.
         if (
-            compute_clip and inserted and asset.asset_type == "IMAGE"
+            compute_clip and we_own and asset.asset_type == "IMAGE"
             and derivs is not None
+            and journal.is_done(cs_hex, "clip", CLIP_VERSION)
+        ):
+            clip_embedded = True
+            _emit(f"    CLIP embedding… [cached, {clip_model}]")
+        if (
+            compute_clip and we_own and asset.asset_type == "IMAGE"
+            and derivs is not None and not clip_embedded
         ):
             preview = next(
                 (d.staged_path for d in derivs if d.kind == "preview"), None,
@@ -643,13 +724,26 @@ def process_trip(
                         )
                         clip_embedded = True
                     _phase(_do_clip, "clip", timings)
+                    if clip_embedded:
+                        journal.mark_done(cs_hex, "clip", CLIP_VERSION)
                 except Exception:
                     if on_clip_error == "raise":
                         raise
                     clip_embedded = False
         faces_detected = 0
+        # Faces: journal-skip path. We don't store the face count in
+        # journal meta because asset_face is the truth; on cached skip
+        # we report 0 ran-this-pass, which is accurate.
         if (
-            compute_faces and inserted and asset.asset_type == "IMAGE"
+            compute_faces and we_own and asset.asset_type == "IMAGE"
+            and derivs is not None
+            and journal.is_done(cs_hex, "faces", FACES_VERSION)
+        ):
+            cached_meta = (journal.get(cs_hex, "faces") or {}).get("meta") or {}
+            faces_detected = int(cached_meta.get("count", 0))
+            _emit(f"    faces… [cached, {faces_model}]")
+        elif (
+            compute_faces and we_own and asset.asset_type == "IMAGE"
             and derivs is not None
         ):
             preview = next(
@@ -664,6 +758,10 @@ def process_trip(
                         ),
                         "faces", timings,
                     )
+                    journal.mark_done(
+                        cs_hex, "faces", FACES_VERSION,
+                        meta={"count": faces_detected},
+                    )
                 except Exception:
                     if on_faces_error == "raise":
                         raise
@@ -673,7 +771,14 @@ def process_trip(
         # the on-disk `<stem>.<lang>.srt` sidecar, so a second `immy process
         # --with-transcripts` pass over an already-ingested trip can
         # retro-fill transcripts without re-running the other ML workers.
-        if compute_transcripts and asset.asset_type == "VIDEO":
+        if (
+            compute_transcripts and asset.asset_type == "VIDEO"
+            and journal.is_done(cs_hex, "transcript", TRANSCRIPT_VERSION)
+        ):
+            cached_meta = (journal.get(cs_hex, "transcript") or {}).get("meta")
+            transcript_info = cached_meta or None
+            _emit(f"    transcript… [cached, {transcript_model}]")
+        elif compute_transcripts and asset.asset_type == "VIDEO":
             make = _str(exif_row.get("EXIF:Make", "QuickTime:Make"))
             _emit("    transcript… (ffprobe → volumedetect → whisper if audio)")
             try:
@@ -686,11 +791,29 @@ def process_trip(
                 )
                 if transcript_info:
                     sink.record_transcript(asset.id, transcript_info)
+                    journal.mark_done(
+                        cs_hex, "transcript", TRANSCRIPT_VERSION,
+                        meta=transcript_info,
+                    )
             except Exception:
                 if on_transcript_error == "raise":
                     raise
                 transcript_info = None
         caption_info: dict | None = None
+        # Caption journal-skip path — strongest signal, used in addition
+        # to (not instead of) the offline-sink prior_caption check and
+        # the DB AI-prefix shortcut. `--recaption` ignores the journal,
+        # forcing re-run.
+        if (
+            compute_captions and asset.asset_type == "IMAGE"
+            and not recaption
+            and journal.is_done(cs_hex, "caption", CAPTION_VERSION)
+        ):
+            cached_meta = (journal.get(cs_hex, "caption") or {}).get("meta")
+            if cached_meta:
+                caption_info = dict(cached_meta)
+                caption_info.setdefault("cached", True)
+                _emit(f"    caption… [cached, {CAPTION_VERSION}]")
         # Per-file resumability: if the sink has a caption recorded for
         # this asset under the same model id, skip the VLM call entirely.
         # Online path: sink.caption_info always returns None so behavior
@@ -760,6 +883,10 @@ def process_trip(
                 )
                 if caption_info:
                     sink.record_caption(asset.id, caption_info)
+                    journal.mark_done(
+                        cs_hex, "caption", CAPTION_VERSION,
+                        meta=caption_info,
+                    )
             except Exception:
                 if on_caption_error == "raise":
                     raise
@@ -794,6 +921,26 @@ def process_trip(
             parts.append(f'caption: "{snippet}…"')
         total_s = time.monotonic() - asset_t0
         _emit(f"    → {' | '.join(parts) if parts else 'nothing to do'}  ({total_s:.1f}s)")
+
+        # Per-asset durability boundary. Without this, a Ctrl-C between
+        # asset insert and end-of-trip rolls back the whole trip — the
+        # next run pays for every enricher again. With per-asset commit,
+        # a re-run skips committed assets via journal lookups and
+        # resumes precisely at the unfinished one. Tests that want the
+        # legacy "single trip transaction" semantics pass
+        # commit_per_asset=False.
+        if commit_per_asset:
+            try:
+                sink.commit()
+            except Exception:
+                # If the per-asset commit fails, surface it — the asset's
+                # work is lost and the journal entries we just wrote
+                # won't match DB state. Better to fail loud than to keep
+                # accumulating ghost journal entries for non-committed
+                # rows.
+                journal.flush()
+                raise
+        journal.flush()
     return results
 
 
