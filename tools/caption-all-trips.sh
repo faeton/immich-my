@@ -153,51 +153,78 @@ else
 fi
 
 # --- Per-trip status reader ------------------------------------------
-# Parses `<trip>/.audit/process.yml` (produced by `immy process`) with a
-# small Python shim. Returns a tab-separated row: processed_at, inserted,
-# already, clip, faces, transcripts, captions. Empty line if no marker.
+# Prints a tab-separated row prefixed with a kind tag:
+#   done    <ts> <new> <existing> <clip> <faces> <srt> <captions>
+#   partial <ts> <new> -         <clip> <faces> <srt> <captions>
+# or nothing if neither `.audit/process.yml` nor `.audit/journal.yml`
+# exists. `done` comes from the end-of-trip marker written by `immy
+# process`; `partial` is reconstructed from the per-asset journal so
+# interrupted runs don't appear as "never processed".
 read_trip_status() {
   local trip="$1"
-  "$IMMY_BIN" --help >/dev/null 2>&1 || true  # sanity; not fatal
   "$IMMY_ROOT/.venv/bin/python" - "$trip" <<'PY' 2>/dev/null || true
 import sys, yaml
 from pathlib import Path
-marker = Path(sys.argv[1]) / ".audit" / "process.yml"
-if not marker.is_file():
-    sys.exit(0)
-d = yaml.safe_load(marker.read_text()) or {}
 from datetime import datetime, timezone
-ts = d.get("processed_at")
-when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "-"
+trip = Path(sys.argv[1])
+marker = trip / ".audit" / "process.yml"
+if marker.is_file():
+    d = yaml.safe_load(marker.read_text()) or {}
+    ts = d.get("processed_at")
+    when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "-"
+    print("\t".join(str(x) for x in [
+        "done", when,
+        d.get("inserted", 0),
+        d.get("already_present", 0),
+        d.get("clip_embedded", 0),
+        d.get("faces_detected", 0),
+        d.get("transcripts_written", 0),
+        d.get("captions_written", 0),
+    ]))
+    sys.exit(0)
+journal = trip / ".audit" / "journal.yml"
+if not journal.is_file():
+    sys.exit(0)
+j = yaml.safe_load(journal.read_text()) or {}
+entries = j.get("entries", {}) or {}
+counts = {"ingest": 0, "clip": 0, "faces": 0, "transcript": 0, "caption": 0}
+for passes in entries.values():
+    for name in counts:
+        if name in passes:
+            counts[name] += 1
+when = datetime.fromtimestamp(journal.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
 print("\t".join(str(x) for x in [
-    when,
-    d.get("inserted", 0),
-    d.get("already_present", 0),
-    d.get("clip_embedded", 0),
-    d.get("faces_detected", 0),
-    d.get("transcripts_written", 0),
-    d.get("captions_written", 0),
+    "partial", when,
+    counts["ingest"], "-",
+    counts["clip"], counts["faces"],
+    counts["transcript"], counts["caption"],
 ]))
 PY
 }
 
 print_status_table() {
-  printf '\n%-40s %-16s %7s %7s %7s %7s %7s %7s\n' \
+  printf '\n%-40s %-22s %7s %7s %7s %7s %7s %7s\n' \
     "trip" "last run" "new" "existing" "clip" "faces" "srt" "captions"
-  printf '%-40s %-16s %7s %7s %7s %7s %7s %7s\n' \
+  printf '%-40s %-22s %7s %7s %7s %7s %7s %7s\n' \
     "----" "--------" "---" "--------" "----" "-----" "---" "--------"
   for trip in "${TRIPS[@]}"; do
     local name status
     name="$(basename "$trip")"
     status="$(read_trip_status "$trip")"
     if [[ -z "$status" ]]; then
-      printf '%-40s %s%-16s%s %7s %7s %7s %7s %7s %7s\n' \
+      printf '%-40s %s%-22s%s %7s %7s %7s %7s %7s %7s\n' \
         "$name" "$C_DIM" "(never processed)" "$C_RESET" \
         "-" "-" "-" "-" "-" "-"
     else
-      IFS=$'\t' read -r ts ins ex cl fa tr cap <<<"$status"
-      printf '%-40s %-16s %7s %7s %7s %7s %7s %7s\n' \
-        "$name" "$ts" "$ins" "$ex" "$cl" "$fa" "$tr" "$cap"
+      IFS=$'\t' read -r kind ts ins ex cl fa tr cap <<<"$status"
+      if [[ "$kind" == "partial" ]]; then
+        printf '%-40s %s%-16s%s %7s %7s %7s %7s %7s %7s\n' \
+          "$name" "$C_WARN" "partial $ts" "$C_RESET" \
+          "$ins" "$ex" "$cl" "$fa" "$tr" "$cap"
+      else
+        printf '%-40s %-22s %7s %7s %7s %7s %7s %7s\n' \
+          "$name" "$ts" "$ins" "$ex" "$cl" "$fa" "$tr" "$cap"
+      fi
     fi
   done
   printf '\n'
