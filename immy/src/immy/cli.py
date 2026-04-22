@@ -12,6 +12,7 @@ from rich.table import Table
 from . import bloat as bloat_mod
 from . import captions as captions_mod
 from . import clip as clip_mod
+from . import clustering as clustering_mod
 from . import offline as offline_mod
 from . import process as process_mod
 from . import promote as promote_mod
@@ -1331,6 +1332,172 @@ def db_setup(
             conn.rollback()
             console.print(f"  [red]failed:[/red] {e}")
     conn.close()
+
+
+@app.command("cluster")
+def cluster(
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--apply",
+        help="Default: print proposed albums only. `--apply` creates/updates "
+             "Immich albums via the API.",
+    ),
+    min_assets: int = typer.Option(
+        clustering_mod.DEFAULT_MIN_ASSETS, "--min-assets",
+        help=f"Drop clusters smaller than this (default: {clustering_mod.DEFAULT_MIN_ASSETS}).",
+    ),
+    max_gap_hours: float = typer.Option(
+        clustering_mod.DEFAULT_MAX_GAP_HOURS, "--max-gap-hours",
+        help=f"Time gap that splits an event (default: {clustering_mod.DEFAULT_MAX_GAP_HOURS} h).",
+    ),
+    max_km: float = typer.Option(
+        clustering_mod.DEFAULT_MAX_KM, "--max-km",
+        help=f"Distance from centroid that splits an event (default: {clustering_mod.DEFAULT_MAX_KM} km).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+) -> None:
+    """Group assets by (time, lat, lon) into events and auto-create albums.
+
+    Pulls every asset with `dateTimeOriginal` + `latitude` + `longitude`
+    from `asset_exif`, runs a sweep-based cluster (new event when time
+    gap > `--max-gap-hours` OR distance > `--max-km`), names each event
+    from the dominant city/country Immich's own reverse-geocode worker
+    already wrote, and (with `--apply`) creates or updates one album per
+    event.
+
+    Idempotent via a `immy-cluster:<stable_key>` marker line embedded in
+    each album's description. The key is derived from rounded centroid +
+    start date so late-arriving photos don't spawn duplicate albums.
+    MVP: we only *add* assets to existing immy-cluster albums — if an
+    asset's cluster membership changes across runs, it ends up in both.
+    Manually prune when that happens.
+    """
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red]")
+        raise typer.Exit(code=2)
+    if config.immich is None:
+        console.print("[red]no immich: block in immy config[/red] — "
+                      "cluster --apply needs api_key to create albums.")
+        raise typer.Exit(code=2)
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    # Pull time+gps rows. Soft-deleted assets are filtered server-side —
+    # otherwise a recent delete would resurrect as a cluster member on
+    # the next run and re-PUT into the album via the idempotent endpoint.
+    with conn.cursor() as cur:
+        cur.execute("""
+            SELECT ae."assetId", ae."dateTimeOriginal",
+                   ae.latitude, ae.longitude, ae.city, ae.country
+            FROM asset_exif ae
+            JOIN asset a ON a.id = ae."assetId"
+            WHERE ae."dateTimeOriginal" IS NOT NULL
+              AND ae.latitude IS NOT NULL
+              AND ae.longitude IS NOT NULL
+              AND a."deletedAt" IS NULL
+        """)
+        rows = cur.fetchall()
+    conn.close()
+
+    points = [
+        clustering_mod.AssetPoint(
+            asset_id=str(r[0]), when=r[1],
+            lat=float(r[2]), lon=float(r[3]),
+            city=r[4], country=r[5],
+        )
+        for r in rows
+    ]
+    clusters = clustering_mod.cluster_assets(
+        points,
+        max_gap_hours=max_gap_hours,
+        max_km=max_km,
+        min_assets=min_assets,
+    )
+    total_assets = sum(len(c.assets) for c in clusters)
+    console.print(
+        f"[bold]cluster[/bold] — {len(points)} geo-dated assets → "
+        f"{len(clusters)} event(s) of ≥{min_assets} "
+        f"({total_assets} asset(s) in events, "
+        f"{len(points) - total_assets} ungrouped)"
+    )
+    if not clusters:
+        return
+
+    for c in clusters:
+        console.print(
+            f"  [cyan]{c.name()}[/cyan]  "
+            f"[dim]{len(c.assets)} asset(s), key={c.stable_key()}[/dim]"
+        )
+
+    if dry_run:
+        console.print(
+            "\n[yellow]dry-run[/yellow] — pass `--apply` to create/update "
+            f"{len(clusters)} album(s) in Immich."
+        )
+        return
+
+    # Apply phase. Fetch every album once (small N in practice); build a
+    # key→album map from descriptions, then per cluster either update
+    # the matching album or create a fresh one.
+    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key)
+    key_to_album: dict[str, dict] = {}
+    existing = client._request("GET", "/api/albums")
+    if isinstance(existing, list):
+        for alb in existing:
+            if not isinstance(alb, dict):
+                continue
+            k = clustering_mod.extract_cluster_key(alb.get("description"))
+            if k:
+                key_to_album[k] = alb
+
+    created = 0
+    updated = 0
+    added_assets_total = 0
+    for c in clusters:
+        key = c.stable_key()
+        name = c.name()
+        marker = clustering_mod.cluster_marker_line(key)
+        # Description: name as first line (human-visible), marker on
+        # second line (machine-parseable, ignored by users).
+        description = f"{name}\n{marker}"
+        asset_ids = [a.asset_id for a in c.assets]
+        existing_alb = key_to_album.get(key)
+        if existing_alb is None:
+            album_id = client.create_album(
+                name, description=description, asset_ids=asset_ids,
+            )
+            if album_id:
+                created += 1
+                added_assets_total += len(asset_ids)
+                console.print(
+                    f"  [green]created[/green] {name} "
+                    f"[dim]({len(asset_ids)} asset(s))[/dim]"
+                )
+            else:
+                console.print(f"  [red]create failed[/red] {name}")
+        else:
+            album_id = existing_alb["id"]
+            # Don't touch name/description if they match — patch is a
+            # no-op but avoids an unnecessary updatedAt bump.
+            if existing_alb.get("description") != description:
+                client.update_album(album_id, description=description)
+            result = client.add_assets_to_album(album_id, asset_ids)
+            added = sum(1 for r in result if isinstance(r, dict) and r.get("success"))
+            updated += 1
+            added_assets_total += added
+            console.print(
+                f"  [green]updated[/green] {name} "
+                f"[dim]({added} new, {len(asset_ids) - added} already present)[/dim]"
+            )
+
+    console.print(
+        f"\n[green]✓[/green] {created} album(s) created, "
+        f"{updated} updated, {added_assets_total} asset-link(s) added"
+    )
 
 
 if __name__ == "__main__":

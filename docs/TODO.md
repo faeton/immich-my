@@ -72,11 +72,26 @@ Not shipped yet.
 
 ### Phase 4 — Event clustering
 
-Not shipped yet.
+- [x] `immy cluster` — sweep-based clustering on `(dateTimeOriginal,
+  latitude, longitude)` from `asset_exif`; new event when time gap
+  > 4 h OR distance-from-centroid > 5 km (both tunable via CLI).
+  Singletons/doubletons dropped by default (`--min-assets`).
+- [x] Album naming from Immich's own `city` / `country` (populated by
+  its reverse-geocode worker). Dominant-city wins ties. Date format is
+  locale-independent and sortable (`19 Feb 2024`, `10–12 Jul 2024`,
+  `29 Apr – 3 May 2024`, `31 Dec 2024 – 2 Jan 2025`).
+- [x] Idempotent album create/update via a `immy-cluster:<key>` marker
+  line embedded in each album's description. Stable key derived from
+  rounded centroid + start date so late-arriving photos don't spawn
+  duplicates.
 
-- Nightly clustering on `(time, lat, lon)`
-- Album naming from reverse geocoding
-- Idempotent album create/update flow
+Known MVP limitation:
+- We only *add* assets to existing immy-cluster albums. If an asset's
+  cluster membership changes between runs (e.g. you refined EXIF
+  timestamps), the asset ends up in both the old and new album. Prune
+  manually when that happens. A proper "remove stale memberships" pass
+  needs a separate mapping of asset → prior-cluster-key; lives behind
+  the job-queue refactor below.
 
 ### Pipeline optimizations
 
