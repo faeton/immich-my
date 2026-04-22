@@ -245,14 +245,15 @@ printf 'Mode: %s%s%s\n' "$C_OK" \
   "$C_RESET"
 
 TOTAL_OK=0; TOTAL_FAIL=0
-for trip in "${TRIPS[@]}"; do
-  name="$(basename "$trip")"
-  banner | tee -a "$RUN_LOG"
-  printf '%s[%s]%s %s\n' "$C_OK" "$(date +%H:%M:%S)" "$C_RESET" "$name" \
-    | tee -a "$RUN_LOG"
-  banner | tee -a "$RUN_LOG"
 
-  if [[ $SYNC_ONLY -eq 1 ]]; then
+if [[ $SYNC_ONLY -eq 1 ]]; then
+  # sync-offline doesn't benefit from a warm model — loop per trip.
+  for trip in "${TRIPS[@]}"; do
+    name="$(basename "$trip")"
+    banner | tee -a "$RUN_LOG"
+    printf '%s[%s]%s %s\n' "$C_OK" "$(date +%H:%M:%S)" "$C_RESET" "$name" \
+      | tee -a "$RUN_LOG"
+    banner | tee -a "$RUN_LOG"
     if "$IMMY_BIN" sync-offline "$trip" 2>&1 | tee -a "$RUN_LOG"; then
       TOTAL_OK=$((TOTAL_OK + 1))
     else
@@ -263,33 +264,36 @@ for trip in "${TRIPS[@]}"; do
         "$C_WARN" "$C_RESET" | tee -a "$RUN_LOG"
       break
     fi
-    continue
-  fi
-
-  # Full pipeline. Every phase is idempotent individually, so re-runs
-  # on an already-processed trip are cheap (checksum match skips ML).
-  # Captions are the slow part; caffeinate keeps the Mac awake.
+  done
+else
+  # Single `immy process` invocation for every trip in one Python process.
+  # Models (CLIP, InsightFace, Whisper) load once and stay warm across
+  # trips — the biggest single win for overnight batch runs, where the
+  # old per-trip fork paid ~600 MB of CLIP load + a few seconds per trip
+  # in ONNX warmup. Per-trip commit boundaries mean a crash in trip N
+  # leaves trips 1..N-1 durable. `nice -n 10` + the NUM_THREADS caps
+  # above keep the machine thermally sane through the whole batch.
   PROCESS_FLAGS=(--with-derivatives --with-clip --with-faces
                  --with-transcripts --with-captions)
   [[ "$MODE" == "offline" ]] && PROCESS_FLAGS+=(--offline)
-  # `nice -n 10` yields to the foreground so the fan controller has
-  # headroom on an hours-long run. Pair with the *_NUM_THREADS caps above.
-  if caffeinate -dims nice -n 10 "$IMMY_BIN" process "$trip" \
-       "${PROCESS_FLAGS[@]}" \
+  banner | tee -a "$RUN_LOG"
+  printf '%s[%s]%s batch: %d trip(s)\n' \
+    "$C_OK" "$(date +%H:%M:%S)" "$C_RESET" "${#TRIPS[@]}" | tee -a "$RUN_LOG"
+  banner | tee -a "$RUN_LOG"
+  if caffeinate -dims nice -n 10 "$IMMY_BIN" process \
+       "${TRIPS[@]}" "${PROCESS_FLAGS[@]}" \
        2>&1 | tee -a "$RUN_LOG"; then
-    TOTAL_OK=$((TOTAL_OK + 1))
+    TOTAL_OK="${#TRIPS[@]}"
   else
     rc=$?
-    TOTAL_FAIL=$((TOTAL_FAIL + 1))
-    printf '%sFAILED%s %s (rc=%s)\n' \
-      "$C_ERR" "$C_RESET" "$name" "$rc" | tee -a "$RUN_LOG"
+    # `immy process` exits 1 when one or more trips failed (but other
+    # trips still committed). Treat the batch as partially ok — the
+    # per-trip summary immy prints is the source of truth.
+    TOTAL_FAIL=1
+    printf '%sBatch exited rc=%s%s — see per-trip output above.\n' \
+      "$C_ERR" "$rc" "$C_RESET" | tee -a "$RUN_LOG"
   fi
-  if (( INTERRUPTED )); then
-    printf '%sInterrupted%s — stopping batch after %s.\n' \
-      "$C_WARN" "$C_RESET" "$name" | tee -a "$RUN_LOG"
-    break
-  fi
-done
+fi
 
 # --- Summary ---------------------------------------------------------
 banner | tee -a "$RUN_LOG"

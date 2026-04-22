@@ -476,6 +476,7 @@ def process_trip(
     compute_faces: bool = False,
     compute_transcripts: bool = False,
     compute_captions: bool = False,
+    recaption: bool = False,
     captioner_config: captions_mod.CaptionerConfig | None = None,
     transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
@@ -710,6 +711,30 @@ def process_trip(
         ):
             caption_info = prior_caption
             _emit(f"    caption… [cached, {captioner_config.model}]")
+        elif (
+            compute_captions
+            and asset.asset_type == "IMAGE"
+            and prior_caption is None
+            and not recaption
+            and captioner_config is not None
+        ):
+            # Online resume path (and offline-without-prior): if the DB
+            # description is already AI-prefixed, skip the VLM call. We
+            # don't know the model it was produced with (that's not
+            # stored in asset_exif), so this is a weaker signal than
+            # offline's prior_caption — `--recaption` is the explicit
+            # override when you do want to regenerate. Saves ~9.5 s /
+            # image on Gemma; the dominant cost of a resumed run.
+            existing = sink.get_description(asset.id)
+            if existing and captions_mod.is_ai_description(existing):
+                caption_info = {
+                    "text": existing[len(captions_mod.AI_PREFIX):],
+                    "model": captioner_config.model,
+                    "prompt_tokens": 0,
+                    "completion_tokens": 0,
+                    "cached": True,
+                }
+                _emit("    caption… [cached, DB AI-prefix]")
 
         if (
             compute_captions
@@ -729,6 +754,7 @@ def process_trip(
                     lambda: _process_caption(
                         sink, asset.id, exif_row.path,
                         captioner_config, preview=preview,
+                        recaption=recaption,
                     ),
                     "caption", timings,
                 )
@@ -836,6 +862,7 @@ def _process_caption(
     config: captions_mod.CaptionerConfig,
     *,
     preview: Path | None = None,
+    recaption: bool = False,
 ) -> dict | None:
     """Caption one image and write the prefixed description to the DB.
 
@@ -844,14 +871,17 @@ def _process_caption(
     written by a previous captioner run. User-typed descriptions and
     Whisper excerpts (no prefix) are left alone.
 
-    Returns None when the DB description is a non-AI string we don't
-    want to overwrite — we still could have spent money calling the
-    API in that case, but the pre-check below avoids it by reading the
-    current description first.
+    Two skip paths — cheapest first — avoid paying for a VLM call we'd
+    either throw away or overwrite identical text with:
+
+    1. Existing description is non-AI (user-typed, or a Whisper
+       excerpt) → skip, leave it alone.
+    2. Existing description is AI-prefixed → skip *unless* `recaption`
+       is True. This is the online equivalent of offline's
+       `prior_caption` short-circuit and is the dominant cost on a
+       resumed overnight run (~9.5 s / image with Gemma). Pass
+       `--recaption` to force a re-run.
     """
-    # Pre-check description: skip paid API call when we wouldn't write
-    # the result anyway. Online this is one cheap SELECT per image;
-    # offline the Sink just returns the cached value.
     existing = sink.get_description(asset_id)
     if existing and not captions_mod.is_ai_description(existing):
         return None

@@ -792,9 +792,151 @@ app.add_typer(bloat_app, name="bloat")
 # --- `immy process` (Phase Y.1) -------------------------------------------
 
 
+def _resolve_offline_library(folder: Path) -> tuple[object | None, bool]:
+    """Return (library, recovered_from_marker) for offline mode.
+
+    Checks global cache, then tries to recover container_root from any
+    marker under `folder` or its siblings. Owner/library UUIDs stay as
+    placeholders; sync-offline fills them in at push time.
+    """
+    library = offline_mod.load_cached_library()
+    if library is not None:
+        return library, False
+    root = offline_mod.derive_container_root_from_marker(folder)
+    if root is None and folder.parent.is_dir():
+        derived = offline_mod.derive_library_from_any_trip(folder.parent)
+        if derived is not None:
+            return derived, True
+    elif root is not None:
+        from .pg import LibraryInfo as _LI
+        return _LI(
+            id="__offline_placeholder__",
+            owner_id="__offline_placeholder__",
+            container_root=root,
+        ), True
+    return None, False
+
+
+def _run_one_trip(
+    folder: Path,
+    *,
+    library,
+    conn,
+    offline: bool,
+    recovered_from_marker: bool,
+    dry_run: bool,
+    compute: bool,
+    compute_clip: bool,
+    compute_faces: bool,
+    with_transcripts: bool,
+    with_captions: bool,
+    recaption: bool,
+    transcode_videos: bool,
+    captioner_config,
+    clip_model: str,
+    transcript_model: str,
+    transcript_prompt: str | None,
+) -> bool:
+    """Run the full pipeline for one trip folder. Returns True on success.
+
+    Per-trip sink + commit boundary: a failure (or KeyboardInterrupt) in
+    one trip rolls back only that trip's writes, so sibling trips already
+    committed are durable. The caller handles Ctrl-C by letting it
+    propagate out — we rollback in `finally` regardless.
+    """
+    if offline:
+        sink: offline_mod.Sink = offline_mod.OfflineSink(folder, library)
+    else:
+        sink = offline_mod.PgSink(conn)
+
+    hint = ""
+    if offline and recovered_from_marker:
+        hint = " [dim](owner_id/library_id pulled at sync time)[/dim]"
+    console.print(
+        f"\n[bold]process[/bold] {folder}"
+        + (f"\n  [yellow]offline mode[/yellow]{hint}" if offline else "")
+        + f"\n  target prefix:  {library.container_root}/{folder.name}/..."
+    )
+
+    if dry_run:
+        from .exif import read_folder as _read
+        rows = _read(folder)
+        console.print(f"[yellow]dry-run[/yellow] would process {len(rows)} file(s)")
+        for r in rows[:5]:
+            asset, _ = process_mod.build_rows(r.path, folder, r, library)
+            console.print(
+                f"  {asset.asset_type:<5} {asset.original_path} "
+                f"[dim]cs={asset.checksum.hex()[:12]}…[/dim]"
+            )
+        if len(rows) > 5:
+            console.print(f"  [dim]… and {len(rows) - 5} more[/dim]")
+        sink.close()
+        return True
+
+    def _progress(msg: str) -> None:
+        console.print(msg, highlight=False)
+
+    try:
+        results = process_mod.process_trip(
+            folder, conn, library,
+            sink=sink,
+            compute_derivatives=compute,
+            compute_clip=compute_clip,
+            compute_faces=compute_faces,
+            compute_transcripts=with_transcripts,
+            compute_captions=with_captions,
+            recaption=recaption,
+            captioner_config=captioner_config,
+            transcode_videos=transcode_videos,
+            clip_model=clip_model,
+            transcript_model=transcript_model,
+            transcript_prompt=transcript_prompt,
+            progress=_progress,
+        )
+        sink.commit()
+    except KeyboardInterrupt:
+        sink.rollback()
+        sink.close()
+        raise
+    except Exception as e:
+        sink.rollback()
+        sink.close()
+        console.print(f"[red]{folder.name} failed, rolled back:[/red] {e}")
+        return False
+    finally:
+        # sink.close is a no-op if already closed.
+        try:
+            sink.close()
+        except Exception:
+            pass
+
+    new_count = sum(1 for r in results if r.inserted)
+    existed = len(results) - new_count
+    derivs = sum(len(r.derivatives) for r in results if r.derivatives)
+    clipped = sum(1 for r in results if r.clip_embedded)
+    face_count = sum(r.faces_detected for r in results)
+    transcript_count = sum(1 for r in results if r.transcript)
+    caption_count = sum(1 for r in results if r.caption)
+    process_mod.write_marker(folder, results)
+    tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
+    tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
+    tail += f", [cyan]{face_count} face(s)[/cyan]" if face_count else ""
+    tail += f", [cyan]{transcript_count} transcript(s)[/cyan]" if transcript_count else ""
+    tail += f", [cyan]{caption_count} caption(s)[/cyan]" if caption_count else ""
+    console.print(
+        f"[green]✓[/green] {folder.name}: {new_count} new asset(s), "
+        f"[dim]{existed} already present[/dim]{tail}"
+    )
+    return True
+
+
 @app.command()
 def process(
-    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    folders: list[Path] = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="One or more trip folders. Multiple folders share a single "
+             "process so MLX/Whisper/InsightFace models load only once.",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Report would-insert rows; no DB writes."),
     with_derivatives: bool = typer.Option(
         True, "--with-derivatives/--no-derivatives",
@@ -816,6 +958,10 @@ def process(
         False, "--with-captions/--no-captions",
         help="Phase 3b — VLM caption per image via OpenAI-compat endpoint (LM Studio / OpenAI / Anthropic / Gemini). Writes 'AI: ...' into asset_exif.description. Configured under `ml.captioner` in config.yml. Off by default (costs tokens on cloud backends).",
     ),
+    recaption: bool = typer.Option(
+        False, "--recaption",
+        help="Re-caption images that already have an AI: description (default: skip — saves ~9.5 s/image on a resumed overnight run).",
+    ),
     transcode_videos: bool = typer.Option(
         True, "--transcode/--no-transcode",
         help="Y.5 — emit a web-playable mp4 (libx264 720p, CRF 23) when the source isn't already h264/aac/mp4 ≤720p. Off → source plays only if the browser supports it.",
@@ -827,14 +973,18 @@ def process(
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
 ) -> None:
     """Phase Y.1/Y.2 — insert asset + asset_exif rows for every media file
-    under <folder> directly into the Immich Postgres, and optionally stage
-    thumbnail + preview derivatives for `immy promote` to upload.
+    under one or more trip folders.
+
+    Passing multiple folders is the right choice for overnight batch runs:
+    MLX CLIP, InsightFace, and Whisper all load once for the entire batch
+    instead of once per `immy process` invocation. Per-trip commit
+    boundaries keep completed work durable even if a later trip fails or
+    the user hits Ctrl-C.
 
     Requires `pg:` and `immich.library_id` in ~/.immy/config.yml.
-    `--with-derivatives` (default) additionally requires `media:` — pyvips
-    writes webp/jpeg under `.audit/derivatives/thumbs/<userId>/...`.
+    `--with-derivatives` (default) additionally requires `media:`.
     Idempotent via `checksum = sha1("path:" + originalPath)`.
-    Drops `.audit/y_processed.yml` so `immy promote` skips the scan POST.
+    Drops `.audit/y_processed.yml` per trip so `immy promote` skips scan.
     """
     config = load_config(config_path)
     if config.immich is None:
@@ -844,49 +994,10 @@ def process(
         )
         raise typer.Exit(code=2)
 
+    # Open pg connection once for the whole batch (online only).
     conn = None
-    sink: offline_mod.Sink
-    if offline:
-        library = offline_mod.load_cached_library()
-        recovered_from_marker = False
-        if library is None:
-            # Fallback: recover container_root from an existing marker
-            # (this trip's own .audit/y_processed.yml, or any sibling).
-            # owner_id/library_id stay as placeholders — sync-offline
-            # resolves them from the live DB at push time.
-            root = offline_mod.derive_container_root_from_marker(folder)
-            if root is None and folder.parent.is_dir():
-                derived = offline_mod.derive_library_from_any_trip(folder.parent)
-                if derived is not None:
-                    library = derived
-                    recovered_from_marker = True
-            elif root is not None:
-                from .pg import LibraryInfo as _LI
-                library = _LI(
-                    id="__offline_placeholder__",
-                    owner_id="__offline_placeholder__",
-                    container_root=root,
-                )
-                recovered_from_marker = True
-        if library is None:
-            console.print(
-                "[red]--offline needs library info[/red] and none was found. "
-                f"Looked at {offline_mod.LIBRARY_CACHE_PATH} and "
-                f"{folder}/.audit/y_processed.yml. Run `immy process` once "
-                "online so library info gets cached."
-            )
-            raise typer.Exit(code=2)
-        sink = offline_mod.OfflineSink(folder, library)
-        hint = ""
-        if recovered_from_marker:
-            hint = " [dim](owner_id/library_id pulled at sync time)[/dim]"
-        console.print(
-            f"[yellow]offline mode[/yellow] — writes go to "
-            f".audit/{offline_mod.OFFLINE_DIR_NAME}/{hint}\n"
-            f"  container_root: {library.container_root}\n"
-            f"  [dim]run `immy sync-offline {folder.name}` later to push[/dim]"
-        )
-    else:
+    shared_library = None
+    if not offline:
         if config.pg is None:
             console.print(
                 "[red]no pg: block in immy config[/red] — add "
@@ -896,7 +1007,7 @@ def process(
             raise typer.Exit(code=2)
         try:
             conn = pg_mod.connect(config.pg)
-        except Exception as e:  # psycopg.OperationalError etc.
+        except Exception as e:
             console.print(
                 f"[red]pg connect failed:[/red] {e}\n"
                 f"[yellow]hint:[/yellow] if tailnet/NAS is unreachable, rerun "
@@ -904,42 +1015,14 @@ def process(
             )
             raise typer.Exit(code=2)
         try:
-            library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+            shared_library = pg_mod.fetch_library_info(conn, config.immich.library_id)
         except LookupError as e:
             console.print(f"[red]{e}[/red]")
             conn.close()
             raise typer.Exit(code=2)
-        # Cache library info so a future --offline run has what it needs.
-        offline_mod.cache_library_info(library)
-        sink = offline_mod.PgSink(conn)
+        offline_mod.cache_library_info(shared_library)
 
-    console.print(
-        f"[bold]process[/bold] {folder}\n"
-        f"  library: {library.id} owner={library.owner_id}\n"
-        f"  container root: {library.container_root}  "
-        f"[dim](where files will live inside the Immich container after `immy promote`)[/dim]\n"
-        f"  target prefix:  {library.container_root}/{folder.name}/...  "
-        f"[dim](baked into asset.originalPath; no copy happens now)[/dim]\n"
-        f"  [dim]nothing is copied — derivatives stage under .audit/; "
-        f"rsync to NAS happens in `immy promote`.[/dim]"
-    )
-
-    if dry_run:
-        from .exif import read_folder as _read
-        rows = _read(folder)
-        console.print(f"[yellow]dry-run[/yellow] would process {len(rows)} file(s)")
-        for r in rows[:5]:
-            asset, _ = process_mod.build_rows(r.path, folder, r, library)
-            console.print(
-                f"  {asset.asset_type:<5} {asset.original_path} "
-                f"[dim]cs={asset.checksum.hex()[:12]}…[/dim]"
-            )
-        if len(rows) > 5:
-            console.print(f"  [dim]… and {len(rows) - 5} more[/dim]")
-        if conn is not None:
-            conn.close()
-        return
-
+    # Phase flags — identical across trips in the batch.
     compute = with_derivatives and config.media is not None
     if with_derivatives and config.media is None:
         console.print(
@@ -950,14 +1033,12 @@ def process(
     compute_clip = with_clip and compute
     if with_clip and not compute:
         console.print(
-            "[yellow]note:[/yellow] --with-clip needs derivatives (CLIP runs "
-            "on the preview file). Skipping CLIP this run."
+            "[yellow]note:[/yellow] --with-clip needs derivatives. Skipping CLIP."
         )
     compute_faces = with_faces and compute
     if with_faces and not compute:
         console.print(
-            "[yellow]note:[/yellow] --with-faces needs derivatives (faces run "
-            "on the preview file). Skipping faces this run."
+            "[yellow]note:[/yellow] --with-faces needs derivatives. Skipping faces."
         )
     clip_model = (
         config.ml.clip_model if config.ml is not None else clip_mod.DEFAULT_MODEL
@@ -965,13 +1046,9 @@ def process(
     transcript_model = transcripts_mod.DEFAULT_MODEL
     if config.ml is not None and config.ml.whisper_model:
         transcript_model = config.ml.whisper_model
-    # Env var wins over config.yml so you can override per-run without
-    # editing the file (handy on trips where the language mix changes).
     transcript_prompt = os.environ.get("IMMY_WHISPER_PROMPT") or (
         config.ml.whisper_prompt if config.ml is not None else None
     )
-    # Resolve captioner config. Env vars shadow config.yml values so the
-    # same `~/.immy/config.yml` works across backends without edits.
     captioner_config: captions_mod.CaptionerConfig | None = None
     if with_captions:
         ml = config.ml
@@ -1024,58 +1101,81 @@ def process(
         phases.append(
             f"captions({captioner_config.model if captioner_config else '?'})"
         )
-    console.print(
-        f"  phases: {', '.join(phases) if phases else '[dim](EXIF + insert only)[/dim]'}"
-    )
-
-    # Rich's markup would turn filenames/prompts into junk; plain print
-    # keeps the progress stream grep-friendly and tees cleanly to the
-    # batch-run log. `highlight=False` suppresses rich's auto-coloring.
-    def _progress(msg: str) -> None:
-        console.print(msg, highlight=False)
-
-    try:
-        results = process_mod.process_trip(
-            folder, conn, library,
-            sink=sink,
-            compute_derivatives=compute,
-            compute_clip=compute_clip,
-            compute_faces=compute_faces,
-            compute_transcripts=with_transcripts,
-            compute_captions=with_captions,
-            captioner_config=captioner_config,
-            transcode_videos=transcode_videos,
-            clip_model=clip_model,
-            transcript_model=transcript_model,
-            transcript_prompt=transcript_prompt,
-            progress=_progress,
+    if shared_library is not None:
+        console.print(
+            f"[bold]batch[/bold] {len(folders)} trip(s)\n"
+            f"  library: {shared_library.id} owner={shared_library.owner_id}\n"
+            f"  phases: {', '.join(phases) if phases else '[dim](EXIF + insert only)[/dim]'}"
         )
-        sink.commit()
-    except Exception as e:
-        sink.rollback()
-        console.print(f"[red]process failed, rolled back:[/red] {e}")
-        raise typer.Exit(code=1)
-    finally:
-        sink.close()
+    else:
+        console.print(
+            f"[bold]batch[/bold] {len(folders)} trip(s)  [yellow](offline)[/yellow]\n"
+            f"  phases: {', '.join(phases) if phases else '[dim](EXIF + insert only)[/dim]'}"
+        )
 
-    new_count = sum(1 for r in results if r.inserted)
-    existed = len(results) - new_count
-    derivs = sum(len(r.derivatives) for r in results if r.derivatives)
-    clipped = sum(1 for r in results if r.clip_embedded)
-    face_count = sum(r.faces_detected for r in results)
-    transcript_count = sum(1 for r in results if r.transcript)
-    caption_count = sum(1 for r in results if r.caption)
-    process_mod.write_marker(folder, results)
-    tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
-    tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
-    tail += f", [cyan]{face_count} face(s)[/cyan]" if face_count else ""
-    tail += f", [cyan]{transcript_count} transcript(s)[/cyan]" if transcript_count else ""
-    tail += f", [cyan]{caption_count} caption(s)[/cyan]" if caption_count else ""
-    console.print(
-        f"[green]✓[/green] {new_count} new asset(s), "
-        f"[dim]{existed} already present[/dim]{tail}  "
-        f"(marker: .audit/{process_mod.Y_MARKER_FILENAME})"
-    )
+    ok = 0
+    failed = 0
+    interrupted = False
+    try:
+        for folder in folders:
+            if offline:
+                library, recovered = _resolve_offline_library(folder)
+                if library is None:
+                    console.print(
+                        f"[red]{folder.name}: --offline needs library info[/red]; "
+                        f"run `immy process` once online so library info gets cached. "
+                        "Skipping."
+                    )
+                    failed += 1
+                    continue
+            else:
+                library = shared_library
+                recovered = False
+            success = _run_one_trip(
+                folder,
+                library=library,
+                conn=conn,
+                offline=offline,
+                recovered_from_marker=recovered,
+                dry_run=dry_run,
+                compute=compute,
+                compute_clip=compute_clip,
+                compute_faces=compute_faces,
+                with_transcripts=with_transcripts,
+                with_captions=with_captions,
+                recaption=recaption,
+                transcode_videos=transcode_videos,
+                captioner_config=captioner_config,
+                clip_model=clip_model,
+                transcript_model=transcript_model,
+                transcript_prompt=transcript_prompt,
+            )
+            if success:
+                ok += 1
+            else:
+                failed += 1
+    except KeyboardInterrupt:
+        interrupted = True
+        console.print("\n[yellow]interrupted[/yellow] — stopping batch.")
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    if len(folders) > 1 or failed or interrupted:
+        tag = "[yellow]partial[/yellow]" if interrupted else (
+            "[green]done[/green]" if failed == 0 else "[yellow]done[/yellow]"
+        )
+        console.print(
+            f"\n{tag} batch summary: {ok} ok"
+            + (f", [red]{failed} failed[/red]" if failed else "")
+            + (f", [yellow]{len(folders) - ok - failed} skipped (interrupted)[/yellow]"
+               if interrupted else "")
+        )
+    if failed and not interrupted:
+        raise typer.Exit(code=1)
 
 
 @app.command("sync-offline")
