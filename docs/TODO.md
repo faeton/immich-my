@@ -103,11 +103,28 @@ Remaining:
   checksum lookup. Skips macOS bundles by default; `--into-bundles`
   descends. Writes `dupes.md` (human) + `dupes.json` (scripting).
 
+- [x] `immy apple-people` — **dry-run only**. Read-only reader for
+  `Photos.sqlite` (resolves `ZMERGETARGETPERSON` chains, pulls real
+  filename+size from `ZADDITIONALASSETATTRIBUTES`), prints per-person
+  match rate against the Immich snapshot by `(filename, size)`. No
+  writes yet — the `--apply` path that creates Immich Person rows and
+  attaches face embeddings is the remaining Phase 7 work.
+
 Not shipped yet (build spec in [/PLAN.md](../PLAN.md)):
+- `immy apple-people --apply` — write path: `POST /api/people` per named
+  person, `UPDATE asset_faces SET personId` where bbox-IoU(apple) > 0.3.
+  Deferred until dry-run match rate is validated on a fresh snapshot.
+  Open questions before writing:
+  - Immich `asset_faces` bbox coord system — normalized 0..1 or pixels?
+    Inspect schema on live DB before committing to IoU math.
+  - Snapshot schema v1 doesn't carry width/height; we'd need v2 to
+    convert Apple normalized bboxes into Immich pixel space.
+  - Two *already-named* Apple persons with the same `ZFULLNAME` would
+    double-POST to `/api/people` — de-dupe by full_name in `apply()`.
+  - Rate-limit `POST /api/people` to keep Immich's job queue sane when
+    seeding 50+ names at once.
 - `immy find-similar` — CLIP near-dup finder for re-exports / edits /
   crops that broke byte-identity. Needs CLIP embeddings in the snapshot.
-- `immy import-apple-people` — read `Photos.sqlite`, seed Immich Person
-  rows with Apple-tagged names, attach face embeddings via snapshot match.
 
 ### Phase 4 — Event clustering
 
@@ -141,6 +158,10 @@ Shipped:
   earlier trips durable through Ctrl-C / a later-trip failure.
 - Caption resume on the online path — skip the VLM when
   `asset_exif.description` is already AI-prefixed. `--recaption` forces.
+- `tools/caption-all-trips.sh --status` surfaces partial progress from
+  `.audit/journal.yml` when `.audit/process.yml` hasn't been written yet
+  (interrupted batch). Earlier the table labelled every interrupted trip
+  "never processed" and hid hours of per-asset work.
 - DNG embedded-preview fast path — `exiftool -b -JpgFromRaw` /
   `-PreviewImage` into libvips. ~3.5× on DJI DNG derivatives vs going
   through libraw's init on every call.
@@ -172,7 +193,6 @@ Deferred:
 - Cross-device near-duplicate reporting
 - Export-to-edit workflows
 - Backup automation
-- Apple Photos people-name seeding
 
 ## Notes
 

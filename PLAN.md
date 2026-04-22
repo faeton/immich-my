@@ -12,9 +12,10 @@ narrative. This file is a focused build spec for the current push. Once these
 ship, roll the summary into `docs/PLAN.md` Phase 7 and delete this file (or
 replace with the next push).
 
-**Status.** Tools 1 (`snapshot`) and 2 (`find-duplicates`) **shipped**. Tools
-3 (`find-similar`) and 4 (`import-apple-people`) are the remaining work —
-specs below are still valid.
+**Status.** Tools 1 (`snapshot`), 2 (`find-duplicates`), and the **dry-run**
+half of tool 4 (`apple-people`) are **shipped**. Remaining: `--apply` path
+for tool 4 (gated on a sensible match rate from a fresh snapshot), and
+tool 3 (`find-similar`, deferred until tools 1+2 have seen real use).
 
 ---
 

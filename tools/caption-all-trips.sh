@@ -153,52 +153,53 @@ else
 fi
 
 # --- Per-trip status reader ------------------------------------------
-# Prints a tab-separated row prefixed with a kind tag:
-#   done    <ts> <new> <existing> <clip> <faces> <srt> <captions>
-#   partial <ts> <new> -         <clip> <faces> <srt> <captions>
-# or nothing if neither `.audit/process.yml` nor `.audit/journal.yml`
-# exists. `done` comes from the end-of-trip marker written by `immy
-# process`; `partial` is reconstructed from the per-asset journal so
-# interrupted runs don't appear as "never processed".
-read_trip_status() {
-  local trip="$1"
-  "$IMMY_ROOT/.venv/bin/python" - "$trip" <<'PY' 2>/dev/null || true
+# Emits one row per trip on stdin. Single Python invocation — earlier we
+# forked per trip and paid ~150 ms × 60 trips of interpreter startup.
+# Output format (tab-separated):
+#   <trip>\tdone\t<ts>\t<new>\t<existing>\t<clip>\t<faces>\t<srt>\t<captions>
+#   <trip>\tpartial\t<ts>\t<new>\t-\t<clip>\t<faces>\t<srt>\t<captions>
+#   <trip>\tnone
+# `done` comes from the end-of-trip `process.yml` marker; `partial` is
+# reconstructed from per-asset `journal.yml` so interrupted runs don't
+# appear as "never processed".
+read_trip_statuses() {
+  # Trips come in on argv so stdin stays free for the heredoc'd program.
+  "$IMMY_ROOT/.venv/bin/python" - "$@" 2>/dev/null <<'PY' || true
 import sys, yaml
 from pathlib import Path
 from datetime import datetime, timezone
-trip = Path(sys.argv[1])
-marker = trip / ".audit" / "process.yml"
-if marker.is_file():
-    d = yaml.safe_load(marker.read_text()) or {}
-    ts = d.get("processed_at")
-    when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "-"
-    print("\t".join(str(x) for x in [
-        "done", when,
-        d.get("inserted", 0),
-        d.get("already_present", 0),
-        d.get("clip_embedded", 0),
-        d.get("faces_detected", 0),
-        d.get("transcripts_written", 0),
-        d.get("captions_written", 0),
-    ]))
-    sys.exit(0)
-journal = trip / ".audit" / "journal.yml"
-if not journal.is_file():
-    sys.exit(0)
-j = yaml.safe_load(journal.read_text()) or {}
-entries = j.get("entries", {}) or {}
-counts = {"ingest": 0, "clip": 0, "faces": 0, "transcript": 0, "caption": 0}
-for passes in entries.values():
-    for name in counts:
-        if name in passes:
-            counts[name] += 1
-when = datetime.fromtimestamp(journal.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
-print("\t".join(str(x) for x in [
-    "partial", when,
-    counts["ingest"], "-",
-    counts["clip"], counts["faces"],
-    counts["transcript"], counts["caption"],
-]))
+
+def row(trip):
+    marker = trip / ".audit" / "process.yml"
+    if marker.is_file():
+        d = yaml.safe_load(marker.read_text()) or {}
+        ts = d.get("processed_at")
+        when = datetime.fromtimestamp(ts, tz=timezone.utc).strftime("%Y-%m-%d %H:%M") if ts else "-"
+        return [str(trip), "done", when,
+                str(d.get("inserted", 0)),
+                str(d.get("already_present", 0)),
+                str(d.get("clip_embedded", 0)),
+                str(d.get("faces_detected", 0)),
+                str(d.get("transcripts_written", 0)),
+                str(d.get("captions_written", 0))]
+    journal = trip / ".audit" / "journal.yml"
+    if not journal.is_file():
+        return [str(trip), "none"]
+    j = yaml.safe_load(journal.read_text()) or {}
+    entries = j.get("entries", {}) or {}
+    counts = {"ingest": 0, "clip": 0, "faces": 0, "transcript": 0, "caption": 0}
+    for passes in entries.values():
+        for name in counts:
+            if name in passes:
+                counts[name] += 1
+    when = datetime.fromtimestamp(journal.stat().st_mtime, tz=timezone.utc).strftime("%Y-%m-%d %H:%M")
+    return [str(trip), "partial", when,
+            str(counts["ingest"]), "-",
+            str(counts["clip"]), str(counts["faces"]),
+            str(counts["transcript"]), str(counts["caption"])]
+
+for arg in sys.argv[1:]:
+    print("\t".join(row(Path(arg))))
 PY
 }
 
@@ -207,25 +208,32 @@ print_status_table() {
     "trip" "last run" "new" "existing" "clip" "faces" "srt" "captions"
   printf '%-40s %-22s %7s %7s %7s %7s %7s %7s\n' \
     "----" "--------" "---" "--------" "----" "-----" "---" "--------"
+  declare -A status_by_trip=()
+  while IFS=$'\t' read -r trip_path rest; do
+    [[ -z "$trip_path" ]] && continue
+    status_by_trip["$trip_path"]="$rest"
+  done < <(read_trip_statuses "${TRIPS[@]}")
+
   for trip in "${TRIPS[@]}"; do
-    local name status
+    local name kind ts ins ex cl fa tr cap
     name="$(basename "$trip")"
-    status="$(read_trip_status "$trip")"
-    if [[ -z "$status" ]]; then
-      printf '%-40s %s%-22s%s %7s %7s %7s %7s %7s %7s\n' \
-        "$name" "$C_DIM" "(never processed)" "$C_RESET" \
-        "-" "-" "-" "-" "-" "-"
-    else
-      IFS=$'\t' read -r kind ts ins ex cl fa tr cap <<<"$status"
-      if [[ "$kind" == "partial" ]]; then
-        printf '%-40s %s%-16s%s %7s %7s %7s %7s %7s %7s\n' \
-          "$name" "$C_WARN" "partial $ts" "$C_RESET" \
-          "$ins" "$ex" "$cl" "$fa" "$tr" "$cap"
-      else
+    IFS=$'\t' read -r kind ts ins ex cl fa tr cap <<<"${status_by_trip[$trip]:-none}"
+    case "$kind" in
+      done)
         printf '%-40s %-22s %7s %7s %7s %7s %7s %7s\n' \
           "$name" "$ts" "$ins" "$ex" "$cl" "$fa" "$tr" "$cap"
-      fi
-    fi
+        ;;
+      partial)
+        printf '%-40s %s%-22s%s %7s %7s %7s %7s %7s %7s\n' \
+          "$name" "$C_WARN" "partial $ts" "$C_RESET" \
+          "$ins" "$ex" "$cl" "$fa" "$tr" "$cap"
+        ;;
+      *)
+        printf '%-40s %s%-22s%s %7s %7s %7s %7s %7s %7s\n' \
+          "$name" "$C_DIM" "(never processed)" "$C_RESET" \
+          "-" "-" "-" "-" "-" "-"
+        ;;
+    esac
   done
   printf '\n'
 }

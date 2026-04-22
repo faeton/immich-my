@@ -35,15 +35,17 @@ class AppleFace:
     """
 
     apple_asset_uuid: str
-    original_filename: str           # e.g. "IMG_1234.HEIC" — real name, not Apple's internal UUID
-    original_size: int | None        # bytes; None if Apple never computed it
-    center_x: float                  # 0..1
-    center_y: float                  # 0..1
-    size: float                      # 0..1 (square side)
+    # Real filename as ingested — `ZASSET.ZFILENAME` is Apple's internal
+    # UUID-based copy, useless for Immich matching.
+    original_filename: str
+    original_size: int | None
+    center_x: float
+    center_y: float
+    size: float
     source_width: int | None
     source_height: int | None
     quality: float | None
-    manual: bool                     # ZMANUAL=1 → user hit "confirm"
+    manual: bool
 
 
 @dataclass
@@ -51,7 +53,6 @@ class ApplePerson:
     apple_pk: int
     full_name: str
     display_name: str | None
-    face_count: int                  # Apple's own ZFACECOUNT (may differ from len(faces))
     faces: list[AppleFace] = field(default_factory=list)
 
 
@@ -115,19 +116,15 @@ def read_named_persons(
       - Optional name filter via `only`.
     """
     persons: dict[int, ApplePerson] = {}
-    person_rows = conn.execute(
-        "SELECT Z_PK, ZFULLNAME, ZDISPLAYNAME, ZFACECOUNT FROM ZPERSON "
+    for pk, full, display in conn.execute(
+        "SELECT Z_PK, ZFULLNAME, ZDISPLAYNAME FROM ZPERSON "
         "WHERE ZFULLNAME IS NOT NULL AND ZFULLNAME != '' "
         "  AND ZMERGETARGETPERSON IS NULL",
-    ).fetchall()
-    for pk, full, display, count in person_rows:
+    ):
         if only is not None and full not in only:
             continue
         persons[pk] = ApplePerson(
-            apple_pk=pk,
-            full_name=full,
-            display_name=display,
-            face_count=int(count or 0),
+            apple_pk=pk, full_name=full, display_name=display,
         )
 
     if not persons:
@@ -210,7 +207,15 @@ def match_to_snapshot(
     than guessed — caller can rerun with `--library` to narrow the
     snapshot if that becomes a real problem.
     """
-    from . import snapshot as snapshot_mod
+    # One scan of the snapshot builds a `(filename, size) -> [asset_id]`
+    # index. Earlier we queried per face — 20k faces = 20k SQLite
+    # round-trips. Full-table scan + dict lookup is O(assets + faces)
+    # and lands well under a second on 200k-asset libraries.
+    index: dict[tuple[str, int], list[str]] = {}
+    for asset_id, filename, size in snapshot.execute(
+        "SELECT asset_id, filename, size_bytes FROM assets"
+    ):
+        index.setdefault((filename, size), []).append(asset_id)
 
     out: dict[int, list[FaceMatch]] = {}
     for person in persons:
@@ -218,10 +223,8 @@ def match_to_snapshot(
         for face in person.faces:
             if face.original_size is None:
                 continue
-            hits = snapshot_mod.match_name_size(
-                snapshot, face.original_filename, face.original_size,
-            )
-            if len(hits) == 1:
-                matched.append(FaceMatch(face=face, immich_asset_id=hits[0].asset_id))
+            hits = index.get((face.original_filename, face.original_size))
+            if hits and len(hits) == 1:
+                matched.append(FaceMatch(face=face, immich_asset_id=hits[0]))
         out[person.apple_pk] = matched
     return out

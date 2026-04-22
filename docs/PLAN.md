@@ -292,32 +292,36 @@ thumbs, open transcripts and face matches — just not the original file.
 
 ## Phase 7 — Quality of life (ongoing)
 
-### External library matching — planned
+### External library matching
 
 Four-tool bundle for finding "is this file already in Immich?" from any
-external disk, and seeding Immich people from Apple Photos. Full build spec
-in [`/PLAN.md`](../PLAN.md) at the repo root (short-horizon; folded back
-here once shipped).
+external disk, and seeding Immich people from Apple Photos. Short-horizon
+build spec lives in [`/PLAN.md`](../PLAN.md) at the repo root until the
+set is fully shipped.
 
-- `immy snapshot` — dump Immich library index (filename, size, SHA1,
-  optional CLIP embeddings) to a portable SQLite file. Foundation for all
-  three other tools.
-- `immy find-duplicates <path>` — scan a disk/folder, report exact matches
-  (filename + size + optional hash) against the snapshot. Three tiers:
-  `exact` / `likely` / `name-only`. Gives you "safe to delete" vs "needs
-  ingest" lists for backup drives.
-- `immy find-similar <path>` — CLIP near-dup finder for files that aren't
-  byte-identical but are the same photo (re-export, edit, crop). Deferred
-  until 1 + 2 have been in use for a while.
-- `immy import-apple-people` — read `Photos.sqlite`, create Immich Person
-  rows with Apple names, attach face embeddings via filename-matched asset
-  overlap. Assumes `--apply` against Immich REST + direct `asset_faces`
-  updates.
+- **Shipped** — `immy snapshot`: dump Immich library index (filename, size,
+  SHA1) to `~/.immy/library-snapshot.sqlite`. Portable, read-only on
+  Immich. Checksum stored as raw 20-byte BLOB.
+- **Shipped** — `immy find-duplicates <path>`: scan a disk/folder, classify
+  every file as `exact` / `likely` / `name-only` / `no-match` against the
+  snapshot. Default mode only hashes when `(name, size)` already matched;
+  `--fast` skips hashing; `--thorough` hashes everything.
+- **Shipped (dry-run)** — `immy apple-people`: read `Photos.sqlite`
+  read-only, list every named person (skipping ~26k Apple auto-clusters),
+  resolve `ZMERGETARGETPERSON` merge chains, report per-person how many
+  tagged faces map to Immich assets via `(filename, size)` match against
+  the snapshot. No write path yet.
+- **Planned** — `immy apple-people --apply`: create Immich Person rows via
+  `POST /api/people`, then `UPDATE asset_faces SET personId` where the
+  existing Immich face bbox overlaps the Apple bbox by IoU > 0.3. Gated on
+  the dry-run match rate looking sensible against a fresh snapshot.
+- **Planned (deferred)** — `immy find-similar <path>`: CLIP near-dup finder
+  for files that aren't byte-identical but are the same photo (re-export,
+  edit, crop). Deferred until shipped tools have been in use enough to
+  know this is actually needed.
 
-Build order: `snapshot` → `find-duplicates` → `import-apple-people` →
-`find-similar`. First two share the most infra; the Apple importer jumps
-the queue over similarity search because tagging history is high-value and
-reuses the same snapshot.
+Build order: `snapshot` → `find-duplicates` → `apple-people` (dry then
+apply) → `find-similar`.
 
 ### Other QoL items
 
