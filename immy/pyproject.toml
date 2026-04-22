@@ -17,6 +17,7 @@ dependencies = [
     "insightface>=0.7.3",
     "opencv-python-headless>=4.9",
     "pyobjc-framework-Vision>=10.0 ; sys_platform == 'darwin'",
+    "mlx-whisper>=0.4 ; sys_platform == 'darwin' and platform_machine == 'arm64'",
 ]
 
 [project.scripts]
@@ -35,7 +36,14 @@ allow-direct-references = true
 [dependency-groups]
 dev = [
     "pytest>=8.0",
+    "pytest-sugar>=1.1.1",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# `-n auto` → pytest-xdist spawns one worker per CPU core (14 on M3 Max).
+# Each test runs in its own subprocess, so MLX / ONNX / mlx-whisper
+# import costs pay in parallel instead of serially. pytest-sugar takes
+# over the terminal formatter automatically when installed.
+addopts = "-n auto"

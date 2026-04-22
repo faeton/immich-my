@@ -24,6 +24,15 @@ Shape:
       container_root: /data                       # IMMICH_MEDIA_LOCATION in the container
     ml:                              # optional; Y.3 CLIP defaults
       clip_model: ViT-B-32__openai   # must match Immich's configured model
+      whisper_prompt: "English, Russian, Ukrainian."  # biases auto-detect
+      captioner:                     # optional; Phase 3b VLM captions
+        endpoint: http://localhost:1234/v1   # LM Studio default; OpenAI/
+                                             # Anthropic/Gemini via their
+                                             # compat URLs
+        model: qwen2.5-vl-7b-instruct
+        api_key_env: OPENAI_API_KEY  # env-var *name*, not the key value
+        prompt: "Describe this photo in one short sentence."
+        max_tokens: 80
 
 Missing config file is not an error for `audit`; `promote` checks what it
 needs and raises a clear message if `originals_root` is absent.
@@ -79,9 +88,32 @@ class MLConfig:
     Immich has configured (default `ViT-B-32__openai`, 512-dim) — a
     mismatch would produce vectors that pgvector refuses to insert into
     `smart_search.embedding`.
+
+    `whisper_model` overrides the default `mlx-community/whisper-large-v3-mlx`
+    used by `--with-transcripts`. Any HF repo id mlx-whisper understands
+    is fine; leave None to use the default.
+
+    `whisper_prompt` is passed to Whisper as `initial_prompt`. A short
+    phrase in the languages you expect (e.g. "English, Russian, Ukrainian.")
+    biases auto-detection and tokenisation toward those — handy when the
+    typical clip is one of a small set but you don't want to force a
+    single language. Also overridable via the `IMMY_WHISPER_PROMPT` env var.
     """
 
     clip_model: str
+    whisper_model: str | None = None
+    whisper_prompt: str | None = None
+    # Captioner (Phase 3b). Any field None → captioner falls back to the
+    # module-level defaults in `captions.py` (LM Studio on localhost,
+    # Qwen2.5-VL-7B, no auth). Point at OpenAI/Anthropic/Gemini by
+    # swapping `captioner_endpoint` + `captioner_model` +
+    # `captioner_api_key_env`. The api-key field is an env-var *name*,
+    # not the key itself — keeps secrets out of config.yml.
+    captioner_endpoint: str | None = None
+    captioner_model: str | None = None
+    captioner_api_key_env: str | None = None
+    captioner_prompt: str | None = None
+    captioner_max_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -149,7 +181,31 @@ def load(path: Path | None = None) -> Config:
     ml_raw = data.get("ml") or {}
     ml = None
     if ml_raw.get("clip_model"):
-        ml = MLConfig(clip_model=str(ml_raw["clip_model"]))
+        whisper = ml_raw.get("whisper_model")
+        prompt = ml_raw.get("whisper_prompt")
+        cap_raw = ml_raw.get("captioner") or {}
+        ml = MLConfig(
+            clip_model=str(ml_raw["clip_model"]),
+            whisper_model=str(whisper) if whisper else None,
+            whisper_prompt=str(prompt) if prompt else None,
+            captioner_endpoint=(
+                str(cap_raw["endpoint"]) if cap_raw.get("endpoint") else None
+            ),
+            captioner_model=(
+                str(cap_raw["model"]) if cap_raw.get("model") else None
+            ),
+            captioner_api_key_env=(
+                str(cap_raw["api_key_env"])
+                if cap_raw.get("api_key_env") else None
+            ),
+            captioner_prompt=(
+                str(cap_raw["prompt"]) if cap_raw.get("prompt") else None
+            ),
+            captioner_max_tokens=(
+                int(cap_raw["max_tokens"])
+                if cap_raw.get("max_tokens") else None
+            ),
+        )
 
     return Config(
         originals_root=root,

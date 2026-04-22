@@ -134,6 +134,8 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 | [docs/SIDECAR.md](docs/SIDECAR.md) | Sidecar internals: DB choice, queue schema, worker-harness contract, process layout |
 | [docs/HARDWARE.md](docs/HARDWARE.md) | DS923+ + MacBook specifics, verified specs, performance expectations |
 | [docs/PLAN.md](docs/PLAN.md) | Phased build plan, milestones, what's custom vs stock |
+| [docs/CAPTIONS.md](docs/CAPTIONS.md) | VLM captioner — supported backends, config, per-image cost table |
+| [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md) | Step-by-step offline runbook — drive `immy` with LM Studio + a local VLM, no internet |
 | [docs/TODO.md](docs/TODO.md) | Explicit backlog of not-yet-shipped work |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | As-deployed operating manual: paths, compose, onboarding choices |
 | [docs/TESTING.md](docs/TESTING.md) | Acceptance tests per phase + ad-hoc smoke checks |
@@ -154,9 +156,27 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 
 ## TODO
 
+Shipped since last README update:
+- Whisper transcripts via `immy process --with-transcripts` (mlx-whisper on
+  Apple Silicon, large-v3 by default). Writes `<stem>.<lang>.srt` next to
+  the source and an excerpt into `asset_exif.description` so Immich search
+  hits spoken words. Four cheap guards (sidecar cache → EXIF-make denylist
+  for DJI/Insta360 → ffprobe audio-stream check → ffmpeg volumedetect) skip
+  Whisper on footage that can't produce meaningful speech. For biased
+  auto-detect in multi-lingual corpora, set `ml.whisper_prompt` in
+  `~/.immy/config.yml` (e.g. `"English, Russian, Ukrainian."`) or export
+  `IMMY_WHISPER_PROMPT` — it's passed to Whisper as `initial_prompt`.
+
+- Image captions via `immy process --with-captions`. Any OpenAI-compat
+  `/chat/completions` endpoint — LM Studio (default, free, local),
+  Ollama, OpenAI, Anthropic, Gemini, OpenRouter, Groq. Captions land in
+  `asset_exif.description` with an `AI: ` prefix so they never clobber
+  user-typed text. Per-image cost table + config recipes in
+  [docs/CAPTIONS.md](docs/CAPTIONS.md) — expect ~$0.5–2 per 1 000
+  photos on the cheap cloud tiers, $0 locally (overnight on Apple
+  Silicon).
+
 Not shipped yet:
-- Whisper transcripts
-- caption generation
 - transcript/caption search plumbing
 - event clustering
 - metadata gap-fill web UI

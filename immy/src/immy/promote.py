@@ -22,6 +22,7 @@ from dataclasses import dataclass
 from pathlib import Path
 import subprocess
 
+from . import offline as offline_mod
 from . import pg as pg_mod
 from .config import Config
 from .derivatives import DERIVATIVES_DIR
@@ -229,6 +230,16 @@ def execute(
         "stacks": [],  # list of (status, detail)
     }
 
+    # Offline-cache drain: if this trip was processed with `immy process
+    # --offline`, cached per-asset YAMLs are sitting in `.audit/offline/`
+    # waiting to hit Postgres. Promote is the first moment the user
+    # *must* be on the tailnet (rsync to NAS), so it's also the right
+    # moment to flush the cache — otherwise a later library scan would
+    # see files on disk with no DB rows and ingest them as blank assets.
+    offline_summary = _drain_offline_cache(plan.folder, config, dry_run=dry_run)
+    if offline_summary is not None:
+        summary["offline_sync"] = offline_summary
+
     if dry_run:
         summary["stacks"] = [("planned", f"{p.lrv.name} ↔ {p.insv.name}") for p in plan.pairs]
         return summary
@@ -265,6 +276,72 @@ def execute(
     summary["album"] = _sync_album(client, plan)
 
     return summary
+
+
+# --- Offline cache drain -------------------------------------------------
+
+
+def _drain_offline_cache(
+    folder: Path, config: Config, *, dry_run: bool,
+) -> dict | None:
+    """Flush any `.audit/offline/*.yml` entries produced by `process
+    --offline` into Postgres. Runs before scan/stack/album so the DB is
+    self-consistent by the time Immich sees the new files.
+
+    Returns None when nothing to do, else a summary dict with counts and
+    an optional `error` key. Failures are soft (we return the error in
+    the summary rather than raising) — the caller is promote, and
+    refusing to rsync because a few sync entries failed would block
+    the path we actually need, NAS file upload.
+    """
+    entries = list(offline_mod.iter_entries(folder))
+    if not entries:
+        return None
+    pending = sum(1 for _, e in entries if not e.get("synced"))
+    if pending == 0:
+        return {"total": len(entries), "pending": 0, "synced": 0, "failed": 0}
+
+    if dry_run:
+        return {
+            "total": len(entries), "pending": pending,
+            "synced": 0, "failed": 0, "note": "dry-run — skipped",
+        }
+
+    if config.pg is None or config.immich is None:
+        return {
+            "total": len(entries), "pending": pending,
+            "synced": 0, "failed": 0,
+            "error": "sync needs pg: and immich.library_id in config — skipped",
+        }
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        return {
+            "total": len(entries), "pending": pending,
+            "synced": 0, "failed": 0,
+            "error": f"pg connect failed: {e}",
+        }
+
+    try:
+        library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+    except LookupError as e:
+        conn.close()
+        return {
+            "total": len(entries), "pending": pending,
+            "synced": 0, "failed": 0, "error": str(e),
+        }
+    offline_mod.cache_library_info(library)
+
+    try:
+        result = offline_mod.sync_trip(folder, conn, library=library)
+    finally:
+        if not conn.closed:
+            conn.close()
+    return {
+        "total": result["total"], "pending": pending,
+        "synced": result["synced"], "failed": result["failed"],
+    }
 
 
 # --- Phase Y.2: derivative rsync + asset_file INSERT ----------------------

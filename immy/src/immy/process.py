@@ -22,21 +22,26 @@ from __future__ import annotations
 
 import hashlib
 import time
+import time
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import psycopg
 import yaml
 
+from . import captions as captions_mod
 from . import clip as clip_mod
 from . import derivatives as derivatives_mod
 from . import faces as faces_mod
+from . import offline as offline_mod
 from . import pg as pg_mod
+from . import transcripts as transcripts_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
+from .offline import Sink
 from .pg import LibraryInfo
 from .state import AUDIT_DIR
 
@@ -339,6 +344,30 @@ SET duration = %(duration)s
 WHERE id = %(id)s
 """
 
+_UPDATE_EXIF_DESCRIPTION = """
+UPDATE asset_exif
+SET description = %(description)s
+WHERE "assetId" = %(asset_id)s
+"""
+
+_UPDATE_EXIF_DESCRIPTION_IF_EMPTY = """
+UPDATE asset_exif
+SET description = %(description)s
+WHERE "assetId" = %(asset_id)s
+  AND (description IS NULL OR description = '')
+"""
+
+# For the captioner: overwrite only when empty or already AI-prefixed
+# (i.e. a prior caption run). User-typed descriptions are never touched.
+# The LIKE is intentionally cheap and anchored — `captions.AI_PREFIX`
+# is fixed at `'AI: '`, so the pattern is stable across versions.
+_UPDATE_EXIF_DESCRIPTION_IF_AI = """
+UPDATE asset_exif
+SET description = %(description)s
+WHERE "assetId" = %(asset_id)s
+  AND (description IS NULL OR description = '' OR description LIKE 'AI: %%')
+"""
+
 
 def update_asset_dimensions(
     conn: psycopg.Connection, asset_id: str, width: int, height: int,
@@ -355,6 +384,19 @@ def update_asset_dimensions(
         cur.execute(
             _UPDATE_ASSET_DIMS,
             {"id": asset_id, "width": width, "height": height},
+        )
+
+
+def update_exif_description(
+    conn: psycopg.Connection, asset_id: str, description: str,
+) -> None:
+    """Write a description excerpt into `asset_exif.description`. Used by
+    the transcript path — the full `.srt` sidecar lives on disk next to
+    the source video; the DB only gets the searchable plain-text excerpt."""
+    with conn.cursor() as cur:
+        cur.execute(
+            _UPDATE_EXIF_DESCRIPTION,
+            {"asset_id": asset_id, "description": description},
         )
 
 
@@ -419,22 +461,33 @@ class ProcessResult:
     derivatives: list[DerivativeFile] | None = None
     clip_embedded: bool = False  # True → smart_search row upserted this run
     faces_detected: int = 0  # count of asset_face rows written this run
+    transcript: dict | None = None  # {"path": str, "language": str} or None
+    caption: dict | None = None  # {"text": str, "model": str, "prompt_tokens", "completion_tokens"}
 
 
 def process_trip(
     trip_folder: Path,
-    conn: psycopg.Connection,
+    conn: psycopg.Connection | None,
     library: LibraryInfo,
     *,
+    sink: Sink | None = None,
     compute_derivatives: bool = False,
     compute_clip: bool = False,
     compute_faces: bool = False,
+    compute_transcripts: bool = False,
+    compute_captions: bool = False,
+    captioner_config: captions_mod.CaptionerConfig | None = None,
     transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
     faces_model: str = faces_mod.DEFAULT_MODEL,
+    transcript_model: str = transcripts_mod.DEFAULT_MODEL,
+    transcript_prompt: str | None = None,
     on_derivative_error: str = "skip",  # 'skip' | 'raise'
     on_clip_error: str = "skip",        # 'skip' | 'raise'
     on_faces_error: str = "skip",       # 'skip' | 'raise'
+    on_transcript_error: str = "skip",  # 'skip' | 'raise'
+    on_caption_error: str = "skip",     # 'skip' | 'raise'
+    progress: Callable[[str], None] | None = None,
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
     per-file results. Caller is responsible for transaction boundaries —
@@ -458,36 +511,109 @@ def process_trip(
     rows = read_folder(trip_folder)
     results: list[ProcessResult] = []
 
+    # Sink routes every would-be DB write. Default is the online PgSink
+    # wrapping the caller's connection; `immy process --offline` passes
+    # an OfflineSink and conn=None. Tests that pass a MagicMock conn
+    # still work — PgSink's methods go through `conn.cursor()`.
+    if sink is None:
+        if conn is None:
+            raise ValueError("process_trip requires either `conn` or `sink`")
+        sink = offline_mod.PgSink(conn)
+
     expected_dim: int | None = None
     if compute_clip:
         if not compute_derivatives:
             raise ValueError("compute_clip requires compute_derivatives=True")
-        expected_dim = pg_mod.fetch_smart_search_dim(conn)
+        expected_dim = sink.clip_dim()
 
-    for exif_row in rows:
-        asset, exif = build_rows(exif_row.path, trip_folder, exif_row, library)
-        inserted = insert_asset(conn, asset, exif)
+    # Per-file progress is opt-in via the `progress` callback. Callers
+    # that want a live counter (CLI / batch scripts) pass `console.print`;
+    # tests and library callers leave it None to stay silent. Each asset
+    # emits a header line on start and one summary line at end with
+    # per-phase wall-clock timings — enough to tell "still making
+    # derivatives" from "stuck on Whisper" without parsing anything.
+    total = len(rows)
+
+    def _emit(msg: str) -> None:
+        if progress is not None:
+            progress(msg)
+
+    def _phase(fn, label: str, timings: dict) -> Any:
+        t0 = time.monotonic()
+        try:
+            return fn()
+        finally:
+            timings[label] = time.monotonic() - t0
+
+    for idx, exif_row in enumerate(rows, start=1):
+        timings: dict[str, float] = {}
+        asset_t0 = time.monotonic()
+
+        # Header line: printed before any work so the user sees which
+        # file is in progress while it's still running. Size helps when
+        # a single 5 GB video starts and the pipeline looks "stuck"
+        # during SHA-1 + ffprobe + transcode.
+        try:
+            size_mb = exif_row.path.stat().st_size / 1e6
+        except OSError:
+            size_mb = 0.0
+        _emit(
+            f"[{idx}/{total}] {exif_row.path.name} "
+            f"({size_mb:.1f} MB)"
+        )
+
+        asset, exif = _phase(
+            lambda: build_rows(exif_row.path, trip_folder, exif_row, library),
+            "exif", timings,
+        )
+        inserted = _phase(
+            lambda: sink.insert_asset_and_exif(asset, exif), "insert", timings,
+        )
         derivs: list[DerivativeFile] | None = None
         clip_embedded = False
         if compute_derivatives and inserted and asset.asset_type in ("IMAGE", "VIDEO"):
+            # Videos hit the expensive path here: full ffmpeg H.264
+            # transcode of the encoded_video derivative. Images just do
+            # pyvips thumb+preview, much cheaper.
+            _emit(
+                f"    derivatives… "
+                f"({'transcode' if asset.asset_type == 'VIDEO' else 'thumb+preview'})"
+            )
             try:
-                result = derivatives_mod.compute_for_asset(
-                    source_media=exif_row.path,
-                    asset_id=asset.id,
-                    owner_id=library.owner_id,
-                    asset_type=asset.asset_type,
-                    trip_folder=trip_folder,
-                    transcode_videos=transcode_videos,
+                result = _phase(
+                    lambda: derivatives_mod.compute_for_asset(
+                        source_media=exif_row.path,
+                        asset_id=asset.id,
+                        owner_id=library.owner_id,
+                        asset_type=asset.asset_type,
+                        trip_folder=trip_folder,
+                        transcode_videos=transcode_videos,
+                    ),
+                    "derivatives", timings,
                 )
                 derivs = result.files
                 if result.width is not None and result.height is not None:
-                    update_asset_dimensions(
-                        conn, asset.id, result.width, result.height,
+                    sink.update_asset_dims(
+                        asset.id, result.width, result.height,
                     )
                     asset.width, asset.height = result.width, result.height
                 if result.duration is not None and result.duration != asset.duration:
-                    update_asset_duration(conn, asset.id, result.duration)
+                    sink.update_asset_duration(asset.id, result.duration)
                     asset.duration = result.duration
+                if derivs is not None:
+                    sink.record_derivatives(
+                        asset.id,
+                        [
+                            {
+                                "kind": d.kind,
+                                "relative_path": d.relative_path,
+                                "staged_path": str(d.staged_path),
+                                "is_progressive": d.is_progressive,
+                                "is_transparent": d.is_transparent,
+                            }
+                            for d in derivs
+                        ],
+                    )
             except Exception:
                 if on_derivative_error == "raise":
                     raise
@@ -500,17 +626,22 @@ def process_trip(
                 (d.staged_path for d in derivs if d.kind == "preview"), None,
             )
             if preview is not None and preview.is_file():
+                _emit("    CLIP embedding…")
                 try:
-                    embedding = clip_mod.embed_image(preview, clip_model)
-                    if expected_dim is not None and len(embedding) != expected_dim:
-                        raise RuntimeError(
-                            f"CLIP dim mismatch: model {clip_model!r} produced "
-                            f"{len(embedding)}, smart_search expects {expected_dim}"
+                    def _do_clip() -> None:
+                        nonlocal clip_embedded
+                        embedding = clip_mod.embed_image(preview, clip_model)
+                        if expected_dim is not None and len(embedding) != expected_dim:
+                            raise RuntimeError(
+                                f"CLIP dim mismatch: model {clip_model!r} produced "
+                                f"{len(embedding)}, smart_search expects {expected_dim}"
+                            )
+                        sink.upsert_clip(
+                            asset.id, list(embedding),
+                            clip_mod.to_pgvector_literal(embedding),
                         )
-                    pg_mod.upsert_smart_search(
-                        conn, asset.id, clip_mod.to_pgvector_literal(embedding),
-                    )
-                    clip_embedded = True
+                        clip_embedded = True
+                    _phase(_do_clip, "clip", timings)
                 except Exception:
                     if on_clip_error == "raise":
                         raise
@@ -524,14 +655,89 @@ def process_trip(
                 (d.staged_path for d in derivs if d.kind == "preview"), None,
             )
             if preview is not None and preview.is_file():
+                _emit("    faces…")
                 try:
-                    faces_detected = _process_faces(
-                        conn, asset.id, preview, faces_model,
+                    faces_detected = _phase(
+                        lambda: _process_faces(
+                            sink, asset.id, preview, faces_model,
+                        ),
+                        "faces", timings,
                     )
                 except Exception:
                     if on_faces_error == "raise":
                         raise
                     faces_detected = 0
+        transcript_info: dict | None = None
+        # Transcripts run regardless of `inserted` — they're idempotent via
+        # the on-disk `<stem>.<lang>.srt` sidecar, so a second `immy process
+        # --with-transcripts` pass over an already-ingested trip can
+        # retro-fill transcripts without re-running the other ML workers.
+        if compute_transcripts and asset.asset_type == "VIDEO":
+            make = _str(exif_row.get("EXIF:Make", "QuickTime:Make"))
+            _emit("    transcript… (ffprobe → volumedetect → whisper if audio)")
+            try:
+                transcript_info = _phase(
+                    lambda: _process_transcript(
+                        sink, asset.id, exif_row.path, transcript_model,
+                        make=make, prompt=transcript_prompt,
+                    ),
+                    "transcript", timings,
+                )
+                if transcript_info:
+                    sink.record_transcript(asset.id, transcript_info)
+            except Exception:
+                if on_transcript_error == "raise":
+                    raise
+                transcript_info = None
+        caption_info: dict | None = None
+        # Per-file resumability: if the sink has a caption recorded for
+        # this asset under the same model id, skip the VLM call entirely.
+        # Online path: sink.caption_info always returns None so behavior
+        # is unchanged (DB description + AI-prefix guard still apply).
+        # Offline path: re-running `immy process --offline` skips images
+        # whose YAML already carries `caption.model == current_model` —
+        # this is how a Ctrl-C'd overnight Gemma run resumes in place
+        # instead of re-captioning thousands of images at 9.5 s each.
+        prior_caption = (
+            sink.caption_info(asset.id)
+            if compute_captions and asset.asset_type == "IMAGE"
+            else None
+        )
+        if (
+            prior_caption
+            and captioner_config is not None
+            and prior_caption.get("model") == captioner_config.model
+        ):
+            caption_info = prior_caption
+            _emit(f"    caption… [cached, {captioner_config.model}]")
+
+        if (
+            compute_captions
+            and caption_info is None
+            and captioner_config is not None
+            and asset.asset_type == "IMAGE"
+        ):
+            preview = None
+            if derivs:
+                preview = next(
+                    (d.staged_path for d in derivs if d.kind == "preview"),
+                    None,
+                )
+            _emit(f"    caption… (VLM @ {captioner_config.model})")
+            try:
+                caption_info = _phase(
+                    lambda: _process_caption(
+                        sink, asset.id, exif_row.path,
+                        captioner_config, preview=preview,
+                    ),
+                    "caption", timings,
+                )
+                if caption_info:
+                    sink.record_caption(asset.id, caption_info)
+            except Exception:
+                if on_caption_error == "raise":
+                    raise
+                caption_info = None
         results.append(ProcessResult(
             asset_id=asset.id,
             container_path=asset.original_path,
@@ -540,12 +746,129 @@ def process_trip(
             derivatives=derivs,
             clip_embedded=clip_embedded,
             faces_detected=faces_detected,
+            transcript=transcript_info,
+            caption=caption_info,
         ))
+
+        # One-liner summary per asset: phase timings + what actually
+        # ran. Kept terse so long trips don't bury the log; `immy audit`
+        # / `.audit/process.yml` are the places to go deep.
+        parts: list[str] = []
+        if not inserted:
+            parts.append("existed")
+        for label in ("derivatives", "clip", "faces", "transcript", "caption"):
+            if label in timings:
+                parts.append(f"{label} {timings[label]:.1f}s")
+        if faces_detected:
+            parts.append(f"{faces_detected} face(s)")
+        if transcript_info:
+            parts.append(f"srt:{transcript_info.get('language', '?')}")
+        if caption_info and caption_info.get("text"):
+            snippet = caption_info["text"][:60].replace("\n", " ")
+            parts.append(f'caption: "{snippet}…"')
+        total_s = time.monotonic() - asset_t0
+        _emit(f"    → {' | '.join(parts) if parts else 'nothing to do'}  ({total_s:.1f}s)")
     return results
 
 
+def _process_transcript(
+    sink: Sink,
+    asset_id: str,
+    media: Path,
+    model: str,
+    *,
+    make: str | None = None,
+    prompt: str | None = None,
+) -> dict | None:
+    """Transcribe a video and write the excerpt into `asset_exif.description`.
+
+    Three cheap guards run before Whisper is ever loaded — in ascending
+    cost order so the fastest rejection wins:
+
+    1. Sidecar already on disk → reuse. Idempotent re-runs pay nothing.
+    2. EXIF make on the transcript denylist (DJI, Insta360) → skip. Zero
+       I/O; EXIF is already read by the caller.
+    3. No audio stream at all (ffprobe, ~100 ms) → skip.
+    4. Audio stream present but mean volume below threshold (ffmpeg
+       volumedetect, ~2 s on a 5-sec sample window) → skip. Catches
+       GoPro/phone clips of wind noise or muted ambient.
+
+    Only after all four pass do we pay the ~1–5× realtime Whisper cost.
+    """
+    for sib in media.parent.glob(f"{media.stem}.*.srt"):
+        if sib.is_file():
+            # Backfill the DB description from the sidecar when it's still
+            # empty — catches the case where an earlier pass wrote the
+            # .srt but didn't reach the DB update (e.g. ad-hoc calls to
+            # `transcripts.transcribe`). Never clobbers an existing
+            # description; user-typed text wins.
+            try:
+                plain = transcripts_mod.srt_to_plaintext(
+                    sib.read_text(encoding="utf-8", errors="replace"),
+                )
+                if plain:
+                    excerpt = transcripts_mod.excerpt_text(plain)
+                    sink.update_description_if_empty(asset_id, excerpt)
+            except OSError:
+                pass
+            return {"path": str(sib), "language": sib.suffixes[-2].lstrip(".")}
+    if transcripts_mod.is_denylisted_make(make):
+        return None
+    if not transcripts_mod.has_audio(media):
+        return None
+    if transcripts_mod.is_silent(media):
+        return None
+    result = transcripts_mod.transcribe(media, model=model, prompt=prompt)
+    if result is None:
+        return None
+    if result.excerpt:
+        # Transcripts use the empty-guard (not the AI-guard) so a user
+        # description never gets clobbered, but we also don't want to
+        # overwrite a prior AI caption with a transcript excerpt.
+        sink.update_description_if_empty(asset_id, result.excerpt)
+    return {"path": str(result.srt_path), "language": result.language}
+
+
+def _process_caption(
+    sink: Sink,
+    asset_id: str,
+    media: Path,
+    config: captions_mod.CaptionerConfig,
+    *,
+    preview: Path | None = None,
+) -> dict | None:
+    """Caption one image and write the prefixed description to the DB.
+
+    Idempotence is handled at the SQL layer via `LIKE 'AI: %'`: the
+    UPDATE touches only rows where the description is empty or was
+    written by a previous captioner run. User-typed descriptions and
+    Whisper excerpts (no prefix) are left alone.
+
+    Returns None when the DB description is a non-AI string we don't
+    want to overwrite — we still could have spent money calling the
+    API in that case, but the pre-check below avoids it by reading the
+    current description first.
+    """
+    # Pre-check description: skip paid API call when we wouldn't write
+    # the result anyway. Online this is one cheap SELECT per image;
+    # offline the Sink just returns the cached value.
+    existing = sink.get_description(asset_id)
+    if existing and not captions_mod.is_ai_description(existing):
+        return None
+
+    result = captions_mod.caption(media, config=config, preview=preview)
+    description = captions_mod.format_description(result.text)
+    sink.update_description_if_ai_or_empty(asset_id, description)
+    return {
+        "text": result.text,
+        "model": result.model,
+        "prompt_tokens": result.prompt_tokens,
+        "completion_tokens": result.completion_tokens,
+    }
+
+
 def _process_faces(
-    conn: psycopg.Connection,
+    sink: Sink,
     asset_id: str,
     preview_path: Path,
     model_name: str,
@@ -572,7 +895,7 @@ def _process_faces(
         }
         for ef in embedded
     ]
-    pg_mod.replace_asset_faces(conn, asset_id, width, height, rows)
+    sink.replace_faces(asset_id, width, height, rows)
     return len(rows)
 
 
@@ -609,6 +932,10 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
             entry["clip_embedded"] = True
         if r.faces_detected:
             entry["faces_detected"] = r.faces_detected
+        if r.transcript:
+            entry["transcript"] = r.transcript
+        if r.caption:
+            entry["caption"] = r.caption
         assets.append(entry)
     payload = {
         "processed_at": int(time.time()),
@@ -619,6 +946,8 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
         ),
         "clip_embedded": sum(1 for r in results if r.clip_embedded),
         "faces_detected": sum(r.faces_detected for r in results),
+        "transcripts_written": sum(1 for r in results if r.transcript),
+        "captions_written": sum(1 for r in results if r.caption),
         "assets": assets,
     }
     marker.write_text(yaml.safe_dump(payload, sort_keys=False))

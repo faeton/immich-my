@@ -140,6 +140,42 @@ def test_promote_rsyncs_and_triggers_scan(config_file, dji_ready, monkeypatch):
     assert fake.scans == ["lib-1"]
 
 
+def test_promote_drains_offline_cache_when_pending(
+    config_file, dji_ready, monkeypatch,
+):
+    """If `.audit/offline/<cs>.yml` entries exist, promote must try to
+    sync them before the scan. When pg is unreachable, failure is soft
+    (surfaced in summary) so the rsync step still runs."""
+    from immy import offline as offline_mod
+    from immy import process as process_mod
+    from immy.pg import LibraryInfo
+
+    # Stash an unsynced offline entry so the drain step has work to do.
+    lib = LibraryInfo(id="lib-1", owner_id="owner-1", container_root="/x")
+    sink = offline_mod.OfflineSink(dji_ready, lib)
+    process_mod.process_trip(dji_ready, None, lib, sink=sink)
+
+    # pg_mod.connect raises — simulates tailnet down. promote must not
+    # crash, and must surface the failure in its summary.
+    from immy import promote as promote_mod
+    monkeypatch.setattr(
+        "immy.promote.pg_mod.connect",
+        lambda cfg: (_ for _ in ()).throw(RuntimeError("tailnet down")),
+    )
+    fake = FakeClient()
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    # Rich wraps long lines, so check for the tokens individually rather
+    # than a composite phrase.
+    flat = result.stdout.replace("\n", " ").replace("  ", " ")
+    # Proves the drain step ran and surfaced the failure instead of
+    # silently letting the promote continue into a split-brain state.
+    assert "offline-sync" in flat, flat
+    assert "1 pending" in flat, flat
+
+
 def test_promote_aliases_push_and_pub_work(config_file, dji_ready, monkeypatch):
     _, originals = config_file
     fake = FakeClient()

@@ -16,15 +16,45 @@ criteria.
 
 ### Phase 3 — Proxy-first AI enrichment
 
-Not shipped yet.
+- [x] Whisper transcripts for videos — `immy process --with-transcripts`
+  - mlx-whisper large-v3 on Apple Silicon
+  - writes `<stem>.<lang>.srt` next to the source (compound suffix keeps
+    it clear of DJI telemetry `.SRT` siblings)
+  - excerpt (first ~500 chars) goes into `asset_exif.description` so
+    spoken words are findable in Immich search
+  - four-gate fast path (sidecar cache / EXIF-make denylist / ffprobe
+    audio-stream / ffmpeg volumedetect) — silent drone footage skips
+    Whisper entirely in <300 ms
+  - `ml.whisper_prompt` in config or `IMMY_WHISPER_PROMPT` env var biases
+    auto-detect toward priority languages (e.g. `"English, Russian,
+    Ukrainian."`) — passed as Whisper `initial_prompt`
 
-- Whisper transcripts for video proxies
-  - run on the Mac
-  - write `.srt` sidecars
-  - optionally append transcript excerpts into searchable metadata
-- Captioner worker
-  - `moondream2` or BLIP-based caption generation
-  - append `AI:` descriptions without overwriting human-written text
+- [x] Image captioner — `immy process --with-captions`
+  - any OpenAI-compat endpoint (LM Studio / Ollama / OpenAI / Anthropic
+    compat / Gemini compat / OpenRouter / Groq) — one config-only swap
+  - feeds the 1440 px `preview.jpeg` when staged; pyvips-resizes the
+    original in memory otherwise
+  - writes `AI: <sentence>` into `asset_exif.description`; pre-reads
+    existing description to skip the paid call when user text is
+    already there; SQL UPDATE is gated `LIKE 'AI: %'` so user text can
+    never be clobbered even under races
+  - records model + token counts per image in `.audit/process.yml` for
+    post-hoc cost audit
+  - see [CAPTIONS.md](CAPTIONS.md) for the price-per-1k-images table
+
+- [x] True offline mode — `immy process --offline` + `immy sync-offline`
+  - caches asset + exif + CLIP embedding + face embeddings + caption
+    text to `<trip>/.audit/offline/<checksum>.yml` (+ sibling `.npy` /
+    `.jsonl` for embeddings) when Postgres is unreachable
+  - idempotent re-runs: checksum-keyed entries reuse asset UUIDs
+  - `immy sync-offline <trip>` replays the cache into DB; each entry
+    runs in its own transaction, placeholder owner/library UUIDs get
+    swapped for real values fetched at sync time
+  - `~/.immy/library.yml` is cached after every online run so offline
+    mode has real UUIDs when available; absent it, `container_root` is
+    recovered from an existing `y_processed.yml` marker
+
+Not shipped yet.
 - Transcript / caption search integration
   - searchable without needing the original file online
 - Job queue + resumability for enrichment workers

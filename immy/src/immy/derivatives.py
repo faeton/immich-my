@@ -45,6 +45,11 @@ DERIVATIVES_DIR = "derivatives"
 THUMBS_SUBDIR = "thumbs"
 ENCODED_VIDEO_SUBDIR = "encoded-video"
 
+# RAW formats where `new_from_file` triggers a full libraw demosaic — skip
+# the dim-probe and rely on EXIF-supplied dims instead. `thumbnail()` itself
+# uses libraw's embedded preview, which is orders of magnitude cheaper.
+_RAW_SUFFIXES = {".dng", ".nef", ".arw", ".cr2", ".cr3", ".rw2", ".raf", ".orf", ".srw"}
+
 FileKind = Literal["thumbnail", "preview", "encoded_video"]
 
 
@@ -143,54 +148,74 @@ def staged_dir(trip_folder: Path) -> Path:
     return trip_folder / AUDIT_DIR / DERIVATIVES_DIR
 
 
-def _write_thumbnail(src: Path, dst: Path) -> None:
-    """250 px WebP, quality 80 — Immich's `thumbnail.webp` spec."""
+def _save_preview(image, dst: Path) -> None:
     vips = _require_pyvips()
-    image = vips.Image.thumbnail(str(src), THUMBNAIL_WIDTH)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    image.webpsave(str(dst), Q=QUALITY, **_save_kwargs(vips))
-
-
-def _write_preview(src: Path, dst: Path) -> None:
-    """1440 px JPEG, quality 80, progressive — Immich's `preview.jpeg` spec."""
-    vips = _require_pyvips()
-    image = vips.Image.thumbnail(str(src), PREVIEW_WIDTH)
     dst.parent.mkdir(parents=True, exist_ok=True)
     image.jpegsave(str(dst), Q=QUALITY, interlace=True, **_save_kwargs(vips))
 
 
+def _save_thumbnail(image, dst: Path) -> None:
+    vips = _require_pyvips()
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    image.webpsave(str(dst), Q=QUALITY, **_save_kwargs(vips))
+
+
 def _image_dims_and_stills(
     source_media: Path, asset_id: str, owner_id: str, base: Path,
-) -> tuple[list[DerivativeFile], int, int]:
-    """IMAGE branch: decode once via libvips (autorot), emit two stills.
+) -> tuple[list[DerivativeFile], int | None, int | None]:
+    """IMAGE branch: decode once via libvips thumbnail, emit two stills.
 
-    libvips is lazy — `autorot` only rewrites metadata until a save
-    forces evaluation, so reading `.width`/`.height` is cheap even for
-    huge originals. Sharp (Immich's stack) applies the same auto-
-    rotation, which is why we surface the *rotated* dims for
-    `asset.width`/`asset.height`.
+    We used to call `vips.Image.thumbnail(src, …)` twice (once per size)
+    *and* `new_from_file` for dims — three decodes per asset. For RAW
+    files (.dng etc.) each decode goes through libraw, so the same image
+    was demosaiced three times. Now: one `thumbnail(src, PREVIEW_WIDTH)`
+    call (which uses shrink-on-load for JPEG and libraw's embedded
+    preview for RAW), then `thumbnail_image` in-memory for the 250 px
+    WebP. Dim probe is skipped for RAW — EXIF already gave us dims, and
+    reprobing via `new_from_file` would re-trigger the full demosaic.
     """
     vips = _require_pyvips()
-    src_img = vips.Image.new_from_file(str(source_media), access="sequential")
-    src_img = src_img.autorot()
-    width = int(src_img.width)
-    height = int(src_img.height)
+    # `thumbnail()` returns a pipeline bound to a sequential loader, so
+    # consuming it twice (preview save + derive-and-save thumbnail) would
+    # trip libvips' "out of order read" guard. `copy_memory()` materialises
+    # the 1440 px image once so both saves read from RAM.
+    preview_img = vips.Image.thumbnail(
+        str(source_media), PREVIEW_WIDTH,
+    ).copy_memory()
 
-    files: list[DerivativeFile] = []
-    for kind in ("thumbnail", "preview"):
-        rel = relative_path_for(asset_id, owner_id, kind)
-        dst = base / rel
-        if kind == "thumbnail":
-            _write_thumbnail(source_media, dst)
-        else:
-            _write_preview(source_media, dst)
-        files.append(DerivativeFile(
-            kind=kind,
-            staged_path=dst,
-            relative_path=rel,
-            is_progressive=(kind == "preview"),
-            is_transparent=False,
-        ))
+    width: int | None = None
+    height: int | None = None
+    if source_media.suffix.lower() not in _RAW_SUFFIXES:
+        try:
+            hdr = vips.Image.new_from_file(
+                str(source_media), access="sequential",
+            ).autorot()
+            width = int(hdr.width)
+            height = int(hdr.height)
+        except Exception:
+            width = height = None
+
+    preview_rel = relative_path_for(asset_id, owner_id, "preview")
+    preview_dst = base / preview_rel
+    _save_preview(preview_img, preview_dst)
+
+    thumb_rel = relative_path_for(asset_id, owner_id, "thumbnail")
+    thumb_dst = base / thumb_rel
+    _save_thumbnail(
+        vips.Image.thumbnail_image(preview_img, THUMBNAIL_WIDTH),
+        thumb_dst,
+    )
+
+    files = [
+        DerivativeFile(
+            kind="thumbnail", staged_path=thumb_dst, relative_path=thumb_rel,
+            is_progressive=False, is_transparent=False,
+        ),
+        DerivativeFile(
+            kind="preview", staged_path=preview_dst, relative_path=preview_rel,
+            is_progressive=True, is_transparent=False,
+        ),
+    ]
     return files, width, height
 
 
@@ -216,21 +241,32 @@ def _video_stills_and_transcode(
     poster = base / "_posters" / f"{asset_id}.jpg"
     video_mod.extract_poster(source_media, poster, duration_s=info.duration_s)
 
-    files: list[DerivativeFile] = []
-    for kind in ("thumbnail", "preview"):
-        rel = relative_path_for(asset_id, owner_id, kind)
-        dst = base / rel
-        if kind == "thumbnail":
-            _write_thumbnail(poster, dst)
-        else:
-            _write_preview(poster, dst)
-        files.append(DerivativeFile(
-            kind=kind,
-            staged_path=dst,
-            relative_path=rel,
-            is_progressive=(kind == "preview"),
-            is_transparent=False,
-        ))
+    vips = _require_pyvips()
+    preview_img = vips.Image.thumbnail(
+        str(poster), PREVIEW_WIDTH,
+    ).copy_memory()
+
+    preview_rel = relative_path_for(asset_id, owner_id, "preview")
+    preview_dst = base / preview_rel
+    _save_preview(preview_img, preview_dst)
+
+    thumb_rel = relative_path_for(asset_id, owner_id, "thumbnail")
+    thumb_dst = base / thumb_rel
+    _save_thumbnail(
+        vips.Image.thumbnail_image(preview_img, THUMBNAIL_WIDTH),
+        thumb_dst,
+    )
+
+    files: list[DerivativeFile] = [
+        DerivativeFile(
+            kind="thumbnail", staged_path=thumb_dst, relative_path=thumb_rel,
+            is_progressive=False, is_transparent=False,
+        ),
+        DerivativeFile(
+            kind="preview", staged_path=preview_dst, relative_path=preview_rel,
+            is_progressive=True, is_transparent=False,
+        ),
+    ]
 
     if transcode and video_mod.needs_transcode(info):
         rel = relative_path_for(asset_id, owner_id, "encoded_video")
@@ -268,10 +304,12 @@ def compute_for_asset(
     base = staged_dir(trip_folder)
 
     if asset_type == "IMAGE":
-        files, w, h = _image_dims_and_stills(
+        files, w_opt, h_opt = _image_dims_and_stills(
             source_media, asset_id, owner_id, base,
         )
-        return DerivativeResult(files=files, width=w, height=h, duration=None)
+        return DerivativeResult(
+            files=files, width=w_opt, height=h_opt, duration=None,
+        )
 
     if asset_type == "VIDEO":
         files, w, h, dur = _video_stills_and_transcode(
