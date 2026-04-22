@@ -76,10 +76,18 @@ Remaining:
   - Docs: `docs/CAPTIONS.md` → "Making captions searchable",
     `docs/OFFLINE-RUNBOOK.md` prereq #5.
 
-Not shipped yet.
-- Job queue + resumability for enrichment workers
-  - keyed by `(checksum, worker, version)`
-  - safe to resume after crash / sleep / disconnect
+- [x] Job queue + resumability for enrichment workers
+  - per-trip journal at `.audit/journal.yml`, keyed by
+    `(checksum_hex, worker, version)` — workers are `ingest`,
+    `derivatives`, `clip`, `faces`, `transcript`, `caption`
+  - online path now commits **per asset** (not per trip), so a Ctrl-C
+    mid-trip leaves every completed asset durable
+  - on resume, each phase checks the journal at the current model
+    version and short-circuits if done; derivatives also re-verify
+    that staged files exist on disk before trusting the journal
+  - `--recaption` ignores the journal so the user can force a re-run
+  - version strings are `clip:<model>`, `caption:<model>`, etc., so
+    bumping a model invalidates only that worker's entries
 
 ### Phase 4 — Event clustering
 
@@ -101,8 +109,9 @@ Known MVP limitation:
   cluster membership changes between runs (e.g. you refined EXIF
   timestamps), the asset ends up in both the old and new album. Prune
   manually when that happens. A proper "remove stale memberships" pass
-  needs a separate mapping of asset → prior-cluster-key; lives behind
-  the job-queue refactor below.
+  needs a separate mapping of asset → prior-cluster-key. The Phase 3
+  journal could carry that mapping under a `cluster` worker key, but
+  the wire-up is still TODO.
 
 ### Pipeline optimizations
 

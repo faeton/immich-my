@@ -981,7 +981,9 @@ def _run_one_trip(
             transcript_prompt=transcript_prompt,
             progress=_progress,
         )
-        sink.commit()
+        # process_trip commits per asset by default (commit_per_asset=True),
+        # so the trip-level commit here is a defensive no-op for the
+        # zero-asset case. Anything in-flight at Ctrl-C is rolled back below.
     except KeyboardInterrupt:
         sink.rollback()
         sink.close()
