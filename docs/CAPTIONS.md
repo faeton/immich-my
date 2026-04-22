@@ -51,8 +51,38 @@ edits — swap `IMMY_CAPTIONER_ENDPOINT` / `IMMY_CAPTIONER_MODEL` per trip.
   description = '' OR description LIKE 'AI: %'`. User-typed text cannot
   be clobbered even by a racing writer.
 - Re-running with a different `model` upgrades existing AI captions in
-  place. Re-running with the same `model` re-captions them (cheap on
-  local; not free on cloud — either flip the model or dry-run first).
+  place. Re-running with the same `model` online: `immy process` skips
+  photos that already have an `AI: …` description (cheapest possible
+  resume). Pass `--recaption` to force regeneration. Offline mode uses
+  a tighter guard — `prior_caption.model == config.model` — so model
+  upgrades still fire.
+
+## Making captions searchable
+
+Captions go into `asset_exif.description`, which Immich's
+`POST /api/search/metadata { "description": "…" }` already matches
+case-insensitively. In the UI this is the "Description" text field in
+the search pane.
+
+At small scale that's fine, but `asset_exif` has no text index out of
+the box. Run once per database:
+
+```
+immy db-setup
+```
+
+Creates `immy_idx_asset_exif_description_trigram` — a GIN trigram
+index on `f_unaccent(description)` matching the pattern Immich uses
+for filename and place-name search. The `immy_` prefix keeps it out
+of Immich's migration namespace, so a future server upgrade can add a
+similarly-named index without colliding. `CREATE INDEX IF NOT EXISTS`
+makes re-runs a no-op.
+
+**Captions only become searchable after they reach the DB.** If you
+ran `immy process --offline`, captions live in
+`<trip>/.audit/offline/<checksum>.yml` and are invisible to Immich
+until `immy sync-offline <trip>` (or the `tools/caption-all-trips.sh
+--sync` wrapper) pushes them.
 
 ## Cost per 1 000 images
 

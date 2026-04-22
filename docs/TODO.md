@@ -54,9 +54,18 @@ criteria.
     mode has real UUIDs when available; absent it, `container_root` is
     recovered from an existing `y_processed.yml` marker
 
+- [x] Transcript / caption search integration
+  - `POST /api/search/metadata { description: "…" }` matches
+    case-insensitively against `asset_exif.description` end-to-end —
+    works for both Whisper transcripts and VLM captions once they
+    reach the DB.
+  - `immy db-setup` creates `immy_idx_asset_exif_description_trigram`
+    (GIN / `f_unaccent(description) gin_trgm_ops`), matching Immich's
+    own pattern for filename + place-name indexes. Idempotent.
+  - Docs: `docs/CAPTIONS.md` → "Making captions searchable",
+    `docs/OFFLINE-RUNBOOK.md` prereq #5.
+
 Not shipped yet.
-- Transcript / caption search integration
-  - searchable without needing the original file online
 - Job queue + resumability for enrichment workers
   - keyed by `(checksum, worker, version)`
   - safe to resume after crash / sleep / disconnect

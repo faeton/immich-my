@@ -22,6 +22,12 @@ Before going fully offline, make sure these are present on the machine:
     ~3 s/image, less detailed.
 - `~/.immy/config.yml` populated with `pg:`, `media:`, `ml:` sections.
   Template below.
+- One-time `immy db-setup` run against the Immich DB to create the
+  trigram GIN index on `asset_exif.description`. Without it, every
+  caption/transcript text search in the Immich UI does a sequential
+  scan of `asset_exif`, which starts to hurt past ~50 k assets. The
+  command is idempotent (`CREATE INDEX IF NOT EXISTS`); run it once
+  per database.
 
 - `~/.immy/library.yml` populated automatically on any online `immy
   process` run (caches `ownerId` + `importPaths[0]` so offline mode

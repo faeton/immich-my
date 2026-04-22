@@ -1261,5 +1261,77 @@ def sync_offline(
         raise typer.Exit(code=1)
 
 
+@app.command("db-setup")
+def db_setup(
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Print SQL we'd run; make no changes."),
+) -> None:
+    """Create immy-owned indexes on the Immich DB (idempotent, safe to re-run).
+
+    Immich 2.7 indexes filenames and place names with trigram GIN for
+    fuzzy search, but `asset_exif.description` — where `immy` writes
+    Whisper transcript excerpts and VLM captions — has no index. At a
+    few thousand assets a sequential scan is fine; past ~50 k it starts
+    hurting search latency in the UI.
+
+    This command adds `immy_idx_asset_exif_description_trigram`, a GIN
+    trigram index matching the pattern Immich uses for its own text
+    columns (`f_unaccent(description) gin_trgm_ops`). `IF NOT EXISTS`
+    guards re-runs, and the `immy_` prefix keeps us out of Immich's
+    migration namespace so a future server upgrade can add a similarly-
+    named index without colliding.
+    """
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print(
+            "[red]no pg: block in immy config[/red] — db-setup needs the "
+            "tailnet up and `pg:` set."
+        )
+        raise typer.Exit(code=2)
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    # Matching Immich's own pattern exactly: `f_unaccent(col) gin_trgm_ops`.
+    # The `f_unaccent` wrapper is Immich's migration artefact — plain
+    # `unaccent()` isn't IMMUTABLE and can't back an index. We reuse it
+    # instead of creating a second helper.
+    stmts = [
+        (
+            "immy_idx_asset_exif_description_trigram",
+            """CREATE INDEX IF NOT EXISTS
+               "immy_idx_asset_exif_description_trigram"
+               ON asset_exif
+               USING gin (f_unaccent(description) gin_trgm_ops)""",
+        ),
+    ]
+    console.print(f"[bold]db-setup[/bold] {config.pg.host}:{config.pg.port}/{config.pg.database}")
+    for name, sql in stmts:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM pg_indexes WHERE indexname = %s", (name,),
+            )
+            exists = cur.fetchone() is not None
+        if exists:
+            console.print(f"  [dim]✓ {name} already present[/dim]")
+            continue
+        if dry_run:
+            console.print(f"  [yellow]would create[/yellow] {name}")
+            console.print(f"    [dim]{' '.join(sql.split())}[/dim]")
+            continue
+        console.print(f"  [yellow]creating[/yellow] {name} (may take a moment on large libraries)…")
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+            conn.commit()
+            console.print(f"  [green]✓[/green] {name}")
+        except Exception as e:
+            conn.rollback()
+            console.print(f"  [red]failed:[/red] {e}")
+    conn.close()
+
+
 if __name__ == "__main__":
     app()
