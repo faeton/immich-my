@@ -787,6 +787,93 @@ def bloat_transcode(
         )
 
 
+@bloat_app.command("sample")
+def bloat_sample(
+    folder: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    frames: int = typer.Option(
+        5, "--frames", "-n",
+        help="How many evenly-spaced frames to extract per pair (default: 5, at 10/30/50/70/90%).",
+    ),
+    review_dir: Path = typer.Option(
+        None, "--review-dir",
+        help="Where to write frames + review.md (default: <folder>/.audit/bloat-review/).",
+    ),
+) -> None:
+    """Extract matched frames from every `*.optimized.*` pair + compute PSNR.
+
+    Run *before* `--apply` to eyeball whether the HEVC transcode kept
+    enough quality. Produces `<folder>/.audit/bloat-review/review.md`
+    with one section per pair — inline JPEG thumbs + overall PSNR —
+    plus per-file verdict (`ok` / `review` / `fail`) based on the PSNR
+    band. Most Markdown viewers (VS Code, Obsidian, Typora) render the
+    thumbs inline so you can flip through it without a bespoke viewer.
+
+    No effect on files: optimized versions stay as `.optimized.ext`,
+    originals untouched. When you're satisfied, run
+    `immy bloat transcode <folder> --apply` to atomic-replace.
+    """
+    # Find all optimized / source pairs under `folder`. `glob` works
+    # fine because optimized files live next to their source (per
+    # `optimized_path()` convention) — no subfolder juggling needed.
+    pairs: list[tuple[Path, Path]] = []
+    for opt in sorted(folder.rglob("*.optimized.*")):
+        if not opt.is_file():
+            continue
+        src = bloat_mod.source_for_optimized(opt)
+        if not src.is_file():
+            console.print(
+                f"[yellow]skip[/yellow] {opt.relative_to(folder)}: "
+                f"source {src.name} missing"
+            )
+            continue
+        pairs.append((src, opt))
+
+    if not pairs:
+        console.print(
+            f"[dim]no `*.optimized.*` files under {folder} — "
+            f"run `immy bloat transcode` first.[/dim]"
+        )
+        return
+
+    if review_dir is None:
+        review_dir = folder / ".audit" / "bloat-review"
+
+    # Evenly-spaced percentages excluding 0/100 so black-padded frames
+    # at video ends don't inflate numeric scores.
+    if frames <= 0:
+        console.print("[red]--frames must be positive[/red]")
+        raise typer.Exit(code=2)
+    step = 100.0 / (frames + 1)
+    percents = tuple(int(round((i + 1) * step)) for i in range(frames))
+
+    console.print(
+        f"[bold]bloat sample[/bold] — {len(pairs)} pair(s), "
+        f"frames at {','.join(f'{p}%' for p in percents)}"
+    )
+    reports: list[bloat_mod.SampleReport] = []
+    for src, opt in pairs:
+        console.print(f"  {src.relative_to(folder)} → sampling…")
+        report = bloat_mod.sample_pair(
+            src, opt, review_dir, percents=percents,
+        )
+        reports.append(report)
+        psnr_str = (
+            f"{report.psnr_db:.2f} dB" if report.psnr_db is not None else "—"
+        )
+        colour = {"ok": "green", "review": "yellow", "fail": "red"}.get(
+            report.verdict, "dim",
+        )
+        console.print(
+            f"    [{colour}]{report.verdict}[/{colour}] "
+            f"psnr={psnr_str}  "
+            f"[dim]({len(report.frames)} frame pair(s))[/dim]"
+        )
+
+    md = review_dir / "review.md"
+    bloat_mod.render_review_md(reports, md)
+    console.print(f"\n[green]✓[/green] wrote {md.relative_to(folder)}")
+
+
 app.add_typer(bloat_app, name="bloat")
 
 

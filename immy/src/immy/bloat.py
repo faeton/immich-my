@@ -185,6 +185,211 @@ def optimized_path(src: Path) -> Path:
     return src.with_name(f"{src.stem}.optimized{src.suffix}")
 
 
+def source_for_optimized(optimized: Path) -> Path:
+    """Strip a `.optimized` marker from the stem so we can find the
+    pre-transcode source sitting next to it. Inverse of `optimized_path`.
+    """
+    stem = optimized.stem
+    if stem.endswith(".optimized"):
+        stem = stem[: -len(".optimized")]
+    return optimized.with_name(f"{stem}{optimized.suffix}")
+
+
+# --- Sampling / before-after review ---------------------------------------
+
+
+# Frame percentages we sample when comparing src vs optimized. Evenly
+# spread but skip 0 % and 100 % — codecs routinely pad black frames at
+# the very start / end which inflate PSNR and aren't representative of
+# what the viewer actually sees.
+_DEFAULT_SAMPLE_PERCENTS = (10, 30, 50, 70, 90)
+
+
+# Rough human-perception bands for PSNR between two video frames:
+#   > 40 dB : visually identical, only numeric difference
+#   35–40   : indistinguishable without side-by-side A/B
+#   30–35   : fine for playback, edge shimmer visible on freeze-frame
+#   < 30    : noticeably degraded
+# We flag anything below 30 as "review" and below 25 as "fail" — those
+# are bitrate-targeting bugs, not normal HEVC delivery noise.
+PSNR_REVIEW_THRESHOLD = 30.0
+PSNR_FAIL_THRESHOLD = 25.0
+
+
+@dataclass
+class SampleFrame:
+    percent: int
+    timestamp: float  # seconds into the source
+    src_jpeg: Path
+    opt_jpeg: Path
+
+
+@dataclass
+class SampleReport:
+    """Output of `sample_pair`: extracted frames + overall PSNR.
+
+    Rendered by the CLI as a small Markdown review doc. Per-frame PSNR
+    isn't tracked here — ffmpeg's `psnr` filter emits a single overall
+    score, which is what we surface. If a pair scores poorly the user
+    can eyeball the saved JPEGs to see where the degradation is.
+    """
+
+    source: Path
+    optimized: Path
+    frames: list[SampleFrame]
+    psnr_db: float | None  # None if ffmpeg didn't emit a score
+    review_dir: Path
+
+    @property
+    def verdict(self) -> str:
+        if self.psnr_db is None:
+            return "unknown"
+        if self.psnr_db >= PSNR_REVIEW_THRESHOLD:
+            return "ok"
+        if self.psnr_db >= PSNR_FAIL_THRESHOLD:
+            return "review"
+        return "fail"
+
+
+def _probe_duration(path: Path) -> float:
+    """Seconds via ffprobe. Returns 0.0 on failure so the caller falls
+    back to a safe "just sample frame 0" behaviour instead of crashing
+    the whole review run on one unreadable file."""
+    try:
+        dur, _ = _ffprobe_streams(path)
+        return dur
+    except TranscodeError:
+        return 0.0
+
+
+def _extract_frame(src: Path, t: float, dst: Path) -> bool:
+    """Pull a single frame at `t` seconds into `dst` as JPEG. Returns
+    True on success. Uses `-ss` before `-i` for fast seek (output may
+    land on the nearest keyframe rather than the exact timestamp, which
+    is fine for quality review — we just need *a* frame near t)."""
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+        "-ss", f"{t:.3f}", "-i", str(src),
+        "-vframes", "1", "-q:v", "3",
+        str(dst),
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True)
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return False
+    return dst.exists() and dst.stat().st_size > 0
+
+
+def _overall_psnr(src: Path, opt: Path) -> float | None:
+    """Compute src-vs-opt PSNR via ffmpeg's `psnr` filter.
+
+    ffmpeg prints a summary line like:
+        [Parsed_psnr_0 @ 0x…] PSNR y:XX.XX u:… v:… average:37.25 min:… max:…
+    We parse `average:` out of stderr. Returns None if no line matched
+    (e.g. ffmpeg's psnr filter refused because resolutions differ, or
+    ffmpeg isn't on PATH).
+    """
+    cmd = [
+        "ffmpeg", "-hide_banner",
+        "-i", str(src), "-i", str(opt),
+        "-lavfi", "psnr", "-f", "null", "-",
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, check=False)
+    except FileNotFoundError:
+        return None
+    out = (r.stderr or "") + (r.stdout or "")
+    for line in out.splitlines():
+        if "PSNR" in line and "average:" in line:
+            # Format: "... average:XX.XX min:..."
+            try:
+                avg = line.split("average:")[1].split()[0]
+                return float(avg)
+            except (IndexError, ValueError):
+                continue
+    return None
+
+
+def sample_pair(
+    source: Path,
+    optimized: Path,
+    review_root: Path,
+    *,
+    percents: Iterable[int] = _DEFAULT_SAMPLE_PERCENTS,
+) -> SampleReport:
+    """Extract matched frames from `source` + `optimized`, compute PSNR.
+
+    Writes frames to `<review_root>/<source.stem>/<pct>_{src,opt}.jpg`
+    so a folder listing is self-documenting. Missing inputs or ffmpeg
+    failures degrade gracefully: an empty frames list + PSNR=None
+    yields verdict `unknown`, the CLI surfaces that rather than
+    crashing the whole review run on one broken file.
+    """
+    dur = _probe_duration(source)
+    review_dir = review_root / source.stem
+    frames: list[SampleFrame] = []
+    for pct in percents:
+        t = dur * (pct / 100.0) if dur > 0 else 0.0
+        src_jpg = review_dir / f"{pct:03d}_src.jpg"
+        opt_jpg = review_dir / f"{pct:03d}_opt.jpg"
+        ok_s = _extract_frame(source, t, src_jpg)
+        ok_o = _extract_frame(optimized, t, opt_jpg)
+        if ok_s and ok_o:
+            frames.append(SampleFrame(
+                percent=pct, timestamp=t, src_jpeg=src_jpg, opt_jpeg=opt_jpg,
+            ))
+    psnr = _overall_psnr(source, optimized)
+    return SampleReport(
+        source=source, optimized=optimized,
+        frames=frames, psnr_db=psnr, review_dir=review_dir,
+    )
+
+
+def render_review_md(reports: list[SampleReport], dst: Path) -> None:
+    """Emit a Markdown review doc listing every pair + its frames.
+
+    The doc opens fine in any Markdown viewer — most preview tools
+    (VS Code, Typora, Obsidian) render the referenced JPEGs inline,
+    which is the whole point: flip through the doc and eyeball the
+    frames side by side, no bespoke viewer needed.
+    """
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    lines: list[str] = [
+        "# Bloat transcode — before/after review",
+        "",
+        "Compare source (left) and optimized (right) frames at evenly-"
+        "spaced percentages. PSNR column is the ffmpeg full-video "
+        f"average. Verdicts: `ok` ≥ {PSNR_REVIEW_THRESHOLD:.0f} dB, "
+        f"`review` ≥ {PSNR_FAIL_THRESHOLD:.0f} dB, `fail` below.",
+        "",
+        "| file | PSNR (dB) | verdict |",
+        "|---|---:|---|",
+    ]
+    for r in reports:
+        psnr_str = f"{r.psnr_db:.2f}" if r.psnr_db is not None else "—"
+        lines.append(f"| {r.source.name} | {psnr_str} | {r.verdict} |")
+    lines.append("")
+    for r in reports:
+        lines.append(f"## {r.source.name}")
+        psnr_str = f"{r.psnr_db:.2f} dB" if r.psnr_db is not None else "—"
+        lines.append(f"PSNR: **{psnr_str}** · verdict: **{r.verdict}**")
+        lines.append("")
+        if not r.frames:
+            lines.append("_no frames extracted_")
+            lines.append("")
+            continue
+        for f in r.frames:
+            rel_src = f.src_jpeg.relative_to(dst.parent)
+            rel_opt = f.opt_jpeg.relative_to(dst.parent)
+            lines.append(
+                f"**t={f.timestamp:.1f}s ({f.percent}%)**  "
+                f"src: ![src]({rel_src})  opt: ![opt]({rel_opt})"
+            )
+        lines.append("")
+    dst.write_text("\n".join(lines), encoding="utf-8")
+
+
 def _sha256(path: Path) -> str:
     h = hashlib.sha256()
     with path.open("rb") as f:

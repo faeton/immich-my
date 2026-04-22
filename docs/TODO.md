@@ -10,9 +10,20 @@ criteria.
 
 ### Phase 2c residuals
 
-- Improve bloat/transcode UX beyond the current CLI flow.
-- Add better sampling / before-after review for candidate transcodes.
-- Tighten catalog identity guarantees after `--apply` on real libraries.
+- [x] `immy bloat sample <folder>` — before/after review for candidate
+  transcodes. Extracts matched frames from every `*.optimized.*` /
+  source pair at evenly-spaced percentages (default 10/30/50/70/90 %),
+  runs ffmpeg's `psnr` filter on the full pair, renders
+  `<folder>/.audit/bloat-review/review.md` with inline JPEG thumbs and
+  per-file verdict (`ok` ≥ 30 dB, `review` ≥ 25 dB, `fail` below).
+  Non-destructive — run before `bloat transcode … --apply`.
+
+Remaining:
+- Catalog identity guarantees after `--apply` on real libraries — this
+  is an audit task (verify asset row + derivatives + library re-scan
+  handle in-place replacement) rather than a build task. Open when
+  something actually breaks; the current `_verify` check on duration
+  + stream count has held across every transcode run so far.
 
 ### Phase 3 — Proxy-first AI enrichment
 
