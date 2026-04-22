@@ -9,6 +9,7 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
+from . import apple_photos as apple_photos_mod
 from . import bloat as bloat_mod
 from . import captions as captions_mod
 from . import clip as clip_mod
@@ -1769,6 +1770,112 @@ def find_duplicates(
     console.print(
         f"\n[green]✓[/green] report: [cyan]{report_md}[/cyan] "
         f"(+ {report_json.name})"
+    )
+
+
+@app.command("apple-people")
+def apple_people(
+    photos_library: Path = typer.Option(
+        Path.home() / "Pictures" / "Photos Library.photoslibrary",
+        "--photos-db",
+        help="Path to a `.photoslibrary` bundle, or directly to Photos.sqlite.",
+    ),
+    snapshot_path: Path = typer.Option(
+        Path.home() / ".immy" / "library-snapshot.sqlite", "--snapshot",
+        help="SQLite snapshot produced by `immy snapshot`.",
+    ),
+    min_faces: int = typer.Option(
+        3, "--min-faces",
+        help="Skip persons with fewer than this many faces in Apple Photos.",
+    ),
+    only: list[str] = typer.Option(
+        None, "--only",
+        help="Restrict to named person(s) (repeatable, exact full-name match).",
+    ),
+) -> None:
+    """Preview Apple Photos face-tagging that would seed Immich Person rows.
+
+    Dry-run only — prints the named persons, their face counts, and how
+    many of those faces map to assets present in the Immich snapshot via
+    `(original_filename, size)` match. No write path yet; the plan is to
+    add `--apply` once the match rate looks sensible.
+
+    Requires a fresh snapshot (`immy snapshot`) for the match phase.
+    """
+    try:
+        db_path = apple_photos_mod.resolve_db_path(photos_library)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+
+    if not snapshot_path.exists():
+        console.print(
+            f"[red]snapshot not found:[/red] {snapshot_path}\n"
+            "Run `immy snapshot` first (needs Immich DB access)."
+        )
+        raise typer.Exit(code=2)
+
+    console.print(
+        f"[bold]apple-people[/bold]\n"
+        f"  photos: [cyan]{db_path}[/cyan]\n"
+        f"  snapshot: [cyan]{snapshot_path}[/cyan]"
+    )
+
+    conn = apple_photos_mod.open_ro(db_path)
+    try:
+        persons = apple_photos_mod.read_named_persons(
+            conn,
+            min_faces=min_faces,
+            only=set(only) if only else None,
+        )
+    finally:
+        conn.close()
+
+    if not persons:
+        console.print("[yellow]no named persons found (or all below --min-faces).[/yellow]")
+        raise typer.Exit(code=0)
+
+    snap = snapshot_mod.open_for_read(snapshot_path)
+    try:
+        matches = apple_photos_mod.match_to_snapshot(persons, snap)
+        snap_meta = snapshot_mod.read_meta(snap)
+    finally:
+        snap.close()
+
+    total_faces = sum(len(p.faces) for p in persons)
+    total_matched = sum(len(m) for m in matches.values())
+    total_assets = snap_meta.get("asset_count", "?")
+
+    console.print(
+        f"\n[bold]{len(persons)}[/bold] named person(s) with ≥{min_faces} faces — "
+        f"[bold]{total_faces:,}[/bold] faces total. "
+        f"Snapshot has {total_assets} asset(s)."
+    )
+
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("person")
+    table.add_column("apple faces", justify="right")
+    table.add_column("→ matched", justify="right")
+    table.add_column("%", justify="right")
+    for person in persons:
+        m = len(matches.get(person.apple_pk, []))
+        total = len(person.faces)
+        pct = f"{100 * m / total:.0f}%" if total else "-"
+        style = "green" if m else "dim"
+        table.add_row(
+            person.full_name,
+            f"{total:,}",
+            f"[{style}]{m:,}[/{style}]",
+            pct,
+        )
+    console.print(table)
+    console.print(
+        f"\nTotal: [bold]{total_matched:,}[/bold] / {total_faces:,} faces "
+        f"({100 * total_matched / total_faces:.0f}%) map to assets in Immich."
+    )
+    console.print(
+        "[dim]No changes made. Write path (`--apply`) not yet implemented — "
+        "review the match rate above first.[/dim]"
     )
 
 
