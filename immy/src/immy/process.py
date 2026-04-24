@@ -35,6 +35,7 @@ import yaml
 from . import captions as captions_mod
 from . import clip as clip_mod
 from . import derivatives as derivatives_mod
+from . import dji as dji_mod
 from . import faces as faces_mod
 from . import insta360 as insta360_mod
 from . import journal as journal_mod
@@ -515,6 +516,15 @@ def process_trip(
     once up-front against `smart_search.embedding` typmod.
     """
     rows = read_folder(trip_folder)
+
+    # DJI drones write every clip as a paired `.MP4` master + `.LRF`
+    # low-res proxy sharing a stem. The LRF is not user-visible content
+    # — it's there to accelerate ffmpeg decode of the master. Drop
+    # paired LRFs from ingest entirely; unpaired orphans fall through
+    # (the user should see them as normal so they can investigate).
+    dji_proxy_index = dji_mod.build_proxy_index(r.path for r in rows)
+    rows = [r for r in rows if not dji_mod.is_paired_proxy(r.path, dji_proxy_index)]
+
     results: list[ProcessResult] = []
 
     # Sink routes every would-be DB write. Default is the online PgSink
@@ -653,10 +663,19 @@ def process_trip(
                 derivs = rebuilt
                 _emit("    derivatives… [cached]")
         if compute_derivatives and we_own and derivs is None and asset.asset_type in ("IMAGE", "VIDEO"):
-            proxy = (
-                insta360_mod.proxy_for(exif_row.path, proxy_index)
-                if asset.asset_type == "VIDEO" else None
-            )
+            proxy = None
+            if asset.asset_type == "VIDEO":
+                # Insta360 VID ↔ LRV pairs share (timestamp, serial);
+                # DJI MP4 ↔ LRF pairs share a stem. Both proxies are
+                # already H.264 and ~10-30× faster to decode than the
+                # master, so feeding them to ffmpeg as `derivative_source`
+                # is a huge win. `proxy_for` returns None for anything
+                # that doesn't match its schema, so the calls are safe
+                # to stack.
+                proxy = (
+                    insta360_mod.proxy_for(exif_row.path, proxy_index)
+                    or dji_mod.proxy_for(exif_row.path, dji_proxy_index)
+                )
             # De-warp only applies to the master file. When we have a
             # proxy (LRV), it's already the camera's stitched
             # equirectangular preview — feeding it through v360 would
@@ -672,7 +691,7 @@ def process_trip(
             if asset.asset_type == "IMAGE":
                 label = "thumb+preview"
             elif proxy:
-                label = "transcode via LRV proxy"
+                label = f"transcode via {proxy.suffix.lstrip('.').upper()} proxy"
             elif dewarp:
                 label = "transcode + fisheye de-warp"
             else:
