@@ -36,6 +36,7 @@ from . import captions as captions_mod
 from . import clip as clip_mod
 from . import derivatives as derivatives_mod
 from . import faces as faces_mod
+from . import insta360 as insta360_mod
 from . import journal as journal_mod
 from . import offline as offline_mod
 from . import pg as pg_mod
@@ -557,6 +558,14 @@ def process_trip(
     # derivatives" from "stuck on Whisper" without parsing anything.
     total = len(rows)
 
+    # Insta360 produces one `VID_*.insv` master per lens (5.7K+ dual-
+    # fisheye, multi-GB) and one `LRV_*.lrv` low-res proxy alongside.
+    # Decoding the proxy for the poster + encoded_video derivative is
+    # ~30× faster and produces an identical-looking dual-fisheye tile.
+    # Asset rows still point at the real master — only ffmpeg's input
+    # changes.
+    proxy_index = insta360_mod.build_proxy_index(r.path for r in rows)
+
     def _emit(msg: str) -> None:
         if progress is not None:
             progress(msg)
@@ -644,13 +653,17 @@ def process_trip(
                 derivs = rebuilt
                 _emit("    derivatives… [cached]")
         if compute_derivatives and we_own and derivs is None and asset.asset_type in ("IMAGE", "VIDEO"):
+            proxy = (
+                insta360_mod.proxy_for(exif_row.path, proxy_index)
+                if asset.asset_type == "VIDEO" else None
+            )
             # Videos hit the expensive path here: full ffmpeg H.264
             # transcode of the encoded_video derivative. Images just do
             # pyvips thumb+preview, much cheaper.
-            _emit(
-                f"    derivatives… "
-                f"({'transcode' if asset.asset_type == 'VIDEO' else 'thumb+preview'})"
+            label = "thumb+preview" if asset.asset_type == "IMAGE" else (
+                "transcode via LRV proxy" if proxy else "transcode"
             )
+            _emit(f"    derivatives… ({label})")
             try:
                 result = _phase(
                     lambda: derivatives_mod.compute_for_asset(
@@ -660,6 +673,7 @@ def process_trip(
                         asset_type=asset.asset_type,
                         trip_folder=trip_folder,
                         transcode_videos=transcode_videos,
+                        derivative_source=proxy,
                     ),
                     "derivatives", timings,
                 )

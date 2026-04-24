@@ -301,10 +301,17 @@ def _image_dims_and_stills(
 
 def _video_stills_and_transcode(
     source_media: Path, asset_id: str, owner_id: str, base: Path,
-    *, transcode: bool,
+    *, transcode: bool, derivative_source: Path | None = None,
 ) -> tuple[list[DerivativeFile], int, int, str | None]:
     """VIDEO branch: ffprobe → poster → two stills via pyvips (+ optional
     transcode). Returns (files, width, height, duration).
+
+    `derivative_source` (when given) is the file fed to ffmpeg for
+    poster extraction and the encoded_video transcode — used for
+    Insta360 masters so we decode the small LRV proxy instead of the
+    multi-gigabyte `.insv`. Dimensions still come from probing the
+    master, so `asset.width`/`asset.height` report what the original
+    actually contains.
 
     The poster is a temp JPEG inside `.audit/derivatives/` that we feed
     to the same `_write_thumbnail` / `_write_preview` helpers used for
@@ -318,8 +325,9 @@ def _video_stills_and_transcode(
         if info.duration_s is not None else None
     )
 
+    ffmpeg_source = derivative_source or source_media
     poster = base / "_posters" / f"{asset_id}.jpg"
-    video_mod.extract_poster(source_media, poster, duration_s=info.duration_s)
+    video_mod.extract_poster(ffmpeg_source, poster, duration_s=info.duration_s)
 
     vips = _require_pyvips()
     preview_img = vips.Image.thumbnail(
@@ -351,7 +359,7 @@ def _video_stills_and_transcode(
     if transcode and video_mod.needs_transcode(info):
         rel = relative_path_for(asset_id, owner_id, "encoded_video")
         dst = base / rel
-        video_mod.transcode(source_media, dst)
+        video_mod.transcode(ffmpeg_source, dst)
         files.append(DerivativeFile(
             kind="encoded_video",
             staged_path=dst,
@@ -371,6 +379,7 @@ def compute_for_asset(
     asset_type: str,
     trip_folder: Path,
     transcode_videos: bool = True,
+    derivative_source: Path | None = None,
 ) -> DerivativeResult:
     """Stage thumbnail + preview (and for videos, optional encoded_video)
     for one asset.
@@ -395,6 +404,7 @@ def compute_for_asset(
         files, w, h, dur = _video_stills_and_transcode(
             source_media, asset_id, owner_id, base,
             transcode=transcode_videos,
+            derivative_source=derivative_source,
         )
         return DerivativeResult(files=files, width=w, height=h, duration=dur)
 
