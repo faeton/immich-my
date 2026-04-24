@@ -113,7 +113,16 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
     the full output into `CompletedProcess.stdout` for the itemized-
     changes parser downstream.
     """
-    args = ["rsync", "-a", "--itemize-changes", "--progress"]
+    # --partial keeps a half-copied file on interrupt; --append resumes by
+    # appending to it on rerun. Safe because trip media is immutable once
+    # written. --inplace writes straight to the destination path (no
+    # temp+rename), which avoids doubling remote disk on a 50 GB file and
+    # pairs naturally with --append. All three are supported by Apple's
+    # openrsync (see /usr/bin/rsync --help).
+    args = [
+        "rsync", "-a", "--itemize-changes", "--progress",
+        "--partial", "--append", "--inplace",
+    ]
     if dry_run:
         args.append("--dry-run")
     for pat in RSYNC_EXCLUDES:
