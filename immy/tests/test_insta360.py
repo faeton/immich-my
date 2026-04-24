@@ -65,6 +65,33 @@ def test_proxy_for_master_without_proxy():
     assert insta360.proxy_for(Path("/trip/VID_20240101_120000_00_001.insv"), idx) is None
 
 
+def test_dewarp_vf_lens_00_clockwise():
+    vf = insta360.dewarp_vf(Path("/trip/VID_20240101_120000_00_001.insv"))
+    assert vf is not None
+    assert "v360=input=fisheye:output=flat" in vf
+    assert "ih_fov=200:iv_fov=200" in vf
+    assert vf.endswith(",transpose=1")
+
+
+def test_dewarp_vf_lens_10_cw_vflip():
+    vf = insta360.dewarp_vf(Path("/trip/VID_20240101_120000_10_001.insv"))
+    assert vf is not None
+    assert vf.endswith(",transpose=3")
+
+
+def test_dewarp_vf_none_for_proxy_and_unknown():
+    # Proxies are already stitched equirect — de-warping them would
+    # double-warp. Returns None so the caller skips the filter.
+    assert insta360.dewarp_vf(
+        Path("/trip/LRV_20240101_120000_01_001.lrv"),
+    ) is None
+    assert insta360.dewarp_vf(Path("/trip/IMG_0001.jpg")) is None
+    # Unknown lens code (e.g. future model) — no mapping, returns None.
+    assert insta360.dewarp_vf(
+        Path("/trip/VID_20240101_120000_99_001.insv"),
+    ) is None
+
+
 def test_proxy_for_non_master_returns_none():
     idx = insta360.build_proxy_index(
         [Path("/trip/LRV_20240101_120000_01_001.lrv")],

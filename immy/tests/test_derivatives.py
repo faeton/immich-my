@@ -161,13 +161,13 @@ def test_compute_video_stages_poster_stills_and_transcode(
     )
     monkeypatch.setattr(video_mod, "probe", lambda p: fake_info)
 
-    def fake_poster(src_p: Path, dst_p: Path, *, duration_s):
+    def fake_poster(src_p: Path, dst_p: Path, *, duration_s, preproc_vf=None):
         dst_p.parent.mkdir(parents=True, exist_ok=True)
         _make_png(dst_p, width=1920, height=1080)
     monkeypatch.setattr(video_mod, "extract_poster", fake_poster)
 
     transcode_calls: list[tuple[Path, Path]] = []
-    def fake_transcode(src_p: Path, dst_p: Path):
+    def fake_transcode(src_p: Path, dst_p: Path, *, preproc_vf=None):
         dst_p.parent.mkdir(parents=True, exist_ok=True)
         dst_p.write_bytes(b"fake-mp4")
         transcode_calls.append((src_p, dst_p))
@@ -205,14 +205,14 @@ def test_compute_video_skips_transcode_for_web_safe_source(
         video_codec="h264", audio_codec="aac", container_ext=".mp4",
     )
     monkeypatch.setattr(video_mod, "probe", lambda p: fake_info)
-    def _poster(s, d, *, duration_s):
+    def _poster(s, d, *, duration_s, preproc_vf=None):
         d.parent.mkdir(parents=True, exist_ok=True)
         _make_png(d, 1280, 720)
     monkeypatch.setattr(video_mod, "extract_poster", _poster)
 
     called = []
     monkeypatch.setattr(video_mod, "transcode",
-                        lambda s, d: called.append((s, d)))
+                        lambda s, d, *, preproc_vf=None: called.append((s, d)))
 
     result = derivatives_mod.compute_for_asset(
         source_media=src,
@@ -240,13 +240,13 @@ def test_compute_video_no_transcode_flag_respected(
         video_codec="hevc", audio_codec="aac", container_ext=".mkv",
     )
     monkeypatch.setattr(video_mod, "probe", lambda p: fake_info)
-    def _poster2(s, d, *, duration_s):
+    def _poster2(s, d, *, duration_s, preproc_vf=None):
         d.parent.mkdir(parents=True, exist_ok=True)
         _make_png(d, 3840, 2160)
     monkeypatch.setattr(video_mod, "extract_poster", _poster2)
     calls = []
     monkeypatch.setattr(video_mod, "transcode",
-                        lambda s, d: calls.append(d))
+                        lambda s, d, *, preproc_vf=None: calls.append(d))
 
     result = derivatives_mod.compute_for_asset(
         source_media=src, asset_id="aa" + "0" * 34,

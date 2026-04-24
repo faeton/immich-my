@@ -184,13 +184,20 @@ def needs_transcode(info: VideoInfo) -> bool:
     return False
 
 
-def extract_poster(src: Path, dst: Path, *, duration_s: float | None) -> None:
+def extract_poster(
+    src: Path, dst: Path, *, duration_s: float | None,
+    preproc_vf: str | None = None,
+) -> None:
     """Write a single-frame JPEG poster.
 
     Seeks to `min(duration/2, 5 s)`; for broken/zero-duration files
     we just seek to 0. `-ss` is placed *before* `-i` so ffmpeg does
     the fast (keyframe-level) seek — accurate-seek would re-decode
     from frame 0 on every call and crawl on long takes.
+
+    `preproc_vf` is an optional filter chain applied before JPEG
+    encoding — used for Insta360 single-lens de-warp (see
+    `insta360.dewarp_vf`).
     """
     if shutil.which("ffmpeg") is None:
         raise VideoTranscodeError("ffmpeg not on PATH — install ffmpeg")
@@ -202,6 +209,10 @@ def extract_poster(src: Path, dst: Path, *, duration_s: float | None) -> None:
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-ss", f"{seek:.3f}",
         "-i", str(src),
+    ]
+    if preproc_vf:
+        args += ["-vf", preproc_vf]
+    args += [
         "-frames:v", "1",
         "-q:v", "2",  # high-quality JPEG; source for later pyvips resize
         "-y", str(dst),
@@ -215,7 +226,7 @@ def extract_poster(src: Path, dst: Path, *, duration_s: float | None) -> None:
         ) from e
 
 
-def transcode(src: Path, dst: Path) -> None:
+def transcode(src: Path, dst: Path, *, preproc_vf: str | None = None) -> None:
     """Produce a web-playable mp4 at the target height.
 
     Encoder choices mirror Immich's defaults (see `IMMICH-INGEST.md`
@@ -223,11 +234,17 @@ def transcode(src: Path, dst: Path) -> None:
     so the browser can start playback before the full file arrives.
     Scale clamps the shorter axis to `TRANSCODE_TARGET_HEIGHT` only
     when the source is taller — never upscales.
+
+    `preproc_vf`, when given, runs *before* the scale filter — used
+    for Insta360 single-lens de-warp. The de-warp already outputs
+    the target height, so the subsequent scale clamp is effectively
+    a no-op for those files.
     """
     if shutil.which("ffmpeg") is None:
         raise VideoTranscodeError("ffmpeg not on PATH — install ffmpeg")
     dst.parent.mkdir(parents=True, exist_ok=True)
-    vf = f"scale='trunc(iw*min(1,{TRANSCODE_TARGET_HEIGHT}/ih)/2)*2':'min({TRANSCODE_TARGET_HEIGHT},ih)'"
+    scale = f"scale='trunc(iw*min(1,{TRANSCODE_TARGET_HEIGHT}/ih)/2)*2':'min({TRANSCODE_TARGET_HEIGHT},ih)'"
+    vf = f"{preproc_vf},{scale}" if preproc_vf else scale
     args = [
         "ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
         "-i", str(src),

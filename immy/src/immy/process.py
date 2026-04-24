@@ -657,12 +657,26 @@ def process_trip(
                 insta360_mod.proxy_for(exif_row.path, proxy_index)
                 if asset.asset_type == "VIDEO" else None
             )
+            # De-warp only applies to the master file. When we have a
+            # proxy (LRV), it's already the camera's stitched
+            # equirectangular preview — feeding it through v360 would
+            # double-warp. No proxy + recognised Insta360 master →
+            # single-lens fisheye → flat perspective crop.
+            dewarp = (
+                insta360_mod.dewarp_vf(exif_row.path)
+                if asset.asset_type == "VIDEO" and proxy is None else None
+            )
             # Videos hit the expensive path here: full ffmpeg H.264
             # transcode of the encoded_video derivative. Images just do
             # pyvips thumb+preview, much cheaper.
-            label = "thumb+preview" if asset.asset_type == "IMAGE" else (
-                "transcode via LRV proxy" if proxy else "transcode"
-            )
+            if asset.asset_type == "IMAGE":
+                label = "thumb+preview"
+            elif proxy:
+                label = "transcode via LRV proxy"
+            elif dewarp:
+                label = "transcode + fisheye de-warp"
+            else:
+                label = "transcode"
             _emit(f"    derivatives… ({label})")
             try:
                 result = _phase(
@@ -674,6 +688,7 @@ def process_trip(
                         trip_folder=trip_folder,
                         transcode_videos=transcode_videos,
                         derivative_source=proxy,
+                        preproc_vf=dewarp,
                     ),
                     "derivatives", timings,
                 )
