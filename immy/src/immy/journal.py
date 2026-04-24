@@ -50,6 +50,12 @@ class Journal:
 
     path: Path
     entries: dict[str, dict[str, dict[str, Any]]] = field(default_factory=dict)
+    # `dirty` is set whenever `mark_done` / `clear_worker` mutates state,
+    # so `flush()` can skip the multi-MB YAML rewrite on trips where the
+    # current run touched nothing (fully-cached resume scans). Without
+    # this, a 3k-asset trip paid ~1–2 s per file rewriting the journal
+    # even when no phase ran.
+    _dirty: bool = False
 
     @classmethod
     def load(cls, trip_folder: Path) -> "Journal":
@@ -90,22 +96,30 @@ class Journal:
         if meta:
             rec["meta"] = dict(meta)
         self.entries.setdefault(checksum_hex, {})[worker] = rec
+        self._dirty = True
 
     def clear_worker(self, checksum_hex: str, worker: str) -> None:
         if checksum_hex in self.entries:
-            self.entries[checksum_hex].pop(worker, None)
+            removed = self.entries[checksum_hex].pop(worker, None)
             if not self.entries[checksum_hex]:
                 self.entries.pop(checksum_hex)
+            if removed is not None:
+                self._dirty = True
 
     def flush(self) -> None:
         """Atomic write: tmp file in the same dir, then rename. Same dir
         is required for rename to be atomic on POSIX (must stay within one
-        filesystem)."""
+        filesystem). No-op when nothing has changed since the last flush —
+        resumed trips where every asset is cached skip the YAML rewrite
+        entirely."""
+        if not self._dirty:
+            return
         self.path.parent.mkdir(parents=True, exist_ok=True)
         payload = {"schema": 1, "entries": self.entries}
         tmp = self.path.with_suffix(self.path.suffix + ".tmp")
         tmp.write_text(yaml.safe_dump(payload, sort_keys=True))
         os.replace(tmp, self.path)
+        self._dirty = False
 
 
 # --- Worker version strings ----------------------------------------------

@@ -590,7 +590,7 @@ def process_trip(
         except OSError:
             size_mb = 0.0
         _emit(
-            f"[{idx}/{total}] {exif_row.path.name} "
+            f"[{idx}/{total}] {trip_folder.name}/{exif_row.path.name} "
             f"({size_mb:.1f} MB)"
         )
 
