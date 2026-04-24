@@ -158,7 +158,7 @@ Shipped:
   earlier trips durable through Ctrl-C / a later-trip failure.
 - Caption resume on the online path — skip the VLM when
   `asset_exif.description` is already AI-prefixed. `--recaption` forces.
-- `tools/caption-all-trips.sh --status` surfaces partial progress from
+- `tools/process-all-trips.sh --status` surfaces partial progress from
   `.audit/journal.yml` when `.audit/process.yml` hasn't been written yet
   (interrupted batch). Earlier the table labelled every interrupted trip
   "never processed" and hid hours of per-asset work.

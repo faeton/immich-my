@@ -64,7 +64,7 @@ success), so you can run it multiple times without duplicates. It also
 re-caches `~/.immy/library.yml` so future offline runs inherit real
 owner/library UUIDs instead of placeholders.
 
-The batch script `tools/caption-all-trips.sh` defaults to `--offline`;
+The batch script `tools/process-all-trips.sh` defaults to `--offline`;
 pass `--online` when the tailnet is up, or `--sync` to just replay.
 
 ## 2. Start the local VLM server

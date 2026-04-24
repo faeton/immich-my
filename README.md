@@ -41,6 +41,23 @@ uv run immy audit tests/fixtures/dji-srt-pair
 uv run pytest
 ```
 
+## Batch wrappers
+
+Two non-interactive batch scripts under `tools/` wrap `immy` for
+overnight runs over every trip under `~/Media/Trips`. Both preflight,
+log to `~/.immy/*-logs/`, and skip work already done:
+
+- `tools/process-all-trips.sh` — runs the full `immy process` pipeline
+  (derivatives + CLIP + faces + transcripts + captions). Defaults to
+  `--offline` (caches to `.audit/offline/`); `--online` writes straight
+  to Postgres, `--sync` replays a cached run to the DB, `--status`
+  reports only. Requires LM Studio + Gemma 4 for captions.
+- `tools/promote-all-trips.sh` — rsyncs originals + derivatives to the
+  NAS and triggers the Immich-side steps for every pending trip. Uses
+  `rsync --partial --append --inplace`, so a dropped connection on a
+  multi-GB video resumes on rerun rather than restarting. Skips trips
+  already logged as promoted.
+
 Local prerequisites:
 - `exiftool`
 - `ffmpeg` / `ffprobe`

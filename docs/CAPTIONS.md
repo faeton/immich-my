@@ -81,7 +81,7 @@ makes re-runs a no-op.
 **Captions only become searchable after they reach the DB.** If you
 ran `immy process --offline`, captions live in
 `<trip>/.audit/offline/<checksum>.yml` and are invisible to Immich
-until `immy sync-offline <trip>` (or the `tools/caption-all-trips.sh
+until `immy sync-offline <trip>` (or the `tools/process-all-trips.sh
 --sync` wrapper) pushes them.
 
 ## Cost per 1 000 images

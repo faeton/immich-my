@@ -6,11 +6,11 @@
 # ingested trip finishes regardless of which pass stopped it.
 #
 # Usage:
-#   tools/caption-all-trips.sh              # process every trip (offline by default)
-#   tools/caption-all-trips.sh <trip-name>  # one trip (folder name only)
-#   tools/caption-all-trips.sh --status     # report-only; don't process
-#   tools/caption-all-trips.sh --online     # write straight to DB (needs tailnet)
-#   tools/caption-all-trips.sh --sync       # replay any cached .audit/offline/ to DB
+#   tools/process-all-trips.sh              # process every trip (offline by default)
+#   tools/process-all-trips.sh <trip-name>  # one trip (folder name only)
+#   tools/process-all-trips.sh --status     # report-only; don't process
+#   tools/process-all-trips.sh --online     # write straight to DB (needs tailnet)
+#   tools/process-all-trips.sh --sync       # replay any cached .audit/offline/ to DB
 #
 # Offline-by-default: every phase (CLIP, faces, transcripts, captions)
 # runs locally and writes to `.audit/offline/<checksum>.yml` per trip.
@@ -320,23 +320,33 @@ else
        "${TRIPS[@]}" "${PROCESS_FLAGS[@]}" \
        2>&1 | tee -a "$RUN_LOG"; then
     TOTAL_OK="${#TRIPS[@]}"
+    BATCH_RC=0
   else
-    rc=$?
-    # `immy process` exits 1 when one or more trips failed (but other
-    # trips still committed). Treat the batch as partially ok — the
-    # per-trip summary immy prints is the source of truth.
-    TOTAL_FAIL=1
+    BATCH_RC=$?
+    # We can't know per-trip ok/fail counts from a single `immy process`
+    # invocation — the per-trip summary immy itself prints above is the
+    # source of truth. Record the batch rc so the summary below can show
+    # "interrupted" (130) vs "partial failure" (other nonzero) honestly
+    # instead of inventing a 0-ok/1-failed tally.
     printf '%sBatch exited rc=%s%s — see per-trip output above.\n' \
-      "$C_ERR" "$rc" "$C_RESET" | tee -a "$RUN_LOG"
+      "$C_ERR" "$BATCH_RC" "$C_RESET" | tee -a "$RUN_LOG"
   fi
 fi
 
 # --- Summary ---------------------------------------------------------
 banner | tee -a "$RUN_LOG"
-printf 'Done. %s%d ok%s, %s%d failed%s. Log: %s\n' \
-  "$C_OK" "$TOTAL_OK" "$C_RESET" \
-  "$C_ERR" "$TOTAL_FAIL" "$C_RESET" \
-  "$RUN_LOG" | tee -a "$RUN_LOG"
+if [[ "${BATCH_RC:-0}" == "130" ]]; then
+  printf 'Interrupted. See per-trip output for what completed. Log: %s\n' \
+    "$RUN_LOG" | tee -a "$RUN_LOG"
+elif [[ "${BATCH_RC:-0}" != "0" && "$MODE" != "online" ]]; then
+  printf 'Batch rc=%s. See per-trip output for what completed. Log: %s\n' \
+    "$BATCH_RC" "$RUN_LOG" | tee -a "$RUN_LOG"
+else
+  printf 'Done. %s%d ok%s, %s%d failed%s. Log: %s\n' \
+    "$C_OK" "$TOTAL_OK" "$C_RESET" \
+    "$C_ERR" "$TOTAL_FAIL" "$C_RESET" \
+    "$RUN_LOG" | tee -a "$RUN_LOG"
+fi
 banner | tee -a "$RUN_LOG"
 printf '\nFinal status:\n' | tee -a "$RUN_LOG"
 print_status_table | tee -a "$RUN_LOG"
