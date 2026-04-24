@@ -159,7 +159,8 @@ fi
 #   <trip>\tdone\t<ts>\t<new>\t<existing>\t<clip>\t<faces>\t<srt>\t<captions>
 #   <trip>\tpartial\t<ts>\t<new>\t-\t<clip>\t<faces>\t<srt>\t<captions>
 #   <trip>\tnone
-# `done` comes from the end-of-trip `process.yml` marker; `partial` is
+# `done` comes from the end-of-trip `y_processed.yml` marker written by
+# `immy process` (see `process_mod.write_marker`). `partial` is
 # reconstructed from per-asset `journal.yml` so interrupted runs don't
 # appear as "never processed".
 read_trip_statuses() {
@@ -170,7 +171,7 @@ from pathlib import Path
 from datetime import datetime, timezone
 
 def row(trip):
-    marker = trip / ".audit" / "process.yml"
+    marker = trip / ".audit" / "y_processed.yml"
     if marker.is_file():
         d = yaml.safe_load(marker.read_text()) or {}
         ts = d.get("processed_at")
