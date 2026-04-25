@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -111,6 +112,10 @@ def _encode_image(source: Path) -> str:
     if suffix in (".jpg", ".jpeg"):
         data = source.read_bytes()
     else:
+        # Silence libvips warnings before the (lazy) import; see the same
+        # block at the top of derivatives.py for details.
+        os.environ.setdefault("VIPS_WARNING", "0")
+        os.environ.setdefault("G_MESSAGES_DEBUG", "")
         import pyvips  # lazy — heavy import, not needed in pure-unit tests
 
         image = pyvips.Image.thumbnail(

@@ -22,12 +22,19 @@ layout under a different root). The transcoded mp4 lands at
 
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
+
+# Silence libvips' GLib warnings (HEIF / ICC / sequential / TIFF chatter
+# that pyvips would otherwise spew to stderr per-image). Must be set
+# *before* `import pyvips` for the env var to take effect.
+os.environ.setdefault("VIPS_WARNING", "0")
+os.environ.setdefault("G_MESSAGES_DEBUG", "")
 
 try:
     import pyvips
