@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import video as video_mod
+from .hallucinations import is_hallucination
 
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
@@ -91,6 +92,20 @@ class TranscriptResult:
     excerpt: str
 
 
+# Sentinel returned by `transcribe()` when Whisper produced text but it
+# was entirely hallucinated boilerplate (DimaTorzok credits etc.). The
+# pipeline distinguishes this from "Whisper produced no text at all"
+# (silent clip) so `process.py` can record a meaningful skip reason
+# instead of a bare empty result.
+class HallucinationOnly:
+    """Marker class — `transcribe()` returns this instance when every
+    Whisper segment was filtered as a known hallucination."""
+    __slots__ = ()
+
+
+HALLUCINATION_ONLY = HallucinationOnly()
+
+
 def _require_mlx_whisper() -> None:
     if mlx_whisper is None:
         raise RuntimeError(
@@ -121,12 +136,17 @@ def format_srt(segments: list[dict]) -> str:
 
     Empty-text segments are dropped — Whisper occasionally emits blank
     cues during long silences and they bloat the sidecar for no benefit.
+    Cues that match a known hallucination pattern (DimaTorzok credits,
+    "Продолжение следует", YouTube-outro thanks, etc.) are also dropped
+    so the sidecar reflects only what was actually said.
     """
     lines: list[str] = []
     index = 1
     for seg in segments:
         text = str(seg.get("text", "")).strip()
         if not text:
+            continue
+        if is_hallucination(text):
             continue
         start = _format_ts(float(seg.get("start", 0.0)))
         end = _format_ts(float(seg.get("end", 0.0)))
@@ -378,7 +398,7 @@ def transcribe(
     language: str | None = None,
     lang_candidates: tuple[str, ...] | None = DEFAULT_LANG_CANDIDATES,
     prompt: str | None = None,
-) -> TranscriptResult | None:
+) -> TranscriptResult | HallucinationOnly | None:
     """Transcribe one video; write the .srt sidecar; return excerpt.
 
     Returns None when Whisper produced no text (silent clip, or a
@@ -397,7 +417,17 @@ def transcribe(
         language = detect_language_constrained(
             media, candidates=lang_candidates, model=model,
         )
-    kwargs: dict = {"path_or_hf_repo": model}
+    # `condition_on_previous_text=False` breaks the main hallucination
+    # feedback loop: by default Whisper feeds each chunk's transcript as
+    # the prompt for the next chunk, so once a single "Продолжение
+    # следует" appears, the next chunk sees it and locks into outputting
+    # the same fansub-style boilerplate for the rest of the file.
+    # Disabling cross-chunk priming costs minor consistency on rare
+    # proper nouns but eliminates the runaway-credit cascades.
+    kwargs: dict = {
+        "path_or_hf_repo": model,
+        "condition_on_previous_text": False,
+    }
     if language:
         kwargs["language"] = language
     if prompt:
@@ -427,18 +457,33 @@ def transcribe(
     if not full_text:
         return None
     detected_lang = str(result.get("language") or language or DEFAULT_LANG_CODE)
+    # Render the SRT first — `format_srt` drops hallucinated cues — and
+    # check whether anything survived. If every segment Whisper emitted
+    # was boilerplate (the typical "60 minutes of wind, but Whisper
+    # produced 200 'DimaTorzok' lines" case), skip writing the sidecar
+    # and signal HALLUCINATION_ONLY so the caller can journal a
+    # meaningful skip reason instead of a fake-positive transcript.
+    srt_body = format_srt(segments)
+    if not srt_body.strip():
+        return HALLUCINATION_ONLY
+    # Rebuild the excerpt from the cleaned SRT so the description doesn't
+    # leak hallucinated text into Immich either.
+    clean_text = srt_to_plaintext(srt_body)
+    if not clean_text:
+        return HALLUCINATION_ONLY
     dst = sidecar_path(media, detected_lang)
-    dst.write_text(format_srt(segments), encoding="utf-8")
+    dst.write_text(srt_body, encoding="utf-8")
     return TranscriptResult(
         srt_path=dst,
         language=detected_lang,
-        excerpt=excerpt_text(full_text),
+        excerpt=excerpt_text(clean_text),
     )
 
 
 __all__ = [
     "DEFAULT_MODEL", "DEFAULT_LANG_CODE", "EXCERPT_MAX_CHARS",
-    "TranscriptResult", "format_srt", "excerpt_text", "srt_to_plaintext",
+    "TranscriptResult", "HallucinationOnly", "HALLUCINATION_ONLY",
+    "format_srt", "excerpt_text", "srt_to_plaintext",
     "sidecar_path", "has_audio", "is_silent", "is_denylisted_make",
     "speech_seconds", "speech_intervals", "detect_language_constrained",
     "transcribe", "DEFAULT_LANG_CANDIDATES", "SPEECH_MIN_SECONDS",

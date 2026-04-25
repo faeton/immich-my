@@ -1077,6 +1077,12 @@ def _process_transcript(
     result = transcripts_mod.transcribe(media, model=model, prompt=prompt)
     if result is None:
         return {"skipped": "whisper-empty"}
+    if isinstance(result, transcripts_mod.HallucinationOnly):
+        # Whisper produced text but every segment was known boilerplate
+        # (DimaTorzok credits, "Продолжение следует", etc.) — treat as a
+        # silent clip for journaling purposes so the asset isn't queued
+        # again on the next pass.
+        return {"skipped": "whisper-hallucination"}
     if result.excerpt:
         # Transcripts use the empty-guard (not the AI-guard) so a user
         # description never gets clobbered, but we also don't want to
