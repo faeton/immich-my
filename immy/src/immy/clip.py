@@ -19,6 +19,7 @@ See docs/IMMICH-INGEST.md §4.3.
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,15 @@ import numpy as np
 
 
 DEFAULT_MODEL = "ViT-B-32__openai"
+
+# mlx-clip's `mlx_clip(model_dir)` interprets its first arg as a local path
+# and downloads/converts weights *into that path* if missing. Default to a
+# user-level cache so repeated runs from any CWD share one copy (~600 MB
+# per model). Override with IMMY_CLIP_CACHE.
+_CLIP_CACHE_ROOT = Path(
+    os.environ.get("IMMY_CLIP_CACHE")
+    or (Path.home() / ".cache" / "mlx-clip")
+)
 
 # Immich model name → mlx-community repo id. Mirrors the accelerator's
 # MODEL_MAP for the models we actually support on Mac. Unknown names fall
@@ -74,7 +84,10 @@ def get_model(model_name: str = DEFAULT_MODEL) -> Any:
         raise ClipUnavailable(
             "mlx-clip is not installed; `uv add mlx-clip` (Apple Silicon only)"
         ) from e
-    model = _mlx_clip(_repo_for(model_name))
+    repo = _repo_for(model_name)
+    cache_dir = _CLIP_CACHE_ROOT / repo
+    cache_dir.parent.mkdir(parents=True, exist_ok=True)
+    model = _mlx_clip(str(cache_dir), hf_repo=repo)
     _MODEL_CACHE[model_name] = model
     return model
 
