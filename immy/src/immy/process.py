@@ -849,7 +849,7 @@ def process_trip(
                     ),
                     "transcript", timings,
                 )
-                if transcript_info:
+                if transcript_info and "skipped" not in transcript_info:
                     sink.record_transcript(asset.id, transcript_info)
                     journal.mark_done(
                         cs_hex, "transcript", TRANSCRIPT_VERSION,
@@ -959,7 +959,10 @@ def process_trip(
             derivatives=derivs,
             clip_embedded=clip_embedded,
             faces_detected=faces_detected,
-            transcript=transcript_info,
+            transcript=(
+                transcript_info if transcript_info and "skipped" not in transcript_info
+                else None
+            ),
             caption=caption_info,
         ))
 
@@ -975,7 +978,10 @@ def process_trip(
         if faces_detected:
             parts.append(f"{faces_detected} face(s)")
         if transcript_info:
-            parts.append(f"srt:{transcript_info.get('language', '?')}")
+            if "skipped" in transcript_info:
+                parts.append(f"srt:skip[{transcript_info['skipped']}]")
+            else:
+                parts.append(f"srt:{transcript_info.get('language', '?')}")
         if caption_info and caption_info.get("text"):
             snippet = caption_info["text"][:60].replace("\n", " ")
             parts.append(f'caption: "{snippet}…"')
@@ -1025,8 +1031,12 @@ def _process_transcript(
     4. Audio stream present but mean volume below threshold (ffmpeg
        volumedetect, ~2 s on a 5-sec sample window) → skip. Catches
        GoPro/phone clips of wind noise or muted ambient.
+    5. Full-file silencedetect sweep (decode-only ffmpeg pass) → skip
+       when total non-silent duration is below the speech threshold.
+       Catches the long-clip case the 5 s window misses, where a
+       sample landed on a noise patch but the rest of the file is dead.
 
-    Only after all four pass do we pay the ~1–5× realtime Whisper cost.
+    Only after all five pass do we pay the ~1–5× realtime Whisper cost.
     """
     for sib in media.parent.glob(f"{media.stem}.*.srt"):
         if sib.is_file():
@@ -1045,15 +1055,28 @@ def _process_transcript(
             except OSError:
                 pass
             return {"path": str(sib), "language": sib.suffixes[-2].lstrip(".")}
+    # Each gate returns a `skipped:<reason>` marker rather than bare None,
+    # so the per-asset summary in `process_assets` can show *why* the
+    # transcript phase ended in 0.1 s (denylist? silent? no audio?). The
+    # caller treats any dict with a "skipped" key as "don't journal, don't
+    # record" — the marker is purely for logging.
     if transcripts_mod.is_denylisted_make(make):
-        return None
+        return {"skipped": "denylisted-make"}
     if not transcripts_mod.has_audio(media):
-        return None
+        return {"skipped": "no-audio"}
     if transcripts_mod.is_silent(media):
-        return None
+        return {"skipped": "silent-sample"}
+    # Full-file sweep: a 60-min clip with only 1–2 s of throat-clearing
+    # is what currently produces `srt:fo` / `srt:nn` garbage — Whisper
+    # latches onto a low-resource language because there's nothing real
+    # to detect. Cheap (decode-only) compared to the Whisper pass that
+    # would otherwise run.
+    speech_s = transcripts_mod.speech_seconds(media)
+    if speech_s is not None and speech_s < transcripts_mod.SPEECH_MIN_SECONDS:
+        return {"skipped": f"silent-sweep ({speech_s:.1f}s speech)"}
     result = transcripts_mod.transcribe(media, model=model, prompt=prompt)
     if result is None:
-        return None
+        return {"skipped": "whisper-empty"}
     if result.excerpt:
         # Transcripts use the empty-guard (not the AI-guard) so a user
         # description never gets clobbered, but we also don't want to
