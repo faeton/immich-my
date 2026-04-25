@@ -986,7 +986,7 @@ def _run_one_trip(
         return True
 
     def _progress(msg: str) -> None:
-        console.print(msg, highlight=False)
+        console.print(msg, highlight=False, markup=False)
 
     try:
         results = process_mod.process_trip(
@@ -1360,7 +1360,7 @@ def sync_offline(
     offline_mod.cache_library_info(library)
 
     def _progress(msg: str) -> None:
-        console.print(msg, highlight=False)
+        console.print(msg, highlight=False, markup=False)
 
     try:
         summary = offline_mod.sync_trip(
