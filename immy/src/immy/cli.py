@@ -967,12 +967,16 @@ def _run_one_trip(
     if dry_run:
         from .exif import read_folder as _read
         from . import dji as _dji
+        from . import raw as _raw
         rows = _read(folder)
         # Match process_trip's filter: paired DJI `.LRF` proxies are
         # consumed as ffmpeg input for their master, not ingested as
-        # standalone assets.
+        # standalone assets. Same for camera-baked JPEG previews next
+        # to a sibling RAW (DJI DNG+JPG, Sony ARW+JPG, …).
         _dji_idx = _dji.build_proxy_index(r.path for r in rows)
         rows = [r for r in rows if not _dji.is_paired_proxy(r.path, _dji_idx)]
+        _raw_idx = _raw.build_raw_index(r.path for r in rows)
+        rows = [r for r in rows if not _raw.is_paired_preview(r.path, _raw_idx)]
         console.print(f"[yellow]dry-run[/yellow] would process {len(rows)} file(s)")
         for r in rows[:5]:
             asset, _ = process_mod.build_rows(r.path, folder, r, library)

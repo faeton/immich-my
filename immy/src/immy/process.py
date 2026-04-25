@@ -41,6 +41,7 @@ from . import insta360 as insta360_mod
 from . import journal as journal_mod
 from . import offline as offline_mod
 from . import pg as pg_mod
+from . import raw as raw_mod
 from . import transcripts as transcripts_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
@@ -524,6 +525,14 @@ def process_trip(
     # (the user should see them as normal so they can investigate).
     dji_proxy_index = dji_mod.build_proxy_index(r.path for r in rows)
     rows = [r for r in rows if not dji_mod.is_paired_proxy(r.path, dji_proxy_index)]
+
+    # Cameras in RAW+JPEG mode (DJI Mavic, Sony α, Canon, Nikon, Fuji)
+    # write `<stem>.DNG/ARW/CR3/…` plus `<stem>.JPG` — the JPG is the
+    # in-camera preview derived from the RAW. Drop the paired JPEG; the
+    # RAW carries full sensor data + the same EXIF/GPS and is the real
+    # asset. Unpaired JPGs (phone photos, exports) ingest normally.
+    raw_index = raw_mod.build_raw_index(r.path for r in rows)
+    rows = [r for r in rows if not raw_mod.is_paired_preview(r.path, raw_index)]
 
     results: list[ProcessResult] = []
 
@@ -1252,6 +1261,7 @@ def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
     """
     from .exif import iter_media as _iter_media
     from . import dji as _dji
+    from . import raw as _raw
 
     marker = read_marker(trip_folder)
     if not marker:
@@ -1263,6 +1273,8 @@ def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
     files = list(_iter_media(trip_folder))
     proxy_index = _dji.build_proxy_index(files)
     files = [f for f in files if not _dji.is_paired_proxy(f, proxy_index)]
+    raw_index = _raw.build_raw_index(files)
+    files = [f for f in files if not _raw.is_paired_preview(f, raw_index)]
     if len(files) != len(expected):
         return False, len(files)
     try:
