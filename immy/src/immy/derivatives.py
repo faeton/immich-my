@@ -383,6 +383,44 @@ def _video_stills_and_transcode(
     return files, info.width, info.height, duration_str
 
 
+def _link_or_copy(src: Path, dst: Path) -> None:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    if dst.exists():
+        dst.unlink()
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
+
+
+def _mirror_video_derivatives(
+    mirror_from: DerivativeResult,
+    source_media: Path,
+    asset_id: str,
+    owner_id: str,
+    base: Path,
+) -> DerivativeResult:
+    info = video_mod.probe(source_media)
+    duration_str = (
+        video_mod.format_duration(info.duration_s)
+        if info.duration_s is not None else None
+    )
+    files: list[DerivativeFile] = []
+    for f in mirror_from.files:
+        rel = relative_path_for(asset_id, owner_id, f.kind)
+        dst = base / rel
+        _link_or_copy(f.staged_path, dst)
+        files.append(DerivativeFile(
+            kind=f.kind, staged_path=dst, relative_path=rel,
+            is_progressive=f.is_progressive,
+            is_transparent=f.is_transparent,
+        ))
+    return DerivativeResult(
+        files=files, width=info.width, height=info.height,
+        duration=duration_str,
+    )
+
+
 def compute_for_asset(
     *,
     source_media: Path,
@@ -393,6 +431,7 @@ def compute_for_asset(
     transcode_videos: bool = True,
     derivative_source: Path | None = None,
     preproc_vf: str | None = None,
+    mirror_from: DerivativeResult | None = None,
 ) -> DerivativeResult:
     """Stage thumbnail + preview (and for videos, optional encoded_video)
     for one asset.
@@ -402,8 +441,20 @@ def compute_for_asset(
     videos — matching what Immich's own pipeline reports). `duration`
     is only set for videos. Raises on decode/probe/transcode failure —
     caller decides whether to skip or abort.
+
+    `mirror_from` (VIDEO only): reuse a prior sibling's staged outputs by
+    hardlinking them to this asset's paths instead of re-running ffmpeg.
+    Intended for Insta360 lens pairs sharing one LRV proxy: the two
+    master `.insv` files produce byte-identical derivatives, so the
+    second sibling is a ~100ms probe instead of a 20+ s transcode.
+    Master is still probed so DB dims/duration reflect this asset.
     """
     base = staged_dir(trip_folder)
+
+    if asset_type == "VIDEO" and mirror_from is not None:
+        return _mirror_video_derivatives(
+            mirror_from, source_media, asset_id, owner_id, base,
+        )
 
     if asset_type == "IMAGE":
         files, w_opt, h_opt = _image_dims_and_stills(

@@ -257,6 +257,59 @@ def test_compute_video_no_transcode_flag_respected(
     assert calls == []
 
 
+def test_compute_video_mirror_from_sibling_skips_ffmpeg(
+    tmp_path: Path, monkeypatch,
+):
+    from immy import video as video_mod
+
+    trip = tmp_path / "trip"; trip.mkdir()
+    src1 = trip / "VID_00.insv"; src1.write_bytes(b"x")
+    src2 = trip / "VID_10.insv"; src2.write_bytes(b"y")
+
+    info = video_mod.VideoInfo(
+        width=2880, height=2880, duration_s=4.0,
+        video_codec="hevc", audio_codec="aac", container_ext=".insv",
+    )
+    monkeypatch.setattr(video_mod, "probe", lambda p: info)
+
+    poster_calls: list[Path] = []
+    transcode_calls: list[Path] = []
+    def _poster(s, d, *, duration_s, preproc_vf=None):
+        d.parent.mkdir(parents=True, exist_ok=True)
+        _make_png(d, 1280, 720)
+        poster_calls.append(s)
+    def _transcode(s, d, *, preproc_vf=None):
+        d.parent.mkdir(parents=True, exist_ok=True)
+        d.write_bytes(b"fake-mp4")
+        transcode_calls.append(s)
+    monkeypatch.setattr(video_mod, "extract_poster", _poster)
+    monkeypatch.setattr(video_mod, "transcode", _transcode)
+
+    first = derivatives_mod.compute_for_asset(
+        source_media=src1, asset_id="aa" + "1" * 34,
+        owner_id="u", asset_type="VIDEO", trip_folder=trip,
+        transcode_videos=True,
+    )
+    assert len(poster_calls) == 1 and len(transcode_calls) == 1
+
+    second = derivatives_mod.compute_for_asset(
+        source_media=src2, asset_id="bb" + "2" * 34,
+        owner_id="u", asset_type="VIDEO", trip_folder=trip,
+        transcode_videos=True,
+        mirror_from=first,
+    )
+    # No extra ffmpeg work.
+    assert len(poster_calls) == 1
+    assert len(transcode_calls) == 1
+    # Same kinds, new asset_id in the paths, files exist on disk.
+    assert {d.kind for d in second.files} == {d.kind for d in first.files}
+    for d in second.files:
+        assert d.staged_path.is_file()
+        assert "bb" in d.relative_path
+    # Probe still ran on the sibling master.
+    assert second.width == 2880 and second.duration == "00:00:04.000"
+
+
 # --- process_trip integration --------------------------------------------
 
 

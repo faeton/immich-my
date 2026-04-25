@@ -575,6 +575,12 @@ def process_trip(
     # Asset rows still point at the real master — only ffmpeg's input
     # changes.
     proxy_index = insta360_mod.build_proxy_index(r.path for r in rows)
+    # Insta360 masters come in lens pairs (_00_ / _10_) that share one
+    # LRV proxy. Both produce byte-identical derivatives, so we keep the
+    # first sibling's `DerivativeResult` and hardlink it onto the
+    # second's asset paths instead of re-running ffmpeg. Keyed by proxy
+    # Path; DJI proxies are 1:1 (no siblings) so they never hit twice.
+    proxy_deriv_cache: dict[Path, "derivatives_mod.DerivativeResult"] = {}
 
     def _emit(msg: str) -> None:
         if progress is not None:
@@ -688,8 +694,11 @@ def process_trip(
             # Videos hit the expensive path here: full ffmpeg H.264
             # transcode of the encoded_video derivative. Images just do
             # pyvips thumb+preview, much cheaper.
+            mirror = proxy_deriv_cache.get(proxy) if proxy else None
             if asset.asset_type == "IMAGE":
                 label = "thumb+preview"
+            elif mirror:
+                label = "mirror from sibling"
             elif proxy:
                 label = f"transcode via {proxy.suffix.lstrip('.').upper()} proxy"
             elif dewarp:
@@ -708,9 +717,12 @@ def process_trip(
                         transcode_videos=transcode_videos,
                         derivative_source=proxy,
                         preproc_vf=dewarp,
+                        mirror_from=mirror,
                     ),
                     "derivatives", timings,
                 )
+                if proxy is not None and mirror is None:
+                    proxy_deriv_cache[proxy] = result
                 derivs = result.files
                 if result.width is not None and result.height is not None:
                     sink.update_asset_dims(
