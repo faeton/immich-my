@@ -927,6 +927,7 @@ def _run_one_trip(
     clip_model: str,
     transcript_model: str,
     transcript_prompt: str | None,
+    force: bool = False,
 ) -> bool:
     """Run the full pipeline for one trip folder. Returns True on success.
 
@@ -935,6 +936,20 @@ def _run_one_trip(
     committed are durable. The caller handles Ctrl-C by letting it
     propagate out — we rollback in `finally` regardless.
     """
+    # Cheap skip: if the trip was fully processed previously and no source
+    # file has been touched since, don't fork exiftool over thousands of
+    # files just to re-confirm everything is cached. One stat() per file vs.
+    # an exiftool spawn — saves ~all the wall-clock on a "scan all trips"
+    # batch when most trips are already done. Pass --force to override.
+    if not dry_run and not force:
+        cached, count = process_mod.is_trip_fully_cached(folder)
+        if cached:
+            console.print(
+                f"\n[dim][cached][/dim] {folder.name}: "
+                f"{count} file(s) unchanged since marker — skipping"
+            )
+            return True
+
     if offline:
         sink: offline_mod.Sink = offline_mod.OfflineSink(folder, library)
     else:
@@ -1068,6 +1083,10 @@ def process(
     offline: bool = typer.Option(
         False, "--offline",
         help="Skip Postgres; cache asset + embedding + caption data to .audit/offline/. Run `immy sync-offline <trip>` later to push. Requires one prior online run to have cached library info to ~/.immy/library.yml.",
+    ),
+    force: bool = typer.Option(
+        False, "--force",
+        help="Re-scan trips even if `.audit/y_processed.yml` says they're done and nothing has changed. Useful after hand-editing files without bumping mtime.",
     ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
 ) -> None:
@@ -1248,6 +1267,7 @@ def process(
                 clip_model=clip_model,
                 transcript_model=transcript_model,
                 transcript_prompt=transcript_prompt,
+                force=force,
             )
             if success:
                 ok += 1

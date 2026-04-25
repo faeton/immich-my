@@ -1207,9 +1207,45 @@ def is_processed(trip_folder: Path) -> bool:
     return marker_path(trip_folder).is_file()
 
 
+def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
+    """True when `.audit/y_processed.yml` exists, the count of ingestable
+    media files matches the marker, and no source file has been modified
+    since the marker was written. Returns `(cached, file_count)` so the
+    caller can log a skip without re-walking.
+
+    The check is one `stat()` per file — orders of magnitude cheaper than
+    `read_folder()` (which spawns exiftool over every file). Paired DJI
+    `.LRF` proxies are filtered before counting because they aren't
+    ingested as standalone assets, so the marker doesn't list them.
+
+    Trusts the marker. If a file is hand-edited without bumping mtime, a
+    re-run will skip it; pass `--force` (or delete the marker) to redo.
+    """
+    from .exif import iter_media as _iter_media
+    from . import dji as _dji
+
+    marker = read_marker(trip_folder)
+    if not marker:
+        return False, 0
+    processed_at = marker.get("processed_at")
+    if not isinstance(processed_at, (int, float)):
+        return False, 0
+    expected = marker.get("assets") or []
+    files = list(_iter_media(trip_folder))
+    proxy_index = _dji.build_proxy_index(files)
+    files = [f for f in files if not _dji.is_paired_proxy(f, proxy_index)]
+    if len(files) != len(expected):
+        return False, len(files)
+    try:
+        newest = max(f.stat().st_mtime for f in files)
+    except (OSError, ValueError):
+        return False, len(files)
+    return newest <= float(processed_at), len(files)
+
+
 __all__ = [
     "AssetRow", "AssetExifRow", "ProcessResult",
     "build_rows", "path_checksum", "container_path_for", "asset_type_for",
     "insert_asset", "process_trip", "write_marker", "read_marker",
-    "is_processed", "marker_path", "Y_MARKER_FILENAME",
+    "is_processed", "is_trip_fully_cached", "marker_path", "Y_MARKER_FILENAME",
 ]
