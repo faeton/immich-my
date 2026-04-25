@@ -266,6 +266,20 @@ export OPENBLAS_NUM_THREADS="$IMMY_THREADS"
 export VECLIB_MAXIMUM_THREADS="$IMMY_THREADS"
 export VIPS_CONCURRENCY="$IMMY_THREADS"
 
+# First-asset noise suppression. These warnings are cosmetic but loud:
+#   - albumentations on import fetches PyPI to check for updates; offline
+#     it times out after ~5 s and prints a UserWarning. NO_ALBUMENTATIONS_UPDATE
+#     skips the call entirely.
+#   - insightface 0.7 still calls skimage's deprecated `SimilarityTransform.estimate`,
+#     which emits a FutureWarning on every first face. Silenced via PYTHONWARNINGS
+#     until insightface upgrades. (Re-enable by unsetting if you want to know
+#     when they fix it.)
+#   - onnxruntime prints "Applied providers: [...]" at session-create time.
+#     ORT_LOGGING_LEVEL=3 (ERROR) keeps real failures while hiding the banner.
+export NO_ALBUMENTATIONS_UPDATE=1
+export PYTHONWARNINGS="${PYTHONWARNINGS:-ignore::FutureWarning:insightface.utils.face_align}"
+export ORT_LOGGING_LEVEL=3
+
 # Ctrl-C handling: without a trap, SIGINT kills the current `immy` (pipe
 # returns nonzero) and the for-loop marches on to the next trip. That's
 # the opposite of what you want when you hit ^C. Catch it here and break
