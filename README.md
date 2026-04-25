@@ -146,8 +146,6 @@ REST API. No forking. Upgrades stay clean.
   `immich-ml-metal` + the curator sidecar. Replaceable with a Mac mini / N100
   later without touching the design.
 
-Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
-
 ## What's in this folder
 
 | File | What it covers |
@@ -155,11 +153,9 @@ Full verified specs and sources in [docs/HARDWARE.md](docs/HARDWARE.md).
 | [docs/LANDSCAPE.md](docs/LANDSCAPE.md) | Survey of open-source alternatives and why Immich won |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical design: tiered storage, mount adapters, pipelines, queues |
 | [docs/SIDECAR.md](docs/SIDECAR.md) | Sidecar internals: DB choice, queue schema, worker-harness contract, process layout |
-| [docs/HARDWARE.md](docs/HARDWARE.md) | DS923+ + MacBook specifics, verified specs, performance expectations |
 | [docs/PLAN.md](docs/PLAN.md) | Phased build plan, milestones, what's custom vs stock |
 | [docs/CAPTIONS.md](docs/CAPTIONS.md) | VLM captioner — supported backends, config, per-image cost table |
 | [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md) | Step-by-step offline runbook — drive `immy` with LM Studio + a local VLM, no internet |
-| [docs/TODO.md](docs/TODO.md) | Explicit backlog of not-yet-shipped work |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | As-deployed operating manual: paths, compose, onboarding choices |
 | [docs/TESTING.md](docs/TESTING.md) | Acceptance tests per phase + ad-hoc smoke checks |
 
@@ -212,13 +208,12 @@ Shipped since last README update:
   hashes only on name+size hits; `--thorough` catches pure renames.
 
 Not shipped yet:
-- CLIP-based near-duplicate search (`find-similar`) — see [PLAN.md](PLAN.md)
-- Apple Photos people-name seeding (`import-apple-people`) — [PLAN.md](PLAN.md)
+- CLIP-based near-duplicate search (`find-similar`)
+- Apple Photos people-name seeding (`apple-people --apply`)
 - metadata gap-fill web UI
 - ghost/offline asset handling
 
-Tracked in [docs/TODO.md](docs/TODO.md). Detailed phased planning remains in
-[docs/PLAN.md](docs/PLAN.md).
+Detailed phased planning lives in [docs/PLAN.md](docs/PLAN.md).
 
 ## License / Publishing Note
 

@@ -27,6 +27,9 @@ build/
 .env
 .immy/
 
+# Personal notes, scratch scripts, TODO drafts. Not for publication.
+raw/
+
 # mlx-clip caches HF model weights under CWD. Keep these out of git —
 # a single checkpoint is ~600 MB.
 mlx-community/

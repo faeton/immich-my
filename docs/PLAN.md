@@ -5,7 +5,8 @@ bolted on in layers. Each phase has a "done when" so we don't drift.
 
 Rough effort estimates are evening-hours for a single person.
 
-Current not-yet-shipped backlog is summarized in [TODO.md](TODO.md).
+Current not-yet-shipped backlog is tracked in personal notes (`raw/TODO.md`,
+not in this repo).
 This file keeps the phase-by-phase rationale and acceptance criteria.
 
 ## Phase 0 — Base stack ✅ done
@@ -295,9 +296,7 @@ thumbs, open transcripts and face matches — just not the original file.
 ### External library matching
 
 Four-tool bundle for finding "is this file already in Immich?" from any
-external disk, and seeding Immich people from Apple Photos. Short-horizon
-build spec lives in [`/PLAN.md`](../PLAN.md) at the repo root until the
-set is fully shipped.
+external disk, and seeding Immich people from Apple Photos.
 
 - **Shipped** — `immy snapshot`: dump Immich library index (filename, size,
   SHA1) to `~/.immy/library-snapshot.sqlite`. Portable, read-only on
