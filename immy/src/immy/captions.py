@@ -116,6 +116,8 @@ def _encode_image(source: Path) -> str:
         # block at the top of derivatives.py for details.
         os.environ.setdefault("VIPS_WARNING", "0")
         os.environ.setdefault("G_MESSAGES_DEBUG", "")
+        import logging as _logging
+        _logging.getLogger("pyvips").setLevel(_logging.WARNING)
         import pyvips  # lazy — heavy import, not needed in pure-unit tests
 
         image = pyvips.Image.thumbnail(

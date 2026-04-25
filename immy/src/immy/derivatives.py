@@ -36,6 +36,14 @@ from typing import Literal
 os.environ.setdefault("VIPS_WARNING", "0")
 os.environ.setdefault("G_MESSAGES_DEBUG", "")
 
+# pyvips' Python wrapper *also* emits per-operation chatter
+# ("VIPS: thumbnailing", "VIPS: reduceh: …") via logging.getLogger("pyvips")
+# at DEBUG/INFO level. The env vars above only quiet the C/glib side; this
+# pins the Python logger so a caller's logging.basicConfig(level=INFO)
+# doesn't flood stderr with one block per image.
+import logging as _logging
+_logging.getLogger("pyvips").setLevel(_logging.WARNING)
+
 try:
     import pyvips
 except (ImportError, OSError) as e:
