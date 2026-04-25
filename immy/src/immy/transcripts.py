@@ -71,12 +71,14 @@ REGION_MAX_SPEECH_FRACTION = 0.7  # only chunk when speech is < 70% of file
 # more accurate when each region has a beat of lead-in / tail-out audio.
 REGION_PAD_SECONDS = 0.75
 
-# Cameras whose output is known-silent or known-non-speech. Short-circuits
-# before any ffprobe call. Matched case-insensitively against exiftool's
-# EXIF:Make / QuickTime:Make. DJI + Insta360 ship videos with no audio
-# stream at all on every model we've seen (Mavic, Mini5Pro, FPV, Avata,
-# ONE X2/X3/X4); keeping them here saves the probe round-trip.
-TRANSCRIBE_MAKE_DENYLIST = ("dji", "insta360", "arashi vision")
+# Cameras whose output is reliably mute on every model we've seen.
+# Short-circuits before any ffprobe call. Matched case-insensitively
+# against exiftool's EXIF:Make / QuickTime:Make. DJI's Mavic / Mini /
+# FPV / Avata lines ship without an audio stream at all, so the probe
+# is wasted I/O. Insta360 used to be on this list but the X-series
+# (X2/X3/X4) does record usable audio on 360-mounted clips; we drop
+# Insta360/Arashi Vision back to the generic ffprobe `has_audio` gate.
+TRANSCRIBE_MAKE_DENYLIST = ("dji",)
 
 
 try:
