@@ -18,6 +18,10 @@ venv/
 .idea/
 *.swp
 
+# Claude Code project-local state (per-project tool permissions,
+# agent worktrees, scheduler lock). Global state lives in ~/.claude/.
+.claude/
+
 # Build artifacts
 dist/
 build/
