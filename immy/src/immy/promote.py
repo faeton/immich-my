@@ -26,7 +26,7 @@ from . import offline as offline_mod
 from . import pg as pg_mod
 from .config import Config
 from .derivatives import DERIVATIVES_DIR
-from .exif import iter_media, read_folder
+from .exif import read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
 from .process import is_processed as y_is_processed, read_marker as y_read_marker
@@ -156,12 +156,11 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
 
     tty_out = getattr(sys.stdout, "buffer", None)
     is_tty = hasattr(sys.stdout, "isatty") and sys.stdout.isatty()
-    if tty_out is None or not is_tty:
+    if tty_out is None:
+        # No buffered stdout (rare — pytest capture, etc.). Fall back to
+        # a buffered run; callers see output only on completion.
         proc = subprocess.run(args, capture_output=True, text=True)
         if proc.returncode != 0:
-            # Surface rsync's own complaint — otherwise callers see only the
-            # exit code and have to re-run manually to diagnose (we hit this
-            # during the bolivia promote: exit 255 with no visible reason).
             sys.stderr.write(proc.stderr)
             sys.stderr.flush()
             raise subprocess.CalledProcessError(
@@ -170,6 +169,9 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
             )
         return proc
 
+    # Stream in both tty and pipe cases. When piped (e.g. `... | tee log`),
+    # convert rsync's `\r` progress overwrites to newlines so the wrapping
+    # process sees live progress instead of silence for the whole transfer.
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         bufsize=0,
@@ -181,7 +183,8 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
         if not chunk:
             break
         buf.extend(chunk)
-        tty_out.write(chunk)
+        out_chunk = chunk if is_tty else (b"\n" if chunk == b"\r" else chunk)
+        tty_out.write(out_chunk)
         sys.stdout.flush()
     stderr = proc.stderr.read() if proc.stderr else b""
     rc = proc.wait()
@@ -282,7 +285,7 @@ def execute(
     for pair in plan.pairs:
         summary["stacks"].append(_stack_pair(client, pair, plan.folder.name))
 
-    summary["album"] = _sync_album(client, plan)
+    summary["album"] = _sync_album(client, plan, config)
 
     return summary
 
@@ -475,21 +478,26 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
     }
 
 
-def _sync_album(client: ImmichClient, plan: Plan) -> dict:
+def _sync_album(client: ImmichClient, plan: Plan, config: Config) -> dict:
     """Create or update an Immich album named after the trip folder.
 
-    - Description comes from the notes body (below front-matter, with the
-      `# Title` and scaffold hint stripped). Empty body → no description
-      write.
-    - Assets = every media file under the trip folder, resolved to Immich
-      asset IDs via `POST /api/search/metadata?originalFileName=`. First
-      file is polled (scan is async); subsequent files use a single lookup
-      each, no wait, so large trips don't spend minutes per file.
-    - Idempotent: `PUT /api/albums/{id}/assets` reports already-present
-      assets as duplicates rather than failing.
+    Resolves the asset list directly from Postgres via
+    `originalPath LIKE '<container_root>/<trip>/%'`. The earlier
+    implementation walked the local trip folder and looked each file up
+    via `/api/search/metadata?originalFileName=` — that path silently
+    drops anything Immich's library scanner has flagged `isOffline=true`
+    or `deletedAt` (search hides soft-deleted rows). After a path rename
+    or a transient rsync hiccup that path would leave 100+ assets out of
+    the album with no warning. The DB query is authoritative and a few
+    orders of magnitude faster than per-file HTTP round-trips.
 
-    Returns a summary dict the CLI formats. Never raises — album sync is
-    a nice-to-have, shouldn't block the rest of promote.
+    Side effect: resurrect rows whose files are back on disk. The Immich
+    scanner only marks offline; it never auto-clears the flag, so a
+    one-shot UPDATE here keeps the trip's view consistent with reality.
+
+    Idempotent: `PUT /api/albums/{id}/assets` reports already-present
+    assets as duplicates rather than failing. Never raises — album sync
+    is a nice-to-have, shouldn't block the rest of promote.
     """
     album_name = plan.folder.name
     summary: dict = {
@@ -497,7 +505,7 @@ def _sync_album(client: ImmichClient, plan: Plan) -> dict:
         "status": "skipped",
         "detail": "",
         "added": 0,
-        "missing": 0,
+        "resurrected": 0,
     }
 
     notes = resolve_notes(plan.folder)
@@ -506,39 +514,52 @@ def _sync_album(client: ImmichClient, plan: Plan) -> dict:
         body = notes_body(notes)
         description = body if body else None
 
-    # Find or create the album.
+    if config.pg is None or config.immich is None:
+        summary.update(detail="pg/immich config missing — album sync skipped")
+        return summary
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        summary.update(status="error", detail=f"pg connect failed: {e}")
+        return summary
+
+    asset_ids: list[str] = []
+    try:
+        library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+        prefix = f"{library.container_root.rstrip('/')}/{album_name}/"
+        like = prefix + "%"
+        with conn.cursor() as cur:
+            cur.execute(
+                'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
+                'WHERE "originalPath" LIKE %s '
+                'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                'AND ("isOffline" = true OR "deletedAt" IS NOT NULL)',
+                (like, config.immich.library_id),
+            )
+            summary["resurrected"] = cur.rowcount
+            cur.execute(
+                'SELECT id FROM asset '
+                'WHERE "originalPath" LIKE %s '
+                'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                'AND "deletedAt" IS NULL '
+                'ORDER BY "originalPath"',
+                (like, config.immich.library_id),
+            )
+            asset_ids = [str(r[0]) for r in cur.fetchall()]
+        conn.commit()
+    except Exception as e:
+        conn.rollback()
+        summary.update(status="error", detail=f"pg query failed: {e}")
+        return summary
+    finally:
+        conn.close()
+
     try:
         existing = client.find_album_by_name(album_name)
     except ImmichError as e:
         summary.update(status="error", detail=f"find album: {e}")
         return summary
-
-    # Resolve asset IDs for every local media file. First file polls (scan
-    # is async); the rest take one-shot lookups so the run doesn't spend
-    # ~12 s per missing asset on a big trip.
-    media_files = list(iter_media(plan.folder))
-    asset_ids: list[str] = []
-    missing = 0
-    first = True
-    folder_name = plan.folder.name
-    for path in media_files:
-        # Disambiguate by path suffix — sibling trip folders can share
-        # filenames (e.g. a smoke-test dir with duplicates), and plain
-        # filename lookup would grab the wrong asset.
-        path_suffix = f"/{folder_name}/{path.name}"
-        if first:
-            aid = wait_for_asset(client, path.name, original_path_suffix=path_suffix)
-            first = False
-        else:
-            try:
-                aid = client.find_asset_id(path.name, original_path_suffix=path_suffix)
-            except ImmichError:
-                aid = None
-        if aid:
-            asset_ids.append(aid)
-        else:
-            missing += 1
-    summary["missing"] = missing
 
     try:
         if existing is None:

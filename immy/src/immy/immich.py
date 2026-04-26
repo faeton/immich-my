@@ -23,12 +23,28 @@ from __future__ import annotations
 import json
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
 
 DEFAULT_TIMEOUT = 10.0  # seconds — caller may raise for bigger ops
+
+# Hosts on the Tailscale tailnet are not reachable through any normal
+# HTTP(S) proxy — the proxy returns "503 CONNECT tunnel failed" on the
+# private hostname. urllib otherwise honours HTTP_PROXY/HTTPS_PROXY env
+# vars set by sysadmins / the parent process (Claude Code, work VPN
+# helpers, etc.), so we build our own opener with an empty ProxyHandler
+# whenever the target host looks like a tailnet name. The user shouldn't
+# have to remember to export NO_PROXY before every `immy` invocation.
+_TAILNET_HOST_SUFFIXES = (".ts.net",)
+_NO_PROXY_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _is_tailnet_host(url: str) -> bool:
+    host = (urllib.parse.urlparse(url).hostname or "").lower()
+    return any(host.endswith(s) for s in _TAILNET_HOST_SUFFIXES)
 
 
 class ImmichError(RuntimeError):
@@ -51,8 +67,12 @@ class ImmichClient:
         if data is not None:
             headers["Content-Type"] = "application/json"
         req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        _open = (
+            _NO_PROXY_OPENER.open if _is_tailnet_host(url)
+            else urllib.request.urlopen
+        )
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with _open(req, timeout=self.timeout) as resp:
                 raw = resp.read()
                 if not raw:
                     return None

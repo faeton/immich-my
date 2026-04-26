@@ -628,11 +628,14 @@ def _promote_impl(
         colour = {
             "created": "green", "updated": "green", "error": "red",
         }.get(album.get("status", ""), "")
+        suffix = ""
+        if album.get("resurrected"):
+            suffix += f" [yellow]({album['resurrected']} resurrected)[/yellow]"
+        if album.get("missing"):
+            suffix += f" [dim]({album['missing']} asset(s) not yet indexed)[/dim]"
         console.print(
             f"album [{colour}]{album['status']}[/{colour}] "
-            f"{album['name']}: {album['detail']}"
-            + (f" [dim]({album['missing']} asset(s) not yet indexed)[/dim]"
-               if album.get("missing") else "")
+            f"{album['name']}: {album['detail']}{suffix}"
         )
 
 
