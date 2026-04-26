@@ -21,7 +21,7 @@ as) process.
 from __future__ import annotations
 
 import hashlib
-import time
+import os
 import time
 import uuid
 from dataclasses import dataclass
@@ -632,6 +632,26 @@ def process_trip(
                 cs_hex, "ingest", INGEST_VERSION,
                 meta={"asset_id": asset.id},
             )
+        elif not journal.is_done(cs_hex, "ingest", INGEST_VERSION):
+            # Self-heal: asset already exists in Immich (checksum
+            # conflict) but our journal has no ingest entry — either this
+            # trip was promoted before journals existed, or `.audit/` was
+            # wiped/renamed between runs (see "trip-folder reorganization
+            # helpers"). Without backfilling, `we_own` stays False below
+            # and every enricher silently skips, producing the puzzling
+            # `existed | derivatives 0.0s` lines and an empty marker.
+            # Resolve the real asset id from the DB and record it so this
+            # run (and every future run) can enrich without --force.
+            resolved_id = sink.existing_asset_id(
+                asset.owner_id, asset.library_id, asset.checksum,
+            )
+            if resolved_id:
+                asset.id = resolved_id
+                exif.asset_id = resolved_id
+                journal.mark_done(
+                    cs_hex, "ingest", INGEST_VERSION,
+                    meta={"asset_id": resolved_id},
+                )
         # `we_own` says "this asset belongs to immy's pipeline." True if
         # we just inserted, OR if a prior immy run inserted it (recorded
         # in the journal). Without this, a Ctrl-C between insert-commit
@@ -677,6 +697,94 @@ def process_trip(
             if rebuilt and all(d.staged_path.is_file() for d in rebuilt):
                 derivs = rebuilt
                 _emit("    derivatives… [cached]")
+        # Derivatives self-heal-from-disk: journal lacks the entry but
+        # the deterministic-path files already exist under
+        # `.audit/derivatives/`. Re-encoding video to recover the marker
+        # row is wasteful (transcode is the most expensive phase in the
+        # pipeline), so reconstruct DerivativeFile metadata from the
+        # files we find and record into journal + sink as if compute had
+        # just run. is_progressive/is_transparent flags are set to the
+        # values produced by the original compute path (preview saves
+        # interlaced JPEG; thumbnail webp + encoded_video are not
+        # progressive). encoded_video is optional — its absence on disk
+        # means either the source was already H.264 (no transcode
+        # needed) or the file was deleted; either way we proceed without
+        # it rather than re-running ffprobe → needs_transcode here.
+        if (
+            compute_derivatives and we_own and derivs is None
+            and asset.asset_type in ("IMAGE", "VIDEO")
+        ):
+            base = derivatives_mod.staged_dir(trip_folder)
+            kinds = ["thumbnail", "preview"]
+            if asset.asset_type == "VIDEO":
+                kinds.append("encoded_video")
+            flags = {
+                "thumbnail": (False, False),
+                "preview": (True, False),
+                "encoded_video": (False, False),
+            }
+            # Search the real owner first, then fall back to the
+            # placeholder tree. Early offline runs (before
+            # `~/.immy/library.yml` was cached) wrote derivatives under
+            # `__offline_placeholder__/<a>/<b>/<id>...` because no real
+            # owner was known. Those files are bit-identical to what the
+            # real owner path would hold — same asset.id, same rel
+            # subpath suffix — so we hardlink/copy them into the
+            # canonical location and reconcile, instead of re-encoding
+            # multi-gigabyte videos to recover the marker.
+            owner_candidates = [library.owner_id, "__offline_placeholder__"]
+            disk_rebuilt: list[DerivativeFile] = []
+            mandatory_missing = False
+            for kind in kinds:
+                canonical_rel = derivatives_mod.relative_path_for(
+                    asset.id, library.owner_id, kind,
+                )
+                canonical_path = base / canonical_rel
+                located: Path | None = None
+                for owner in owner_candidates:
+                    rel = derivatives_mod.relative_path_for(
+                        asset.id, owner, kind,
+                    )
+                    candidate = base / rel
+                    if candidate.is_file():
+                        located = candidate
+                        break
+                if located is None:
+                    if kind != "encoded_video":
+                        mandatory_missing = True
+                        break
+                    continue
+                if located != canonical_path:
+                    canonical_path.parent.mkdir(parents=True, exist_ok=True)
+                    try:
+                        os.link(located, canonical_path)
+                    except OSError:
+                        import shutil as _shutil
+                        _shutil.copy2(located, canonical_path)
+                prog, transp = flags[kind]
+                disk_rebuilt.append(DerivativeFile(
+                    kind=kind, staged_path=canonical_path,
+                    relative_path=canonical_rel,
+                    is_progressive=prog, is_transparent=transp,
+                ))
+            if not mandatory_missing and disk_rebuilt:
+                deriv_payload = [
+                    {
+                        "kind": d.kind,
+                        "relative_path": d.relative_path,
+                        "staged_path": str(d.staged_path),
+                        "is_progressive": d.is_progressive,
+                        "is_transparent": d.is_transparent,
+                    }
+                    for d in disk_rebuilt
+                ]
+                sink.record_derivatives(asset.id, deriv_payload)
+                journal.mark_done(
+                    cs_hex, "derivatives", DERIV_VERSION,
+                    meta={"files": deriv_payload},
+                )
+                derivs = disk_rebuilt
+                _emit("    derivatives… [reconciled from disk]")
         if compute_derivatives and we_own and derivs is None and asset.asset_type in ("IMAGE", "VIDEO"):
             proxy = None
             if asset.asset_type == "VIDEO":
