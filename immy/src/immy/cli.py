@@ -1182,11 +1182,19 @@ def process(
             or (ml.captioner_endpoint if ml else None)
             or captions_mod.DEFAULT_ENDPOINT
         )
-        model = (
+        explicit_model = (
             os.environ.get("IMMY_CAPTIONER_MODEL")
             or (ml.captioner_model if ml else None)
-            or captions_mod.DEFAULT_MODEL
         )
+        if explicit_model:
+            model = explicit_model
+        else:
+            # No model pinned → ask LM Studio what's loaded right now and
+            # use that; otherwise fall back to a known-installed VLM.
+            model = (
+                captions_mod.detect_lm_studio_model(endpoint)
+                or captions_mod.LM_STUDIO_FALLBACK_MODEL
+            )
         api_key_env = (
             os.environ.get("IMMY_CAPTIONER_API_KEY_ENV")
             or (ml.captioner_api_key_env if ml else None)

@@ -31,7 +31,11 @@ set -euo pipefail
 TRIPS_ROOT="${TRIPS_ROOT:-$HOME/Media/Trips}"
 IMMY_ROOT="${IMMY_ROOT:-$HOME/Sites/immich-my/immy}"
 LMSTUDIO_URL="${LMSTUDIO_URL:-http://localhost:1234/v1}"
-MODEL="${MODEL:-google/gemma-4-26b-a4b}"
+# MODEL: pin a specific LM Studio captioner model. If unset, the preflight
+# below auto-detects whichever VLM is currently loaded in LM Studio and
+# uses that — lets the user swap models in the GUI without editing this
+# script. If detection fails, immy falls back to LM_STUDIO_FALLBACK_MODEL.
+MODEL="${MODEL:-}"
 # Logs live outside the media tree so immy's rglob-based file scan can
 # never touch them. `.audit` inside each trip folder is the only media-
 # tree state immy writes; everything else about this script lives here.
@@ -51,12 +55,14 @@ banner() { printf '%s%s%s\n' "$C_DIM" "-----------------------------------------
 # --- Args ------------------------------------------------------------
 STATUS_ONLY=0
 SYNC_ONLY=0
+FORCE=0
 MODE="offline"  # offline | online
 TRIP_ARG=""
 for arg in "$@"; do
   case "$arg" in
     --status) STATUS_ONLY=1 ;;
     --sync)   SYNC_ONLY=1 ;;
+    --force)  FORCE=1 ;;
     --online) MODE="online" ;;
     --offline) MODE="offline" ;;
     -h|--help) sed -n '2,25p' "$0"; exit 0 ;;
@@ -114,17 +120,59 @@ if [[ $STATUS_ONLY -eq 0 && $SYNC_ONLY -eq 0 ]]; then
   fi
 
   printf 'Checking LM Studio at %s ...\n' "$LMSTUDIO_URL"
-  if ! MODELS_JSON="$(curl -fsS -m 5 "$LMSTUDIO_URL/models" 2>/dev/null)"; then
+  # /api/v0/models exposes per-model `state` (loaded/not-loaded) and
+  # `type` (vlm/llm/embeddings); the OpenAI-compat /v1/models doesn't.
+  # Mirror captions.py:detect_lm_studio_model — prefer a loaded VLM, then
+  # any loaded model, so swapping models in the GUI just works.
+  LMSTUDIO_BASE="${LMSTUDIO_URL%/v1}"
+  if ! MODELS_JSON="$(curl -fsS -m 5 "$LMSTUDIO_BASE/api/v0/models" 2>/dev/null)"; then
     printf '  %sMISS%s %-18s server not responding (start it in the Developer tab)\n' \
       "$C_ERR" "$C_RESET" "LM Studio"
     MISSING=$((MISSING + 1))
-  elif ! printf '%s' "$MODELS_JSON" | grep -q "\"$MODEL\""; then
-    printf '  %sMISS%s %-18s model %s not loaded\n' \
-      "$C_ERR" "$C_RESET" "LM Studio" "$MODEL"
-    MISSING=$((MISSING + 1))
+  elif [[ -n "$MODEL" ]]; then
+    # User pinned a specific model — verify it's loaded.
+    if printf '%s' "$MODELS_JSON" | python3 -c '
+import json, sys
+want = sys.argv[1]
+data = json.load(sys.stdin).get("data") or []
+loaded = [m["id"] for m in data if m.get("state") == "loaded"]
+sys.exit(0 if want in loaded else 1)
+' "$MODEL"; then
+      printf '  %sOK%s  %-18s %s (pinned: %s)\n' \
+        "$C_OK" "$C_RESET" "LM Studio" "$LMSTUDIO_URL" "$MODEL"
+    else
+      printf '  %sMISS%s %-18s pinned model %s not loaded\n' \
+        "$C_ERR" "$C_RESET" "LM Studio" "$MODEL"
+      MISSING=$((MISSING + 1))
+    fi
   else
-    printf '  %sOK%s  %-18s %s (serving %s)\n' \
-      "$C_OK" "$C_RESET" "LM Studio" "$LMSTUDIO_URL" "$MODEL"
+    # Auto-pick: walk PREFERRED_MODELS in order, take first one that's
+    # loaded; else any loaded VLM; else any loaded model. Lets the user
+    # leave a "junk" VLM loaded for other apps and still have us pick the
+    # captioner-grade one when it's available.
+    PREFERRED_MODELS="${PREFERRED_MODELS:-mlx-qwopus3.5-27b-v3-vision gemma-4-31b-it}"
+    DETECTED="$(printf '%s' "$MODELS_JSON" \
+      | PREFERRED_MODELS="$PREFERRED_MODELS" python3 -c '
+import json, os, sys
+data = json.load(sys.stdin).get("data") or []
+loaded_ids = {m["id"] for m in data if m.get("state") == "loaded"}
+for pref in os.environ.get("PREFERRED_MODELS", "").split():
+    if pref in loaded_ids:
+        print(pref); sys.exit(0)
+loaded = [m for m in data if m.get("state") == "loaded"]
+vlms = [m for m in loaded if m.get("type") == "vlm"]
+pick = vlms[0] if vlms else (loaded[0] if loaded else None)
+print(pick["id"] if pick else "")
+')"
+    if [[ -n "$DETECTED" ]]; then
+      MODEL="$DETECTED"
+      printf '  %sOK%s  %-18s %s (auto-detected: %s)\n' \
+        "$C_OK" "$C_RESET" "LM Studio" "$LMSTUDIO_URL" "$MODEL"
+    else
+      printf '  %sMISS%s %-18s no model loaded — load a VLM in LM Studio first\n' \
+        "$C_ERR" "$C_RESET" "LM Studio"
+      MISSING=$((MISSING + 1))
+    fi
   fi
 
   if [[ $MISSING -gt 0 ]]; then
@@ -326,6 +374,7 @@ else
   PROCESS_FLAGS=(--with-derivatives --with-clip --with-faces
                  --with-transcripts --with-captions)
   [[ "$MODE" == "offline" ]] && PROCESS_FLAGS+=(--offline)
+  [[ $FORCE -eq 1 ]] && PROCESS_FLAGS+=(--force)
   banner | tee -a "$RUN_LOG"
   printf '%s[%s]%s batch: %d trip(s)\n' \
     "$C_OK" "$(date +%H:%M:%S)" "$C_RESET" "${#TRIPS[@]}" | tee -a "$RUN_LOG"
