@@ -48,7 +48,19 @@ from pathlib import Path
 
 
 DEFAULT_ENDPOINT = "http://localhost:1234/v1"  # LM Studio default
-DEFAULT_MODEL = "qwen2.5-vl-7b-instruct"
+DEFAULT_MODEL = "mlx-qwopus3.5-27b-v3-vision"
+# When pointing at LM Studio with no explicit model configured, we ask
+# its REST API which model is currently loaded and pick from this list
+# in order — saves the user from juggling config every time they swap
+# models in the GUI. Both winners of raw/vlm-bench/ (2026-04-26):
+# qwopus is best on quality / OCR, gemma-31b is the fast fallback for
+# very large batches. If neither is loaded, we walk to "any loaded VLM"
+# inside detect_lm_studio_model, then to LM_STUDIO_FALLBACK_MODEL.
+LM_STUDIO_PREFERRED_MODELS: tuple[str, ...] = (
+    "mlx-qwopus3.5-27b-v3-vision",
+    "gemma-4-31b-it",
+)
+LM_STUDIO_FALLBACK_MODEL = LM_STUDIO_PREFERRED_MODELS[0]
 # Reasoning-capable VLMs (Gemma 4, DeepSeek-VL, GPT-5 family) spend
 # 200-400 tokens "thinking" before emitting the user-visible answer,
 # and LM Studio reports that via `reasoning_content` / the
@@ -127,6 +139,44 @@ def _encode_image(source: Path) -> str:
         data = image.jpegsave_buffer(Q=PREVIEW_JPEG_QUALITY, interlace=True)
     b64 = base64.b64encode(data).decode("ascii")
     return f"data:image/jpeg;base64,{b64}"
+
+
+def detect_lm_studio_model(
+    endpoint: str,
+    *,
+    timeout_s: float = 5.0,
+) -> str | None:
+    """Return the id of a currently-loaded LM Studio model, or None.
+
+    Hits LM Studio's REST API (`/api/v0/models`) which exposes a `state`
+    field per model; the OpenAI-compat `/v1/models` does not. Walks
+    `LM_STUDIO_PREFERRED_MODELS` in order first (so a loaded captioner-
+    grade model wins over an unrelated VLM left running for some other
+    app), then falls back to any loaded VLM, then any loaded model.
+    Returns None if the endpoint isn't LM Studio, nothing is loaded, or
+    the call fails — the caller is expected to fall back to a hard-coded
+    default.
+    """
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    url = f"{base.rstrip('/')}/api/v0/models"
+    try:
+        req = urllib.request.Request(url, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = json.loads(resp.read())
+    except (urllib.error.URLError, urllib.error.HTTPError,
+            json.JSONDecodeError, OSError):
+        return None
+    items = body.get("data") or []
+    loaded = [m for m in items if m.get("state") == "loaded"]
+    loaded_ids = {m.get("id") for m in loaded}
+    for pref in LM_STUDIO_PREFERRED_MODELS:
+        if pref in loaded_ids:
+            return pref
+    vlms = [m for m in loaded if m.get("type") == "vlm"]
+    pick = vlms[0] if vlms else (loaded[0] if loaded else None)
+    return str(pick["id"]) if pick and pick.get("id") else None
 
 
 def _post_json(
@@ -223,6 +273,8 @@ def is_ai_description(description: str | None) -> bool:
 __all__ = [
     "AI_PREFIX",
     "DEFAULT_ENDPOINT", "DEFAULT_MODEL", "DEFAULT_PROMPT", "DEFAULT_MAX_TOKENS",
+    "LM_STUDIO_PREFERRED_MODELS", "LM_STUDIO_FALLBACK_MODEL",
     "CaptionError", "CaptionResult", "CaptionerConfig",
-    "caption", "format_description", "is_ai_description",
+    "caption", "detect_lm_studio_model",
+    "format_description", "is_ai_description",
 ]
