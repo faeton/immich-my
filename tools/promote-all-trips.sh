@@ -181,6 +181,21 @@ for trip in "${TRIPS[@]}"; do
     | tee -a "$RUN_LOG"
   banner | tee -a "$RUN_LOG"
 
+  # Apply HIGH findings (date/GPS-from-SRT, trip-tags, timezone, etc.)
+  # before promote — promote.py gates on pending HIGH findings. --auto
+  # skips the interactive trip-anchor prompt for trips lacking GPS.
+  if [[ $DRY_RUN -eq 0 ]]; then
+    if ! caffeinate -dims nice -n 10 \
+           "$IMMY_BIN" audit "$trip" --write --auto \
+           2>&1 | tee -a "$RUN_LOG"; then
+      rc=${PIPESTATUS[0]}
+      TOTAL_FAIL=$((TOTAL_FAIL + 1))
+      printf '%s[fail rc=%s audit]%s %s\n' \
+        "$C_ERR" "$rc" "$C_RESET" "$name" | tee -a "$RUN_LOG"
+      continue
+    fi
+  fi
+
   if caffeinate -dims nice -n 10 \
        "$IMMY_BIN" promote "$trip" "${PROMOTE_FLAGS[@]}" \
        2>&1 | tee -a "$RUN_LOG"; then
