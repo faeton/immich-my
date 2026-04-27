@@ -9,23 +9,51 @@ import typer
 from rich.console import Console
 from rich.table import Table
 
-from . import apple_photos as apple_photos_mod
-from . import bloat as bloat_mod
-from . import captions as captions_mod
-from . import clip as clip_mod
-from . import clustering as clustering_mod
-from . import duplicates as duplicates_mod
-from . import offline as offline_mod
-from . import process as process_mod
-from . import promote as promote_mod
-from . import pg as pg_mod
-from . import snapshot as snapshot_mod
-from . import transcripts as transcripts_mod
+# Heavy submodules (torch/transformers/etc.) are loaded lazily on first
+# attribute access so `immy audit` doesn't pay multi-second import cost
+# for code paths it doesn't touch. Each name is a proxy that imports its
+# real module on the first attribute lookup.
+import importlib as _importlib
+
+
+class _LazyModule:
+    __slots__ = ("_name", "_mod")
+
+    def __init__(self, name: str) -> None:
+        object.__setattr__(self, "_name", name)
+        object.__setattr__(self, "_mod", None)
+
+    def _load(self):
+        mod = object.__getattribute__(self, "_mod")
+        if mod is None:
+            mod = _importlib.import_module(
+                "." + object.__getattribute__(self, "_name"), __package__
+            )
+            object.__setattr__(self, "_mod", mod)
+        return mod
+
+    def __getattr__(self, attr):
+        return getattr(self._load(), attr)
+
+
+apple_photos_mod = _LazyModule("apple_photos")
+bloat_mod = _LazyModule("bloat")
+captions_mod = _LazyModule("captions")
+clip_mod = _LazyModule("clip")
+clustering_mod = _LazyModule("clustering")
+duplicates_mod = _LazyModule("duplicates")
+offline_mod = _LazyModule("offline")
+process_mod = _LazyModule("process")
+promote_mod = _LazyModule("promote")
+pg_mod = _LazyModule("pg")
+snapshot_mod = _LazyModule("snapshot")
+transcripts_mod = _LazyModule("transcripts")
 from .config import load as load_config
 from .exif import has_gps, read_folder
 from .immich import ImmichClient
 from .notes import (
     ensure_notes,
+    join_make_model as _join_make_model,
     parse_frontmatter,
     resolve as resolve_notes,
     update_frontmatter,
@@ -224,9 +252,7 @@ def _fmt_make_model(row) -> str:
         row,
         "EXIF:Model", "QuickTime:Model", "QuickTime:AndroidModel",
     )
-    make = make or ""
-    model = model or ""
-    s = f"{make} {model}".strip()
+    s = _join_make_model(make, model)
     if s:
         return s
 
@@ -237,15 +263,6 @@ def _fmt_make_model(row) -> str:
                 camera = item.removeprefix("Gear/Camera/").strip()
                 if camera:
                     return f"{camera} (xmp)"
-
-    subj = row.get("XMP:Subject")
-    if isinstance(subj, list):
-        for item in subj:
-            if isinstance(item, str) and item.strip():
-                text = item.strip()
-                # Avoid generic trip/source tags; keep this conservative.
-                if text not in {"IMG", "VID"} and "/" not in text:
-                    return f"{text} (xmp)"
 
     return "—"
 
@@ -448,6 +465,7 @@ def audit(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Per-file EXIF dump."),
 ) -> None:
     """Read EXIF, propose corrections, optionally write XMP sidecars."""
+    console.print(f"[bold cyan]immy audit[/bold cyan] {folder}")
     rows = read_folder(folder)
 
     # Scaffold notes file BEFORE any interactive prompt, so the prompt has

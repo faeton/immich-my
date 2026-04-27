@@ -15,6 +15,8 @@
 # Usage:
 #   tools/promote-all-trips.sh            # promote every trip not yet logged
 #   tools/promote-all-trips.sh <trip>     # one trip (folder name only)
+#   tools/promote-all-trips.sh '2024-*'   # glob: every trip matching pattern
+#   tools/promote-all-trips.sh a b c      # multiple trips / patterns
 #   tools/promote-all-trips.sh --status   # report-only; don't promote
 #   tools/promote-all-trips.sh --dry-run  # rsync --dry-run for every trip
 #   tools/promote-all-trips.sh --force    # redo trips already logged as promoted
@@ -43,15 +45,15 @@ banner() { printf '%s%s%s\n' "$C_DIM" "-----------------------------------------
 STATUS_ONLY=0
 DRY_RUN=0
 FORCE=0
-TRIP_ARG=""
+TRIP_ARGS=()
 for arg in "$@"; do
   case "$arg" in
     --status)  STATUS_ONLY=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --force)   FORCE=1 ;;
-    -h|--help) sed -n '2,24p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,26p' "$0"; exit 0 ;;
     -*) printf 'Unknown flag: %s\n' "$arg" >&2; exit 2 ;;
-    *)  TRIP_ARG="$arg" ;;
+    *)  TRIP_ARGS+=("$arg") ;;
   esac
 done
 
@@ -102,11 +104,27 @@ RUN_LOG="$LOG_DIR/run-$RUN_TS.log"
 
 # --- Pick trips ------------------------------------------------------
 declare -a TRIPS
-if [[ -n "$TRIP_ARG" ]]; then
-  TRIPS=("$TRIPS_ROOT/$TRIP_ARG")
-  [[ -d "${TRIPS[0]}" ]] || {
-    printf '%sERROR%s no such trip: %s\n' "$C_ERR" "$C_RESET" "${TRIPS[0]}"; exit 1
-  }
+if [[ ${#TRIP_ARGS[@]} -gt 0 ]]; then
+  # Expand each arg as a glob (or literal) against TRIPS_ROOT. Patterns
+  # like '2024-*' come in as a single quoted string and get expanded here.
+  declare -A SEEN=()
+  shopt -s nullglob
+  for pat in "${TRIP_ARGS[@]}"; do
+    matched=0
+    for dir in "$TRIPS_ROOT"/$pat; do
+      [[ -d "$dir" ]] || continue
+      [[ -n "${SEEN[$dir]:-}" ]] && continue
+      SEEN[$dir]=1
+      TRIPS+=("$dir")
+      matched=1
+    done
+    if [[ $matched -eq 0 ]]; then
+      printf '%sERROR%s no trips matched: %s\n' "$C_ERR" "$C_RESET" "$pat"; exit 1
+    fi
+  done
+  shopt -u nullglob
+  # Sort for deterministic order across patterns.
+  IFS=$'\n' TRIPS=($(printf '%s\n' "${TRIPS[@]}" | sort)); unset IFS
 else
   while IFS= read -r -d '' dir; do
     TRIPS+=("$dir")
@@ -186,7 +204,7 @@ for trip in "${TRIPS[@]}"; do
   # skips the interactive trip-anchor prompt for trips lacking GPS.
   if [[ $DRY_RUN -eq 0 ]]; then
     if ! caffeinate -dims nice -n 10 \
-           "$IMMY_BIN" audit "$trip" --write --auto \
+           "$IMMY_BIN" audit "$trip" --write --auto --yes-medium \
            2>&1 | tee -a "$RUN_LOG"; then
       rc=${PIPESTATUS[0]}
       TOTAL_FAIL=$((TOTAL_FAIL + 1))

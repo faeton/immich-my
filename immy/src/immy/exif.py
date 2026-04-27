@@ -58,6 +58,9 @@ def iter_media(folder: Path) -> Iterable[Path]:
 
 
 def read_folder(folder: Path) -> list[ExifRow]:
+    import sys
+    import time
+    t_total = time.monotonic()
     files = list(iter_media(folder))
     if not files:
         return []
@@ -83,6 +86,92 @@ def read_folder(folder: Path) -> list[ExifRow]:
             blobs = []
 
     by_path = {Path(b["SourceFile"]): b for b in blobs if "SourceFile" in b}
+
+    # Insta360 stores Make/Model in a vendor trailer that the default
+    # header-only read doesn't reach. Trailer parsing requires -ee, which
+    # confuses pyexiftool's stay-open mode on large files (.insv routinely
+    # 9GB), so call exiftool as a one-shot subprocess instead.
+    # Insta360 stores Make/Model only in a vendor trailer at the end of
+    # the file, which exiftool -ee can read but takes 10–20 s on a 9 GB
+    # .insv (it parses the whole accelerometer stream to get there).
+    # The model is per-camera, not per-file, so we sample exactly one
+    # .insv per trip and cache the result in .audit/insta360-camera.json.
+    # First run on a trip ≈ 12 s; every later run is instant.
+    insta_files = [f for f in files if f.suffix.lower() in (".insv", ".lrv", ".insp")]
+    if insta_files:
+        import json
+        import subprocess
+        from .state import AUDIT_DIR
+        cache_path = folder / AUDIT_DIR / "insta360-camera.json"
+        camera: dict | None = None
+        if cache_path.is_file():
+            try:
+                camera = json.loads(cache_path.read_text())
+            except Exception:
+                camera = None
+        if not camera or not camera.get("model"):
+            # Sample smallest .insv first (parse cost grows with size),
+            # but try the next-smallest if the file lacks a trailer
+            # (truncated / malformed). Cap attempts so a corrupt trip
+            # doesn't grind through every file.
+            sampled = sorted(
+                (f for f in insta_files if f.suffix.lower() == ".insv"),
+                key=lambda p: p.stat().st_size,
+            )
+            t1 = time.monotonic()
+            camera = {}
+            attempts = 0
+            for sample in sampled[:8]:
+                attempts += 1
+                sys.stderr.write(
+                    f"  detecting Insta360 camera from {sample.name} "
+                    f"({sample.stat().st_size // (1024*1024)} MB)…\n"
+                )
+                sys.stderr.flush()
+                try:
+                    result = subprocess.run(
+                        ["exiftool", "-G", "-n", "-m", "-ee", "-j",
+                         "-Trailer:Model", "-Trailer:SerialNumber", str(sample)],
+                        capture_output=True, text=True, check=False,
+                    )
+                    blobs = json.loads(result.stdout) if result.stdout.strip() else []
+                except Exception:
+                    blobs = []
+                model = blobs[0].get("Trailer:Model") if blobs else None
+                if model:
+                    camera = {
+                        "make": "Insta360",
+                        "model": model,
+                        "serial": blobs[0].get("Trailer:SerialNumber"),
+                        "sampled_from": sample.name,
+                    }
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    cache_path.write_text(json.dumps(camera, indent=2))
+                    break
+                sys.stderr.write(
+                    f"    no trailer in {sample.name}; trying next…\n"
+                )
+                sys.stderr.flush()
+            sys.stderr.write(
+                f"  Insta360 detect done in {time.monotonic() - t1:.1f}s "
+                f"after {attempts} attempt(s) "
+                f"(model: {camera.get('model') or 'unknown'})\n"
+            )
+            sys.stderr.flush()
+        # When cache is hit, stay silent — read_folder is called many
+        # times per audit (once per apply-pass) and the message becomes
+        # noisy.
+
+        if camera and camera.get("model"):
+            for f in insta_files:
+                raw = by_path.get(f)
+                if raw is None:
+                    continue
+                if "EXIF:Model" in raw or "QuickTime:Model" in raw:
+                    continue
+                raw["QuickTime:Model"] = camera["model"]
+                raw.setdefault("QuickTime:Make", camera.get("make", "Insta360"))
+
     rows: list[ExifRow] = []
     for f in files:
         raw = dict(by_path.get(f, {"SourceFile": str(f)}))
@@ -93,4 +182,8 @@ def read_folder(folder: Path) -> list[ExifRow]:
                 if k.startswith("XMP:") and k not in raw:
                     raw[k] = v
         rows.append(ExifRow(path=f, raw=raw))
+    sys.stderr.write(
+        f"  read {len(rows)} file(s) in {time.monotonic() - t_total:.1f}s\n"
+    )
+    sys.stderr.flush()
     return rows

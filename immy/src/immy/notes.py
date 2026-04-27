@@ -18,6 +18,25 @@ NOTES_ORDER = ("TRIP.md", "IMMY.md", "README.md")
 DEFAULT_WRITE = "README.md"
 
 
+def join_make_model(make: str | None, model: str | None) -> str:
+    """Canonical "<Make> <Model>" with no double-brand.
+
+    Many vendors put the make inside the model (Canon → "Canon EOS R7",
+    Nikon → "NIKON Z 50_2"). Naive concatenation produces "Canon Canon
+    EOS R7". If model already begins with the make (case-insensitive),
+    use the model as-is.
+    """
+    mk = (make or "").strip()
+    md = (model or "").strip()
+    if not mk:
+        return md
+    if not md:
+        return mk
+    if md.lower().startswith(mk.lower()):
+        return md
+    return f"{mk} {md}"
+
+
 def resolve(folder: Path) -> Path | None:
     for name in NOTES_ORDER:
         candidate = folder / name
@@ -169,7 +188,7 @@ def detect_identity(folder: Path, rows: list[ExifRow]) -> TripIdentity:
                 break
         make = r.get("EXIF:Make", "QuickTime:Make") or ""
         model = r.get("EXIF:Model", "QuickTime:Model") or ""
-        cam = f"{make} {model}".strip()
+        cam = join_make_model(make, model)
         if cam:
             cameras.add(cam)
         p = _prefix(r.path)
