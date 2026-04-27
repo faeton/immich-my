@@ -31,6 +31,7 @@ from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
 from .process import is_processed as y_is_processed, read_marker as y_read_marker
 from .rules import evaluate
+from .heartbeat import Heartbeat
 from .state import AUDIT_DIR, State, log_event, patch_hash
 
 
@@ -228,6 +229,8 @@ def execute(
     """Run the plan. Returns a dict with summary counters; `promote` CLI
     formats it for the user. Separated from build_plan so tests can stub
     the client."""
+    hb = Heartbeat.for_trip(plan.folder, phase="promote")
+    hb.write(step="rsync originals", detail=str(plan.target))
     rsync_proc = rsync(plan.folder, plan.target, dry_run=dry_run)
     rsync_changes = [
         line for line in rsync_proc.stdout.splitlines()
@@ -248,12 +251,14 @@ def execute(
     # *must* be on the tailnet (rsync to NAS), so it's also the right
     # moment to flush the cache — otherwise a later library scan would
     # see files on disk with no DB rows and ingest them as blank assets.
+    hb.write(step="offline cache drain")
     offline_summary = _drain_offline_cache(plan.folder, config, dry_run=dry_run)
     if offline_summary is not None:
         summary["offline_sync"] = offline_summary
 
     if dry_run:
         summary["stacks"] = [("planned", f"{p.lrv.name} ↔ {p.insv.name}") for p in plan.pairs]
+        hb.clear()
         return summary
 
     # Record promote event in the source folder's audit log so the JSONL
@@ -265,28 +270,37 @@ def execute(
     })
 
     if client is None or config.immich is None:
+        hb.clear()
         return summary
 
     # Phase Y.1: if `immy process` already inserted rows for this trip, the
     # scan POST is pure wasted work — skip it. The marker is our signal.
     if y_is_processed(plan.folder):
         summary["scan_skipped_reason"] = "y_processed"
+        hb.write(step="rsync derivatives")
         derivatives_summary = _push_derivatives(plan, config)
         if derivatives_summary is not None:
             summary["derivatives"] = derivatives_summary
     else:
+        hb.write(step="library scan")
         try:
             client.scan_library(config.immich.library_id)
             summary["scan_triggered"] = True
         except ImmichError as e:
             summary["scan_error"] = str(e)
+            hb.clear()
             return summary
 
-    for pair in plan.pairs:
+    if plan.pairs:
+        hb.write(step="stack insta360 pairs", total=len(plan.pairs))
+    for idx, pair in enumerate(plan.pairs, start=1):
+        hb.write(file=pair.lrv.name, index=idx)
         summary["stacks"].append(_stack_pair(client, pair, plan.folder.name))
 
+    hb.write(step="album sync")
     summary["album"] = _sync_album(client, plan, config)
 
+    hb.clear()
     return summary
 
 

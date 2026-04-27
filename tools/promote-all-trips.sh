@@ -21,6 +21,11 @@
 #   tools/promote-all-trips.sh --dry-run  # rsync --dry-run for every trip
 #   tools/promote-all-trips.sh --force    # redo trips already logged as promoted
 #
+# While running, press Ctrl+T (SIGINFO) to print live progress: current trip,
+# index/total + %, elapsed time on this trip, total run time, ok/fail/skip.
+# Status is also mirrored to $LOG_DIR/run-<ts>.status — `cat` it from any
+# other terminal to peek without touching the running shell.
+#
 # Env overrides: TRIPS_ROOT, IMMY_ROOT, LOG_DIR.
 
 set -euo pipefail
@@ -101,6 +106,7 @@ fi
 mkdir -p "$LOG_DIR"
 RUN_TS="$(date +%Y%m%d-%H%M%S)"
 RUN_LOG="$LOG_DIR/run-$RUN_TS.log"
+STATUS_FILE="$LOG_DIR/run-$RUN_TS.status"
 
 # --- Pick trips ------------------------------------------------------
 declare -a TRIPS
@@ -176,18 +182,111 @@ INTERRUPTED=0
 trap 'INTERRUPTED=1' INT
 
 printf '\nLogging to %s\n' "$RUN_LOG"
+printf 'Status:  %s  (Ctrl+T for live progress)\n' "$STATUS_FILE"
 PROMOTE_FLAGS=()
 [[ $DRY_RUN -eq 1 ]] && PROMOTE_FLAGS+=(--dry-run)
 
 TOTAL_OK=0; TOTAL_FAIL=0; TOTAL_SKIP=0
 
+# --- Live progress (Ctrl+T / SIGINFO) -------------------------------
+# Updated before each trip / phase; read by the trap and mirrored to
+# $STATUS_FILE so a second terminal can `cat` it without disturbing
+# the running shell.
+RUN_START_TS=$(date +%s)
+CURRENT_TRIP=""
+CURRENT_PHASE="init"
+CURRENT_INDEX=0
+TRIP_START_TS=$RUN_START_TS
+
+fmt_dur() {
+  local s=$1
+  printf '%dh%02dm%02ds' $((s/3600)) $(((s%3600)/60)) $((s%60))
+}
+
+write_status() {
+  local now total done pct trip_el run_el
+  now=$(date +%s)
+  total=${#TRIPS[@]}
+  done=$((CURRENT_INDEX > 0 ? CURRENT_INDEX - 1 : 0))
+  pct=0
+  [[ $total -gt 0 ]] && pct=$((done * 100 / total))
+  trip_el=$((now - TRIP_START_TS))
+  run_el=$((now - RUN_START_TS))
+  {
+    printf 'trip:        %s\n' "${CURRENT_TRIP:-(none)}"
+    printf 'phase:       %s\n' "$CURRENT_PHASE"
+    printf 'progress:    %d/%d  (%d%% done)\n' "$CURRENT_INDEX" "$total" "$pct"
+    printf 'trip time:   %s\n' "$(fmt_dur "$trip_el")"
+    printf 'run time:    %s\n' "$(fmt_dur "$run_el")"
+    printf 'tally:       %d ok, %d failed, %d skipped\n' \
+      "$TOTAL_OK" "$TOTAL_FAIL" "$TOTAL_SKIP"
+    printf 'log:         %s\n' "$RUN_LOG"
+    printf 'updated:     %s\n' "$(date '+%Y-%m-%d %H:%M:%S')"
+  } > "$STATUS_FILE.tmp" && mv "$STATUS_FILE.tmp" "$STATUS_FILE"
+}
+
+print_progress() {
+  write_status
+  printf '\n%s[status]%s ' "$C_OK" "$C_RESET" >&2
+  sed 's/^/           /' "$STATUS_FILE" | sed '1s/^ *//' >&2
+  # Surface the in-process heartbeat written by `immy` itself: shows
+  # which file inside the trip is currently being worked on, plus the
+  # phase (exif / derivatives / clip / faces / transcript / caption /
+  # rsync originals / stack insta360 pairs / album sync). No trip yet
+  # = nothing to show.
+  if [[ -n "$CURRENT_TRIP" ]]; then
+    local hb="$TRIPS_ROOT/$CURRENT_TRIP/.audit/.progress"
+    if [[ -f "$hb" ]]; then
+      printf '%s[heartbeat]%s\n' "$C_OK" "$C_RESET" >&2
+      sed 's/^/           /' "$hb" >&2
+    fi
+  fi
+  printf '\n' >&2
+}
+
+# Ctrl+T on macOS sends SIGINFO to the foreground process group. We run
+# the immy pipelines in the background and `wait` on them, so bash itself
+# stays in the foreground and the trap fires immediately.
+trap 'print_progress' INFO
+
+# Initial snapshot so the status file exists before the first trip.
+write_status
+
+# Run a pipeline in the background and wait, so bash can service SIGINFO
+# (Ctrl+T) while a long immy invocation is running. Returns the pipeline
+# exit code (with `pipefail` already set above, this reflects immy's rc).
+run_bg() {
+  # Subshell so pipefail collapses the pipeline's status into one exit
+  # code we can `wait` on. Without the subshell, $! would be tee's PID
+  # and we'd lose immy's real rc.
+  ( set -o pipefail; "$@" 2>&1 | tee -a "$RUN_LOG" ) &
+  local pid=$!
+  local rc=0
+  # `wait` returns 128+signum if interrupted by a caught signal; in that
+  # case the child is still alive and we loop back to wait again.
+  while :; do
+    if wait "$pid"; then rc=0; break; fi
+    rc=$?
+    kill -0 "$pid" 2>/dev/null || break
+  done
+  return "$rc"
+}
+
 # caffeinate -dims: keep Mac awake (no display, no idle, no system sleep)
 # for the full overnight run. Without this, a closed-lid or idle-sleep
 # mid-transfer kills rsync. nice -n 10 keeps interactive apps responsive
 # if you check in on the laptop.
+trip_idx=0
 for trip in "${TRIPS[@]}"; do
+  trip_idx=$((trip_idx + 1))
   name="$(basename "$trip")"
+  CURRENT_INDEX=$trip_idx
+  CURRENT_TRIP="$name"
+  TRIP_START_TS=$(date +%s)
+
   if [[ $FORCE -eq 0 ]] && is_promoted "$trip"; then
+    CURRENT_PHASE="skip (already promoted)"
+    write_status
     printf '%s[skip]%s %s (already promoted)\n' \
       "$C_DIM" "$C_RESET" "$name" | tee -a "$RUN_LOG"
     TOTAL_SKIP=$((TOTAL_SKIP + 1))
@@ -203,10 +302,11 @@ for trip in "${TRIPS[@]}"; do
   # before promote — promote.py gates on pending HIGH findings. --auto
   # skips the interactive trip-anchor prompt for trips lacking GPS.
   if [[ $DRY_RUN -eq 0 ]]; then
-    if ! caffeinate -dims nice -n 10 \
-           "$IMMY_BIN" audit "$trip" --write --auto --yes-medium \
-           2>&1 | tee -a "$RUN_LOG"; then
-      rc=${PIPESTATUS[0]}
+    CURRENT_PHASE="audit --write --auto"
+    write_status
+    if ! run_bg caffeinate -dims nice -n 10 \
+           "$IMMY_BIN" audit "$trip" --write --auto --yes-medium; then
+      rc=$?
       TOTAL_FAIL=$((TOTAL_FAIL + 1))
       printf '%s[fail rc=%s audit]%s %s\n' \
         "$C_ERR" "$rc" "$C_RESET" "$name" | tee -a "$RUN_LOG"
@@ -214,12 +314,13 @@ for trip in "${TRIPS[@]}"; do
     fi
   fi
 
-  if caffeinate -dims nice -n 10 \
-       "$IMMY_BIN" promote "$trip" "${PROMOTE_FLAGS[@]}" \
-       2>&1 | tee -a "$RUN_LOG"; then
+  CURRENT_PHASE="promote"
+  write_status
+  if run_bg caffeinate -dims nice -n 10 \
+       "$IMMY_BIN" promote "$trip" "${PROMOTE_FLAGS[@]}"; then
     TOTAL_OK=$((TOTAL_OK + 1))
   else
-    rc=${PIPESTATUS[0]}
+    rc=$?
     TOTAL_FAIL=$((TOTAL_FAIL + 1))
     printf '%s[fail rc=%s]%s %s\n' \
       "$C_ERR" "$rc" "$C_RESET" "$name" | tee -a "$RUN_LOG"
@@ -231,6 +332,9 @@ for trip in "${TRIPS[@]}"; do
     break
   fi
 done
+
+CURRENT_PHASE="done"
+write_status
 
 # --- Summary ---------------------------------------------------------
 banner | tee -a "$RUN_LOG"

@@ -45,6 +45,7 @@ from . import raw as raw_mod
 from . import transcripts as transcripts_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
+from .heartbeat import Heartbeat
 from .journal import Journal
 from .offline import Sink
 from .pg import LibraryInfo
@@ -595,7 +596,14 @@ def process_trip(
         if progress is not None:
             progress(msg)
 
+    # Heartbeat: live `.audit/.progress` file external watchers can read
+    # (e.g. tools/promote-all-trips.sh's Ctrl+T trap). One write per file
+    # + per phase; cheap (~200 B atomic rename) compared to derivative /
+    # CLIP / Whisper work that surrounds it.
+    hb = Heartbeat.for_trip(trip_folder, phase="process")
+
     def _phase(fn, label: str, timings: dict) -> Any:
+        hb.write(step=label)
         t0 = time.monotonic()
         try:
             return fn()
@@ -617,6 +625,10 @@ def process_trip(
         _emit(
             f"[{idx}/{total}] {trip_folder.name}/{exif_row.path.name} "
             f"({size_mb:.1f} MB)"
+        )
+        hb.write(
+            file=exif_row.path.name, index=idx, total=total,
+            detail=f"{size_mb:.1f} MB", step="exif",
         )
 
         asset, exif = _phase(
@@ -1124,6 +1136,10 @@ def process_trip(
                 journal.flush()
                 raise
         journal.flush()
+    # Successful exit: drop the heartbeat. On exception we deliberately
+    # leave the last-known state on disk — `updated_at` tells watchers
+    # the run died, and the file pinpoints which asset was in flight.
+    hb.clear()
     return results
 
 
