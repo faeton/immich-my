@@ -83,15 +83,19 @@ banner
 # Pull destination out of config for reachability check.
 ORIG_ROOT="$(awk '/^originals_root:/ {print $2; exit}' "$CONFIG")"
 HOST_ROOT="$(awk '/^[[:space:]]*host_root:/ {print $2; exit}' "$CONFIG")"
+SSH_HOST=""
+REMOTE_PATH=""
+if [[ "$ORIG_ROOT" == *:* ]]; then
+  SSH_HOST="${ORIG_ROOT%%:*}"
+  REMOTE_PATH="${ORIG_ROOT#*:}"
+fi
 printf '  destination (originals): %s\n' "$ORIG_ROOT"
 printf '  destination (host_root): %s\n' "$HOST_ROOT"
 
 if [[ $STATUS_ONLY -eq 0 ]]; then
   # If originals_root is user@host:/path, ssh to verify we can reach it
   # and the remote path exists. Saves discovering a dead link 10 hours in.
-  if [[ "$ORIG_ROOT" == *:* ]]; then
-    SSH_HOST="${ORIG_ROOT%%:*}"
-    REMOTE_PATH="${ORIG_ROOT#*:}"
+  if [[ -n "$SSH_HOST" ]]; then
     printf 'Reachability check: ssh %s ...\n' "$SSH_HOST"
     if ! ssh -o BatchMode=yes -o ConnectTimeout=10 "$SSH_HOST" \
            "test -d '$REMOTE_PATH'" 2>/dev/null; then
@@ -197,6 +201,9 @@ CURRENT_TRIP=""
 CURRENT_PHASE="init"
 CURRENT_INDEX=0
 TRIP_START_TS=$RUN_START_TS
+TRIP_FILES=0
+TRIP_SIZE_H=""
+TRIP_BYTES=0
 
 fmt_dur() {
   local s=$1
@@ -214,8 +221,11 @@ write_status() {
   run_el=$((now - RUN_START_TS))
   {
     printf 'trip:        %s\n' "${CURRENT_TRIP:-(none)}"
+    if [[ $TRIP_FILES -gt 0 || -n "$TRIP_SIZE_H" ]]; then
+      printf 'trip size:   %s files, %s\n' "$TRIP_FILES" "${TRIP_SIZE_H:-?}"
+    fi
     printf 'phase:       %s\n' "$CURRENT_PHASE"
-    printf 'progress:    %d/%d  (%d%% done)\n' "$CURRENT_INDEX" "$total" "$pct"
+    printf 'trips:       %d/%d done  (on trip %d, %d%%)\n' "$done" "$total" "$CURRENT_INDEX" "$pct"
     printf 'trip time:   %s\n' "$(fmt_dur "$trip_el")"
     printf 'run time:    %s\n' "$(fmt_dur "$run_el")"
     printf 'tally:       %d ok, %d failed, %d skipped\n' \
@@ -229,6 +239,26 @@ print_progress() {
   write_status
   printf '\n%s[status]%s ' "$C_OK" "$C_RESET" >&2
   sed 's/^/           /' "$STATUS_FILE" | sed '1s/^ *//' >&2
+  # Parse the run log locally for rsync's own progress signal — no ssh
+  # round-trip. `--itemize-changes` emits one `>f...`/`<f...` line per
+  # file at transfer start, and `--progress` emits the per-file byte
+  # counter. Files-started is itemize count; current pct is the last
+  # progress line for the file in flight.
+  if [[ -n "$CURRENT_TRIP" && -f "$RUN_LOG" ]]; then
+    local files_started cur_pct cur_line
+    # Tail keeps this O(constant) regardless of log length.
+    files_started=$(grep -cE '^[<>][fdL]' "$RUN_LOG" 2>/dev/null || echo 0)
+    cur_line=$(grep -E '^[[:space:]]+[0-9,]+[[:space:]]+[0-9]+%' "$RUN_LOG" 2>/dev/null | tail -1)
+    cur_pct=$(printf '%s\n' "$cur_line" | awk '{for(i=1;i<=NF;i++) if($i~/%$/){gsub("%","",$i); print $i; exit}}')
+    if [[ "${files_started:-0}" -gt 0 || -n "$cur_pct" ]]; then
+      local pct_files=0
+      [[ "${TRIP_FILES:-0}" -gt 0 ]] && pct_files=$((files_started * 100 / TRIP_FILES))
+      printf '%s[rsync]%s    files started: %s/%s (%d%%)' \
+        "$C_OK" "$C_RESET" "${files_started:-0}" "${TRIP_FILES:-?}" "$pct_files" >&2
+      [[ -n "$cur_pct" ]] && printf ', current file: %s%%' "$cur_pct" >&2
+      printf '\n' >&2
+    fi
+  fi
   # Surface the in-process heartbeat written by `immy` itself: shows
   # which file inside the trip is currently being worked on, plus the
   # phase (exif / derivatives / clip / faces / transcript / caption /
@@ -237,8 +267,26 @@ print_progress() {
   if [[ -n "$CURRENT_TRIP" ]]; then
     local hb="$TRIPS_ROOT/$CURRENT_TRIP/.audit/.progress"
     if [[ -f "$hb" ]]; then
-      printf '%s[heartbeat]%s\n' "$C_OK" "$C_RESET" >&2
-      sed 's/^/           /' "$hb" >&2
+      # Only surface fields not already in [status]: step, detail, and
+      # how stale the heartbeat is (rsync doesn't refresh it, so a long
+      # stale-time during the rsync phase is expected and informative).
+      local hb_now hb_upd hb_age step detail
+      hb_now=$(date +%s)
+      hb_upd=$(awk -F'"' '/"updated_at":/ {print $4; exit}' "$hb")
+      step=$(awk -F'"' '/"step":/ {print $4; exit}' "$hb")
+      detail=$(awk -F'"' '/"detail":/ {print $4; exit}' "$hb")
+      hb_age=""
+      if [[ -n "$hb_upd" ]]; then
+        local hb_upd_ts
+        hb_upd_ts=$(date -j -f '%Y-%m-%dT%H:%M:%S' "${hb_upd%%.*}" +%s 2>/dev/null || echo 0)
+        [[ $hb_upd_ts -gt 0 ]] && hb_age="$(fmt_dur $((hb_now - hb_upd_ts))) stale"
+      fi
+      if [[ -n "$step$detail" ]]; then
+        printf '%s[heartbeat]%s ' "$C_OK" "$C_RESET" >&2
+        printf 'step: %s\n' "${step:-?}" >&2
+        [[ -n "$detail" ]] && printf '           detail: %s\n' "$detail" >&2
+        [[ -n "$hb_age" ]] && printf '           %s\n' "$hb_age" >&2
+      fi
     fi
   fi
   printf '\n' >&2
@@ -283,6 +331,21 @@ for trip in "${TRIPS[@]}"; do
   CURRENT_INDEX=$trip_idx
   CURRENT_TRIP="$name"
   TRIP_START_TS=$(date +%s)
+  # Sample trip size/file count once at trip start so Ctrl+T is cheap.
+  # Excludes .audit/ since promote rsyncs originals + .audit derivatives
+  # separately; the bulk-of-transfer figure is what's most useful here.
+  if [[ -d "$trip" ]]; then
+    TRIP_FILES=$(find "$trip" -type f -not -path "*/.audit/*" 2>/dev/null | wc -l | tr -d ' ')
+    # KB-units (du semantics differ from apparent-size sums).
+    kb=$(du -sk "$trip" 2>/dev/null | awk '{print $1+0}')
+    TRIP_BYTES=$(( ${kb:-0} * 1024 ))
+    TRIP_SIZE_H=$(awk -v b="${TRIP_BYTES:-0}" 'BEGIN{
+      u="BKMGT"; i=1; while(b>=1024 && i<5){b/=1024; i++}
+      printf "%.1f%s", b, substr(u,i,1)
+    }')
+  else
+    TRIP_FILES=0; TRIP_BYTES=0; TRIP_SIZE_H=""
+  fi
 
   if [[ $FORCE -eq 0 ]] && is_promoted "$trip"; then
     CURRENT_PHASE="skip (already promoted)"
