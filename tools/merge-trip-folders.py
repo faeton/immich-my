@@ -11,8 +11,10 @@ Usage:
     merge-trip-folders.py <src1> <src2> [<src3> ...] --to <name> [--apply]
 
 All folders must be siblings under the same trips root. Default is
-dry-run; use --apply to execute. Refuses to run if it detects filename
-or checksum collisions across sources.
+dry-run; use --apply to execute. The destination may already exist; in
+that case its existing files and .audit metadata are preserved and
+included in collision checks / metadata merges. Refuses to run if it
+detects filename or checksum collisions across sources and destination.
 """
 from __future__ import annotations
 
@@ -23,6 +25,9 @@ import sys
 from pathlib import Path
 
 import yaml
+
+
+NOTES_FILENAME = "README.md"
 
 
 def err(msg: str) -> None:
@@ -48,9 +53,13 @@ def rewrite_obj(obj, name_map: dict[str, str]) -> tuple[object, int]:
     if isinstance(obj, dict):
         out: dict = {}
         for k, v in obj.items():
+            k2 = k
+            if isinstance(k, str):
+                k2, m = rewrite_str(k, name_map)
+                n += m
             v2, m = rewrite_obj(v, name_map)
             n += m
-            out[k] = v2
+            out[k2] = v2
         return out, n
     if isinstance(obj, list):
         out_l: list = []
@@ -102,6 +111,82 @@ def collect_top_files(src: Path) -> list[Path]:
             continue
         out.append(p)
     return out
+
+
+def _dedup_list(values: list) -> list:
+    out: list = []
+    for value in values:
+        if value not in out:
+            out.append(value)
+    return out
+
+
+def _read_readme(path: Path) -> tuple[dict, str]:
+    if not path.exists():
+        return {}, ""
+    text = path.read_text()
+    if not text.startswith("---\n"):
+        return {}, text
+    try:
+        _, front, body = text.split("---\n", 2)
+    except ValueError:
+        return {}, text
+    data = yaml.safe_load(front) or {}
+    return data if isinstance(data, dict) else {}, body
+
+
+def _write_readme(path: Path, data: dict, body: str) -> None:
+    path.write_text("---\n" + yaml.safe_dump(data, sort_keys=False) + "---\n" + body)
+
+
+def merge_readmes(dest: Path, sources: list[Path], name_map: dict[str, str], *, apply: bool) -> tuple[int, int]:
+    dst = dest / NOTES_FILENAME
+    merged, body = _read_readme(dst)
+    rewrites = 0
+    merged.setdefault("trip", dest.name)
+
+    merged_location = merged.get("location")
+    if not isinstance(merged_location, dict):
+        merged_location = {}
+    merged["location"] = merged_location
+
+    consumed = 0
+    for src_dir in sources:
+        src = src_dir / NOTES_FILENAME
+        if not src.exists():
+            continue
+        consumed += 1
+        data, _src_body = _read_readme(src)
+        data, m = rewrite_obj(data, name_map)
+        rewrites += m
+
+        for key in ("dates", "cameras", "tags"):
+            values = []
+            if isinstance(merged.get(key), list):
+                values.extend(merged[key])
+            if isinstance(data.get(key), list):
+                values.extend(data[key])
+            if values:
+                merged[key] = _dedup_list(values)
+
+        src_location = data.get("location")
+        if isinstance(src_location, dict):
+            for key in ("name", "coords"):
+                if not merged_location.get(key) and src_location.get(key):
+                    merged_location[key] = src_location[key]
+
+        for key in ("timezone",):
+            if not merged.get(key) and data.get(key):
+                merged[key] = data[key]
+
+    merged["trip"] = dest.name
+    if apply and consumed:
+        _write_readme(dst, merged, body)
+        for src_dir in sources:
+            src = src_dir / NOTES_FILENAME
+            if src.exists():
+                src.unlink()
+    return consumed, rewrites
 
 
 def merge_yaml_dict_under_key(
@@ -171,25 +256,20 @@ def merge_y_processed(
 def concat_jsonl(sources: list[Path], dst: Path, name_map: dict[str, str], *, apply: bool) -> tuple[int, int]:
     lines = 0
     rewrites = 0
+    out_lines: list[str] = []
+    for src in sources:
+        if not src.exists():
+            continue
+        with src.open() as f:
+            for line in f:
+                line2, m = rewrite_str(line, name_map)
+                rewrites += m
+                lines += 1
+                out_lines.append(line2)
     if apply:
         dst.parent.mkdir(parents=True, exist_ok=True)
-        out_f = dst.open("w")
-    else:
-        out_f = None
-    try:
-        for src in sources:
-            if not src.exists():
-                continue
-            with src.open() as f:
-                for line in f:
-                    line2, m = rewrite_str(line, name_map)
-                    rewrites += m
-                    lines += 1
-                    if out_f:
-                        out_f.write(line2)
-    finally:
-        if out_f:
-            out_f.close()
+        with dst.open("w") as out_f:
+            out_f.writelines(out_lines)
     return lines, rewrites
 
 
@@ -228,6 +308,9 @@ def main() -> int:
     if dest in src_paths:
         err("dest cannot be one of the sources")
         return 2
+    if dest.exists() and not dest.is_dir():
+        err(f"dest exists but is not a directory: {dest}")
+        return 2
 
     name_map = {p.name: dest.name for p in src_paths}
     print(f"trips root: {trips_root}")
@@ -237,15 +320,21 @@ def main() -> int:
     print()
 
     # ---- Pre-flight collision checks ----
+    existing_dest = dest if dest.is_dir() else None
+    merge_paths = ([existing_dest] if existing_dest else []) + src_paths
+    merge_notes = bool(existing_dest and (dest / NOTES_FILENAME).exists())
+
     top_seen: dict[str, Path] = {}
     poster_seen: dict[str, Path] = {}
     offline_seen: dict[str, Path] = {}
     collisions: list[str] = []
-    for src in src_paths:
+    for src in merge_paths:
         for f in collect_top_files(src):
             if f.name in top_seen:
+                if merge_notes and f.name == NOTES_FILENAME:
+                    continue
                 collisions.append(f"top-level filename collision: {f.name} in {top_seen[f.name].parent.name} and {src.name}")
-            top_seen[f.name] = f
+            top_seen.setdefault(f.name, f)
         posters = src / ".audit" / "derivatives" / "_posters"
         if posters.is_dir():
             for f in posters.iterdir():
@@ -265,7 +354,17 @@ def main() -> int:
             err(c)
         return 3
 
-    print(f"pre-flight ok: {len(top_seen)} top files, {len(offline_seen)} offline ymls, {len(poster_seen)} posters")
+    source_top_count = sum(
+        1
+        for src in src_paths
+        for f in collect_top_files(src)
+        if not (merge_notes and f.name == NOTES_FILENAME)
+    )
+    print(
+        f"pre-flight ok: {len(top_seen)} total top files "
+        f"({source_top_count} to move), {len(offline_seen)} offline ymls, "
+        f"{len(poster_seen)} posters"
+    )
     print()
 
     apply = args.apply
@@ -279,10 +378,18 @@ def main() -> int:
     # ---- Move top-level files ----
     for src in src_paths:
         for f in collect_top_files(src):
+            if merge_notes and f.name == NOTES_FILENAME:
+                continue
             target = dest / f.name
             log.append(f"mv {f} → {target}")
             if apply:
                 shutil.move(str(f), str(target))
+
+    # ---- Merge trip notes ----
+    if merge_notes:
+        readme_count, readme_rew = merge_readmes(dest, src_paths, name_map, apply=apply)
+    else:
+        readme_count, readme_rew = 0, 0
 
     # ---- Move offline ymls (with path rewrite) ----
     offline_rewrites = 0
@@ -336,47 +443,47 @@ def main() -> int:
                         pass
 
     # ---- Merge journal.yml ----
-    journals = [p / ".audit" / "journal.yml" for p in src_paths]
+    journals = [p / ".audit" / "journal.yml" for p in merge_paths]
     j_count, j_rew = merge_yaml_dict_under_key(
         journals, "entries", dest / ".audit" / "journal.yml", name_map, apply=apply
     )
     if apply:
-        for j in journals:
+        for j in [p / ".audit" / "journal.yml" for p in src_paths]:
             if j.exists():
                 j.unlink()
 
     # ---- Merge y_processed.yml ----
-    yps = [p / ".audit" / "y_processed.yml" for p in src_paths]
+    yps = [p / ".audit" / "y_processed.yml" for p in merge_paths]
     if any(y.exists() for y in yps):
         yp_assets, yp_rew = merge_y_processed(
             yps, dest / ".audit" / "y_processed.yml", name_map, apply=apply
         )
         if apply:
-            for y in yps:
+            for y in [p / ".audit" / "y_processed.yml" for p in src_paths]:
                 if y.exists():
                     y.unlink()
     else:
         yp_assets, yp_rew = 0, 0
 
     # ---- Merge state.yml ----
-    states = [p / ".audit" / "state.yml" for p in src_paths]
+    states = [p / ".audit" / "state.yml" for p in merge_paths]
     if any(s.exists() for s in states):
         s_count, s_rew = merge_yaml_dict_under_key(
             states, "applied", dest / ".audit" / "state.yml", name_map, apply=apply
         )
         if apply:
-            for s in states:
+            for s in [p / ".audit" / "state.yml" for p in src_paths]:
                 if s.exists():
                     s.unlink()
     else:
         s_count, s_rew = 0, 0
 
     # ---- Concat audit.jsonl ----
-    audits = [p / ".audit" / "audit.jsonl" for p in src_paths]
+    audits = [p / ".audit" / "audit.jsonl" for p in merge_paths]
     if any(a.exists() for a in audits):
         a_lines, a_rew = concat_jsonl(audits, dest / ".audit" / "audit.jsonl", name_map, apply=apply)
         if apply:
-            for a in audits:
+            for a in [p / ".audit" / "audit.jsonl" for p in src_paths]:
                 if a.exists():
                     a.unlink()
     else:
@@ -445,7 +552,8 @@ def main() -> int:
                 err(f"source not empty after merge, keeping: {src}")
 
     # ---- Summary ----
-    print(f"top-level moves: {len(top_seen)}")
+    print(f"top-level moves: {source_top_count}")
+    print(f"readmes merged:  {readme_count}  (rewrites={readme_rew})")
     print(f"offline ymls:    {moved_offline}  (rewrites={offline_rewrites})")
     print(f"journal entries: {j_count}  (rewrites={j_rew})")
     print(f"y_processed assets: {yp_assets}  (rewrites={yp_rew})")

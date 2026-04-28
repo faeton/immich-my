@@ -205,7 +205,7 @@ def _dedup_by_field(findings: list[Finding]) -> list[Finding]:
 def _first_present(row, *keys: str) -> tuple[object | None, str | None]:
     for key in keys:
         value = row.get(key)
-        if value is not None:
+        if value is not None and not (isinstance(value, str) and not value.strip()):
             return value, key
     return None, None
 

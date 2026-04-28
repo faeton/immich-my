@@ -35,10 +35,14 @@ class ExifRow:
         return None
 
 
+def _has_value(value: Any) -> bool:
+    return value is not None and not (isinstance(value, str) and not value.strip())
+
+
 def has_gps(row: "ExifRow") -> bool:
     lat = row.get("Composite:GPSLatitude", "EXIF:GPSLatitude", "XMP:GPSLatitude")
     lon = row.get("Composite:GPSLongitude", "EXIF:GPSLongitude", "XMP:GPSLongitude")
-    return lat is not None and lon is not None
+    return _has_value(lat) and _has_value(lon)
 
 
 def _is_under_audit_dir(folder: Path, path: Path) -> bool:

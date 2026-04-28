@@ -34,6 +34,11 @@ def write(media: Path, patch: dict[str, object]) -> Path:
     in the sidecar — idempotent when the same list is re-applied.
     """
     sidecar = _sidecar_path(media)
+    # Clean up stale exiftool temp from a prior interrupted/failed run —
+    # otherwise exiftool refuses with "File already exists: ..._exiftool_tmp".
+    stale_tmp = sidecar.with_name(sidecar.name + "_exiftool_tmp")
+    if stale_tmp.exists():
+        stale_tmp.unlink()
     args = [EXIFTOOL, "-overwrite_original", "-q", "-q"]
     for tag, value in patch.items():
         if isinstance(value, (list, tuple)):

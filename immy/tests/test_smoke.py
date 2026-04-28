@@ -8,7 +8,7 @@ import pytest
 from typer.testing import CliRunner
 
 from immy.cli import _fmt_date, _fmt_gps, _fmt_make_model, app
-from immy.exif import ExifRow, iter_media
+from immy.exif import ExifRow, has_gps, iter_media
 
 FIXTURES = Path(__file__).parent / "fixtures"
 runner = CliRunner()
@@ -86,6 +86,18 @@ def test_fmt_gps_shows_xmp_source():
         },
     )
     assert _fmt_gps(row) == "-16.2893,-67.8272 (xmp)"
+
+
+def test_blank_gps_values_are_missing():
+    row = ExifRow(
+        path=Path("IMG_0001.JPG"),
+        raw={
+            "Composite:GPSLatitude": "",
+            "Composite:GPSLongitude": "",
+        },
+    )
+    assert _fmt_gps(row) == "—"
+    assert not has_gps(row)
 
 
 def test_fmt_make_model_uses_quicktime_android_fields():
