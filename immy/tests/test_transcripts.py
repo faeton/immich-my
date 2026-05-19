@@ -71,13 +71,13 @@ def test_sidecar_path_uses_compound_suffix(tmp_path: Path):
 
 
 def test_denylist_matches_drone_makes():
-    # Every drone file in ~/Media/Trips produced by DJI/Insta360 has
-    # zero audio streams. The denylist skips the ffprobe round-trip
-    # entirely for these cameras.
+    # DJI drone clips have no audio streams, so skip the ffprobe round-trip.
+    # Insta360 X-series clips can carry useful audio and should fall through
+    # to the generic has-audio gate.
     assert is_denylisted_make("DJI")
     assert is_denylisted_make("dji")
-    assert is_denylisted_make("Insta360")
-    assert is_denylisted_make("Arashi Vision")  # Insta360's legal name
+    assert not is_denylisted_make("Insta360")
+    assert not is_denylisted_make("Arashi Vision")  # Insta360's legal name
     assert not is_denylisted_make("Apple")
     assert not is_denylisted_make("GoPro")
     assert not is_denylisted_make(None)

@@ -30,8 +30,9 @@ class _FakeMlxClip:
     """Stand-in for `mlx_clip.mlx_clip`. Returns a fixed 4-D vector so the
     test can assert on exact normalized values."""
 
-    def __init__(self, repo_id: str):
+    def __init__(self, repo_id: str, *, hf_repo: str | None = None):
         self.repo_id = repo_id
+        self.hf_repo = hf_repo
 
     def image_encoder(self, path: str):
         # Un-normalized; clip.embed_image must normalize before returning.
@@ -83,9 +84,9 @@ def test_get_model_caches_single_instance(monkeypatch):
     calls = {"n": 0}
 
     class _Counting(_FakeMlxClip):
-        def __init__(self, repo_id: str):
+        def __init__(self, repo_id: str, *, hf_repo: str | None = None):
             calls["n"] += 1
-            super().__init__(repo_id)
+            super().__init__(repo_id, hf_repo=hf_repo)
 
     fake_mod = types.ModuleType("mlx_clip")
     fake_mod.mlx_clip = _Counting  # type: ignore[attr-defined]

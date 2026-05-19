@@ -35,6 +35,18 @@ class _LazyModule:
     def __getattr__(self, attr):
         return getattr(self._load(), attr)
 
+    def __setattr__(self, attr, value):
+        if attr in self.__slots__:
+            object.__setattr__(self, attr, value)
+            return
+        setattr(self._load(), attr, value)
+
+    def __delattr__(self, attr):
+        if attr in self.__slots__:
+            object.__delattr__(self, attr)
+            return
+        delattr(self._load(), attr)
+
 
 apple_photos_mod = _LazyModule("apple_photos")
 bloat_mod = _LazyModule("bloat")

@@ -463,10 +463,10 @@ def test_push_derivatives_rsyncs_and_inserts(tmp_path: Path, monkeypatch):
 
     # Capture rsync call + DB calls.
     rsync_calls: list[list[str]] = []
-    def fake_run(args, **kw):
+    def fake_run(args):
         rsync_calls.append(args)
         return subprocess.CompletedProcess(args, 0, "", "")
-    monkeypatch.setattr(promote_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(promote_mod, "_run_streaming", fake_run)
 
     fake_conn = MagicMock()
     fake_conn.closed = False
@@ -525,9 +525,9 @@ def test_push_derivatives_rsync_error_reports_detail(tmp_path: Path, monkeypatch
     trip.mkdir()
     _marker_with_derivs(trip)
 
-    def fake_run(args, **kw):
+    def fake_run(args):
         raise subprocess.CalledProcessError(23, args, output="", stderr="boom")
-    monkeypatch.setattr(promote_mod.subprocess, "run", fake_run)
+    monkeypatch.setattr(promote_mod, "_run_streaming", fake_run)
 
     plan = promote_mod.Plan(folder=trip, target=Path("/tmp"), pairs=[], pending_high=0)
     summary = promote_mod._push_derivatives(plan, _cfg("/dest"))

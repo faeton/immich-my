@@ -338,10 +338,41 @@ def _indexed_set(folder: Path) -> set[str]:
     return {p.name for p in iter_media(folder)}
 
 
+def _enable_fake_album_pg(config_file: tuple[Path, Path], monkeypatch) -> MagicMock:
+    cfg_path, _ = config_file
+    data = yaml.safe_load(cfg_path.read_text()) or {}
+    data["pg"] = {
+        "host": "127.0.0.1", "port": 15432,
+        "user": "postgres", "password": "x", "database": "immich",
+    }
+    cfg_path.write_text(yaml.safe_dump(data))
+
+    fake_conn = MagicMock()
+    fake_conn.closed = False
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.rowcount = 0
+    cur.fetchall.return_value = [("asset-1",)]
+    fake_conn.cursor.return_value = cur
+    monkeypatch.setattr(promote_mod.pg_mod, "connect", lambda cfg: fake_conn)
+    monkeypatch.setattr(
+        promote_mod.pg_mod,
+        "fetch_library_info",
+        lambda conn, lib_id: LibraryInfo(
+            id=lib_id,
+            owner_id="owner-1",
+            container_root="/mnt/external/originals",
+        ),
+    )
+    return fake_conn
+
+
 def test_promote_creates_album_with_description_from_notes(
     config_file, dji_ready, monkeypatch
 ):
     _, originals = config_file
+    _enable_fake_album_pg(config_file, monkeypatch)
     # Append a body to the notes file so `notes_body` returns something.
     notes = dji_ready / "README.md"
     text = notes.read_text()
@@ -363,6 +394,7 @@ def test_promote_creates_album_with_description_from_notes(
 
 def test_promote_updates_existing_album(config_file, dji_ready, monkeypatch):
     _, originals = config_file
+    _enable_fake_album_pg(config_file, monkeypatch)
     notes = dji_ready / "README.md"
     text = notes.read_text()
     notes.write_text(text + "\nNew body text.\n")
