@@ -547,16 +547,16 @@ preserve codecs (ProRes / DNxHR / CineForm / FFV1 / RAW), Insta360 content
 (any extension), and folders whose segment contains `raw` / `source` /
 `edit` / `project` / `insta360`.
 
-### `immy process` — Phase Y.1 direct-to-DB insert
+### `immy process` — Phase Y direct-to-DB ingest
 
 Writes `asset` + `asset_exif` rows directly into Immich's Postgres over the
-tailnet, so the library scan becomes a no-op for Mac-handled trips. See
-[IMMICH-INGEST.md](IMMICH-INGEST.md) §1 + §8 for the exact schema; the
-rest of Phase Y builds derivatives on top of this.
+tailnet, then stages derivatives and configured ML outputs on the Mac. The
+library scan becomes a no-op for Mac-handled trips. See
+[IMMICH-INGEST.md](IMMICH-INGEST.md) §1 + §8 for the exact schema.
 
 ```
-immy process <folder>            # connect, INSERT asset+exif, drop marker
-immy process <folder> --dry-run  # report would-insert; no DB writes
+immy process <folder>            # insert asset/exif, derive media, run enabled ML
+immy process <folder> --dry-run  # report would-process; no DB writes
 ```
 
 **Config.** Reads a `pg:` block from `~/.immy/config.yml` (host/port/user/
@@ -577,10 +577,11 @@ call — the rows are already there. Marker path is stable
 (`immy.process.marker_path(folder)`), so later Y phases can extend it with
 derivative-path records without breaking the skip logic.
 
-**Y.1 scope = metadata only.** No thumbnails, no smart_search, no faces —
-those are Y.2/Y.3/Y.4. A Y.1-processed trip shows up in the Immich UI with
-placeholder thumbs and full EXIF detail; the library scan still won't try
-to re-process it.
+**Metadata-only mode.** The original Y.1 slice inserted only `asset` and
+`asset_exif`; that path is still useful for tests and debugging when derivative
+or ML flags are disabled. Normal `immy process` now stages derivatives, video
+proxies, CLIP, faces, transcripts, and captions as configured, then records the
+full marker for `immy promote`.
 
 ### `immy process --with-derivatives` — Phase Y.2
 
@@ -595,8 +596,10 @@ worker uses. Output matches §3 bucketing:
 
 Staging is deliberately local — compute (Mac, Metal) and upload (NAS,
 bandwidth-bound) are split so a flaky uplink can resume the rsync without
-re-encoding. Only newly-inserted IMAGE assets get derivatives; checksum
-conflicts (already indexed) and VIDEO rows (Y.5) are skipped.
+re-encoding. Images get thumbnail/preview derivatives from libvips. Videos go
+through the Y.5 path: poster extraction, thumbnail/preview from the poster, and
+optional encoded-video proxy generation. Re-runs use the per-trip journal and
+staged files to avoid repeating expensive work.
 
 **Config.** Requires a `media:` block alongside `pg:`:
 

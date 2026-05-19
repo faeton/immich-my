@@ -154,6 +154,8 @@ REST API. No forking. Upgrades stay clean.
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical design: tiered storage, mount adapters, pipelines, queues |
 | [docs/SIDECAR.md](docs/SIDECAR.md) | Sidecar internals: DB choice, queue schema, worker-harness contract, process layout |
 | [docs/PLAN.md](docs/PLAN.md) | Phased build plan, milestones, what's custom vs stock |
+| [docs/ROADMAP.md](docs/ROADMAP.md) | Current work order and forward roadmap |
+| [docs/REVIEW-RECOMMENDATIONS.md](docs/REVIEW-RECOMMENDATIONS.md) | Current engineering review, fixes, suggestions, and commit plan |
 | [docs/CAPTIONS.md](docs/CAPTIONS.md) | VLM captioner — supported backends, config, per-image cost table |
 | [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md) | Step-by-step offline runbook — drive `immy` with LM Studio + a local VLM, no internet |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | As-deployed operating manual: paths, compose, onboarding choices |
@@ -173,16 +175,16 @@ REST API. No forking. Upgrades stay clean.
   2026-04-20 — `immy` is the sole ingestion path. See
   [docs/PLAN.md](docs/PLAN.md) for the Y.1–Y.6 ladder.
 
-## TODO
+## Current capabilities
 
-Shipped since last README update:
 - Whisper transcripts via `immy process --with-transcripts` (mlx-whisper on
   Apple Silicon, large-v3 by default). Writes `<stem>.<lang>.srt` next to
   the source and an excerpt into `asset_exif.description` so Immich search
-  hits spoken words. Four cheap guards (sidecar cache → EXIF-make denylist
-  for DJI/Insta360 → ffprobe audio-stream check → ffmpeg volumedetect) skip
-  Whisper on footage that can't produce meaningful speech. For biased
-  auto-detect in multi-lingual corpora, set `ml.whisper_prompt` in
+  hits spoken words. Cheap guards (sidecar cache → DJI make denylist →
+  ffprobe audio-stream check → ffmpeg volume/silence detection) skip Whisper
+  on footage that can't produce meaningful speech. Insta360 clips are probed
+  normally because newer X-series cameras can record useful audio. For biased
+  auto-detect in multilingual corpora, set `ml.whisper_prompt` in
   `~/.immy/config.yml` (e.g. `"English, Russian, Ukrainian."`) or export
   `IMMY_WHISPER_PROMPT` — it's passed to Whisper as `initial_prompt`.
 
@@ -207,13 +209,18 @@ Shipped since last README update:
   (safe to delete) vs which is a candidate for ingest. Default mode
   hashes only on name+size hits; `--thorough` catches pure renames.
 
-Not shipped yet:
+## Known gaps
+
 - CLIP-based near-duplicate search (`find-similar`)
 - Apple Photos people-name seeding (`apple-people --apply`)
+- local Immich triage of offline-cached trips
+- `immy doctor` environment/schema preflight
+- `immy status <trip>` summary command
 - metadata gap-fill web UI
 - ghost/offline asset handling
 
-Detailed phased planning lives in [docs/PLAN.md](docs/PLAN.md).
+Current work order lives in [docs/ROADMAP.md](docs/ROADMAP.md). Detailed
+phased planning lives in [docs/PLAN.md](docs/PLAN.md).
 
 ## License / Publishing Note
 

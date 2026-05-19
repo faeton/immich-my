@@ -60,7 +60,7 @@ dropped because:
 big-video-on-NAS problem at the pre-ingest layer, which was the main
 motivation for Phase 1. Phase Y extends the same pattern to ML.
 
-## Phase Y — direct-to-Immich-DB pre-processing (Mac-native) — in design
+## Phase Y — direct-to-Immich-DB pre-processing (Mac-native) — shipped / maintenance
 
 **Compute everything on the Mac, write directly to Immich's Postgres,
 skip Immich's own processing queue for Mac-originated content.**
@@ -70,7 +70,8 @@ Model:
 ```
 immy audit   — metadata fixes (XMP sidecars, shipped)
 immy bloat   — pre-ingest HEVC transcode (shipped)
-immy process — NEW: checksum + thumbnail + preview + CLIP + faces, all on Mac
+immy process — checksum + thumbnail + preview + video proxy + CLIP + faces,
+               transcripts, captions, all on Mac
 immy promote — rsync originals + derivatives to NAS + direct PG INSERTs,
                no library scan triggered for Mac-handled trips
 ```
@@ -107,6 +108,10 @@ only supported maintenance path — no "gracefully handle unknown schema".
 **Done when** (whole phase): a Mac-audited trip runs `immy audit → bloat →
 process → promote` and appears in Immich fully processed, without
 Immich's NAS microservices having touched it. Acc-free, queue-free.
+
+Status: ✅ shipped 2026-04-20. Current work is maintenance: keep the direct
+DB write surface aligned with Immich schema changes, expand offline/local
+replay, and keep fixture + smoke coverage current.
 
 ## Phase 1b — Mount adapter framework (1–2 days)
 
