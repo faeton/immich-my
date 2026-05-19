@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 import yaml
@@ -9,8 +10,10 @@ from typer.testing import CliRunner
 
 from immy.cli import app
 from immy.config import Config
+from immy.heartbeat import heartbeat_path
 from immy import immich as immich_mod
 from immy import promote as promote_mod
+from immy.pg import LibraryInfo
 
 
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -138,6 +141,24 @@ def test_promote_rsyncs_and_triggers_scan(config_file, dji_ready, monkeypatch):
     # .audit/ excluded
     assert not (originals / "dji-srt-pair" / ".audit").exists()
     assert fake.scans == ["lib-1"]
+
+
+def test_promote_interrupt_stops_without_traceback(config_file, dji_ready, monkeypatch):
+    fake = FakeClient()
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+
+    def interrupted(*args, **kwargs):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(promote_mod, "rsync", interrupted)
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 130, result.stdout
+    assert "interrupted" in result.stdout
+    assert "Traceback" not in result.stdout
+    assert fake.scans == []
+    assert fake.stacks == []
+    assert not heartbeat_path(dji_ready).exists()
 
 
 def test_promote_drains_offline_cache_when_pending(

@@ -21,6 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from pathlib import Path
 import subprocess
+import signal
 
 from . import offline as offline_mod
 from . import pg as pg_mod
@@ -161,6 +162,8 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
         # No buffered stdout (rare — pytest capture, etc.). Fall back to
         # a buffered run; callers see output only on completion.
         proc = subprocess.run(args, capture_output=True, text=True)
+        if proc.returncode == 20 or proc.returncode == -signal.SIGINT:
+            raise KeyboardInterrupt
         if proc.returncode != 0:
             sys.stderr.write(proc.stderr)
             sys.stderr.flush()
@@ -179,16 +182,31 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
     )
     buf = bytearray()
     assert proc.stdout is not None
-    while True:
-        chunk = proc.stdout.read(1)
-        if not chunk:
-            break
-        buf.extend(chunk)
-        out_chunk = chunk if is_tty else (b"\n" if chunk == b"\r" else chunk)
-        tty_out.write(out_chunk)
-        sys.stdout.flush()
-    stderr = proc.stderr.read() if proc.stderr else b""
-    rc = proc.wait()
+    try:
+        while True:
+            chunk = proc.stdout.read(1)
+            if not chunk:
+                break
+            buf.extend(chunk)
+            out_chunk = chunk if is_tty else (b"\n" if chunk == b"\r" else chunk)
+            tty_out.write(out_chunk)
+            sys.stdout.flush()
+        stderr = proc.stderr.read() if proc.stderr else b""
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        raise
+    # rsync returns 20 when it was interrupted by SIGINT/SIGTERM. Treat it
+    # as user cancellation so callers don't print a Python traceback or run
+    # later promote phases after a partial transfer.
+    if rc == 20 or rc == -signal.SIGINT:
+        raise KeyboardInterrupt
     if rc != 0:
         raise subprocess.CalledProcessError(
             rc, args, output=bytes(buf), stderr=stderr,
@@ -230,8 +248,12 @@ def execute(
     formats it for the user. Separated from build_plan so tests can stub
     the client."""
     hb = Heartbeat.for_trip(plan.folder, phase="promote")
-    hb.write(step="rsync originals", detail=str(plan.target))
-    rsync_proc = rsync(plan.folder, plan.target, dry_run=dry_run)
+    try:
+        hb.write(step="rsync originals", detail=str(plan.target))
+        rsync_proc = rsync(plan.folder, plan.target, dry_run=dry_run)
+    except KeyboardInterrupt:
+        hb.clear()
+        raise
     rsync_changes = [
         line for line in rsync_proc.stdout.splitlines()
         if line and not line.startswith(("sending ", "total ", "sent "))

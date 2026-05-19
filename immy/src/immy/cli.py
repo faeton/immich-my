@@ -593,7 +593,11 @@ def _promote_impl(
     elif config.immich is None:
         console.print("[dim]no immich creds — rsync only, no scan or stacks.[/dim]")
 
-    summary = promote_mod.execute(plan, config, dry_run=dry_run, client=client)
+    try:
+        summary = promote_mod.execute(plan, config, dry_run=dry_run, client=client)
+    except KeyboardInterrupt:
+        console.print("\n[yellow]interrupted[/yellow] — rsync stopped; scan/stack/album skipped.")
+        raise typer.Exit(code=130)
 
     prefix = "[yellow]dry-run[/yellow] " if dry_run else ""
     changed = len(summary["rsync_changes"])
