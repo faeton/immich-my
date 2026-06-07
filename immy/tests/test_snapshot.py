@@ -158,6 +158,26 @@ def test_write_rows_returns_count_and_persists(tmp_path: Path) -> None:
     assert sorted(rows) == [("a", "x.jpg", 100), ("b", "y.jpg", 200), ("c", "z.jpg", 300)]
 
 
+def test_write_rows_persists_null_size(tmp_path: Path) -> None:
+    # An asset with no asset_exif row yet has NULL fileSizeInByte. The LEFT
+    # JOIN emits it with size_bytes=None; the snapshot schema must accept it
+    # (it was wrongly declared NOT NULL, which crashed `immy snapshot` on a
+    # real library containing pre-exif assets).
+    p = tmp_path / "snap.sqlite"
+    db = snap.create(p)
+    count = snap.write_rows(db, [
+        snap.AssetRow(
+            asset_id="a", filename="x.jpg", size_bytes=None,
+            checksum=None, taken_at=None, asset_type="IMAGE", library_id=None,
+        ),
+    ])
+    db.close()
+    assert count == 1
+    rd = sqlite3.connect(p)
+    rows = list(rd.execute("SELECT asset_id, size_bytes FROM assets"))
+    assert rows == [("a", None)]
+
+
 def test_write_rows_batches_past_the_flush_boundary(tmp_path: Path) -> None:
     # Batch size internal is 2000; make sure both the batched flush and the
     # trailing-remainder flush fire.

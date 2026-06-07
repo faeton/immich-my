@@ -32,7 +32,11 @@ _CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
   asset_id   TEXT PRIMARY KEY,
   filename   TEXT NOT NULL,
-  size_bytes INTEGER NOT NULL,
+  -- Nullable: an asset with no asset_exif row yet (freshly inserted,
+  -- pre-exif-extract) has no fileSizeInByte. The LEFT JOIN emits it with
+  -- NULL size rather than dropping it; a NULL-size row simply never matches
+  -- a (filename, size) duplicate probe, which is the correct behaviour.
+  size_bytes INTEGER,
   checksum   BLOB,
   taken_at   TEXT,
   asset_type TEXT NOT NULL,
