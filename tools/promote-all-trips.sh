@@ -5,8 +5,9 @@
 # preflighted.
 #
 # Every step is idempotent:
-#   - rsync uses --partial --append --inplace (see promote.py), so a dropped
-#     connection mid-file picks up where it left off on rerun.
+#   - rsync uses --partial --inplace (see promote.py), plus --append-verify
+#     where the local rsync supports it, so a dropped connection mid-file
+#     picks up where it left off on rerun without trusting unverified bytes.
 #   - Trips already fully promoted log a "promoted" event in .audit/audit.jsonl;
 #     we skip them unless --force is passed.
 #   - The post-rsync API phase (register + stack + derivative rsync) upserts,
