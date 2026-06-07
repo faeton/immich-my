@@ -25,6 +25,7 @@ Default is plan/report only; the CLI applies under `--apply`.
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -33,9 +34,35 @@ from zoneinfo import ZoneInfo
 from .exif import ExifRow, read_folder
 from .filenames import parse_date as parse_filename_date
 from .pg import LibraryInfo
-from .process import _best_datetime, asset_type_for, container_path_for
+from .process import _best_datetime, _parse_exif_datetime, container_path_for
 from .srt import find_sibling, parse as parse_srt
 from .rules.trip_timezone_guess import _tz_finder, guess_timezone
+
+
+_QUICKTIME_EXTS = {".mp4", ".mov", ".m4v"}
+
+
+def _quicktime_create_date(media_path: Path) -> datetime | None:
+    """Full (non `-fast2`) read of the container CreateDate.
+
+    immy's `read_folder` uses exiftool `-fast2`, which skips the MP4 `moov`
+    atom — so DJI's `QuickTime:CreateDate` is invisible to ingest and these
+    clips land dateless even though the date is right there. Per the
+    QuickTime spec (and verified against DJI footage: CreateDate matches the
+    file's modification time expressed in UTC) the value is UTC, so the
+    caller tags it kind="utc". One exiftool spawn per file — only reached as
+    a last resort, so the cost stays bounded to genuinely SRT-less clips.
+    """
+    if media_path.suffix.lower() not in _QUICKTIME_EXTS:
+        return None
+    try:
+        out = subprocess.run(
+            ["exiftool", "-n", "-s3", "-CreateDate", str(media_path)],
+            capture_output=True, text=True, check=False,
+        ).stdout.strip()
+    except Exception:
+        return None
+    return _parse_exif_datetime(out) if out else None
 
 
 # --- date resolution ------------------------------------------------------
@@ -75,6 +102,12 @@ def resolve_capture(media_path: Path, row: ExifRow) -> tuple[datetime, str, str]
     fn = parse_filename_date(media_path)
     if fn is not None:
         return fn.dt, f"filename {media_path.name}", "local"
+
+    # Last resort: DJI's QuickTime CreateDate, which immy's -fast2 ingest read
+    # skips. UTC.
+    qt = _quicktime_create_date(media_path)
+    if qt is not None:
+        return qt, "QuickTime CreateDate", "utc"
 
     return None
 

@@ -53,9 +53,37 @@ def test_resolve_capture_filename_fallback(tmp_path: Path) -> None:
     assert kind == "local"  # filename stamp is local wall-clock
 
 
-def test_resolve_capture_none(tmp_path: Path) -> None:
+def test_resolve_capture_dji_compact_filename(tmp_path: Path) -> None:
+    # DJI's newer naming packs the date with no separator: this used to slip
+    # past the filename parser entirely.
+    mov = tmp_path / "DJI_20240412150201_0008_D.MP4"
+    mov.write_bytes(b"")
+    dt, source, kind = bf.resolve_capture(mov, ExifRow(path=mov, raw={}))
+    assert dt == datetime(2024, 4, 12, 15, 2, 1)
+    assert kind == "local"
+    assert "filename" in source
+
+
+def test_resolve_capture_quicktime_fallback(tmp_path: Path, monkeypatch) -> None:
+    mov = tmp_path / "DJI_0001.MOV"  # old-scheme name: no date, no SRT
+    mov.write_bytes(b"")
+    monkeypatch.setattr(
+        bf.subprocess, "run",
+        lambda *a, **k: type("P", (), {"stdout": "2024:02:17 16:16:10\n"})(),
+    )
+    dt, source, kind = bf.resolve_capture(mov, ExifRow(path=mov, raw={}))
+    assert dt == datetime(2024, 2, 17, 16, 16, 10)
+    assert kind == "utc"  # QuickTime CreateDate is UTC
+    assert "QuickTime" in source
+
+
+def test_resolve_capture_none(tmp_path: Path, monkeypatch) -> None:
     mov = tmp_path / "clip.MOV"
     mov.write_bytes(b"")
+    monkeypatch.setattr(
+        bf.subprocess, "run",
+        lambda *a, **k: type("P", (), {"stdout": ""})(),
+    )
     assert bf.resolve_capture(mov, ExifRow(path=mov, raw={})) is None
 
 

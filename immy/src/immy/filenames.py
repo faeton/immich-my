@@ -12,7 +12,9 @@ _RE_DATE_FILENAME = re.compile(
     r"(?:^|[_-])"
     r"(?P<prefix>VID|IMG|DJI|MVI|PXL)_"
     r"(?P<y>\d{4})(?P<mo>\d{2})(?P<d>\d{2})"
-    r"[_-](?P<H>\d{2})(?P<M>\d{2})(?P<S>\d{2})",
+    # Separator optional: phones use VID_YYYYMMDD_HHMMSS, but DJI's newer
+    # naming packs it as DJI_YYYYMMDDHHMMSS_NNNN_D with no separator.
+    r"[_-]?(?P<H>\d{2})(?P<M>\d{2})(?P<S>\d{2})",
     re.IGNORECASE,
 )
 
