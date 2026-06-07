@@ -37,3 +37,8 @@ raw/
 # mlx-clip caches HF model weights under CWD. Keep these out of git —
 # a single checkpoint is ~600 MB.
 mlx-community/
+
+# codanna code/doc index + embedding cache
+.codanna/
+.codannaignore
+.fastembed_cache

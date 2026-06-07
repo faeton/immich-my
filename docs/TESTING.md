@@ -45,31 +45,7 @@ against the real NAS PG whenever a Y slice lands.
 | Y.5 | Video proxy | ✅ Unit: ffprobe metadata, rotation handling, poster extraction, encoded-video relative paths, derivative marker payloads, and promote-side `asset_file` UPSERT. Hardware smoke confirmed video duration/dimensions and playable encoded video. |
 | Y.6 | Accelerator uninstalled | ✅ Manual smoke: `immich-accelerator` was uninstalled 2026-04-20, then a fresh test trip processed/promoted with `immy` alone. Current maintenance task: add `immy doctor` schema/version probes before direct DB writes. |
 
-## Phase 1 — Mac as burst ML node
-
-Operating constraint: Mac is mobile, often on 5–10 Mbps uplink, sometimes
-off-tailnet entirely. All tests assume Mac-unreachable is a normal state,
-not a failure.
-
-| # | Test | Pass criteria |
-|---|---|---|
-| 1.1 | `immich-ml-metal` reachable from NAS | From `${NAS_HOST}`: `curl -sf http://<mac-tailscale>:3003/ping` returns 200 with the Mac awake and on tailnet. |
-| 1.2 | Immich prefers Mac when available | With both URLs configured, a 100-photo face backfill shows ML jobs hitting the Mac (check process list / container logs). |
-| 1.3 | Fallback when Mac sleeps / off-tailnet | Put the Mac to sleep (or disable Tailscale on it) mid-backfill. Jobs drain on Syno fallback within the configured timeout (2–3 s per attempt). No job stuck in "active" > 10 min. |
-| 1.4 | 50k backfill budget (stable link) | With Mac awake on mains + reliable Tailscale, full face backfill on 50k assets completes in ≈ 1 h wall clock. (Fails loudly if we regressed to CPU path.) |
-| 1.5 | 50k backfill budget (Mac offline) | Same backfill with Mac never reachable: completes on Syno CPU alone, finishes, no wedged jobs. Wall clock is hours, not minutes — that's fine. |
-| 1.6 | Captive-portal / flaky link survival | Simulate with `pfctl`-throttled tailnet + periodic drops during a backfill. Progress is monotonic; no duplicated work on reconnect (idempotent on `(checksum, worker, version)`). |
-| 1.7 | Mac reboot / lid-close is a no-op | Reboot the Mac or close the lid mid-queue; on return, queue resumes where it left off. |
-
-## Phase 1b — Mount adapter framework
-
-| # | Test | Pass criteria |
-|---|---|---|
-| 1b.1 | SMB mount health check | Wrapper reports `healthy=true` for a live SMB share, `healthy=false` after the provider goes down (simulate with `ifconfig` down on the source). |
-| 1b.2 | Unplug-mid-scan doesn't wedge | Start an external-library scan against a USB drive, yank the drive. Scan returns an error within 60 s; Immich server process stays up; UI stays responsive. |
-| 1b.3 | Thumbs keep rendering offline | After 1b.2, timeline thumbs for offline assets render from tier-0 derivatives. Only "open original" fails, with the friendly message. |
-| 1b.4 | `rclone` VFS cache capped | Fill-up simulation: cache dir on NVMe never exceeds the configured cap; oldest blocks evicted first. |
-| 1b.5 | Catalog-only toggle | For a source marked catalog-only, ingest reads header + preview but never pulls full bytes (verify via `rclone mount --vfs-read-chunk-size` counters or SMB byte counters). |
+_Phase 1 (Mac-pull) and 1b (mount adapters) were abandoned 2026-04-19 — see docs/archive/PLAN-2026-04-historical.md._
 
 ## Phase 2a — `immy` metadata forensics
 

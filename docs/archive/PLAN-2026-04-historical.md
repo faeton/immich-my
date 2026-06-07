@@ -1,5 +1,7 @@
 # Build plan
 
+> **Archived 2026-06-07.** Historical phase narrative (Phase 0/1/1b/Y/2a). Kept for context. The live forward-looking plan is [ROADMAP.md](../ROADMAP.md).
+
 Phased so each phase is independently useful. Stock Immich first, sidecar
 bolted on in layers. Each phase has a "done when" so we don't drift.
 
@@ -13,7 +15,7 @@ This file keeps the phase-by-phase rationale and acceptance criteria.
 
 **Stock Immich on the Syno, no custom code.** Running under Container Manager,
 docker project `${COMPOSE_PROJECT}`, all state under `${DEPLOY_ROOT}`. Full as-built
-notes in [DEPLOY.md](DEPLOY.md); acceptance checks in [TESTING.md](TESTING.md).
+notes in [DEPLOY.md](../DEPLOY.md); acceptance checks in [TESTING.md](../TESTING.md).
 
 Deviations from the original plan:
 - NVMe on this DS923+ is deployed as **SSD read/write cache** (md3 RAID1) for
@@ -34,7 +36,7 @@ Deviations from the original plan:
   and one end-to-end upload hit the Immich timeline.
 - ✅ First `pg_dumpall` (16 MB gzipped) + `library/` tarball (92 MB) landed in
   `${BACKUP_ROOT}`; `gunzip -t` passes. Drill documented in
-  [DEPLOY.md](DEPLOY.md#backup) (note: docker compose on DSM needs `sudo`).
+  [DEPLOY.md](../DEPLOY.md#backup) (note: docker compose on DSM needs `sudo`).
   Off-NAS copy still manual until Hyper Backup is wired up.
 
 ## Phase 1 — Mac as burst ML node — **abandoned**
@@ -97,7 +99,7 @@ only supported maintenance path — no "gracefully handle unknown schema".
 
 | # | Scope | Done when | Status |
 |---|---|---|---|
-| **Y.0** | **Research** — read accelerator's bundled server code, document: exact SQL for new asset ingest, derivative path conventions, ML model invocation surface, checksum algo, scan-vs-direct-insert behaviour, Immich version pinned. | Single internal doc under `docs/` maps every call Immich makes on ingest to the exact table rows + file paths it produces. | ✅ 2026-04-19 → [IMMICH-INGEST.md](IMMICH-INGEST.md) (1037 lines, cited) |
+| **Y.0** | **Research** — read accelerator's bundled server code, document: exact SQL for new asset ingest, derivative path conventions, ML model invocation surface, checksum algo, scan-vs-direct-insert behaviour, Immich version pinned. | Single internal doc under `docs/` maps every call Immich makes on ingest to the exact table rows + file paths it produces. | ✅ 2026-04-19 → [IMMICH-INGEST.md](../IMMICH-INGEST.md) (1037 lines, cited) |
 | **Y.1** | `immy process <trip>` computes checksum + EXIF rows, writes asset+exif to PG. No derivatives yet. `promote` stops triggering scan for Y-processed trips. | One trip lands in Immich UI with metadata-only entries, no timeline thumb, no errors on NAS logs. | ✅ 2026-04-20 — `immy process` lands asset + asset_exif via `psycopg3`, checksum = `sha1("path:"+container_path)`, ON CONFLICT DO NOTHING on `(ownerId, libraryId, checksum)`. Drops `.audit/y_processed.yml`; promote skips the scan POST when present. Smoke-tested against DS923+ PG: row + exif + GPS land as expected. 23 new unit tests (119 total passing). |
 | **Y.2** | Thumbnail + preview generation via vips (Sharp). Written to NAS `library/thumbs/` via rsync, paths recorded in PG. | Same trip now renders timeline thumbs. | ✅ 2026-04-20 — `immy process --with-derivatives` (default) stages 250px WebP + 1440px JPEG via `pyvips` under `.audit/derivatives/thumbs/<userId>/<xx>/<yy>/<id>_*`. Marker extended with per-asset derivative records. `immy promote` rsyncs staged tree into `media.host_root` and UPSERTs `asset_file` rows with `path = media.container_root + /thumbs/...`. Compute (Mac) and upload (NAS) split so bad uplinks can resume without re-encoding. 14 new unit tests (133 total passing). |
 | **Y.3** | CLIP embedding via mlx-clip. `smart_search` row per asset. | Text search finds Y-processed assets. | ✅ 2026-04-20 (code) — `immy process --with-clip` (default on) lazy-loads `mlx-clip` (pinned to the accelerator's commit), embeds the staged preview, L2-normalizes, and `INSERT … ON CONFLICT ("assetId") DO UPDATE` into `smart_search`. Embedding passes as a pgvector text literal; dim verified against `format_type(smart_search.embedding)` up-front. Model defaults to `ViT-B-32__openai` (512-dim), configurable via `ml.clip_model`. Skipped for videos / already-present rows. 18 new unit tests (151 total passing). Hardware smoke-tested 2026-04-20 on DS923+ PG via `2026-04-bolivia-smoke` (3 assets: 2 images + 1 video; 6 faces on group photo, CLIP rows per image, video duration/dims via ffprobe). |

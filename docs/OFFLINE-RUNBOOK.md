@@ -109,6 +109,10 @@ ml:
     max_tokens: 1024
 ```
 
+See [CAPTIONS.md](CAPTIONS.md) for the full backend list, cost table, and all
+config options. The `captioner:` block above is the minimal offline (LM Studio)
+case; everything else here — `pg:`, `media:`, the tunnel — is offline-specific.
+
 ## 4. Run the test suite (sanity)
 
 Before touching real trips, confirm the code still works end-to-end:

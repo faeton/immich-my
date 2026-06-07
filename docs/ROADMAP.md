@@ -2,8 +2,9 @@
 
 Current planning snapshot: 2026-05-19.
 
-This file is the short, current roadmap. `docs/PLAN.md` remains the historical
-phase narrative and acceptance criteria; `raw/TODO.md` remains the private
+This file is the short, current roadmap.
+`docs/archive/PLAN-2026-04-historical.md` remains the historical phase
+narrative and acceptance criteria; `raw/TODO.md` remains the private
 scratchpad.
 
 ## Now
@@ -18,6 +19,8 @@ scratchpad.
   direct-DB ingest.
 
 ### Local Immich Triage
+
+Spec: [raw/LOCAL-IMMICH-TRIAGE.md](../raw/LOCAL-IMMICH-TRIAGE.md) (planned).
 
 Goal: replay existing offline caches into a local Immich instance, review and
 prune trips locally, then replay the same cached work to vv-nas later.
@@ -57,7 +60,7 @@ Add `immy status <trip>`:
 ### Docs Restructure
 
 - Keep `README.md` concise: current capabilities, setup, and links.
-- Keep `docs/PLAN.md` as historical phase context.
+- Keep `docs/archive/PLAN-2026-04-historical.md` as historical phase context.
 - Keep this file as the active roadmap.
 - Keep `docs/REVIEW-RECOMMENDATIONS.md` as the review snapshot that motivated
   this roadmap.
@@ -74,6 +77,10 @@ Likely storage:
 ## Later
 
 ### Apple Photos People Apply
+
+Spec: [raw/PLAN.md](../raw/PLAN.md) — external-library matching.
+`snapshot` + `find-duplicates` shipped; `find-similar` deferred (see below);
+`apple-people --apply` pending a good match rate from a fresh snapshot.
 
 The dry-run importer exists. The apply path should wait until a fresh snapshot
 shows a good match rate.

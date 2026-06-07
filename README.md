@@ -146,6 +146,18 @@ REST API. No forking. Upgrades stay clean.
   `immich-ml-metal` + the curator sidecar. Replaceable with a Mac mini / N100
   later without touching the design.
 
+## Documentation map
+
+Docs grouped by role:
+
+- **Entry** — this README.
+- **Design** — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SIDECAR.md](docs/SIDECAR.md).
+- **Operations** — [docs/DEPLOY.md](docs/DEPLOY.md), [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md).
+- **Current work** — [docs/ROADMAP.md](docs/ROADMAP.md), [docs/REVIEW-RECOMMENDATIONS.md](docs/REVIEW-RECOMMENDATIONS.md).
+- **Feature guides** — [docs/CAPTIONS.md](docs/CAPTIONS.md), [docs/LANDSCAPE.md](docs/LANDSCAPE.md).
+- **Reference** — [docs/IMMICH-INGEST.md](docs/IMMICH-INGEST.md), [docs/archive/](docs/archive/) (historical phase plan).
+- **Personal backlog** — [raw/](raw/).
+
 ## What's in this folder
 
 | File | What it covers |
@@ -153,8 +165,8 @@ REST API. No forking. Upgrades stay clean.
 | [docs/LANDSCAPE.md](docs/LANDSCAPE.md) | Survey of open-source alternatives and why Immich won |
 | [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) | Technical design: tiered storage, mount adapters, pipelines, queues |
 | [docs/SIDECAR.md](docs/SIDECAR.md) | Sidecar internals: DB choice, queue schema, worker-harness contract, process layout |
-| [docs/PLAN.md](docs/PLAN.md) | Phased build plan, milestones, what's custom vs stock |
 | [docs/ROADMAP.md](docs/ROADMAP.md) | Current work order and forward roadmap |
+| [docs/archive/PLAN-2026-04-historical.md](docs/archive/PLAN-2026-04-historical.md) | Historical phased build plan (Phase 0/1/1b/Y/2a), kept for context |
 | [docs/REVIEW-RECOMMENDATIONS.md](docs/REVIEW-RECOMMENDATIONS.md) | Current engineering review, fixes, suggestions, and commit plan |
 | [docs/CAPTIONS.md](docs/CAPTIONS.md) | VLM captioner — supported backends, config, per-image cost table |
 | [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md) | Step-by-step offline runbook — drive `immy` with LM Studio + a local VLM, no internet |
@@ -173,7 +185,8 @@ REST API. No forking. Upgrades stay clean.
   pipeline. InsightFace `buffalo_l` runs on the ANE via onnxruntime-CoreML;
   MLX-CLIP and Apple Vision cover the rest. `immich-accelerator` removed
   2026-04-20 — `immy` is the sole ingestion path. See
-  [docs/PLAN.md](docs/PLAN.md) for the Y.1–Y.6 ladder.
+  [docs/archive/PLAN-2026-04-historical.md](docs/archive/PLAN-2026-04-historical.md)
+  for the Y.1–Y.6 ladder.
 
 ## Current capabilities
 
@@ -219,8 +232,9 @@ REST API. No forking. Upgrades stay clean.
 - metadata gap-fill web UI
 - ghost/offline asset handling
 
-Current work order lives in [docs/ROADMAP.md](docs/ROADMAP.md). Detailed
-phased planning lives in [docs/PLAN.md](docs/PLAN.md).
+Current work order lives in [docs/ROADMAP.md](docs/ROADMAP.md). Historical
+phased planning lives in
+[docs/archive/PLAN-2026-04-historical.md](docs/archive/PLAN-2026-04-historical.md).
 
 ## License / Publishing Note
 

@@ -1,9 +1,12 @@
 # Sidecar internals
 
+> **Deep reference.** Rules engine, XMP write contract, state.yml format, worker/process layout. For the high-level model read [ARCHITECTURE.md](ARCHITECTURE.md) first.
+
 Concrete shape of the curator sidecar: where its state lives, how workers
 claim and run jobs, and how the processes are laid out across the two
 hosts. For the broader architecture and phased rollout, see
-[ARCHITECTURE.md](ARCHITECTURE.md) and [PLAN.md](PLAN.md).
+[ARCHITECTURE.md](ARCHITECTURE.md) and the historical
+[archive/PLAN-2026-04-historical.md](archive/PLAN-2026-04-historical.md).
 
 ## Glossary
 
@@ -691,7 +694,7 @@ migrations. Mac → Syno connectivity is already solved by Tailscale
 
 ## Schema
 
-Five tables. Everything keys off `asset_checksum` so the sidecar's view
+Four tables. Everything keys off `asset_checksum` so the sidecar's view
 of an asset lines up with Immich's own identity.
 
 ```sql
@@ -753,14 +756,6 @@ CREATE TABLE artifacts (
   bytes           BIGINT NOT NULL,
   created_at      TIMESTAMPTZ DEFAULT now(),
   UNIQUE (asset_checksum, kind)
-);
-
--- mount adapter health so the scanner doesn't hang on dead shares
-CREATE TABLE mount_health (
-  name        TEXT PRIMARY KEY,     -- 'archive-2024', 'icloud', 'desktop-scratch'
-  status      TEXT NOT NULL,        -- online|offline|degraded
-  last_check  TIMESTAMPTZ DEFAULT now(),
-  detail      JSONB
 );
 ```
 
