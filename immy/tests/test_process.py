@@ -247,12 +247,15 @@ def test_insert_asset_executes_two_inserts_and_returns_true(tmp_path: Path):
     assert params_exif["description"] == ""
 
 
-def test_insert_asset_conflict_skips_exif(tmp_path: Path):
+def test_insert_asset_conflict_backfills_exif(tmp_path: Path):
     asset, exif, _ = _make_rows(tmp_path)
-    # RETURNING returns no row → checksum conflict on the asset insert;
-    # we must NOT issue the exif INSERT (it'd dangle without a parent).
+    # RETURNING returns no row → checksum conflict on the asset insert.
     # Follow-up SELECT resolves the existing id so caller code can key
     # derivatives off the real asset, not the ghost UUID build_rows made.
+    # We then re-issue the exif INSERT against the resolved id: the asset
+    # may exist without an asset_exif row (prior crash between the two
+    # inserts), and _INSERT_EXIF is ON CONFLICT ("assetId") DO NOTHING so
+    # backfilling is a no-op when the row is already present.
     conn = MagicMock()
     cur = MagicMock()
     cur.__enter__.return_value = cur
@@ -264,9 +267,13 @@ def test_insert_asset_conflict_skips_exif(tmp_path: Path):
     inserted = process_mod.insert_asset(conn, asset, exif)
 
     assert inserted is False
-    assert cur.execute.call_count == 2  # asset INSERT + SELECT for real id
+    # asset INSERT + SELECT for real id + exif backfill INSERT
+    assert cur.execute.call_count == 3
     assert "INSERT INTO asset" in cur.execute.call_args_list[0].args[0]
     assert "SELECT id FROM asset" in cur.execute.call_args_list[1].args[0]
+    assert "INSERT INTO asset_exif" in cur.execute.call_args_list[2].args[0]
+    # exif backfill targets the resolved id, not the ghost UUID
+    assert cur.execute.call_args_list[2].args[1]["asset_id"] == "real-existing-id"
     assert asset.id == "real-existing-id" != ghost_id
     assert exif.asset_id == "real-existing-id"
 

@@ -100,6 +100,32 @@ def test_exact_match_verified_by_sha1(tmp_path: Path) -> None:
     assert r.matched_asset_id == "a"
 
 
+def test_exact_match_found_among_multiple_name_size_candidates(tmp_path: Path) -> None:
+    # Two snapshot rows share name+size (cross-library collision). The FIRST
+    # candidate has a non-matching checksum; the SECOND is the true exact
+    # match. We must scan all candidates, not just matches[0], or this is
+    # misreported as NAME_ONLY against the wrong asset.
+    snap_path = tmp_path / "snap.sqlite"
+    body = b"the real photo bytes"
+    sha = hashlib.sha1(body).digest()
+    wrong = hashlib.sha1(b"different bytes same size!").digest()
+    _seed_snapshot(snap_path, [
+        _row("wrong-first", "photo.jpg", len(body), wrong),
+        _row("right-second", "photo.jpg", len(body), sha),
+    ])
+
+    local = tmp_path / "scan" / "photo.jpg"
+    _write(local, body)
+
+    db = snap.open_for_read(snap_path)
+    try:
+        r = dup.classify_one(local, db)
+    finally:
+        db.close()
+    assert r.verdict == dup.Verdict.EXACT
+    assert r.matched_asset_id == "right-second"
+
+
 def test_likely_when_fast_mode_skips_hash(tmp_path: Path) -> None:
     snap_path = tmp_path / "snap.sqlite"
     body = b"photo bytes"

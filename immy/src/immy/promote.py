@@ -115,16 +115,22 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
     the full output into `CompletedProcess.stdout` for the itemized-
     changes parser downstream.
     """
-    # --partial keeps a half-copied file on interrupt; --append resumes by
-    # appending to it on rerun. Safe because trip media is immutable once
-    # written. --inplace writes straight to the destination path (no
-    # temp+rename), which avoids doubling remote disk on a 50 GB file and
-    # pairs naturally with --append. All three are supported by Apple's
-    # openrsync (see /usr/bin/rsync --help).
+    # --partial keeps a half-copied file on interrupt; --inplace writes
+    # straight to the destination path (no temp+rename), avoiding doubled
+    # remote disk on a 50 GB file. We deliberately do NOT use plain
+    # --append: it trusts the existing destination prefix without verifying
+    # it, so a partial-but-different or size-matched-but-different file is
+    # silently accepted and corrupted. --append-verify checksums the prefix
+    # first, so we use it when the local rsync supports it (GNU rsync); on
+    # Apple's openrsync (no --append-verify) we fall back to plain
+    # --partial --inplace, whose delta-transfer checksum-verifies the
+    # existing blocks rather than blindly trusting them.
     args = [
         "rsync", "-a", "--itemize-changes", "--progress",
-        "--partial", "--append", "--inplace",
+        "--partial", "--inplace",
     ]
+    if _rsync_supports("--append-verify"):
+        args.append("--append-verify")
     if dry_run:
         args.append("--dry-run")
     for pat in RSYNC_EXCLUDES:
@@ -140,6 +146,30 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
         target.parent.mkdir(parents=True, exist_ok=True)
     args.extend([src, dst])
     return _run_streaming(args)
+
+
+_RSYNC_FLAG_CACHE: dict[str, bool] = {}
+
+
+def _rsync_supports(flag: str) -> bool:
+    """True if the local rsync advertises `flag` in its --help output.
+
+    openrsync (macOS default) and GNU rsync differ in supported flags;
+    cached so we probe at most once per process.
+    """
+    cached = _RSYNC_FLAG_CACHE.get(flag)
+    if cached is not None:
+        return cached
+    try:
+        proc = subprocess.run(
+            ["rsync", "--help"], capture_output=True, text=True,
+        )
+        help_text = (proc.stdout or "") + (proc.stderr or "")
+    except Exception:
+        help_text = ""
+    supported = flag in help_text
+    _RSYNC_FLAG_CACHE[flag] = supported
+    return supported
 
 
 def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
@@ -176,12 +206,28 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
     # Stream in both tty and pipe cases. When piped (e.g. `... | tee log`),
     # convert rsync's `\r` progress overwrites to newlines so the wrapping
     # process sees live progress instead of silence for the whole transfer.
+    import threading
+
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         bufsize=0,
     )
     buf = bytearray()
     assert proc.stdout is not None
+    # Drain stderr on a separate thread. We read stdout one byte at a time to
+    # preserve rsync's `\r` progress animation, so a noisy stderr stream would
+    # otherwise fill its 64 KiB pipe buffer and deadlock the child before we
+    # ever reach `proc.stderr.read()`.
+    stderr_buf = bytearray()
+
+    def _drain_stderr() -> None:
+        if proc.stderr is None:
+            return
+        for chunk in iter(lambda: proc.stderr.read(4096), b""):
+            stderr_buf.extend(chunk)
+
+    stderr_thread = threading.Thread(target=_drain_stderr, daemon=True)
+    stderr_thread.start()
     try:
         while True:
             chunk = proc.stdout.read(1)
@@ -191,8 +237,9 @@ def _run_streaming(args: list[str]) -> subprocess.CompletedProcess:
             out_chunk = chunk if is_tty else (b"\n" if chunk == b"\r" else chunk)
             tty_out.write(out_chunk)
             sys.stdout.flush()
-        stderr = proc.stderr.read() if proc.stderr else b""
         rc = proc.wait()
+        stderr_thread.join()
+        stderr = bytes(stderr_buf)
     except KeyboardInterrupt:
         if proc.poll() is None:
             proc.terminate()
@@ -243,6 +290,7 @@ def execute(
     *,
     dry_run: bool,
     client: ImmichClient | None = None,
+    resurrect_deleted: bool = False,
 ) -> dict:
     """Run the plan. Returns a dict with summary counters; `promote` CLI
     formats it for the user. Separated from build_plan so tests can stub
@@ -320,7 +368,9 @@ def execute(
         summary["stacks"].append(_stack_pair(client, pair, plan.folder.name))
 
     hb.write(step="album sync")
-    summary["album"] = _sync_album(client, plan, config)
+    summary["album"] = _sync_album(
+        client, plan, config, resurrect_deleted=resurrect_deleted,
+    )
 
     hb.clear()
     return summary
@@ -514,7 +564,10 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
     }
 
 
-def _sync_album(client: ImmichClient, plan: Plan, config: Config) -> dict:
+def _sync_album(
+    client: ImmichClient, plan: Plan, config: Config,
+    *, resurrect_deleted: bool = False,
+) -> dict:
     """Create or update an Immich album named after the trip folder.
 
     Resolves the asset list directly from Postgres via
@@ -527,9 +580,13 @@ def _sync_album(client: ImmichClient, plan: Plan, config: Config) -> dict:
     the album with no warning. The DB query is authoritative and a few
     orders of magnitude faster than per-file HTTP round-trips.
 
-    Side effect: resurrect rows whose files are back on disk. The Immich
-    scanner only marks offline; it never auto-clears the flag, so a
-    one-shot UPDATE here keeps the trip's view consistent with reality.
+    Side effect: clears `isOffline` for rows under this path whose files
+    are back on disk. The Immich scanner only marks offline; it never
+    auto-clears the flag, so a one-shot UPDATE here keeps the trip's view
+    consistent with reality. By default we do NOT touch `deletedAt`:
+    clearing it would resurrect assets the user soft-deleted in the Immich
+    UI, silently undoing an explicit action. Pass `resurrect_deleted=True`
+    (CLI `--resurrect-deleted`) to also un-delete rows under this path.
 
     Idempotent: `PUT /api/albums/{id}/assets` reports already-present
     assets as duplicates rather than failing. Never raises — album sync
@@ -566,13 +623,24 @@ def _sync_album(client: ImmichClient, plan: Plan, config: Config) -> dict:
         prefix = f"{library.container_root.rstrip('/')}/{album_name}/"
         like = prefix + "%"
         with conn.cursor() as cur:
-            cur.execute(
-                'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
-                'WHERE "originalPath" LIKE %s '
-                'AND ("libraryId" = %s OR "libraryId" IS NULL) '
-                'AND ("isOffline" = true OR "deletedAt" IS NOT NULL)',
-                (like, config.immich.library_id),
-            )
+            if resurrect_deleted:
+                cur.execute(
+                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
+                    'WHERE "originalPath" LIKE %s '
+                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                    'AND ("isOffline" = true OR "deletedAt" IS NOT NULL)',
+                    (like, config.immich.library_id),
+                )
+            else:
+                # Default: only clear the scanner's offline flag. Leave
+                # user-soft-deleted rows (deletedAt) alone.
+                cur.execute(
+                    'UPDATE asset SET "isOffline" = false '
+                    'WHERE "originalPath" LIKE %s '
+                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                    'AND "isOffline" = true',
+                    (like, config.immich.library_id),
+                )
             summary["resurrected"] = cur.rowcount
             cur.execute(
                 'SELECT id FROM asset '

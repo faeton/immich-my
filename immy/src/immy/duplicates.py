@@ -206,9 +206,8 @@ def classify_one(
     matches = snapshot_mod.match_name_size(db, path.name, size)
 
     if matches:
-        pick = matches[0]  # multiple is rare; any match is enough for verdict
-
         if hash_mode == HashMode.FAST:
+            pick = matches[0]  # any match is enough for the FAST verdict
             return ScanResult(
                 path=path, size_bytes=size, verdict=Verdict.LIKELY,
                 matched_asset_id=pick.asset_id,
@@ -216,11 +215,14 @@ def classify_one(
                 matched_size=pick.size_bytes,
             )
 
-        # ON_MATCH and THOROUGH both hash here. We already have a name+size
-        # match — verify byte identity.
-        if pick.checksum is None:
-            # Snapshot has no hash for this asset (pre-exif Immich state).
+        # ON_MATCH and THOROUGH both hash here. Verify byte identity against
+        # EVERY same-name/size candidate, not just the first: a cross-library
+        # collision can put a non-matching row ahead of the true exact match.
+        hashed = [m for m in matches if m.checksum is not None]
+        if not hashed:
+            # Snapshot has no hash for any candidate (pre-exif Immich state).
             # We can't confirm exact; downgrade to likely.
+            pick = matches[0]
             return ScanResult(
                 path=path, size_bytes=size, verdict=Verdict.LIKELY,
                 matched_asset_id=pick.asset_id,
@@ -228,16 +230,18 @@ def classify_one(
                 matched_size=pick.size_bytes,
             )
         local = sha1_of(path)
-        if local == pick.checksum:
+        exact = next((m for m in hashed if m.checksum == local), None)
+        if exact is not None:
             return ScanResult(
                 path=path, size_bytes=size, verdict=Verdict.EXACT,
-                matched_asset_id=pick.asset_id,
-                matched_filename=pick.filename,
-                matched_size=pick.size_bytes,
+                matched_asset_id=exact.asset_id,
+                matched_filename=exact.filename,
+                matched_size=exact.size_bytes,
             )
-        # Same name + size but different bytes — edge case (rolled-over
-        # filename? collision?). Classify as name-only so it surfaces in
-        # the report for manual review.
+        # Same name + size but different bytes from every hashed candidate —
+        # edge case (rolled-over filename? collision?). Classify as name-only
+        # so it surfaces in the report for manual review.
+        pick = matches[0]
         return ScanResult(
             path=path, size_bytes=size, verdict=Verdict.NAME_ONLY,
             matched_asset_id=pick.asset_id,

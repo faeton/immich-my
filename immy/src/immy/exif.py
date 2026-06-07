@@ -86,8 +86,21 @@ def read_folder(folder: Path) -> list[ExifRow]:
     ) as et:
         try:
             blobs = et.get_metadata(targets)
-        except Exception:
+        except Exception as exc:
+            # A batch failure (one unreadable file, exiftool crash) must not
+            # blank metadata for every sibling in the folder. Retry per file
+            # so the rest still get dates/GPS/dimensions, and log what failed.
+            sys.stderr.write(
+                f"  exiftool batch read failed ({exc}); retrying per file…\n"
+            )
+            sys.stderr.flush()
             blobs = []
+            for t in targets:
+                try:
+                    blobs.extend(et.get_metadata([t]))
+                except Exception as inner:
+                    sys.stderr.write(f"    exiftool failed on {t}: {inner}\n")
+                    sys.stderr.flush()
 
     by_path = {Path(b["SourceFile"]): b for b in blobs if "SourceFile" in b}
 

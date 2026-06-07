@@ -487,8 +487,21 @@ def apply_one(c: BloatCandidate, optimized: Path) -> Path:
     backup = c.path.with_name(c.path.name + ".original")
     receipt = c.path.with_name(c.path.name + ".transcode.json")
 
+    # Never clobber a pre-existing backup — that would destroy the real
+    # original from an earlier transcode/manual step.
+    if backup.exists():
+        raise TranscodeError(
+            f"backup already exists, refusing to overwrite: {backup}"
+        )
+
     c.path.rename(backup)
-    optimized.rename(c.path)
+    try:
+        optimized.rename(c.path)
+    except OSError:
+        # Restore the original so the canonical source path is never left
+        # empty if the second rename fails (full disk, perms, cross-device).
+        backup.rename(c.path)
+        raise
 
     post_size = c.path.stat().st_size
     data = {

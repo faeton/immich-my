@@ -143,6 +143,29 @@ def test_promote_rsyncs_and_triggers_scan(config_file, dji_ready, monkeypatch):
     assert fake.scans == ["lib-1"]
 
 
+def test_rsync_never_uses_plain_append(tmp_path, monkeypatch):
+    # Plain --append trusts the destination prefix without verifying it and
+    # can silently corrupt media. We must never pass it; --inplace stays.
+    # --append-verify is allowed only when the local rsync supports it.
+    captured: dict = {}
+
+    def fake_run(args):
+        captured["args"] = args
+        return MagicMock(stdout="", returncode=0)
+
+    monkeypatch.setattr(promote_mod, "_run_streaming", fake_run)
+    src = tmp_path / "trip"
+    src.mkdir()
+    promote_mod.rsync(src, tmp_path / "dest", dry_run=True)
+
+    args = captured["args"]
+    assert "--append" not in args
+    assert "--inplace" in args
+    assert "--partial" in args
+    if "--append-verify" in args:
+        assert promote_mod._rsync_supports("--append-verify")
+
+
 def test_promote_interrupt_stops_without_traceback(config_file, dji_ready, monkeypatch):
     fake = FakeClient()
     monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)

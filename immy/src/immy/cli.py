@@ -566,6 +566,7 @@ def _promote_impl(
     dry_run: bool,
     force: bool,
     config_path: Path | None,
+    resurrect_deleted: bool = False,
 ) -> None:
     """Rsync + Immich library-scan + Insta360 stack calls.
 
@@ -606,7 +607,10 @@ def _promote_impl(
         console.print("[dim]no immich creds — rsync only, no scan or stacks.[/dim]")
 
     try:
-        summary = promote_mod.execute(plan, config, dry_run=dry_run, client=client)
+        summary = promote_mod.execute(
+            plan, config, dry_run=dry_run, client=client,
+            resurrect_deleted=resurrect_deleted,
+        )
     except KeyboardInterrupt:
         console.print("\n[yellow]interrupted[/yellow] — rsync stopped; scan/stack/album skipped.")
         raise typer.Exit(code=130)
@@ -678,9 +682,13 @@ def _promote(
     dry_run: bool = typer.Option(False, "--dry-run", help="Report the plan; no rsync, no API calls."),
     force: bool = typer.Option(False, "--force", help="Promote even if HIGH findings are still pending."),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+    resurrect_deleted: bool = typer.Option(False, "--resurrect-deleted", help="Also un-delete (clear deletedAt) assets under this trip path. Off by default so album sync never undoes a soft-delete you made in Immich."),
 ) -> None:
     """Rsync trip into originals + trigger Immich scan + stack Insta360 pairs."""
-    _promote_impl(folder, dry_run=dry_run, force=force, config_path=config_path)
+    _promote_impl(
+        folder, dry_run=dry_run, force=force, config_path=config_path,
+        resurrect_deleted=resurrect_deleted,
+    )
 
 
 # Register under three names — Typer has no native aliases, so we just

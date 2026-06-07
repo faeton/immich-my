@@ -266,6 +266,11 @@ class PgSink:
                 if existing is not None:
                     asset.id = str(existing[0])
                     exif.asset_id = asset.id
+                    # Backfill a missing asset_exif row: the asset can exist
+                    # without its exif (prior crash between the two inserts,
+                    # legacy data). _INSERT_EXIF is ON CONFLICT DO NOTHING, so
+                    # this is a no-op when the row is already present.
+                    cur.execute(_INSERT_EXIF, exif.__dict__)
                 return False
             cur.execute(_INSERT_EXIF, exif.__dict__)
         return True
@@ -682,10 +687,14 @@ def sync_trip(
         _emit(f"[{idx}/{len(entries)}] {rel}")
         try:
             _replay_entry(conn, trip_folder, data, library=library)
+            # Commit BEFORE stamping the YAML synced. If the commit fails the
+            # exception path rolls back and the entry stays unsynced for the
+            # next run; replay is idempotent (ON CONFLICT), so a crash between
+            # commit and _dump_entry just replays harmlessly next time.
+            conn.commit()
             data["synced"] = True
             data["synced_at"] = int(time.time())
             _dump_entry(yml_path, data)
-            conn.commit()
             synced += 1
             _emit(f"    → synced")
         except Exception as exc:
@@ -747,6 +756,11 @@ def _replay_entry(
             if existing is None:
                 raise RuntimeError("insert conflict but no existing row found")
             asset_id = str(existing[0])
+            # Backfill exif even on conflict — the asset may exist without it.
+            # _INSERT_EXIF is ON CONFLICT DO NOTHING so this is a no-op when
+            # the exif row is already present.
+            exif_params["asset_id"] = asset_id
+            cur.execute(_INSERT_EXIF, exif_params)
         else:
             asset_id = str(row[0])
             exif_params["asset_id"] = asset_id

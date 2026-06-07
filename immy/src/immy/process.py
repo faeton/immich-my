@@ -450,6 +450,11 @@ def insert_asset(conn: psycopg.Connection, asset: AssetRow, exif: AssetExifRow) 
                 existing_id = str(existing[0])
                 asset.id = existing_id
                 exif.asset_id = existing_id
+                # Backfill a missing asset_exif row: the asset can exist
+                # without its exif (prior crash between the two inserts).
+                # _INSERT_EXIF is ON CONFLICT DO NOTHING, so this is a no-op
+                # when the row is already present.
+                cur.execute(_INSERT_EXIF, exif.__dict__)
             return False
         cur.execute(_INSERT_EXIF, exif.__dict__)
     return True
