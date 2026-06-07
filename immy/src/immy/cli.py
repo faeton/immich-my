@@ -49,6 +49,7 @@ class _LazyModule:
 
 
 apple_photos_mod = _LazyModule("apple_photos")
+backfill_dates_mod = _LazyModule("backfill_dates")
 bloat_mod = _LazyModule("bloat")
 captions_mod = _LazyModule("captions")
 clip_mod = _LazyModule("clip")
@@ -1732,6 +1733,105 @@ def snapshot(
         f"  [green]✓[/green] {count:,} asset(s) → "
         f"{size_mb:.1f} MB at [cyan]{out}[/cyan]"
     )
+
+
+@app.command("backfill-dates")
+def backfill_dates(
+    folders: list[Path] = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Trip folder(s) whose local files still carry the date source "
+             "(DJI .SRT sidecars, filename stamps).",
+    ),
+    apply: bool = typer.Option(
+        False, "--apply",
+        help="Write the dates. Default is a dry-run report only.",
+    ),
+    timezone: str = typer.Option(
+        None, "--timezone",
+        help="IANA zone (e.g. Indian/Mauritius) for naive SRT/filename wall "
+             "clocks. Default: infer from notes / EXIF-GPS / SRT-GPS; if none, "
+             "store the wall numbers as UTC (ordering correct, absolute offset).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
+) -> None:
+    """Backfill capture dates for already-ingested assets that landed dateless.
+
+    For DJI footage promoted before the SRT-date rule existed, the asset_exif
+    row exists with a NULL dateTimeOriginal — and `immy process` can't fix it
+    (`ON CONFLICT DO NOTHING`). This reads each file's `.SRT` (or embedded /
+    filename date), matches it to the Immich asset by originalPath, and
+    UPDATEs `asset_exif.dateTimeOriginal` + `asset.localDateTime` (what the
+    timeline sorts by) — only ever touching rows that are still dateless.
+
+    Read-only by default; pass --apply to write. After applying, re-run
+    `immy cluster` if you use auto-albums (it selects on dateTimeOriginal).
+    """
+    config = load_config(config_path)
+    if config.pg is None or config.immich is None:
+        console.print("[red]need pg: + immich.library_id in config[/red]")
+        raise typer.Exit(code=2)
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    try:
+        library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+    except LookupError as e:
+        console.print(f"[red]{e}[/red]")
+        conn.close()
+        raise typer.Exit(code=2)
+
+    mode = "[yellow]DRY-RUN[/yellow]" if not apply else "[red]APPLY[/red]"
+    grand_written = grand_cands = 0
+    try:
+        for folder in folders:
+            plan = backfill_dates_mod.plan_folder(
+                conn, library, folder, tz_override=timezone,
+            )
+            tz_disp = plan.tz_name or "(none — wall-as-UTC)"
+            console.print(
+                f"\n[bold]{folder.name}[/bold] {mode}  "
+                f"tz=[cyan]{tz_disp}[/cyan] [dim]({plan.tz_reason})[/dim]"
+            )
+            if plan.tz_name is None and plan.candidates:
+                console.print(
+                    "  [yellow]⚠ no timezone signal[/yellow] — wall clock stored "
+                    "as UTC; relative order is correct, absolute time is offset. "
+                    "Re-run with --timezone <IANA> for exact instants."
+                )
+            for c in plan.candidates[:50]:
+                console.print(
+                    f"  [green]{c.local_date_time:%Y-%m-%d %H:%M:%S}[/green] "
+                    f"[dim]{c.mode}[/dim] {c.media_path.name} "
+                    f"[dim]← {c.source}[/dim]"
+                )
+            if len(plan.candidates) > 50:
+                console.print(f"  [dim]… +{len(plan.candidates) - 50} more[/dim]")
+            console.print(
+                f"  [bold]{len(plan.candidates)}[/bold] datable | "
+                f"[dim]{plan.already_dated} already dated, "
+                f"{len(plan.no_date_source)} no date source, "
+                f"{len(plan.unmatched)} not in Immich[/dim]"
+            )
+            grand_cands += len(plan.candidates)
+            if apply and plan.candidates:
+                written = backfill_dates_mod.apply_plan(conn, plan)
+                grand_written += written
+                console.print(f"  [green]✓ wrote {written} date(s)[/green]")
+    finally:
+        conn.close()
+
+    if apply:
+        console.print(
+            f"\n[bold green]done[/bold green] — dated {grand_written} asset(s). "
+            "Re-run `immy cluster` if you use auto-albums."
+        )
+    else:
+        console.print(
+            f"\n[bold]{grand_cands} asset(s) would be dated.[/bold] "
+            "Re-run with [bold]--apply[/bold] to write."
+        )
 
 
 @app.command("find-duplicates")
