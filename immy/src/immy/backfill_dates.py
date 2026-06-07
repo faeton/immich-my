@@ -150,9 +150,17 @@ def _compute_instant(
 
 
 def _tz_from_srt(rows: list[ExifRow], folder: Path) -> tuple[str, str] | None:
-    """Best-effort trip zone from any DJI SRT's GPS, when no file carries
-    EXIF GPS and notes have no coords (so `guess_timezone` returns None)."""
+    """Best-effort trip zone from DJI SRT GPS, when no file carries EXIF GPS
+    and notes have no coords (so `guess_timezone` returns None).
+
+    Majority vote, NOT first-match: a folder that spans locations (or holds a
+    stray clip from another trip) must not let one outlier zone the whole
+    trip. The per-clip zone still overrides this default for clips that carry
+    their own GPS — this is only the fallback for clips that don't."""
+    from collections import Counter
+
     finder = _tz_finder()
+    zones: Counter[str] = Counter()
     for row in rows:
         srt = find_sibling(row.path)
         if srt is None:
@@ -162,8 +170,27 @@ def _tz_from_srt(rows: list[ExifRow], folder: Path) -> tuple[str, str] | None:
             continue
         zone = finder.timezone_at(lat=tele.latitude, lng=tele.longitude)
         if zone:
-            return zone, f"SRT GPS [{tele.latitude:.4f}, {tele.longitude:.4f}]"
-    return None
+            zones[zone] += 1
+    if not zones:
+        return None
+    top, n = zones.most_common(1)[0]
+    return top, f"SRT GPS majority {n}/{sum(zones.values())} → {top}"
+
+
+def _clip_timezone(media_path: Path) -> str | None:
+    """A single clip's zone from its own sibling-SRT GPS.
+
+    For folders that span locations — a travel day, or a stray clip from a
+    different trip filed in the wrong folder — this localises each clip to
+    where it was actually shot, instead of stamping one trip-wide guess on
+    everything (which mis-zones the outliers by whole hours)."""
+    srt = find_sibling(media_path)
+    if srt is None:
+        return None
+    tele = parse_srt(srt)
+    if tele.latitude is None or tele.longitude is None:
+        return None
+    return _tz_finder().timezone_at(lat=tele.latitude, lng=tele.longitude)
 
 
 def resolve_timezone(
@@ -197,7 +224,9 @@ class Candidate:
     local_date_time: datetime
     date_time_original: datetime  # tz-aware UTC
     file_size: int
-    mode: str  # 'update' (exif row exists, date NULL) | 'insert' (no exif row)
+    # 'update' (exif row exists, date NULL) | 'insert' (no exif row) |
+    # 'retime' (--retime: overwrite an existing date)
+    mode: str
 
 
 @dataclass
@@ -227,9 +256,15 @@ def plan_folder(
     folder: Path,
     *,
     tz_override: str | None = None,
+    retime: bool = False,
 ) -> FolderPlan:
     """Match every dateless local media file in `folder` to its Immich asset
-    and compute the date/zone we'd write. No DB writes."""
+    and compute the date/zone we'd write. No DB writes.
+
+    `retime=True` also re-dates assets that already have a date — used to
+    correct a wrong earlier write (e.g. a mixed-location folder that got one
+    trip-wide zone). Without it, dated assets are left untouched.
+    """
     rows = read_folder(folder)
     tz_name, tz_reason = resolve_timezone(rows, folder, tz_override)
     plan = FolderPlan(folder=folder, tz_name=tz_name, tz_reason=tz_reason)
@@ -250,11 +285,20 @@ def plan_folder(
             plan.unmatched.append(media)
             continue
         asset_id, exif_assetid, existing_dto = match
-        if existing_dto is not None:
+        if existing_dto is not None and not retime:
             plan.already_dated += 1
             continue
 
-        ldt, dto = _compute_instant(dt, kind, tz_name)
+        # Per-clip zone (its own SRT GPS) beats the trip-wide guess — unless
+        # the user forced one with --timezone.
+        clip_tz = tz_override or _clip_timezone(media) or tz_name
+        if existing_dto is not None:
+            mode = "retime"
+        elif exif_assetid is not None:
+            mode = "update"
+        else:
+            mode = "insert"
+        ldt, dto = _compute_instant(dt, kind, clip_tz)
         try:
             size = media.stat().st_size
         except OSError:
@@ -264,11 +308,11 @@ def plan_folder(
             asset_id=str(asset_id),
             original_path=original_path,
             source=source,
-            tz_name=tz_name,
+            tz_name=clip_tz,
             local_date_time=ldt,
             date_time_original=dto,
             file_size=size,
-            mode="update" if exif_assetid is not None else "insert",
+            mode=mode,
         ))
 
     return plan
@@ -290,6 +334,13 @@ VALUES (%(aid)s, %(dto)s, %(tz)s, %(size)s)
 ON CONFLICT ("assetId") DO NOTHING
 """
 
+_RETIME_EXIF = """
+UPDATE asset_exif
+SET "dateTimeOriginal" = %(dto)s,
+    "timeZone" = %(tz)s
+WHERE "assetId" = %(aid)s
+"""
+
 _UPDATE_ASSET = """
 UPDATE asset
 SET "localDateTime" = %(ldt)s,
@@ -299,11 +350,12 @@ WHERE id = %(aid)s
 
 
 def apply_plan(conn, plan: FolderPlan) -> int:
-    """Write a folder's candidates in one transaction. The exif write keeps
-    its `dateTimeOriginal IS NULL` / `ON CONFLICT DO NOTHING` guard, so a row
-    that got a date concurrently is left untouched and its asset row is not
-    re-dated either (we only touch the asset when the exif write hit). Returns
-    the number of assets actually dated."""
+    """Write a folder's candidates in one transaction. The 'update' exif write
+    keeps its `dateTimeOriginal IS NULL` / `ON CONFLICT DO NOTHING` guard, so a
+    row that got a date concurrently is left untouched and its asset row is not
+    re-dated either (we only touch the asset when the exif write hit). The
+    'retime' write deliberately overwrites an existing date. Returns the number
+    of assets actually dated."""
     written = 0
     try:
         with conn.cursor() as cur:
@@ -317,6 +369,8 @@ def apply_plan(conn, plan: FolderPlan) -> int:
                 }
                 if c.mode == "update":
                     cur.execute(_UPDATE_EXIF, params)
+                elif c.mode == "retime":
+                    cur.execute(_RETIME_EXIF, params)
                 else:
                     cur.execute(_INSERT_EXIF_MIN, params)
                 if cur.rowcount != 1:

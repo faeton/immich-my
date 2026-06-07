@@ -1748,9 +1748,15 @@ def backfill_dates(
     ),
     timezone: str = typer.Option(
         None, "--timezone",
-        help="IANA zone (e.g. Indian/Mauritius) for naive SRT/filename wall "
-             "clocks. Default: infer from notes / EXIF-GPS / SRT-GPS; if none, "
-             "store the wall numbers as UTC (ordering correct, absolute offset).",
+        help="Force an IANA zone (e.g. Indian/Mauritius) for the whole run. "
+             "Default: per-clip from its own SRT GPS, else notes / EXIF-GPS / "
+             "trip SRT-GPS; if none, wall numbers as UTC (order ok, offset).",
+    ),
+    retime: bool = typer.Option(
+        False, "--retime",
+        help="Also re-date assets that ALREADY have a date — to correct a "
+             "wrong earlier write (e.g. a mixed-location folder zoned wrong). "
+             "Overwrites existing dateTimeOriginal/localDateTime/timeZone.",
     ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
@@ -1787,7 +1793,7 @@ def backfill_dates(
     try:
         for folder in folders:
             plan = backfill_dates_mod.plan_folder(
-                conn, library, folder, tz_override=timezone,
+                conn, library, folder, tz_override=timezone, retime=retime,
             )
             tz_disp = plan.tz_name or "(none — wall-as-UTC)"
             console.print(
@@ -1801,9 +1807,12 @@ def backfill_dates(
                     "Re-run with --timezone <IANA> for exact instants."
                 )
             for c in plan.candidates[:50]:
+                tz_note = ""
+                if c.tz_name and c.tz_name != plan.tz_name:
+                    tz_note = f" [magenta]@{c.tz_name}[/magenta]"  # per-clip override
                 console.print(
                     f"  [green]{c.local_date_time:%Y-%m-%d %H:%M:%S}[/green] "
-                    f"[dim]{c.mode}[/dim] {c.media_path.name} "
+                    f"[dim]{c.mode}[/dim] {c.media_path.name}{tz_note} "
                     f"[dim]← {c.source}[/dim]"
                 )
             if len(plan.candidates) > 50:

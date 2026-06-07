@@ -193,6 +193,52 @@ def test_plan_folder_insert_mode_when_no_exif_row(tmp_path: Path, monkeypatch) -
     assert plan.candidates[0].mode == "insert"
 
 
+def test_plan_folder_per_clip_timezone_beats_trip(tmp_path: Path, monkeypatch) -> None:
+    # A stray clip in a France folder shot in Cyprus must be localised to
+    # Cyprus, not the trip-wide France guess.
+    mov = tmp_path / "DJI_0663.MOV"
+    mov.write_bytes(b"x")
+    _write_srt(tmp_path / "DJI_0663.SRT")  # 2024-02-15 10:30:00 UTC
+    _patch_read_folder(monkeypatch, [ExifRow(path=mov, raw={})])
+    monkeypatch.setattr(bf, "resolve_timezone", lambda r, f, o: ("Europe/Paris", "trip"))
+    monkeypatch.setattr(bf, "_clip_timezone", lambda p: "Asia/Nicosia")
+    conn, cur = _mock_conn(("a", "a", None))
+
+    plan = bf.plan_folder(conn, LIB, tmp_path)  # no override
+    c = plan.candidates[0]
+    assert c.tz_name == "Asia/Nicosia"                     # per-clip won
+    assert c.local_date_time == datetime(2024, 2, 15, 12, 30, 0)  # 10:30 UTC +2
+
+
+def test_plan_folder_timezone_override_beats_per_clip(tmp_path: Path, monkeypatch) -> None:
+    mov = tmp_path / "DJI_0663.MOV"
+    mov.write_bytes(b"x")
+    _write_srt(tmp_path / "DJI_0663.SRT")
+    _patch_read_folder(monkeypatch, [ExifRow(path=mov, raw={})])
+    monkeypatch.setattr(bf, "_clip_timezone", lambda p: "Asia/Nicosia")
+    conn, cur = _mock_conn(("a", "a", None))
+
+    plan = bf.plan_folder(conn, LIB, tmp_path, tz_override="UTC")
+    assert plan.candidates[0].tz_name == "UTC"  # explicit override wins
+
+
+def test_plan_folder_retime_redates_already_dated(tmp_path: Path, monkeypatch) -> None:
+    mov = tmp_path / "DJI_0001.MOV"
+    mov.write_bytes(b"x")
+    _write_srt(tmp_path / "DJI_0001.SRT")
+    _patch_read_folder(monkeypatch, [ExifRow(path=mov, raw={})])
+    existing = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    conn, cur = _mock_conn(("asset-9", "asset-9", existing))
+
+    plan = bf.plan_folder(conn, LIB, tmp_path, tz_override="UTC", retime=True)
+    assert len(plan.candidates) == 1
+    assert plan.candidates[0].mode == "retime"
+    assert plan.already_dated == 0
+    # without retime the same asset is skipped
+    conn2, _ = _mock_conn(("asset-9", "asset-9", existing))
+    assert bf.plan_folder(conn2, LIB, tmp_path, tz_override="UTC").candidates == []
+
+
 def test_plan_folder_unmatched(tmp_path: Path, monkeypatch) -> None:
     mov = tmp_path / "DJI_0004.MOV"
     mov.write_bytes(b"x")
@@ -230,6 +276,19 @@ def test_apply_plan_writes_and_commits(tmp_path: Path) -> None:
     assert cur.execute.call_count == 2
     assert "asset_exif" in cur.execute.call_args_list[0].args[0]
     assert "UPDATE asset" in cur.execute.call_args_list[1].args[0]
+
+
+def test_apply_plan_retime_overwrites_existing_date(tmp_path: Path) -> None:
+    conn, cur = _mock_conn(None, rowcount=1)
+    plan = bf.FolderPlan(folder=tmp_path, tz_name="UTC", tz_reason="x")
+    plan.candidates = [_candidate("retime")]
+
+    written = bf.apply_plan(conn, plan)
+    assert written == 1
+    assert cur.execute.call_count == 2
+    sql = cur.execute.call_args_list[0].args[0]
+    assert "asset_exif" in sql
+    assert "IS NULL" not in sql  # retime is unguarded — it overwrites
 
 
 def test_apply_plan_skips_asset_when_exif_guard_blocks(tmp_path: Path) -> None:
