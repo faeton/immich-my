@@ -41,57 +41,76 @@ from .rules.trip_timezone_guess import _tz_finder, guess_timezone
 # --- date resolution ------------------------------------------------------
 
 
-def resolve_capture(media_path: Path, row: ExifRow) -> tuple[datetime, str] | None:
+def resolve_capture(media_path: Path, row: ExifRow) -> tuple[datetime, str, str] | None:
     """Find the capture instant for a dateless file. Backfill-specific
     authority order (SRT first — these files are dateless *because* their
     embedded tags are empty, and SRT is the camera's own record):
 
         SRT telemetry → embedded QuickTime/EXIF → filename pattern.
 
-    Returns `(dt, source_label)` or None. `dt` is whatever the source
-    carries: SRT/filename are naive wall-clock; an embedded tag may be
-    tz-aware.
+    Returns `(dt, source_label, kind)` or None, where `kind` says how to
+    interpret `dt`:
+      - "utc"   — `dt` is an absolute instant (DJI SRT wall-clock is UTC; a
+                  tz-aware embedded tag is absolute). localDateTime is then
+                  derived by converting into the trip zone.
+      - "local" — `dt` is local wall-clock (filename stamp, naive embedded
+                  tag). It IS the localDateTime; the absolute instant is
+                  derived by interpreting it in the trip zone.
+
+    DJI SRT carries no tz marker but the timestamp is UTC — verified against
+    real footage: a Hawaii clip stamped `03:32` with bright-daylight exposure
+    is 17:32 local (UTC-10), a golden-hour flight, not 3 AM.
     """
     srt = find_sibling(media_path)
     if srt is not None:
         tele = parse_srt(srt)
         if tele.datetime_original is not None:
-            return tele.datetime_original, f"SRT {srt.name}"
+            return tele.datetime_original, f"SRT {srt.name}", "utc"
 
     embedded = _best_datetime(row)
     if embedded is not None:
-        return embedded, "embedded EXIF/QuickTime"
+        kind = "utc" if embedded.tzinfo is not None else "local"
+        return embedded, "embedded EXIF/QuickTime", kind
 
     fn = parse_filename_date(media_path)
     if fn is not None:
-        return fn.dt, f"filename {media_path.name}"
+        return fn.dt, f"filename {media_path.name}", "local"
 
     return None
 
 
-def _split_instant(
-    dt: datetime, tz_name: str | None,
+def _compute_instant(
+    dt: datetime, kind: str, tz_name: str | None,
 ) -> tuple[datetime, datetime]:
     """Return `(local_date_time, date_time_original_utc)`.
 
-    `local_date_time` is the naive wall-clock Immich sorts the timeline by.
+    `local_date_time` is the naive wall-clock Immich sorts the timeline by;
     `date_time_original_utc` is the absolute instant for the metadata panel.
 
-    - tz-aware `dt` (rare embedded case): wall = dt with tz stripped;
-      absolute = dt in UTC.
-    - naive `dt` (SRT / filename) + known zone: interpret the wall clock in
-      that zone to get the absolute instant.
-    - naive `dt` + no zone: store the wall numbers as UTC. Ordering within
-      the trip stays correct; the absolute instant is offset by the real
-      zone until a `timezone:` is supplied. The caller logs this loudly.
+    - kind="utc": `dt` is an absolute instant. The absolute time is known;
+      localDateTime is that instant rendered in the trip zone (or left at the
+      UTC wall numbers if no zone is known — the caller warns).
+    - kind="local": `dt` is the wall clock the user saw. That IS
+      localDateTime; the absolute instant comes from interpreting it in the
+      trip zone (or treating the wall numbers as UTC if no zone is known).
     """
-    if dt.tzinfo is not None:
-        local = dt.replace(tzinfo=None)
-        return local, dt.astimezone(timezone.utc)
+    if kind == "utc":
+        abs_utc = (
+            dt.astimezone(timezone.utc) if dt.tzinfo is not None
+            else dt.replace(tzinfo=timezone.utc)
+        )
+        if tz_name is not None:
+            local = abs_utc.astimezone(ZoneInfo(tz_name)).replace(tzinfo=None)
+        else:
+            local = abs_utc.replace(tzinfo=None)
+        return local, abs_utc
+
+    local = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
     if tz_name is not None:
-        aware = dt.replace(tzinfo=ZoneInfo(tz_name))
-        return dt, aware.astimezone(timezone.utc)
-    return dt, dt.replace(tzinfo=timezone.utc)
+        abs_utc = local.replace(tzinfo=ZoneInfo(tz_name)).astimezone(timezone.utc)
+    else:
+        abs_utc = local.replace(tzinfo=timezone.utc)
+    return local, abs_utc
 
 
 # --- timezone for the trip ------------------------------------------------
@@ -188,7 +207,7 @@ def plan_folder(
         if resolved is None:
             plan.no_date_source.append(media)
             continue
-        dt, source = resolved
+        dt, source, kind = resolved
         original_path = container_path_for(media, folder, library.container_root)
 
         with conn.cursor() as cur:
@@ -202,7 +221,7 @@ def plan_folder(
             plan.already_dated += 1
             continue
 
-        ldt, dto = _split_instant(dt, tz_name)
+        ldt, dto = _compute_instant(dt, kind, tz_name)
         try:
             size = media.stat().st_size
         except OSError:

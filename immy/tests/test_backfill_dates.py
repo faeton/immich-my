@@ -37,18 +37,20 @@ def test_resolve_capture_prefers_srt(tmp_path: Path) -> None:
     mov.write_bytes(b"")
     _write_srt(tmp_path / "DJI_0001.SRT")
     row = ExifRow(path=mov, raw={"QuickTime:CreateDate": "2020:01:01 00:00:00"})
-    dt, source = bf.resolve_capture(mov, row)
+    dt, source, kind = bf.resolve_capture(mov, row)
     assert dt == datetime(2024, 2, 15, 10, 30, 0)  # SRT beat the embedded tag
     assert "SRT" in source
+    assert kind == "utc"  # DJI SRT timestamps are UTC
 
 
 def test_resolve_capture_filename_fallback(tmp_path: Path) -> None:
     mov = tmp_path / "DJI_20240309_141147_001.MOV"
     mov.write_bytes(b"")
     row = ExifRow(path=mov, raw={})  # no SRT, no embedded date
-    dt, source = bf.resolve_capture(mov, row)
+    dt, source, kind = bf.resolve_capture(mov, row)
     assert dt == datetime(2024, 3, 9, 14, 11, 47)
     assert "filename" in source
+    assert kind == "local"  # filename stamp is local wall-clock
 
 
 def test_resolve_capture_none(tmp_path: Path) -> None:
@@ -57,26 +59,41 @@ def test_resolve_capture_none(tmp_path: Path) -> None:
     assert bf.resolve_capture(mov, ExifRow(path=mov, raw={})) is None
 
 
-# --- _split_instant -------------------------------------------------------
+# --- _compute_instant -----------------------------------------------------
 
 
-def test_split_instant_naive_with_zone() -> None:
-    ldt, dto = bf._split_instant(datetime(2024, 2, 15, 10, 30, 0), "Indian/Mauritius")
-    assert ldt == datetime(2024, 2, 15, 10, 30, 0)          # wall clock preserved
-    assert dto == datetime(2024, 2, 15, 6, 30, 0, tzinfo=timezone.utc)  # -4h
+def test_compute_instant_utc_source_converts_to_local() -> None:
+    # DJI SRT case: 03:32 UTC in Hawaii (UTC-10) is 17:32 the previous day.
+    ldt, dto = bf._compute_instant(
+        datetime(2023, 11, 26, 3, 32, 49), "utc", "Pacific/Honolulu",
+    )
+    assert dto == datetime(2023, 11, 26, 3, 32, 49, tzinfo=timezone.utc)
+    assert ldt == datetime(2023, 11, 25, 17, 32, 49)  # localised wall clock
 
 
-def test_split_instant_naive_no_zone() -> None:
-    ldt, dto = bf._split_instant(datetime(2024, 2, 15, 10, 30, 0), None)
+def test_compute_instant_utc_source_no_zone_keeps_utc_wall() -> None:
+    ldt, dto = bf._compute_instant(
+        datetime(2023, 11, 26, 3, 32, 49), "utc", None,
+    )
+    assert dto == datetime(2023, 11, 26, 3, 32, 49, tzinfo=timezone.utc)
+    assert ldt == datetime(2023, 11, 26, 3, 32, 49)  # can't localise → UTC wall
+
+
+def test_compute_instant_local_source_with_zone() -> None:
+    # filename stamp: 10:30 local in Mauritius (UTC+4) is 06:30 UTC.
+    ldt, dto = bf._compute_instant(
+        datetime(2024, 2, 15, 10, 30, 0), "local", "Indian/Mauritius",
+    )
+    assert ldt == datetime(2024, 2, 15, 10, 30, 0)  # wall clock preserved
+    assert dto == datetime(2024, 2, 15, 6, 30, 0, tzinfo=timezone.utc)
+
+
+def test_compute_instant_local_source_no_zone() -> None:
+    ldt, dto = bf._compute_instant(
+        datetime(2024, 2, 15, 10, 30, 0), "local", None,
+    )
     assert ldt == datetime(2024, 2, 15, 10, 30, 0)
-    assert dto == datetime(2024, 2, 15, 10, 30, 0, tzinfo=timezone.utc)  # wall-as-UTC
-
-
-def test_split_instant_aware() -> None:
-    aware = datetime(2024, 2, 15, 10, 30, 0, tzinfo=timezone.utc)
-    ldt, dto = bf._split_instant(aware, "Indian/Mauritius")
-    assert ldt == datetime(2024, 2, 15, 10, 30, 0)  # tz stripped → wall
-    assert dto == aware
+    assert dto == datetime(2024, 2, 15, 10, 30, 0, tzinfo=timezone.utc)
 
 
 # --- resolve_timezone -----------------------------------------------------
