@@ -131,6 +131,93 @@ def test_sync_marks_entries_synced_and_skips_on_rerun(tmp_path: Path):
     cur.execute.assert_not_called()
 
 
+def test_late_caption_unsyncs_and_redrains(tmp_path: Path):
+    """The two-command overnight: the sync command may drain a trip before
+    the captioner reaches it. A caption written afterwards must flip the
+    entry back to unsynced so the next drain re-pushes the description —
+    otherwise the overnight caption never reaches Postgres."""
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    sink = offline_mod.OfflineSink(target, LIB)
+    process_mod.process_trip(target, None, LIB, sink=sink)
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("replayed-uuid",)
+    conn.cursor.return_value = cur
+
+    # 1. Sync drains the trip first (caption not computed yet).
+    summary1 = offline_mod.sync_trip(target, conn, library=LIB)
+    assert summary1["synced"] == 1
+    entry_path = next((target / ".audit" / "offline").glob("*.yml"))
+    asset_id = yaml.safe_load(entry_path.read_text())["asset"]["id"]
+    assert yaml.safe_load(entry_path.read_text())["synced"] is True
+
+    # 2. Captioner lands a description on the already-synced entry. A fresh
+    #    process pass reopens the cached entry (repopulating the id→hex map,
+    #    as the real captioner run does) before the description write.
+    sink2 = offline_mod.OfflineSink(target, LIB)
+    process_mod.process_trip(target, None, LIB, sink=sink2)
+    sink2.update_description_if_ai_or_empty(asset_id, "AI: a drone over fields")
+    reloaded = yaml.safe_load(entry_path.read_text())
+    assert reloaded["synced"] is False, "caption must un-sync the entry"
+    assert reloaded["exif"]["description"] == "AI: a drone over fields"
+
+    # 3. Re-drain now re-pushes the entry (caption reaches the DB).
+    cur.reset_mock()
+    summary2 = offline_mod.sync_trip(target, conn, library=LIB)
+    assert summary2["synced"] == 1
+    assert summary2["skipped"] == 0
+
+
+def test_sync_does_not_clobber_concurrent_caption(tmp_path: Path):
+    """The snapshot-then-clobber wedge: sync_trip snapshots entries, replays,
+    then stamps synced:True. If the parallel captioner rewrites the YAML
+    (new description) AFTER the snapshot but BEFORE the stamp, sync must NOT
+    write its stale copy back — that would erase the caption forever. The
+    re-read-before-stamp guard leaves the captioner's entry (synced:False)
+    so the next drain pushes it."""
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    sink = offline_mod.OfflineSink(target, LIB)
+    process_mod.process_trip(target, None, LIB, sink=sink)
+
+    entry_path = next((target / ".audit" / "offline").glob("*.yml"))
+    asset_id = yaml.safe_load(entry_path.read_text())["asset"]["id"]
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("replayed-uuid",)
+    conn.cursor.return_value = cur
+
+    # Simulate a concurrent captioner: it rewrites the YAML with a fresh
+    # description right after sync_trip snapshots, by hooking _replay_entry.
+    real_replay = offline_mod._replay_entry
+
+    def _replay_then_caption(c, folder, data, **kw):
+        real_replay(c, folder, data, **kw)
+        sink2 = offline_mod.OfflineSink(target, LIB)
+        process_mod.process_trip(target, None, LIB, sink=sink2)
+        sink2.update_description_if_ai_or_empty(asset_id, "AI: late caption")
+
+    import unittest.mock as _mock
+    with _mock.patch.object(offline_mod, "_replay_entry", _replay_then_caption):
+        offline_mod.sync_trip(target, conn, library=LIB)
+
+    # The on-disk entry must still carry the caption and remain unsynced.
+    reloaded = yaml.safe_load(entry_path.read_text())
+    assert reloaded["exif"]["description"] == "AI: late caption"
+    assert reloaded["synced"] is False, "stale stamp must not clobber the caption"
+
+    # And a follow-up drain pushes it.
+    summary = offline_mod.sync_trip(target, conn, library=LIB)
+    assert summary["synced"] == 1
+
+
 def test_derive_container_root_from_marker(tmp_path: Path):
     trip = tmp_path / "2024-02-chile"
     (trip / ".audit").mkdir(parents=True)

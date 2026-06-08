@@ -29,6 +29,8 @@ Offline runs read that. If absent, the user is told to run online once.
 from __future__ import annotations
 
 import json
+import os
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass
@@ -379,16 +381,41 @@ def _embeddings_dir(offline_root: Path) -> Path:
 
 
 def _load_entry(path: Path) -> dict:
+    # `_dump_entry` writes atomically (tmp + os.replace), so a concurrent
+    # writer can never yield a torn file here — a reader sees either the
+    # whole old file or the whole new one. The except is belt-and-suspenders
+    # for a pre-existing hand-edited or truncated entry.
     if not path.is_file():
         return {}
-    return yaml.safe_load(path.read_text()) or {}
+    try:
+        return yaml.safe_load(path.read_text()) or {}
+    except (OSError, yaml.YAMLError):
+        return {}
 
 
 def _dump_entry(path: Path, data: dict) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
-    # `default_flow_style=False` and `sort_keys=False` keep the files
-    # readable for debugging (a trip dir full of these gets grep'd).
-    path.write_text(yaml.safe_dump(data, sort_keys=False))
+    # Atomic write: serialize to a unique temp file in the SAME dir, then
+    # os.replace() (rename is atomic within one filesystem). This matters
+    # because the two overnight commands — `process --with-captions` and the
+    # promote/drain — can write the same <hex>.yml concurrently; a plain
+    # write_text() would let a reader see a torn file or let one writer's
+    # partial content survive. A pid-unique temp avoids the two writers
+    # clobbering a shared temp before either rename lands.
+    # `sort_keys=False` keeps the files readable (a trip dir full of these
+    # gets grep'd).
+    fd, tmp_name = tempfile.mkstemp(
+        dir=str(path.parent), prefix=f"{path.name}.", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w") as fh:
+            fh.write(yaml.safe_dump(data, sort_keys=False))
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _serialise_datetime(dt: datetime | None) -> str | None:
@@ -524,16 +551,30 @@ class OfflineSink:
     def update_description_if_empty(self, asset_id: str, text: str) -> None:
         hex_key, entry = self._entry_for(asset_id)
         current = entry.get("exif", {}).get("description") or ""
-        if not current:
+        if not current and text != current:
             entry["exif"]["description"] = text
+            self._mark_dirty(entry)
             self._flush(hex_key)
 
     def update_description_if_ai_or_empty(self, asset_id: str, text: str) -> None:
         hex_key, entry = self._entry_for(asset_id)
         current = entry.get("exif", {}).get("description") or ""
-        if not current or current.startswith("AI: "):
+        if (not current or current.startswith("AI: ")) and text != current:
             entry["exif"]["description"] = text
+            self._mark_dirty(entry)
             self._flush(hex_key)
+
+    @staticmethod
+    def _mark_dirty(entry: dict) -> None:
+        """A late enrichment (e.g. an overnight caption) can land on an entry
+        the sync command already drained (`synced: True`). `sync_trip` skips
+        synced entries, so without this the new description would never reach
+        Postgres. Flipping the flag back makes the next drain re-push it —
+        which is why the captions command and the sync command can run in
+        parallel, in any order: sync uploads what's ready now, captions
+        un-sync the entries they touch, and a later/again sync flushes them."""
+        if entry.get("synced"):
+            entry["synced"] = False
 
     def clip_dim(self) -> int | None:
         return self._clip_dim
@@ -548,6 +589,7 @@ class OfflineSink:
             "dim": len(embedding),
             "path": emb_path.relative_to(self.root).as_posix(),
         }
+        self._mark_dirty(entry)
         self._flush(hex_key)
 
     def replace_faces(
@@ -574,21 +616,25 @@ class OfflineSink:
             "height": height,
             "path": faces_path.relative_to(self.root).as_posix(),
         }
+        self._mark_dirty(entry)
         self._flush(hex_key)
 
     def record_derivatives(self, asset_id: str, derivatives: list[dict]) -> None:
         hex_key, entry = self._entry_for(asset_id)
         entry["derivatives"] = derivatives
+        self._mark_dirty(entry)
         self._flush(hex_key)
 
     def record_transcript(self, asset_id: str, info: dict) -> None:
         hex_key, entry = self._entry_for(asset_id)
         entry["transcript"] = info
+        self._mark_dirty(entry)
         self._flush(hex_key)
 
     def record_caption(self, asset_id: str, info: dict) -> None:
         hex_key, entry = self._entry_for(asset_id)
         entry["caption"] = info
+        self._mark_dirty(entry)
         self._flush(hex_key)
 
     # Resumability queries — offline mode's whole reason for existence.
@@ -638,10 +684,24 @@ def iter_entries(trip_folder: Path) -> Iterator[tuple[Path, dict]]:
     if not root.is_dir():
         return
     for yml in sorted(root.glob("*.yml")):
-        data = yaml.safe_load(yml.read_text()) or {}
+        data = _load_entry(yml)
         if not data:
             continue
         yield yml, data
+
+
+# Bookkeeping keys that the drain itself stamps; they must NOT count as a
+# "the captioner changed this entry underneath us" divergence.
+_SYNC_META_KEYS = ("synced", "synced_at")
+
+
+def _content_changed(replayed: dict, on_disk: dict) -> bool:
+    """True if the on-disk entry diverges from the one we just replayed,
+    ignoring the drain's own synced/synced_at bookkeeping. Used to detect a
+    parallel captioner that rewrote the YAML after the drain's snapshot."""
+    a = {k: v for k, v in replayed.items() if k not in _SYNC_META_KEYS}
+    b = {k: v for k, v in on_disk.items() if k not in _SYNC_META_KEYS}
+    return a != b
 
 
 def _pgvector_literal_from_npy(path: Path) -> tuple[list[float], str]:
@@ -692,10 +752,23 @@ def sync_trip(
             # next run; replay is idempotent (ON CONFLICT), so a crash between
             # commit and _dump_entry just replays harmlessly next time.
             conn.commit()
+            synced += 1
+            # Re-read from disk before stamping. `entries` is a snapshot taken
+            # at the top; if the parallel captioner rewrote this YAML (new
+            # description, synced flipped back to False) AFTER our snapshot,
+            # blindly writing our stale `data` with synced:True would clobber
+            # that caption and it would never reach the DB. So only stamp when
+            # the on-disk content still matches what we just replayed; if it
+            # diverged, leave the captioner's fresher entry (synced:False) in
+            # place and the next drain pass pushes it. This is what lets the
+            # captions command and the sync command run concurrently.
+            fresh = _load_entry(yml_path)
+            if not fresh or _content_changed(data, fresh):
+                _emit(f"    → synced (entry changed underfoot; re-sync next pass)")
+                continue
             data["synced"] = True
             data["synced_at"] = int(time.time())
             _dump_entry(yml_path, data)
-            synced += 1
             _emit(f"    → synced")
         except Exception as exc:
             conn.rollback()

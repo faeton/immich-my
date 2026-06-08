@@ -33,6 +33,17 @@ USAGE
     tools/overnight.py '2025-11-pacific-*' # subset by glob
     tools/overnight.py --status            # show what's pending and exit
 
+TWO-COMMAND OVERNIGHT (decoupled CPU vs internet — run both at once):
+    # Terminal A — captions only (CPU/LM Studio, no network):
+    tools/overnight.py --captions --reprocess --no-upload
+    # Terminal B — sync only (uploads already-processed trips, drains caption cache):
+    tools/overnight.py --no-process
+
+    They're safe to run in parallel on the same trips: a caption written
+    after a trip was already drained flips its offline-cache entry back to
+    "unsynced", and B's drain (this run, or a quick re-run in the morning)
+    pushes it. See immy/src/immy/offline.py (_mark_dirty / sync_trip guard).
+
 ENV: TRIPS_ROOT (default ~/Media/Trips), IMMY_CONFIG (default ~/.immy/config.yml).
 """
 
@@ -112,8 +123,17 @@ def main() -> None:
     ap.add_argument("--captions", action="store_true", help="also run the LM Studio VLM captioner (slow)")
     ap.add_argument("--no-transcode", action="store_true", help="skip the 720p web transcode")
     ap.add_argument("--force", action="store_true", help="redo trips already promoted")
+    ap.add_argument("--reprocess", action="store_true",
+                    help="re-run `immy process --force` on every trip to fill missing CLIP/faces/captions (journal skips done phases), then upload")
+    ap.add_argument("--no-upload", action="store_true",
+                    help="CPU side only: run the process/caption stage, skip the upload pool (pairs with --captions --reprocess)")
+    ap.add_argument("--no-process", action="store_true",
+                    help="network side only: run the parallel upload pool over already-processed trips, skip the process stage")
     ap.add_argument("--status", action="store_true", help="print pending trips and exit")
     args = ap.parse_args()
+    if args.no_upload and args.no_process:
+        print("--no-upload and --no-process are mutually exclusive", file=sys.stderr)
+        sys.exit(1)
 
     if not TRIPS_ROOT.is_dir():
         print(f"trips root not found: {TRIPS_ROOT}", file=sys.stderr)
@@ -134,6 +154,20 @@ def main() -> None:
         print("nothing pending — all trips already promoted.")
         return
 
+    if args.no_process:
+        # Upload side runs alone: a trip with no y_processed marker would
+        # never become "ready", so the pool would wait on it forever. Drop
+        # the unprocessed ones (the captions/process command handles those).
+        ready_trips = [t for t in trips if _is_processed(t)]
+        skipped = [t for t in trips if not _is_processed(t)]
+        if skipped:
+            print(f"--no-process: skipping {len(skipped)} not-yet-processed trip(s): "
+                  + ", ".join(t.name for t in skipped))
+        trips = ready_trips
+        if not trips:
+            print("nothing to upload — no processed trips pending.")
+            return
+
     run_id = time.strftime("%Y%m%d-%H%M%S")
     run_dir = LOG_ROOT / f"overnight-{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -141,8 +175,13 @@ def main() -> None:
     total_gb = sum(_size_gb(t) for t in trips)
     cap = "  +captions" if args.captions else ""
     tc = "no-transcode" if args.no_transcode else "transcode"
-    print(f"overnight: {len(trips)} trip(s), {total_gb:.0f} GB  ·  1 process ({tc}{cap}) "
-          f"+ {args.promote_workers} upload streams  ·  logs → {run_dir}")
+    if args.no_upload:
+        mode = f"CPU only · 1 process ({tc}{cap}), no upload"
+    elif args.no_process:
+        mode = f"network only · {args.promote_workers} upload streams, no process"
+    else:
+        mode = f"1 process ({tc}{cap}) + {args.promote_workers} upload streams"
+    print(f"overnight: {len(trips)} trip(s), {total_gb:.0f} GB  ·  {mode}  ·  logs → {run_dir}")
     print("Ctrl-C stops cleanly; re-run to resume.\n")
 
     # --- single process invocation over ALL trips (models loaded once) ---------
@@ -150,11 +189,28 @@ def main() -> None:
     proc_flags.append("--no-transcode" if args.no_transcode else "--transcode")
     if args.captions:
         proc_flags.append("--with-captions")
-    # Skip trips already processed (their marker exists) to resume fast.
-    to_process = [t for t in trips if not _is_processed(t)]
+    if args.reprocess:
+        # --force re-runs every trip; the per-asset journal still skips phases
+        # already done, so this only fills the missing CLIP/faces/captions.
+        proc_flags.append("--force")
+        to_process = list(trips)
+    else:
+        # Default: only process trips with no marker yet (resume fast).
+        to_process = [t for t in trips if not _is_processed(t)]
+    # A trip is "ready to promote" once its marker is fresh. With --reprocess
+    # the marker already exists, so gate on mtime >= when process started;
+    # otherwise just on existence.
+    process_start = time.time()
+
+    def _ready(trip: Path) -> bool:
+        m = trip / ".audit" / "y_processed.yml"
+        if not m.is_file():
+            return False
+        return m.stat().st_mtime >= process_start if args.reprocess else True
+
     process_log = open(run_dir / "process.log", "wb")
     process_proc = None
-    if to_process:
+    if to_process and not args.no_process:
         cmd = ["caffeinate", "-dims", "nice", "-n", "5", IMMY, "process",
                *[str(t) for t in to_process], *proc_flags]
         process_log.write((" ".join(cmd) + "\n\n").encode())
@@ -220,30 +276,44 @@ def main() -> None:
     with ThreadPoolExecutor(max_workers=args.promote_workers) as ex:
         futures = []
         while not stopping.is_set():
-            # Hand every freshly-processed (or already-processed) trip to the pool.
-            for t in trips:
-                with lock:
-                    done = t.name in submitted
-                if done or _is_promoted(t):
-                    continue
-                if _is_processed(t):
+            # Hand every freshly-processed (or already-processed) trip to the
+            # pool — unless this is a CPU-only (--no-upload) run.
+            if not args.no_upload:
+                for t in trips:
                     with lock:
-                        submitted.add(t.name)
-                    futures.append(ex.submit(promote_one, t))
+                        done = t.name in submitted
+                    if done or _is_promoted(t):
+                        continue
+                    if _ready(t):
+                        with lock:
+                            submitted.add(t.name)
+                        futures.append(ex.submit(promote_one, t))
             proc_done = process_proc is None or process_proc.poll() is not None
-            with lock:
-                all_handled = all(t.name in submitted or _is_promoted(t) for t in trips)
+            if args.no_upload:
+                # No uploads to wait on; finish when the process stage exits.
+                all_handled = True
+            else:
+                with lock:
+                    all_handled = all(t.name in submitted or _is_promoted(t) for t in trips)
             if proc_done and all_handled and all(f.done() for f in futures):
                 break
             # status line
-            with lock:
-                ok, fail, inflight = len(promoted), len(failed), len(live_procs)
-            pend = sum(1 for t in trips if t.name not in submitted and not _is_promoted(t))
-            phase = "processing" if not proc_done else "draining uploads"
             el = int(time.time() - run_start)
-            print(f"\r[{el//3600}h{(el%3600)//60:02d}m] {phase}  ·  "
-                  f"uploaded {ok}  uploading {inflight}  waiting-on-process {pend}  "
-                  f"failed {fail}   ", end="", flush=True)
+            stamp = f"[{el//3600}h{(el%3600)//60:02d}m]"
+            if args.no_upload:
+                # CPU-only: the upload counters are all zero/meaningless;
+                # report the process stage (live detail is in process.log).
+                state = "running" if not proc_done else "done"
+                print(f"\r{stamp} processing/captions {state}   ",
+                      end="", flush=True)
+            else:
+                with lock:
+                    ok, fail, inflight = len(promoted), len(failed), len(live_procs)
+                pend = sum(1 for t in trips if t.name not in submitted and not _is_promoted(t))
+                phase = "processing" if not proc_done else "draining uploads"
+                print(f"\r{stamp} {phase}  ·  "
+                      f"uploaded {ok}  uploading {inflight}  waiting-on-process {pend}  "
+                      f"failed {fail}   ", end="", flush=True)
             time.sleep(5)
         ex.shutdown(wait=not stopping.is_set())
 
@@ -253,8 +323,13 @@ def main() -> None:
         except subprocess.TimeoutExpired:
             pass
     process_log.close()
-    print(f"\n\nDone. {len(promoted)} uploaded, {len(failed)} failed, "
-          f"{len(trips)-len(promoted)-len(failed)} not finished.  logs {run_dir}")
+    if args.no_upload:
+        rc = process_proc.poll() if process_proc else 0
+        state = "completed" if rc == 0 else f"exited rc={rc}"
+        print(f"\n\nDone (CPU only). process stage {state}.  logs {run_dir}")
+    else:
+        print(f"\n\nDone. {len(promoted)} uploaded, {len(failed)} failed, "
+              f"{len(trips)-len(promoted)-len(failed)} not finished.  logs {run_dir}")
     for name, rc in failed.items():
         print(f"  fail rc={rc}  {name}  → {run_dir}/promote-{name}.log")
 
