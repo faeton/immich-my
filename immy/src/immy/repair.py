@@ -25,12 +25,15 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+import os
+import subprocess
+import tempfile
 import threading
 
 from . import pg as pg_mod
 from .config import Config
 from .derivatives import compute_for_asset, staged_dir
-from .promote import _INSERT_ASSET_FILE, _rsync_derivatives
+from .promote import _INSERT_ASSET_FILE
 
 
 # Broken = no thumbnail asset_file row at all, OR one pointing at the
@@ -79,6 +82,32 @@ def find_broken(conn, library_id: str, library, trip_name: str) -> list[tuple[st
     with conn.cursor() as cur:
         cur.execute(_BROKEN_SQL, {"prefix": prefix + "%", "lib": library_id, "ph": _PLACEHOLDER})
         return [(str(r[0]), str(r[1]), str(r[2])) for r in cur.fetchall()]
+
+
+def _push_files(staged_root: Path, host_root: str, rel_paths: list[str]) -> None:
+    """rsync ONLY the given relative paths to the NAS media tree.
+
+    Deliberately NOT `_rsync_derivatives` (which pushes the whole
+    `.audit/derivatives/` tree): that tree can hold stale derivatives from a
+    prior `immy process` run — e.g. multi-MB `encoded-video/...` files, some
+    under an `__offline_placeholder__` owner dir — which we must not re-upload.
+    `--files-from` restricts the transfer to exactly what we just generated;
+    rsync creates the needed parent dirs implicitly.
+    """
+    if not rel_paths:
+        return
+    src = f"{str(staged_root).rstrip('/')}/"
+    dst = host_root if ":" in host_root else f"{host_root.rstrip('/')}/"
+    with tempfile.NamedTemporaryFile("w", suffix=".lst", delete=False) as fh:
+        fh.write("\n".join(rel_paths) + "\n")
+        list_path = fh.name
+    try:
+        subprocess.run(
+            ["rsync", "-rt", "--files-from", list_path, src, dst],
+            check=True, capture_output=True, text=True,
+        )
+    finally:
+        os.unlink(list_path)
 
 
 def _resolve_source(original_path: str, container_root: str, trip_folder: Path) -> Path | None:
@@ -134,6 +163,7 @@ def repair_trip(
     # 1. Generate thumbnail+preview locally, in parallel (pyvips/ffmpeg
     #    release the GIL, so threads scale across cores).
     specs: list[dict] = []
+    rel_paths: list[str] = []          # exactly the files to rsync this run
     specs_lock = threading.Lock()
 
     def _gen(t: BrokenAsset) -> None:
@@ -145,6 +175,7 @@ def repair_trip(
             trip_folder=trip_folder,
             transcode_videos=False,  # thumbnail repair only; no re-encode
         )
+        keep = [df for df in res.files if df.kind in ("thumbnail", "preview")]
         rows_out = [
             {
                 "asset_id": t.asset_id,
@@ -153,11 +184,11 @@ def repair_trip(
                 "is_progressive": df.is_progressive,
                 "is_transparent": df.is_transparent,
             }
-            for df in res.files
-            if df.kind in ("thumbnail", "preview")
+            for df in keep
         ]
         with specs_lock:
             specs.extend(rows_out)
+            rel_paths.extend(df.relative_path for df in keep)
             result.generated += 1
             if progress is not None:
                 progress(result.generated, len(targets))
@@ -177,9 +208,9 @@ def repair_trip(
                          else f"{result.missing_source} no local source")
         return result
 
-    # 2. Push staged derivatives to the NAS.
+    # 2. Push ONLY the derivatives we just generated (not the whole tree).
     try:
-        _rsync_derivatives(staged_dir(trip_folder), config.media.host_root)
+        _push_files(staged_dir(trip_folder), config.media.host_root, rel_paths)
     except Exception as e:
         result.status, result.detail = "error", f"rsync derivatives failed: {e}"
         return result
