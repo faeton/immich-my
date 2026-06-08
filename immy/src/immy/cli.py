@@ -1652,6 +1652,63 @@ def cluster(
     )
 
 
+@app.command("repair-thumbs")
+def repair_thumbs(
+    folders: list[Path] = typer.Argument(..., help="Trip folder(s) whose Immich thumbnails are broken."),
+    parallel: int = typer.Option(8, "-P", "--parallel", help="Concurrent derivative generations (default 8)."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Report what would regenerate; touch nothing."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+) -> None:
+    """Repair broken thumbnails IN PLACE for assets already in Immich.
+
+    For assets scanned while their originals were offline (Immich wrote a
+    `__offline_placeholder__` thumbnail, or none), regenerate thumbnail +
+    preview locally on the laptop and upsert the `asset_file` rows — reusing
+    each asset's existing UUID, so albums/favorites/faces survive. No delete,
+    no re-ingest, no NAS thumbnail CPU. Idempotent; resumable (re-run safely).
+    """
+    from . import repair as repair_mod
+
+    config = load_config(config_path)
+    if config.pg is None or config.immich is None or config.media is None:
+        console.print("[red]repair-thumbs needs pg + immich + media blocks in config.[/red]")
+        raise typer.Exit(code=2)
+
+    totals = {"broken": 0, "generated": 0, "rows": 0, "no_src": 0, "failed": 0}
+    for folder in folders:
+        if not folder.is_dir():
+            console.print(f"[red]not a folder:[/red] {folder}")
+            continue
+        console.print(f"[bold]repair-thumbs[/bold] {folder.name} …")
+        res = repair_mod.repair_trip(
+            folder, config, parallel=parallel, dry_run=dry_run,
+            progress=lambda done, total: None,
+        )
+        totals["broken"] += res.broken
+        totals["generated"] += res.generated
+        totals["rows"] += res.rows_upserted
+        totals["no_src"] += res.missing_source
+        if res.status == "error":
+            totals["failed"] += 1
+            console.print(f"  [red]error:[/red] {res.detail}")
+        elif res.broken == 0:
+            console.print("  [green]clean[/green] — no broken thumbnails")
+        else:
+            tail = f"  ([yellow]{res.missing_source} no local source[/yellow])" if res.missing_source else ""
+            verb = "would regenerate" if dry_run else "regenerated"
+            console.print(
+                f"  [green]{verb}[/green] {res.generated}/{res.broken}"
+                + (f", {res.rows_upserted} asset_file row(s) upserted" if not dry_run else "")
+                + tail
+            )
+    console.print(
+        f"\n[bold]Done.[/bold] {totals['broken']} broken, {totals['generated']} "
+        f"{'would regenerate' if dry_run else 'regenerated'}, "
+        f"{totals['rows']} row(s) upserted, {totals['no_src']} no source, "
+        f"[red]{totals['failed']} trip(s) failed[/red]"
+    )
+
+
 @app.command("snapshot")
 def snapshot(
     out: Path = typer.Option(
