@@ -52,6 +52,7 @@ from __future__ import annotations
 import argparse
 import glob
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -92,6 +93,104 @@ def _size_gb(trip: Path) -> float:
         return int(out.stdout.split()[0]) / (1024 * 1024)
     except (ValueError, IndexError, subprocess.SubprocessError):
         return 0.0
+
+
+def _read_heartbeat(trip: Path) -> dict | None:
+    """Parse a trip's `.audit/.progress` flat-YAML heartbeat into a dict.
+
+    Adds a synthetic `_age` (seconds since updated_at, from file mtime) so
+    the dashboard can tell the live trip from stale leftovers."""
+    p = trip / ".audit" / ".progress"
+    try:
+        text = p.read_text()
+        mtime = p.stat().st_mtime
+    except OSError:
+        return None
+    d: dict = {}
+    for line in text.splitlines():
+        k, sep, v = line.partition(":")
+        if sep:
+            d[k.strip()] = v.strip()
+    d["_age"] = time.time() - mtime
+    return d
+
+
+def _offline_count(trip: Path) -> int:
+    """Assets cached to the offline sink so far (one YAML per asset)."""
+    try:
+        return sum(1 for _ in (trip / ".audit" / "offline").glob("*.yml"))
+    except OSError:
+        return 0
+
+
+def _last_rsync_line(path: Path, maxbytes: int = 8192) -> str:
+    """Most recent rsync --progress line (`… 45%  2.34MB/s  0:00:05`)."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - maxbytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    best = ""
+    for raw in data.decode("utf-8", "replace").splitlines():
+        s = raw.strip()
+        if "%" in s and ("B/s" in s or "/s" in s):
+            best = s
+    return best
+
+
+def _last_line(path: Path, maxbytes: int = 8192) -> str:
+    """Last non-empty line of a log — used to explain a failed promote."""
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, 2)
+            fh.seek(max(0, fh.tell() - maxbytes))
+            data = fh.read()
+    except OSError:
+        return ""
+    for raw in reversed(data.decode("utf-8", "replace").splitlines()):
+        if raw.strip():
+            return raw.strip()
+    return ""
+
+
+class _ProcessLog:
+    """Incremental tail of process.log: counts fresh VLM captions + assets
+    seen and keeps the latest caption text, reading only new bytes per poll."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self._off = 0
+        self.captioned = 0   # actual VLM calls this run (not cached)
+        self.assets = 0      # asset header lines seen
+        self.last = ""       # most recent caption text
+        self.recent: list[str] = []
+
+    def poll(self) -> None:
+        try:
+            with open(self.path, "rb") as fh:
+                fh.seek(self._off)
+                chunk = fh.read()
+                self._off = fh.tell()
+        except OSError:
+            return
+        if not chunk:
+            return
+        for raw in chunk.decode("utf-8", "replace").splitlines():
+            s = raw.strip()
+            if not s:
+                continue
+            self.recent.append(s)
+            if s.startswith("[") and "]" in s and "/" in s.split("]", 1)[0]:
+                self.assets += 1
+            elif "caption… (VLM @" in s:
+                self.captioned += 1
+            elif s.startswith("caption:") or 'caption: "' in s:
+                snip = s.split('caption:', 1)[1].strip().strip('"').rstrip("…").strip('"')
+                if snip:
+                    self.last = snip
+        self.recent = self.recent[-6:]
 
 
 def discover(patterns: list[str], *, force: bool) -> list[Path]:
@@ -211,7 +310,14 @@ def main() -> None:
             return False
         return m.stat().st_mtime >= process_start if args.reprocess else True
 
-    process_log = open(run_dir / "process.log", "wb")
+    # PYTHONUNBUFFERED: child stdout is block-buffered when redirected to a
+    # file, which would make the live tail lag by KBs. Force line-prompt
+    # flushing so caption snippets show up in the dashboard as they land.
+    child_env = os.environ.copy()
+    child_env["PYTHONUNBUFFERED"] = "1"
+
+    process_log_path = run_dir / "process.log"
+    process_log = open(process_log_path, "wb")
     process_proc = None
     if to_process and not args.no_process:
         cmd = ["caffeinate", "-dims", "nice", "-n", "5", IMMY, "process",
@@ -219,11 +325,14 @@ def main() -> None:
         process_log.write((" ".join(cmd) + "\n\n").encode())
         process_log.flush()
         process_proc = subprocess.Popen(
-            cmd, stdout=process_log, stderr=subprocess.STDOUT, start_new_session=True)
+            cmd, stdout=process_log, stderr=subprocess.STDOUT,
+            env=child_env, start_new_session=True)
+    plog = _ProcessLog(process_log_path)
 
     # --- parallel promote pool, fed as trips finish processing -----------------
     env = os.environ.copy()
     env["IMMY_RSYNC_SSH_OPTS"] = SSH_OPTS
+    env["PYTHONUNBUFFERED"] = "1"
     promoted: set[str] = set()
     submitted: set[str] = set()
     failed: dict[str, int] = {}
@@ -231,32 +340,50 @@ def main() -> None:
     stopping = threading.Event()
     live_procs: dict[int, subprocess.Popen] = {}
 
+    def _run(stage: list[str], fh) -> int:
+        p = subprocess.Popen(
+            ["caffeinate", "-dims", "nice", "-n", "10", IMMY, *stage],
+            stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+        with lock:
+            live_procs[p.pid] = p
+        p.wait()
+        with lock:
+            live_procs.pop(p.pid, None)
+        return p.returncode
+
     def promote_one(trip: Path) -> None:
         if stopping.is_set():
             return
         log = run_dir / f"promote-{trip.name}.log"
+        audit = ["audit", str(trip), "--write", "--auto", "--yes-medium"]
         with open(log, "wb") as fh:
             # Apply HIGH findings (GPS-from-siblings, dates, trip-tags, …) +
-            # auto-accept MEDIUM before promote — promote refuses on pending
-            # HIGH. Same per-trip flow as promote-parallel/promote-all-trips.
-            for stage in (["audit", str(trip), "--write", "--auto", "--yes-medium"],
-                          ["promote", str(trip)]):
+            # auto-accept MEDIUM, THEN promote. The catch: writing findings
+            # shifts neighbour inference, so a re-read surfaces a fresh
+            # cascade of HIGH findings a single pass never sees — promote
+            # then refuses on those stragglers ("N HIGH pending"). So loop
+            # audit→promote until promote accepts or the cascade stops
+            # shrinking (genuinely-manual HIGH that auto can't apply → fail
+            # loud after the cap, with the reason surfaced in the dashboard).
+            for attempt in range(4):
                 if stopping.is_set():
                     return
-                p = subprocess.Popen(
-                    ["caffeinate", "-dims", "nice", "-n", "10", IMMY, *stage],
-                    stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
-                with lock:
-                    live_procs[p.pid] = p
-                p.wait()
-                with lock:
-                    live_procs.pop(p.pid, None)
-                if p.returncode != 0:
+                if _run(audit, fh) != 0:
                     with lock:
-                        failed[trip.name] = p.returncode
+                        failed[trip.name] = 1
                     return
+                if stopping.is_set():
+                    return
+                rc = _run(["promote", str(trip)], fh)
+                if rc == 0:
+                    with lock:
+                        promoted.add(trip.name)
+                    return
+                fh.write(f"\n[overnight] promote refused (rc={rc}); "
+                         f"re-auditing for cascade (attempt {attempt + 1}/4)\n".encode())
+                fh.flush()
             with lock:
-                promoted.add(trip.name)
+                failed[trip.name] = rc
 
     def stop_all() -> None:
         stopping.set()
@@ -276,6 +403,9 @@ def main() -> None:
     signal.signal(signal.SIGINT, lambda *_: (print("\ninterrupt — stopping…"), stop_all()))
 
     run_start = time.time()
+    is_tty = sys.stdout.isatty()
+    prev_lines = 0          # rows the last dashboard frame occupied (TTY redraw)
+    last_plain = 0.0        # throttle for non-TTY (nohup) append-only logging
     with ThreadPoolExecutor(max_workers=args.promote_workers) as ex:
         futures = []
         while not stopping.is_set():
@@ -300,24 +430,75 @@ def main() -> None:
                     all_handled = all(t.name in submitted or _is_promoted(t) for t in trips)
             if proc_done and all_handled and all(f.done() for f in futures):
                 break
-            # status line
+            # ---- live dashboard -------------------------------------------
             el = int(time.time() - run_start)
-            stamp = f"[{el//3600}h{(el%3600)//60:02d}m]"
+            stamp = f"{el//3600}h{(el % 3600)//60:02d}m{el % 60:02d}s"
+            cols = shutil.get_terminal_size((100, 20)).columns
+            lines: list[str] = []
+
             if args.no_upload:
-                # CPU-only: the upload counters are all zero/meaningless;
-                # report the process stage (live detail is in process.log).
+                # CPU/captions side: heartbeat → which trip + [idx/total] +
+                # phase; process.log tail → fresh-caption count + latest text.
+                plog.poll()
+                live = None  # (trip, hb) with the freshest heartbeat
+                for t in to_process:
+                    hb = _read_heartbeat(t)
+                    if hb and (live is None or hb["_age"] < live[1]["_age"]):
+                        live = (t, hb)
+                cached = sum(_offline_count(t) for t in to_process)
                 state = "running" if not proc_done else "done"
-                print(f"\r{stamp} processing/captions {state}   ",
-                      end="", flush=True)
+                lines.append(
+                    f"[{stamp}] captions {state}  ·  {plog.captioned} generated  ·  "
+                    f"{cached} assets cached  ·  {len(to_process)} trips")
+                if live:
+                    t, hb = live
+                    age = int(hb.get("_age", 0))
+                    idle = "  (idle — model warming / stuck?)" if age > 120 else ""
+                    detail = " ".join(x for x in (hb.get("file", ""), hb.get("detail", "")) if x)
+                    lines.append(
+                        f"  ▸ {t.name}  [{hb.get('index','?')}/{hb.get('total','?')}]  "
+                        f"{hb.get('step','')}  {detail}{idle}".rstrip())
+                if plog.last:
+                    lines.append(f"    last caption: “{plog.last}”")
             else:
+                # Upload side: per active trip, heartbeat step + live rsync
+                # speed; failed trips show their last log line so "failed 1"
+                # is never a mystery.
                 with lock:
                     ok, fail, inflight = len(promoted), len(failed), len(live_procs)
-                pend = sum(1 for t in trips if t.name not in submitted and not _is_promoted(t))
-                phase = "processing" if not proc_done else "draining uploads"
-                print(f"\r{stamp} {phase}  ·  "
-                      f"uploaded {ok}  uploading {inflight}  waiting-on-process {pend}  "
-                      f"failed {fail}   ", end="", flush=True)
-            time.sleep(5)
+                    submitted_n = set(submitted)
+                    promoted_n = set(promoted)
+                    failed_n = dict(failed)
+                pend = sum(1 for t in trips if t.name not in submitted_n and not _is_promoted(t))
+                phase = "uploading" if not proc_done else "draining uploads"
+                lines.append(
+                    f"[{stamp}] {phase}  ·  {ok}/{len(trips)} done  ·  {inflight} active  ·  "
+                    f"{pend} waiting  ·  {fail} failed")
+                active = [t for t in trips if t.name in submitted_n
+                          and t.name not in promoted_n and t.name not in failed_n]
+                for t in active[:max(1, args.promote_workers)]:
+                    hb = _read_heartbeat(t)
+                    step = hb.get("step", "queued") if hb else "queued"
+                    speed = _last_rsync_line(run_dir / f"promote-{t.name}.log")
+                    line = f"  ▸ {t.name}  ·  {step}"
+                    if speed:
+                        line += f"  ·  {speed}"
+                    lines.append(line)
+                for name, rc in list(failed_n.items())[-3:]:
+                    why = _last_line(run_dir / f"promote-{name}.log") or "see log"
+                    lines.append(f"  ✗ {name}  rc={rc}  ·  {why}")
+
+            lines = [ln if len(ln) < cols else ln[:cols - 1] for ln in lines]
+            if is_tty:
+                if prev_lines:
+                    sys.stdout.write(f"\x1b[{prev_lines}F\x1b[J")  # up N, clear down
+                sys.stdout.write("\n".join(lines) + "\n")
+                prev_lines = len(lines)
+                sys.stdout.flush()
+            elif time.time() - last_plain >= 20:  # nohup/redirect: append-only
+                print("  |  ".join(lines), flush=True)
+                last_plain = time.time()
+            time.sleep(2)
         ex.shutdown(wait=not stopping.is_set())
 
     if process_proc and process_proc.poll() is None:
@@ -334,7 +515,10 @@ def main() -> None:
         print(f"\n\nDone. {len(promoted)} uploaded, {len(failed)} failed, "
               f"{len(trips)-len(promoted)-len(failed)} not finished.  logs {run_dir}")
     for name, rc in failed.items():
+        why = _last_line(run_dir / f"promote-{name}.log")
         print(f"  fail rc={rc}  {name}  → {run_dir}/promote-{name}.log")
+        if why:
+            print(f"           {why}")
 
 
 if __name__ == "__main__":
