@@ -177,18 +177,27 @@ def main() -> None:
             return
         log = run_dir / f"promote-{trip.name}.log"
         with open(log, "wb") as fh:
-            p = subprocess.Popen(
-                ["caffeinate", "-dims", "nice", "-n", "10", IMMY, "promote", str(trip)],
-                stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+            # Apply HIGH findings (GPS-from-siblings, dates, trip-tags, …) +
+            # auto-accept MEDIUM before promote — promote refuses on pending
+            # HIGH. Same per-trip flow as promote-parallel/promote-all-trips.
+            for stage in (["audit", str(trip), "--write", "--auto", "--yes-medium"],
+                          ["promote", str(trip)]):
+                if stopping.is_set():
+                    return
+                p = subprocess.Popen(
+                    ["caffeinate", "-dims", "nice", "-n", "10", IMMY, *stage],
+                    stdout=fh, stderr=subprocess.STDOUT, env=env, start_new_session=True)
+                with lock:
+                    live_procs[p.pid] = p
+                p.wait()
+                with lock:
+                    live_procs.pop(p.pid, None)
+                if p.returncode != 0:
+                    with lock:
+                        failed[trip.name] = p.returncode
+                    return
             with lock:
-                live_procs[p.pid] = p
-            p.wait()
-            with lock:
-                live_procs.pop(p.pid, None)
-                if p.returncode == 0:
-                    promoted.add(trip.name)
-                else:
-                    failed[trip.name] = p.returncode
+                promoted.add(trip.name)
 
     def stop_all() -> None:
         stopping.set()
