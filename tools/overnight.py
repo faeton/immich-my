@@ -142,7 +142,10 @@ def main() -> None:
         print(f"immy not found: {IMMY}", file=sys.stderr)
         sys.exit(1)
 
-    trips = discover(args.patterns, force=args.force)
+    # --reprocess backfills CLIP/faces/captions onto trips that are usually
+    # ALREADY promoted, so discovery must include promoted trips too (else the
+    # very trips needing caption backfill get filtered out).
+    trips = discover(args.patterns, force=args.force or args.reprocess)
     if args.status:
         total = sum(_size_gb(t) for t in trips)
         print(f"{len(trips)} pending trip(s), {total:.0f} GB ({total/1024:.2f} TB):")

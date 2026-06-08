@@ -994,12 +994,29 @@ def process_trip(
                     raise
                 transcript_info = None
         caption_info: dict | None = None
+        # The VLM captions a single still image. For an IMAGE that's the
+        # asset's own preview JPEG; for a VIDEO we caption the poster `preview`
+        # frame ffmpeg already generated, so drone/video assets get described
+        # too (the original .mp4 can't be sent to the VLM). A video with no
+        # preview poster has no still to caption, so it's not eligible.
+        caption_preview = (
+            next((d.staged_path for d in derivs if d.kind == "preview"), None)
+            if derivs else None
+        )
+        caption_eligible = (
+            compute_captions
+            and captioner_config is not None
+            and (
+                asset.asset_type == "IMAGE"
+                or (asset.asset_type == "VIDEO" and caption_preview is not None)
+            )
+        )
         # Caption journal-skip path — strongest signal, used in addition
         # to (not instead of) the offline-sink prior_caption check and
         # the DB AI-prefix shortcut. `--recaption` ignores the journal,
         # forcing re-run.
         if (
-            compute_captions and asset.asset_type == "IMAGE"
+            caption_eligible
             and not recaption
             and journal.is_done(cs_hex, "caption", CAPTION_VERSION)
         ):
@@ -1018,7 +1035,7 @@ def process_trip(
         # instead of re-captioning thousands of images at 9.5 s each.
         prior_caption = (
             sink.caption_info(asset.id)
-            if compute_captions and asset.asset_type == "IMAGE"
+            if caption_eligible
             else None
         )
         if (
@@ -1029,11 +1046,9 @@ def process_trip(
             caption_info = prior_caption
             _emit(f"    caption… [cached, {captioner_config.model}]")
         elif (
-            compute_captions
-            and asset.asset_type == "IMAGE"
+            caption_eligible
             and prior_caption is None
             and not recaption
-            and captioner_config is not None
         ):
             # Online resume path (and offline-without-prior): if the DB
             # description is already AI-prefixed, skip the VLM call. We
@@ -1053,25 +1068,15 @@ def process_trip(
                 }
                 _emit("    caption… [cached, DB AI-prefix]")
 
-        if (
-            compute_captions
-            and caption_info is None
-            and captioner_config is not None
-            and asset.asset_type == "IMAGE"
-        ):
-            preview = None
-            if derivs:
-                preview = next(
-                    (d.staged_path for d in derivs if d.kind == "preview"),
-                    None,
-                )
+        if caption_eligible and caption_info is None:
             _emit(f"    caption… (VLM @ {captioner_config.model})")
             try:
                 caption_info = _phase(
                     lambda: _process_caption(
                         sink, asset.id, exif_row.path,
-                        captioner_config, preview=preview,
+                        captioner_config, preview=caption_preview,
                         recaption=recaption,
+                        require_preview=asset.asset_type == "VIDEO",
                     ),
                     "caption", timings,
                 )
@@ -1237,8 +1242,14 @@ def _process_caption(
     *,
     preview: Path | None = None,
     recaption: bool = False,
+    require_preview: bool = False,
 ) -> dict | None:
     """Caption one image and write the prefixed description to the DB.
+
+    `require_preview` is set for VIDEO assets: the caption must come from the
+    poster `preview` frame, never the original — `captions.caption()` would
+    otherwise fall back to `media`, and feeding an .mp4 to the VLM is wrong.
+    If the preview is missing we skip rather than send video bytes.
 
     Idempotence is handled at the SQL layer via `LIKE 'AI: %'`: the
     UPDATE touches only rows where the description is empty or was
@@ -1259,6 +1270,9 @@ def _process_caption(
     existing = sink.get_description(asset_id)
     if existing and not captions_mod.is_ai_description(existing):
         return None
+
+    if require_preview and (preview is None or not preview.is_file()):
+        return None  # video with no poster still — nothing safe to caption
 
     result = captions_mod.caption(media, config=config, preview=preview)
     description = captions_mod.format_description(result.text)

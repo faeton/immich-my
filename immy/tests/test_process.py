@@ -840,3 +840,40 @@ def test_promote_skips_scan_when_marker_present(config_full, tmp_path, monkeypat
     assert result.exit_code == 0, result.stdout
     assert fake.scans == []  # the whole point
     assert "scan skipped" in result.stdout
+
+
+def test_process_caption_video_requires_preview(tmp_path: Path, monkeypatch):
+    """Video captioning must feed the poster `preview` frame, never the
+    original .mp4. With require_preview=True and no preview on disk,
+    _process_caption skips (returns None) instead of sending video bytes
+    to the VLM — and never calls captions.caption()."""
+    from immy import captions as captions_mod
+
+    class _Sink:
+        def get_description(self, asset_id):
+            return None  # empty → would otherwise proceed to caption
+        def update_description_if_ai_or_empty(self, asset_id, text):
+            raise AssertionError("must not write a description when skipped")
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        captions_mod, "caption",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1),
+    )
+    cfg = captions_mod.CaptionerConfig(endpoint="http://example.invalid/v1")
+
+    # No preview → must skip without touching the VLM.
+    out = process_mod._process_caption(
+        _Sink(), "vid-1", tmp_path / "DJI_0001.MP4", cfg,
+        preview=None, require_preview=True,
+    )
+    assert out is None
+    assert called["n"] == 0
+
+    # A missing-on-disk preview path is treated the same (no MP4 fallback).
+    out = process_mod._process_caption(
+        _Sink(), "vid-1", tmp_path / "DJI_0001.MP4", cfg,
+        preview=tmp_path / "nonexistent_preview.jpeg", require_preview=True,
+    )
+    assert out is None
+    assert called["n"] == 0
