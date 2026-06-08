@@ -102,10 +102,13 @@ def _push_files(staged_root: Path, host_root: str, rel_paths: list[str]) -> None
         fh.write("\n".join(rel_paths) + "\n")
         list_path = fh.name
     try:
-        subprocess.run(
+        proc = subprocess.run(
             ["rsync", "-rt", "--files-from", list_path, src, dst],
-            check=True, capture_output=True, text=True,
+            capture_output=True, text=True,
         )
+        if proc.returncode != 0:
+            tail = (proc.stderr or proc.stdout or "").strip().splitlines()[-3:]
+            raise RuntimeError(f"rsync rc={proc.returncode}: {' | '.join(tail)}")
     finally:
         os.unlink(list_path)
 
