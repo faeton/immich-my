@@ -87,6 +87,23 @@ class ImmichClient:
         """Fire-and-forget. Immich returns 204 and scans async in the background."""
         self._request("POST", f"/api/libraries/{library_id}/scan", body={})
 
+    def regenerate_thumbnails(self, asset_ids: list[str]) -> None:
+        """Queue thumbnail (re)generation for specific assets.
+
+        `POST /api/assets/jobs` with name `regenerate-thumbnail`. Used by
+        promote to repair assets that were registered while their originals
+        were still offline (Immich wrote a `__offline_placeholder__` thumb,
+        or none) and never re-thumbnailed after the files landed on the NAS —
+        clearing `isOffline` alone does NOT re-queue derivative jobs. Batched
+        because Immich caps the request body; fire-and-forget (204)."""
+        if not asset_ids:
+            return
+        for i in range(0, len(asset_ids), 1000):
+            self._request(
+                "POST", "/api/assets/jobs",
+                body={"assetIds": asset_ids[i:i + 1000], "name": "regenerate-thumbnail"},
+            )
+
     def find_asset_id(
         self,
         original_file_name: str,

@@ -38,7 +38,7 @@ from pathlib import Path
 from statistics import median
 
 from ..dates import resolve as resolve_date
-from ..exif import ExifRow, has_gps
+from ..exif import ExifRow, has_valid_gps as has_gps
 from .registry import Finding, Rule, register
 
 

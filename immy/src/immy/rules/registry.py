@@ -7,7 +7,7 @@ file's XMP sidecar (or a non-write action like "pair with X").
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Literal
 
@@ -55,4 +55,36 @@ def evaluate(rows: list[ExifRow], folder: Path) -> list[Finding]:
     out: list[Finding] = []
     for rule in registry:
         out.extend(rule.propose(rows, folder))
+    return out
+
+
+def dedup_by_field(findings: list[Finding]) -> list[Finding]:
+    """Per-tier, per-(path, xmp_field) dedup. Within a confidence tier the
+    first-registered rule wins (specific > general). Tiers are independent
+    so a MEDIUM finding still surfaces when a HIGH rule claims the same
+    field — the user decides whether MEDIUM overrides after HIGH lands.
+
+    Shared by `immy audit` (which surfaces/applies pending findings) and
+    `immy promote` (which gates on pending HIGH). They MUST dedup the same
+    way: when two HIGH rules claim a file's GPS — e.g. `dji-gps-from-srt`
+    (already applied) and `trip-gps-from-siblings` (the loser) — only the
+    winner counts. If promote counted the deduped-out loser as "pending"
+    it would refuse to promote a folder audit considers clean, stranding
+    the trip forever.
+    """
+    out: list[Finding] = []
+    for tier in ("high", "medium", "low"):
+        claimed: set[tuple] = set()
+        for f in findings:
+            if f.confidence != tier:
+                continue
+            if f.action != "write_xmp":
+                out.append(f)
+                continue
+            remaining = {k: v for k, v in f.patch.items() if (f.path, k) not in claimed}
+            if not remaining:
+                continue
+            for k in remaining:
+                claimed.add((f.path, k))
+            out.append(f if remaining == f.patch else replace(f, patch=remaining))
     return out

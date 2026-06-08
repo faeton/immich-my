@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from ..exif import ExifRow, has_gps as _has_gps
+from ..exif import ExifRow, has_valid_gps as _has_gps
 from ..srt import find_sibling, parse
 from .registry import Finding, Rule, register
 

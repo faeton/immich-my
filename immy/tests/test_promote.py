@@ -42,6 +42,10 @@ class FakeClient:
     def scan_library(self, library_id: str) -> None:
         self.scans.append(library_id)
 
+    def regenerate_thumbnails(self, asset_ids: list[str]) -> None:
+        self.thumb_regens = getattr(self, "thumb_regens", [])
+        self.thumb_regens.append(list(asset_ids))
+
     def find_asset_id(
         self,
         original_file_name: str,
@@ -338,6 +342,44 @@ def test_build_plan_ignores_staged_derivatives_for_pending_high(
     assert plan.pending_high == 0
 
 
+def test_build_plan_dedups_pending_high_like_audit(
+    config_file, dji_ready, monkeypatch,
+):
+    """Regression: promote must dedup findings the SAME way `immy audit`
+    does. Two HIGH rules claim the same file's GPS field; the first-
+    registered winner is already applied. The deduped-out loser must NOT
+    be counted as pending — otherwise promote refuses a folder audit
+    considers clean and the trip is stranded as perpetually pending.
+    """
+    from immy.rules import Finding
+    from immy.state import State, patch_hash
+
+    cfg_path, originals = config_file
+    cfg = Config(
+        originals_root=originals, immich=None, pg=None, media=None, ml=None,
+        notes_filename=None, source=cfg_path,
+    )
+    target = dji_ready / "DJI_0001.JPG"
+    winner = Finding(rule="rule-a", confidence="high", path=target,
+                     action="write_xmp", patch={"GPSLatitude": "1.0"})
+    loser = Finding(rule="rule-b", confidence="high", path=target,
+                    action="write_xmp", patch={"GPSLatitude": "2.0"})
+    # build_plan calls evaluate(); return the two competitors regardless of rows.
+    monkeypatch.setattr(promote_mod, "evaluate", lambda rows, folder: [winner, loser])
+
+    # Mark only the winner applied in on-disk state.
+    rel = "DJI_0001.JPG"
+    state = State.load(dji_ready)
+    state.mark_applied(rel, winner.rule, patch_hash(
+        {"action": winner.action, "patch": winner.patch,
+         "pair_with": str(winner.pair_with)}))
+    state.save()
+
+    plan = promote_mod.build_plan(dji_ready, cfg)
+    # Without dedup the loser (rule-b, unapplied) would make this 1.
+    assert plan.pending_high == 0
+
+
 def test_promote_idempotent(config_file, dji_ready, monkeypatch):
     _, originals = config_file
     fake = FakeClient()
@@ -440,6 +482,22 @@ def test_promote_updates_existing_album(config_file, dji_ready, monkeypatch):
     assert updated_id == "album-existing"
     assert "New body text." in body["description"]
     assert fake.album_assets  # assets added (idempotent on Immich side)
+
+
+def test_promote_repairs_thumbnails_for_brought_online_assets(
+    config_file, dji_ready, monkeypatch
+):
+    """Assets registered while offline keep broken thumbs after the files
+    land unless promote re-queues regeneration. The fake pg returns asset
+    ids needing repair → promote must call regenerate_thumbnails for them."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert getattr(fake, "thumb_regens", []) == [["asset-1"]]
 
 
 def test_promote_skips_album_when_no_immich_creds(tmp_path, dji_ready, monkeypatch):

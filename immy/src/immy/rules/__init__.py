@@ -1,4 +1,4 @@
-from .registry import Rule, Finding, registry, evaluate, register
+from .registry import Rule, Finding, registry, evaluate, register, dedup_by_field
 
 # Side-effect imports register each rule into `registry`.
 # Order matters: more specific rules first. The CLI's per-field dedup keeps
@@ -8,6 +8,7 @@ from . import dji_srt  # noqa: F401
 from . import filename_date  # noqa: F401
 from . import insta360  # noqa: F401
 from . import geotag_from_gpx  # noqa: F401
+from . import trip_gps_siblings  # noqa: F401
 from . import trip_gps  # noqa: F401
 from . import trip_tags  # noqa: F401
 from . import trip_timezone_guess  # noqa: F401
@@ -20,4 +21,4 @@ from . import bloat_candidate  # noqa: F401
 from . import makernote_present  # noqa: F401
 from . import geocode_place  # noqa: F401
 
-__all__ = ["Rule", "Finding", "registry", "evaluate", "register"]
+__all__ = ["Rule", "Finding", "registry", "evaluate", "register", "dedup_by_field"]

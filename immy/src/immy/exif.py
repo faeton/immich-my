@@ -40,9 +40,31 @@ def _has_value(value: Any) -> bool:
 
 
 def has_gps(row: "ExifRow") -> bool:
+    """True if a GPS lat/lon tag is *present* (may be the null-island 0,0
+    sensor artifact). Use for 'does this file carry a GPS tag at all'."""
     lat = row.get("Composite:GPSLatitude", "EXIF:GPSLatitude", "XMP:GPSLatitude")
     lon = row.get("Composite:GPSLongitude", "EXIF:GPSLongitude", "XMP:GPSLongitude")
     return _has_value(lat) and _has_value(lon)
+
+
+def has_valid_gps(row: "ExifRow") -> bool:
+    """True only for a *usable* fix — present and not null-island (0,0).
+
+    This is the right test for 'does this file still need a position?' and
+    for 'can this file serve as a GPS source?'. Cameras and exports often
+    stamp 0,0 when they have no lock; treating that as located leaves the
+    file unrepairable and lets it seed siblings with garbage coords."""
+    lat = row.get("Composite:GPSLatitude", "EXIF:GPSLatitude", "XMP:GPSLatitude")
+    lon = row.get("Composite:GPSLongitude", "EXIF:GPSLongitude", "XMP:GPSLongitude")
+    if not (_has_value(lat) and _has_value(lon)):
+        return False
+    try:
+        lat_f, lon_f = float(lat), float(lon)
+    except (TypeError, ValueError):
+        # Present but unparseable (e.g. a DMS string from a non-`-n` read) —
+        # treat as a real fix; we can't prove it's null-island.
+        return True
+    return not (abs(lat_f) < 1e-3 and abs(lon_f) < 1e-3)
 
 
 def _is_under_audit_dir(folder: Path, path: Path) -> bool:

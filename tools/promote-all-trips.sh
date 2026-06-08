@@ -249,6 +249,10 @@ print_progress() {
     local files_started cur_pct cur_line
     # Tail keeps this O(constant) regardless of log length.
     files_started=$(grep -cE '^[<>][fdL]' "$RUN_LOG" 2>/dev/null || echo 0)
+    # Scope to THIS trip: subtract the lines that were already in the shared
+    # log when the trip began (set in the loop above; 0 before the first trip).
+    files_started=$(( files_started - ${TRIP_ITEMIZE_BASE:-0} ))
+    [[ $files_started -lt 0 ]] && files_started=0
     cur_line=$(grep -E '^[[:space:]]+[0-9,]+[[:space:]]+[0-9]+%' "$RUN_LOG" 2>/dev/null | tail -1)
     cur_pct=$(printf '%s\n' "$cur_line" | awk '{for(i=1;i<=NF;i++) if($i~/%$/){gsub("%","",$i); print $i; exit}}')
     if [[ "${files_started:-0}" -gt 0 || -n "$cur_pct" ]]; then
@@ -332,6 +336,11 @@ for trip in "${TRIPS[@]}"; do
   CURRENT_INDEX=$trip_idx
   CURRENT_TRIP="$name"
   TRIP_START_TS=$(date +%s)
+  # Baseline of itemized-file lines already in the SHARED run log before this
+  # trip starts. print_progress counts itemize lines (`>f…`/`<f…`) in $RUN_LOG,
+  # which accumulates across every trip — without subtracting this baseline the
+  # count is the whole-run total and "files started" reads e.g. 5605/76 (7375%).
+  TRIP_ITEMIZE_BASE=$(grep -cE '^[<>][fdL]' "$RUN_LOG" 2>/dev/null || echo 0)
   # Sample trip size/file count once at trip start so Ctrl+T is cheap.
   # Excludes .audit/ since promote rsyncs originals + .audit derivatives
   # separately; the bulk-of-transfer figure is what's most useful here.

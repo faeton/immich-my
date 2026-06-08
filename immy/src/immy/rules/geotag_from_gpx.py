@@ -31,7 +31,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..dates import resolve as resolve_date
-from ..exif import ExifRow, has_gps
+from ..exif import ExifRow, has_valid_gps as has_gps
 from ..notes import parse_frontmatter, resolve as resolve_notes
 from .registry import Finding, Rule, register
 

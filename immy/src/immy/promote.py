@@ -20,6 +20,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 import subprocess
 import signal
 
@@ -31,7 +32,7 @@ from .exif import read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
 from .process import is_processed as y_is_processed, read_marker as y_read_marker
-from .rules import evaluate
+from .rules import evaluate, dedup_by_field
 from .heartbeat import Heartbeat
 from .state import AUDIT_DIR, State, log_event, patch_hash
 
@@ -71,7 +72,12 @@ def build_plan(folder: Path, config: Config) -> Plan:
 
     rows = read_folder(folder)
     state = State.load(folder)
-    findings = evaluate(rows, folder)
+    # Dedup the SAME way `immy audit` does (rules.dedup_by_field). Without
+    # this, promote counted HIGH findings that audit deduplicates away — e.g.
+    # `trip-gps-from-siblings` losing a file's GPS to an already-applied
+    # `dji-gps-from-srt` — as "pending", then refused to promote a folder
+    # audit considered clean. That stranded such trips as perpetually pending.
+    findings = dedup_by_field(evaluate(rows, folder))
 
     pending_high = 0
     pairs_by_key: dict[tuple[str, str], InstaPair] = {}
@@ -131,8 +137,29 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
     ]
     if _rsync_supports("--append-verify"):
         args.append("--append-verify")
+    # Opt-in tuning hooks. Unset → default promote is byte-for-byte unchanged;
+    # tools/promote-parallel.py sets these per worker:
+    #   IMMY_RSYNC_BWLIMIT    rsync --bwlimit syntax (e.g. "2m"). The parallel
+    #                         launcher passes total_budget // worker_count, so
+    #                         the aggregate is a predictable hard ceiling.
+    #   IMMY_RSYNC_WHOLE_FILE skip delta-transfer on first copy of large
+    #                         already-compressed media (the rolling checksum is
+    #                         wasted CPU/IO when the dest doesn't exist yet).
+    #   IMMY_RSYNC_SSH_OPTS   extra ssh options for the transport — disabling
+    #                         ControlMaster (else parallel rsyncs multiplex onto
+    #                         ONE TCP, killing the multi-stream win), compression
+    #                         off, keepalives.
+    bwlimit = os.environ.get("IMMY_RSYNC_BWLIMIT")
+    if bwlimit:
+        args.append(f"--bwlimit={bwlimit}")
+    if os.environ.get("IMMY_RSYNC_WHOLE_FILE") and _rsync_supports("--whole-file"):
+        # openrsync (macOS default) has no --whole-file; silently skip there.
+        args.append("--whole-file")
     if dry_run:
         args.append("--dry-run")
+    ssh_opts = os.environ.get("IMMY_RSYNC_SSH_OPTS")
+    if ssh_opts:
+        args.extend(["-e", f"ssh {ssh_opts}"])
     for pat in RSYNC_EXCLUDES:
         args.extend(["--exclude", pat])
 
@@ -599,6 +626,7 @@ def _sync_album(
         "detail": "",
         "added": 0,
         "resurrected": 0,
+        "thumbs_repaired": 0,
     }
 
     notes = resolve_notes(plan.folder)
@@ -618,11 +646,34 @@ def _sync_album(
         return summary
 
     asset_ids: list[str] = []
+    repair_ids: list[str] = []
     try:
         library = pg_mod.fetch_library_info(conn, config.immich.library_id)
         prefix = f"{library.container_root.rstrip('/')}/{album_name}/"
         like = prefix + "%"
         with conn.cursor() as cur:
+            # Assets that need a thumbnail (re)generation: registered while
+            # their original was still offline, so Immich wrote a
+            # `__offline_placeholder__` thumb (or none) and never re-ran the
+            # job after the file landed. Captured BEFORE the UPDATE below
+            # clears isOffline. Clearing the flag alone doesn't re-queue
+            # derivative jobs, so without this the trip shows "Error loading
+            # image" on every tile forever.
+            cur.execute(
+                'SELECT a.id FROM asset a '
+                'WHERE a."originalPath" LIKE %s '
+                'AND (a."libraryId" = %s OR a."libraryId" IS NULL) '
+                'AND a."deletedAt" IS NULL AND ('
+                '  a."isOffline" = true '
+                '  OR NOT EXISTS (SELECT 1 FROM asset_file f '
+                '       WHERE f."assetId" = a.id AND f.type = %s) '
+                '  OR EXISTS (SELECT 1 FROM asset_file f '
+                '       WHERE f."assetId" = a.id AND f.type = %s '
+                '       AND f.path LIKE %s))',
+                (like, config.immich.library_id, "thumbnail", "thumbnail",
+                 "%__offline_placeholder__%"),
+            )
+            repair_ids = [str(r[0]) for r in cur.fetchall()]
             if resurrect_deleted:
                 cur.execute(
                     'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
@@ -658,6 +709,16 @@ def _sync_album(
         return summary
     finally:
         conn.close()
+
+    # Repair broken thumbnails for assets brought back online by this rsync.
+    # Soft: a job-queue failure must not fail the promote (files are already
+    # on the NAS). Immich regenerates async in the background.
+    if repair_ids:
+        try:
+            client.regenerate_thumbnails(repair_ids)
+            summary["thumbs_repaired"] = len(repair_ids)
+        except ImmichError as e:
+            summary["thumbs_repair_error"] = str(e)
 
     try:
         existing = client.find_album_by_name(album_name)

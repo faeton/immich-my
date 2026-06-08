@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import os
 import sys
-from dataclasses import replace
 from pathlib import Path
 
 import typer
@@ -62,7 +61,7 @@ pg_mod = _LazyModule("pg")
 snapshot_mod = _LazyModule("snapshot")
 transcripts_mod = _LazyModule("transcripts")
 from .config import load as load_config
-from .exif import has_gps, read_folder
+from .exif import has_valid_gps as has_gps, read_folder
 from .immich import ImmichClient
 from .notes import (
     ensure_notes,
@@ -71,7 +70,7 @@ from .notes import (
     resolve as resolve_notes,
     update_frontmatter,
 )
-from .rules import Finding, evaluate
+from .rules import Finding, evaluate, dedup_by_field as _dedup_by_field
 from .rules.trip_timezone_guess import guess_timezone
 from .sidecar import write as write_xmp
 from .state import State, log_event, patch_hash
@@ -190,29 +189,6 @@ def _apply_loop(folder: Path, state: State, initial_pending: list[Finding]) -> i
         console.print(f"[dim]pass {pass_n}: {len(pending)} new finding(s) after re-read[/dim]")
         total += _apply_once(folder, state, pending)
     return total
-
-
-def _dedup_by_field(findings: list[Finding]) -> list[Finding]:
-    """Per-tier, per-(path, xmp_field) dedup. Within a confidence tier the
-    first-registered rule wins (specific > general). Tiers are independent
-    so a MEDIUM finding still surfaces when a HIGH rule claims the same
-    field — the user decides whether MEDIUM overrides after HIGH lands."""
-    out: list[Finding] = []
-    for tier in ("high", "medium", "low"):
-        claimed: set[tuple] = set()
-        for f in findings:
-            if f.confidence != tier:
-                continue
-            if f.action != "write_xmp":
-                out.append(f)
-                continue
-            remaining = {k: v for k, v in f.patch.items() if (f.path, k) not in claimed}
-            if not remaining:
-                continue
-            for k in remaining:
-                claimed.add((f.path, k))
-            out.append(f if remaining == f.patch else replace(f, patch=remaining))
-    return out
 
 
 def _first_present(row, *keys: str) -> tuple[object | None, str | None]:
