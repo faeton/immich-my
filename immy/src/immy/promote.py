@@ -46,6 +46,13 @@ RSYNC_EXCLUDES = (
     ".Trashes",
     ".fseventsd",
     "Thumbs.db",
+    # DJI low-res proxies: `immy process` drops paired `.LRF` files from
+    # ingest (the `.MP4` master is the real asset), so they should never
+    # reach the NAS — otherwise Immich's library scan ingests them as
+    # junk low-res tiles. NOTE: do NOT exclude `.lrv` — that's the Insta360
+    # low-res, which immy KEEPS and stacks as the primary (insta360-pair).
+    "*.LRF",
+    "*.lrf",
 )
 
 
