@@ -50,6 +50,8 @@ ENV: TRIPS_ROOT (default ~/Media/Trips), IMMY_CONFIG (default ~/.immy/config.yml
 from __future__ import annotations
 
 import argparse
+import atexit
+import functools
 import glob
 import os
 import shutil
@@ -87,6 +89,7 @@ def _is_processed(trip: Path) -> bool:
     return (trip / ".audit" / "y_processed.yml").is_file()
 
 
+@functools.lru_cache(maxsize=None)
 def _size_gb(trip: Path) -> float:
     try:
         out = subprocess.run(["du", "-sk", str(trip)], capture_output=True, text=True)
@@ -138,6 +141,120 @@ def _last_rsync_line(path: Path, maxbytes: int = 8192) -> str:
         if "%" in s and ("B/s" in s or "/s" in s):
             best = s
     return best
+
+
+def _pid_alive(pid) -> bool:
+    """True if `pid` is a live process. Used to tell a heartbeat written by
+    the running promote from a corpse left by an interrupted run (e.g. a
+    killed `--captions` run that never reached `hb.clear()`)."""
+    try:
+        os.kill(int(pid), 0)
+    except (TypeError, ValueError, ProcessLookupError):
+        return False
+    except PermissionError:
+        return True  # exists, owned by someone else
+    return True
+
+
+def _trip_step(hb: dict | None, speed: str) -> str:
+    """The step label to show for an active upload trip.
+
+    The heartbeat is a single shared per-trip dotfile, so its `step` can be
+    a lie: a corpse from a killed `--captions` run (dead pid), or — worse —
+    a *live* concurrent `--captions` run writing `phase: process` into the
+    same file. Trust the step only when it was written by a live *promote*
+    writer; otherwise infer from what the upload log is actually doing."""
+    if hb and hb.get("phase") == "promote" and _pid_alive(hb.get("pid")):
+        return hb.get("step", "queued")
+    return "rsync originals" if speed else "queued"
+
+
+def _quiet_tty(is_tty: bool):
+    """While the in-place dashboard owns the terminal, stop the kernel from
+    injecting lines the repaint can't account for: Ctrl+T's SIGINFO `load: …`
+    status line (NOKERNINFO) and the `^C`/`^T` control-char echo (ECHOCTL).
+    Returns (fd, saved_attrs) to hand back to `_restore_tty`, or None."""
+    if not is_tty:
+        return None
+    try:
+        import termios
+        fd = sys.stdout.fileno()
+        saved = termios.tcgetattr(fd)
+        attrs = termios.tcgetattr(fd)
+        attrs[3] &= ~getattr(termios, "ECHOCTL", 0)
+        attrs[3] |= getattr(termios, "NOKERNINFO", 0)
+        termios.tcsetattr(fd, termios.TCSANOW, attrs)
+        return fd, saved
+    except Exception:
+        return None
+
+
+def _restore_tty(state) -> None:
+    if not state:
+        return
+    try:
+        import termios
+        fd, saved = state
+        termios.tcsetattr(fd, termios.TCSANOW, saved)
+    except Exception:
+        pass
+
+
+class _ByteMeter:
+    """Reconstruct bytes actually transferred this run. openrsync gives no
+    cross-file byte total (no `to-chk`/`xfr#`), so we sum the on-disk sizes
+    of the files it itemized as changed — the `<f…`/`>f…` lines emitted by
+    `--itemize-changes`. Incremental: each log is read only past its last
+    offset, each file stat-ed exactly once. Approximate (counts a file the
+    moment rsync starts it, and skipped/unchanged files on a resumed run
+    produce no itemize line), so callers prefix the figure with `~`."""
+
+    def __init__(self) -> None:
+        self._seen: set[str] = set()
+        self._off: dict[Path, int] = {}
+        self._buf: dict[Path, str] = {}   # trailing partial line per log
+        self.bytes = 0
+        self.files = 0
+
+    def update(self, trip: Path, log: Path) -> None:
+        try:
+            with open(log, "rb") as fh:
+                fh.seek(self._off.get(log, 0))
+                data = fh.read()
+                self._off[log] = fh.tell()
+        except OSError:
+            return
+        # A mid-flush read can split a record; \r-progress updates become
+        # their own (skipped) lines. Carry the unterminated tail to next poll
+        # so a filename straddling a chunk boundary is never dropped.
+        text = self._buf.get(log, "") + data.decode("utf-8", "replace")
+        lines = text.replace("\r", "\n").split("\n")
+        self._buf[log] = lines.pop()
+        for raw in lines:
+            parts = raw.split(None, 1)
+            if len(parts) != 2:
+                continue
+            flags, rel = parts
+            # A data-transferred regular file is `<f…` (sent) / `>f…` (recv).
+            # This excludes dirs (`.d…`), symlinks (`<L…`), metadata-only
+            # changes (`.f…`, no bytes moved), deletions, and progress/byte
+            # lines (numeric first token). `.audit/derivatives` paths use a
+            # different source root, so `trip / rel` won't resolve → dropped.
+            if len(flags) < 2 or flags[0] not in "<>" or flags[1] != "f":
+                continue
+            key = f"{trip.name}/{rel}"
+            if key in self._seen:
+                continue
+            self._seen.add(key)
+            try:
+                self.bytes += (trip / rel).stat().st_size
+                self.files += 1
+            except OSError:
+                pass
+
+    @property
+    def gb(self) -> float:
+        return self.bytes / (1024 ** 3)
 
 
 def _last_line(path: Path, maxbytes: int = 8192) -> str:
@@ -193,7 +310,7 @@ class _ProcessLog:
         self.recent = self.recent[-6:]
 
 
-def discover(patterns: list[str], *, force: bool) -> list[Path]:
+def discover(patterns: list[str], *, force: bool, smallest_first: bool = False) -> list[Path]:
     if patterns:
         dirs: list[Path] = []
         seen = set()
@@ -210,8 +327,14 @@ def discover(patterns: list[str], *, force: bool) -> list[Path]:
         dirs = sorted(p for p in TRIPS_ROOT.iterdir()
                       if p.is_dir() and not p.name.startswith("."))
     pending = [d for d in dirs if force or not _is_promoted(d)]
-    # LPT: biggest first so a 300 GB trip's long process+upload starts early.
-    pending.sort(key=lambda d: -_size_gb(d))
+    if smallest_first:
+        # Upload-only: smallest first so trips actually COMPLETE early and
+        # become queryable in Immich within minutes. Biggest-first here just
+        # pins all N workers to the N giants for ~14 h while everything waits.
+        pending.sort(key=_size_gb)
+    else:
+        # LPT: biggest first so a 300 GB trip's long process+upload starts early.
+        pending.sort(key=lambda d: -_size_gb(d))
     return pending
 
 
@@ -244,7 +367,8 @@ def main() -> None:
     # --reprocess backfills CLIP/faces/captions onto trips that are usually
     # ALREADY promoted, so discovery must include promoted trips too (else the
     # very trips needing caption backfill get filtered out).
-    trips = discover(args.patterns, force=args.force or args.reprocess)
+    trips = discover(args.patterns, force=args.force or args.reprocess,
+                     smallest_first=args.no_process)
     if args.status:
         total = sum(_size_gb(t) for t in trips)
         print(f"{len(trips)} pending trip(s), {total:.0f} GB ({total/1024:.2f} TB):")
@@ -406,6 +530,10 @@ def main() -> None:
     is_tty = sys.stdout.isatty()
     prev_lines = 0          # rows the last dashboard frame occupied (TTY redraw)
     last_plain = 0.0        # throttle for non-TTY (nohup) append-only logging
+    meter = _ByteMeter()    # bytes actually moved this run (upload side)
+    gb_total = sum(_size_gb(t) for t in trips) if not args.no_upload else 0.0
+    tty_state = _quiet_tty(is_tty)
+    atexit.register(_restore_tty, tty_state)  # safety net if we exit abnormally
     with ThreadPoolExecutor(max_workers=args.promote_workers) as ex:
         futures = []
         while not stopping.is_set():
@@ -470,16 +598,20 @@ def main() -> None:
                     promoted_n = set(promoted)
                     failed_n = dict(failed)
                 pend = sum(1 for t in trips if t.name not in submitted_n and not _is_promoted(t))
+                for t in trips:
+                    if t.name in submitted_n:
+                        meter.update(t, run_dir / f"promote-{t.name}.log")
                 phase = "uploading" if not proc_done else "draining uploads"
                 lines.append(
-                    f"[{stamp}] {phase}  ·  {ok}/{len(trips)} done  ·  {inflight} active  ·  "
+                    f"[{stamp}] {phase}  ·  {ok}/{len(trips)} done  ·  "
+                    f"~{meter.gb:.0f}/{gb_total:.0f} GB  ·  {inflight} active  ·  "
                     f"{pend} waiting  ·  {fail} failed")
                 active = [t for t in trips if t.name in submitted_n
                           and t.name not in promoted_n and t.name not in failed_n]
                 for t in active[:max(1, args.promote_workers)]:
                     hb = _read_heartbeat(t)
-                    step = hb.get("step", "queued") if hb else "queued"
                     speed = _last_rsync_line(run_dir / f"promote-{t.name}.log")
+                    step = _trip_step(hb, speed)
                     line = f"  ▸ {t.name}  ·  {step}"
                     if speed:
                         line += f"  ·  {speed}"
@@ -500,6 +632,8 @@ def main() -> None:
                 last_plain = time.time()
             time.sleep(2)
         ex.shutdown(wait=not stopping.is_set())
+    _restore_tty(tty_state)  # back to normal echo for the final summary
+    atexit.unregister(_restore_tty)  # normal path done; drop the fallback
 
     if process_proc and process_proc.poll() is None:
         try:
@@ -512,8 +646,12 @@ def main() -> None:
         state = "completed" if rc == 0 else f"exited rc={rc}"
         print(f"\n\nDone (CPU only). process stage {state}.  logs {run_dir}")
     else:
+        for t in trips:
+            meter.update(t, run_dir / f"promote-{t.name}.log")
         print(f"\n\nDone. {len(promoted)} uploaded, {len(failed)} failed, "
-              f"{len(trips)-len(promoted)-len(failed)} not finished.  logs {run_dir}")
+              f"{len(trips)-len(promoted)-len(failed)} not finished.  "
+              f"~{meter.gb:.0f} GB moved in {meter.files} files of {gb_total:.0f} GB total.  "
+              f"logs {run_dir}")
     for name, rc in failed.items():
         why = _last_line(run_dir / f"promote-{name}.log")
         print(f"  fail rc={rc}  {name}  → {run_dir}/promote-{name}.log")
