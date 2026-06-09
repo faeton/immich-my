@@ -213,6 +213,7 @@ class _ByteMeter:
         self._seen: set[str] = set()
         self._off: dict[Path, int] = {}
         self._buf: dict[Path, str] = {}   # trailing partial line per log
+        self._by_trip: dict[str, int] = {}  # bytes moved, keyed by trip name
         self.bytes = 0
         self.files = 0
 
@@ -247,7 +248,9 @@ class _ByteMeter:
                 continue
             self._seen.add(key)
             try:
-                self.bytes += (trip / rel).stat().st_size
+                sz = (trip / rel).stat().st_size
+                self.bytes += sz
+                self._by_trip[trip.name] = self._by_trip.get(trip.name, 0) + sz
                 self.files += 1
             except OSError:
                 pass
@@ -255,6 +258,9 @@ class _ByteMeter:
     @property
     def gb(self) -> float:
         return self.bytes / (1024 ** 3)
+
+    def trip_gb(self, name: str) -> float:
+        return self._by_trip.get(name, 0) / (1024 ** 3)
 
 
 def _last_line(path: Path, maxbytes: int = 8192) -> str:
@@ -398,7 +404,8 @@ def main() -> None:
     run_dir = LOG_ROOT / f"overnight-{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    total_gb = sum(_size_gb(t) for t in trips)
+    sizes = {t.name: _size_gb(t) for t in trips}
+    total_gb = sum(sizes.values())
     cap = "  +captions" if args.captions else ""
     tc = "no-transcode" if args.no_transcode else "transcode"
     if args.no_upload:
@@ -613,6 +620,11 @@ def main() -> None:
                     speed = _last_rsync_line(run_dir / f"promote-{t.name}.log")
                     step = _trip_step(hb, speed)
                     line = f"  ▸ {t.name}  ·  {step}"
+                    tot = sizes.get(t.name, 0)
+                    if tot:
+                        done_gb = meter.trip_gb(t.name)
+                        pct = min(100, int(done_gb / tot * 100))
+                        line += f"  ·  ~{done_gb:.1f}/{tot:.1f} GB ({pct}%)"
                     if speed:
                         line += f"  ·  {speed}"
                     lines.append(line)
