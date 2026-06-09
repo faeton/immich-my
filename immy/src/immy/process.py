@@ -488,6 +488,7 @@ def process_trip(
     compute_transcripts: bool = False,
     compute_captions: bool = False,
     recaption: bool = False,
+    caption_fill_missing_only: bool = False,
     captioner_config: captions_mod.CaptionerConfig | None = None,
     transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
@@ -1068,6 +1069,26 @@ def process_trip(
                 }
                 _emit("    caption… [cached, DB AI-prefix]")
 
+        # Model-bump-safe "fill missing only": if the asset already has ANY
+        # caption (any model version), keep it instead of re-captioning. This
+        # is what makes changing `ml.captioner.model` apply to never-captioned
+        # assets only — without it the new model id invalidates the journal
+        # version and redoes thousands already done. `--recaption` still wins.
+        if (
+            caption_eligible
+            and caption_info is None
+            and not recaption
+            and caption_fill_missing_only
+        ):
+            prior = journal.get(cs_hex, "caption")
+            if prior and prior.get("meta"):
+                caption_info = dict(prior["meta"])
+                caption_info.setdefault("cached", True)
+                _emit(f"    caption… [kept, prior {prior.get('version', '?')}]")
+            elif prior_caption:  # offline cache had one under another model id
+                caption_info = prior_caption
+                _emit(f"    caption… [kept, prior {prior_caption.get('model', '?')}]")
+
         if caption_eligible and caption_info is None:
             _emit(f"    caption… (VLM @ {captioner_config.model})")
             try:
@@ -1086,9 +1107,15 @@ def process_trip(
                         cs_hex, "caption", CAPTION_VERSION,
                         meta=caption_info,
                     )
-            except Exception:
+            except Exception as e:
                 if on_caption_error == "raise":
                     raise
+                # Don't swallow silently: a down/misconfigured VLM otherwise
+                # leaves NO trace (the `(VLM @ …)` line already printed, so
+                # naive log-tailers count it as "generated"). Emit the reason
+                # so callers can tell "captioned" from "tried and failed".
+                reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
+                _emit(f"    caption… FAILED: {reason}")
                 caption_info = None
         results.append(ProcessResult(
             asset_id=asset.id,

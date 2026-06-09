@@ -944,6 +944,7 @@ def _run_one_trip(
     with_transcripts: bool,
     with_captions: bool,
     recaption: bool,
+    caption_fill_missing_only: bool,
     transcode_videos: bool,
     captioner_config,
     clip_model: str,
@@ -1024,6 +1025,7 @@ def _run_one_trip(
             compute_transcripts=with_transcripts,
             compute_captions=with_captions,
             recaption=recaption,
+            caption_fill_missing_only=caption_fill_missing_only,
             captioner_config=captioner_config,
             transcode_videos=transcode_videos,
             clip_model=clip_model,
@@ -1101,6 +1103,10 @@ def process(
     recaption: bool = typer.Option(
         False, "--recaption",
         help="Re-caption images that already have an AI: description (default: skip — saves ~9.5 s/image on a resumed overnight run).",
+    ),
+    captions_fill_missing: bool = typer.Option(
+        False, "--captions-fill-missing",
+        help="Caption only assets with NO caption yet (any model). Keeps captions made by a previous model id intact across a captioner-model bump, instead of redoing them. Ignored under --recaption.",
     ),
     transcode_videos: bool = typer.Option(
         True, "--transcode/--no-transcode",
@@ -1296,6 +1302,7 @@ def process(
                 with_transcripts=with_transcripts,
                 with_captions=with_captions,
                 recaption=recaption,
+                caption_fill_missing_only=captions_fill_missing,
                 transcode_videos=transcode_videos,
                 captioner_config=captioner_config,
                 clip_model=clip_model,

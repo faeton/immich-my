@@ -877,3 +877,89 @@ def test_process_caption_video_requires_preview(tmp_path: Path, monkeypatch):
     )
     assert out is None
     assert called["n"] == 0
+
+
+# --- caption fill-missing (model-bump safety) ----------------------------
+
+def _cs_hex_for(media_file: Path, trip: Path) -> str:
+    cpath = process_mod.container_path_for(media_file, trip, LIB.container_root)
+    return process_mod.path_checksum(cpath).hex()
+
+
+def _caption_conn():
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+    return conn
+
+
+def test_caption_fill_missing_keeps_prior_model_caption(tmp_path: Path, monkeypatch):
+    """With caption_fill_missing_only, an asset already captioned by a
+    PREVIOUS model id is kept as-is — the VLM is never called even though
+    the journal version no longer matches the configured model."""
+    from immy import captions as captions_mod
+    from immy import journal as journal_mod
+
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    cs = _cs_hex_for(target / "DJI_0001.JPG", target)
+    j = journal_mod.Journal.load(target)
+    j.mark_done(cs, "caption", "caption:old-model-v1",
+                meta={"text": "an old caption", "model": "old-model-v1"})
+    j.flush()
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        process_mod, "_process_caption",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"text": "NEW"},
+    )
+    cfg = captions_mod.CaptionerConfig(model="new-model-v2",
+                                       endpoint="http://example.invalid/v1")
+
+    results = process_mod.process_trip(
+        target, _caption_conn(), LIB,
+        compute_captions=True, caption_fill_missing_only=True,
+        captioner_config=cfg,
+    )
+
+    assert called["n"] == 0  # the whole point: no VLM call
+    assert results[0].caption is not None
+    assert results[0].caption["text"] == "an old caption"
+
+
+def test_caption_recaptions_on_model_bump_without_fill_missing(tmp_path: Path, monkeypatch):
+    """Default (no fill-missing): a captioner-model change DOES re-caption,
+    because the journal version is keyed by model id. This is the behavior
+    fill-missing exists to suppress."""
+    from immy import captions as captions_mod
+    from immy import journal as journal_mod
+
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    cs = _cs_hex_for(target / "DJI_0001.JPG", target)
+    j = journal_mod.Journal.load(target)
+    j.mark_done(cs, "caption", "caption:old-model-v1",
+                meta={"text": "an old caption", "model": "old-model-v1"})
+    j.flush()
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        process_mod, "_process_caption",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"text": "NEW", "model": "new-model-v2"},
+    )
+    cfg = captions_mod.CaptionerConfig(model="new-model-v2",
+                                       endpoint="http://example.invalid/v1")
+
+    results = process_mod.process_trip(
+        target, _caption_conn(), LIB,
+        compute_captions=True, caption_fill_missing_only=False,
+        captioner_config=cfg,
+    )
+
+    assert called["n"] == 1  # version bump → re-captioned
+    assert results[0].caption["text"] == "NEW"

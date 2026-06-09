@@ -77,6 +77,75 @@ SSH_OPTS = ("-o ControlMaster=no -o ControlPath=none -o Compression=no "
             "-o IPQoS=throughput -o ServerAliveInterval=15 -o ServerAliveCountMax=3")
 
 
+CONFIG_PATH = Path(os.environ.get("IMMY_CONFIG", str(Path.home() / ".immy" / "config.yml")))
+
+
+def _captioner_target() -> tuple[str, str | None]:
+    """Resolve (endpoint, configured_model) the way `immy process` will:
+    env override → config.yml ml.captioner → LM Studio default. model is
+    None when nothing is pinned (immy then asks LM Studio what's loaded)."""
+    endpoint = os.environ.get("IMMY_CAPTIONER_ENDPOINT")
+    model = os.environ.get("IMMY_CAPTIONER_MODEL")
+    if not (endpoint and model):
+        try:
+            import yaml
+            cap = ((yaml.safe_load(CONFIG_PATH.read_text()) or {})
+                   .get("ml", {}) or {}).get("captioner", {}) or {}
+            endpoint = endpoint or cap.get("endpoint")
+            model = model or cap.get("model")
+        except Exception:
+            pass
+    return (endpoint or "http://localhost:1234/v1", model)
+
+
+def _vlm_preflight() -> tuple[list[str], str]:
+    """Probe the captioner endpoint. Returns (reasons, note): `reasons` are
+    HARD blockers ([] == ok to run); `note` is a friendly one-line status.
+
+    The point: a down VLM makes `immy process` print a cheerful 'Done' while
+    writing zero captions (per-asset errors are skipped). But LM Studio does
+    just-in-time loading — an unloaded-but-DOWNLOADED model loads on the first
+    request — so "not currently loaded" is NOT a blocker. We gate on the model
+    being present in the catalog (downloadable/loadable), not on `state`."""
+    import json
+    import urllib.request
+    import urllib.error
+
+    endpoint, want = _captioner_target()
+    base = endpoint.rstrip("/")
+    if base.endswith("/v1"):
+        base = base[:-3]
+    # LM Studio's /api/v0/models lists every DOWNLOADED model with per-model
+    # `state` (loaded vs not-loaded); /v1/models can't tell us either fact.
+    url = f"{base.rstrip('/')}/api/v0/models"
+    try:
+        with urllib.request.urlopen(url, timeout=5) as r:
+            body = json.loads(r.read())
+    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
+        return ([f"VLM endpoint unreachable at {endpoint} ({e.__class__.__name__}: "
+                 f"{getattr(e, 'reason', e)}). Captions cannot generate — "
+                 f"start LM Studio (or your backend)."], "")
+    items = body.get("data") or []
+    available = {m.get("id") for m in items}            # downloaded → JIT-loadable
+    loaded = {m.get("id") for m in items if m.get("state") == "loaded"}
+    if not want:
+        # No model pinned → immy uses whatever's loaded, else a fallback.
+        if not available:
+            return (["VLM reachable but NO models are installed — download a "
+                     "VLM in LM Studio."], "")
+        return ([], f"endpoint up, {len(available)} model(s) available "
+                    f"(immy will use the loaded/auto-detected one).")
+    if want not in available:
+        return ([f"Configured captioner '{want}' is NOT downloaded in LM Studio "
+                 f"(available: {', '.join(sorted(available)) or 'none'}). JIT can't "
+                 f"load what isn't there — pull '{want}' or repoint "
+                 f"ml.captioner.model in {CONFIG_PATH.name}."], "")
+    if want in loaded:
+        return ([], f"'{want}' is loaded and ready.")
+    return ([], f"'{want}' is downloaded but not loaded — LM Studio will "
+                f"JIT-load it on the first caption request.")
+
+
 def _is_promoted(trip: Path) -> bool:
     audit = trip / ".audit" / "audit.jsonl"
     try:
@@ -285,10 +354,20 @@ class _ProcessLog:
     def __init__(self, path: Path) -> None:
         self.path = path
         self._off = 0
-        self.captioned = 0   # actual VLM calls this run (not cached)
+        self.attempted = 0   # `(VLM @ …)` lines: fresh VLM calls STARTED this run
+        self.failed = 0      # `caption… FAILED:` lines (VLM down/errored)
+        self.last_error = "" # most recent failure reason, for the dashboard
         self.assets = 0      # asset header lines seen
         self.last = ""       # most recent caption text
         self.recent: list[str] = []
+
+    @property
+    def captioned(self) -> int:
+        """Captions actually generated this run = fresh calls that didn't
+        fail. (Cached hits print `[cached, …]`, never `(VLM @`, so they're
+        correctly excluded.) Never negative if a FAILED line outraces its
+        attempt across a poll boundary."""
+        return max(0, self.attempted - self.failed)
 
     def poll(self) -> None:
         try:
@@ -308,7 +387,10 @@ class _ProcessLog:
             if s.startswith("[") and "]" in s and "/" in s.split("]", 1)[0]:
                 self.assets += 1
             elif "caption… (VLM @" in s:
-                self.captioned += 1
+                self.attempted += 1
+            elif "caption… FAILED:" in s:
+                self.failed += 1
+                self.last_error = s.split("FAILED:", 1)[1].strip()
             elif s.startswith("caption:") or 'caption: "' in s:
                 snip = s.split('caption:', 1)[1].strip().strip('"').rstrip("…").strip('"')
                 if snip:
@@ -348,7 +430,8 @@ def main() -> None:
     ap = argparse.ArgumentParser(description="Pipelined overnight process + parallel upload.")
     ap.add_argument("patterns", nargs="*", help="trip name(s)/glob(s); default: all pending")
     ap.add_argument("-P", "--promote-workers", type=int, default=4, help="concurrent upload streams (default 4)")
-    ap.add_argument("--captions", action="store_true", help="also run the LM Studio VLM captioner (slow)")
+    ap.add_argument("--captions", action="store_true", help="also run the LM Studio VLM captioner (slow); fills only never-captioned assets by default")
+    ap.add_argument("--recaption-all", action="store_true", help="with --captions: re-caption everything under the current model, even assets already captioned by a previous model (default: keep them)")
     ap.add_argument("--no-transcode", action="store_true", help="skip the 720p web transcode")
     ap.add_argument("--force", action="store_true", help="redo trips already promoted")
     ap.add_argument("--reprocess", action="store_true",
@@ -400,6 +483,25 @@ def main() -> None:
             print("nothing to upload — no processed trips pending.")
             return
 
+    # Captions need a live, correctly-loaded VLM. Without this gate a
+    # down/mismatched backend silently no-ops every caption yet the run
+    # still ends "Done" — the exact confusion this guard exists to kill.
+    if args.captions and not args.no_process:
+        reasons, note = _vlm_preflight()
+        if reasons:
+            print("captioner preflight FAILED — captions would be skipped:")
+            for r in reasons:
+                print(f"  ✗ {r}")
+            if os.environ.get("IMMY_SKIP_VLM_PREFLIGHT") == "1":
+                print("  (IMMY_SKIP_VLM_PREFLIGHT=1 set — continuing anyway)\n")
+            else:
+                print("\nRefusing to start a caption run against a dead backend. "
+                      "Fix the above, or set IMMY_SKIP_VLM_PREFLIGHT=1 to override.",
+                      file=sys.stderr)
+                sys.exit(2)
+        else:
+            print(f"captioner preflight OK — {note}")
+
     run_id = time.strftime("%Y%m%d-%H%M%S")
     run_dir = LOG_ROOT / f"overnight-{run_id}"
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -422,6 +524,11 @@ def main() -> None:
     proc_flags.append("--no-transcode" if args.no_transcode else "--transcode")
     if args.captions:
         proc_flags.append("--with-captions")
+        # Default: keep captions made by a previous model id, only fill the
+        # never-captioned ones — a captioner-model bump shouldn't redo work
+        # that's already good. `--recaption-all` opts into a full re-caption.
+        if not args.recaption_all:
+            proc_flags.append("--captions-fill-missing")
     if args.reprocess:
         # --force re-runs every trip; the per-asset journal still skips phases
         # already done, so this only fills the missing CLIP/faces/captions.
@@ -582,9 +689,14 @@ def main() -> None:
                         live = (t, hb)
                 cached = sum(_offline_count(t) for t in to_process)
                 state = "running" if not proc_done else "done"
+                fail_str = f"  ·  {plog.failed} FAILED" if plog.failed else ""
                 lines.append(
-                    f"[{stamp}] captions {state}  ·  {plog.captioned} generated  ·  "
+                    f"[{stamp}] captions {state}  ·  {plog.captioned} generated{fail_str}  ·  "
                     f"{cached} assets cached  ·  {len(to_process)} trips")
+                if plog.failed and plog.last_error:
+                    # If captions are failing, the reason is the headline —
+                    # not buried in a log nobody opens.
+                    lines.append(f"    ✗ last caption error: {plog.last_error}")
                 if live:
                     t, hb = live
                     age = int(hb.get("_age", 0))
@@ -656,7 +768,19 @@ def main() -> None:
     if args.no_upload:
         rc = process_proc.poll() if process_proc else 0
         state = "completed" if rc == 0 else f"exited rc={rc}"
+        plog.poll()  # drain any tail written after the loop's last poll
         print(f"\n\nDone (CPU only). process stage {state}.  logs {run_dir}")
+        if args.captions:
+            # "completed" only means the child exited — it says nothing about
+            # whether captions were actually written. Report the real split.
+            print(f"  captions: {plog.captioned} generated, {plog.failed} failed "
+                  f"(of {plog.attempted} attempted).")
+            if plog.failed:
+                print(f"  ✗ {plog.failed} caption(s) failed — last reason: "
+                      f"{plog.last_error or 'see process.log'}")
+            if plog.failed and plog.captioned == 0:
+                print("  ⚠ ZERO captions generated despite a clean exit — the "
+                      "backend is down or misconfigured; nothing was captioned.")
     else:
         for t in trips:
             meter.update(t, run_dir / f"promote-{t.name}.log")
