@@ -391,6 +391,40 @@ def test_caption_workers_rechecks_user_text_before_recording(tmp_path: Path, mon
     assert sum(1 for rec in j.entries.values() if "caption" in rec) == 0
 
 
+def test_caption_workers_ticks_heartbeat(tmp_path: Path, monkeypatch):
+    """The pool must refresh the per-trip heartbeat on every completion, else
+    its age climbs past the overnight dashboard's 120s 'stuck?' threshold even
+    while captions stream in. Also confirms the progress bar tracks captions
+    (index/total = jobs), not the prior derivatives scan count."""
+    from immy.heartbeat import Heartbeat
+
+    target = tmp_path / "clock-drift-simple"
+    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+    monkeypatch.setattr(process_mod.captions_mod, "caption",
+                        _fake_caption_factory([]))
+
+    ticks: list[tuple] = []
+    real_write = Heartbeat.write
+
+    def _spy(self, **kw):
+        if kw.get("step") == "caption" and "index" in kw:
+            ticks.append((kw.get("index"), kw.get("total")))
+        return real_write(self, **kw)
+
+    monkeypatch.setattr(Heartbeat, "write", _spy)
+
+    sink = offline_mod.OfflineSink(target, LIB)
+    process_mod.process_trip(
+        target, None, LIB, sink=sink,
+        compute_captions=True, captioner_config=_CFG, caption_workers=2,
+    )
+
+    # Initial tick at 0/4, then one per completion up to 4/4; total stays 4.
+    assert (0, 4) in ticks
+    assert max(i for i, _ in ticks) == 4
+    assert all(t == 4 for _, t in ticks)
+
+
 def test_derive_container_root_from_marker(tmp_path: Path):
     trip = tmp_path / "2024-02-chile"
     (trip / ".audit").mkdir(parents=True)

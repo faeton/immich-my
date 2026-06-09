@@ -1268,16 +1268,25 @@ def process_trip(
                 "completion_tokens": result.completion_tokens,
             }
 
-        hb.write(step="caption")
+        hb.write(step="caption", index=0, total=len(caption_jobs), file="")
         _emit(
             f"  ⠿ captioning {len(caption_jobs)} asset(s) "
             f"with {caption_workers} workers (VLM @ {captioner_config.model})"
         )
         ex = ThreadPoolExecutor(max_workers=caption_workers)
         futs = {ex.submit(_vlm_only, j): j for j in caption_jobs}
+        done = 0
         try:
             for fut in as_completed(futs):
                 job = futs[fut]
+                # Tick the heartbeat on every completion (success, failure, or
+                # skip) so external watchers + the overnight dashboard see the
+                # pool is live — without this the file's age climbs past the
+                # 120s "stuck?" threshold even while captions stream in — and
+                # so the progress bar tracks captions, not the prior scan.
+                done += 1
+                hb.write(step="caption", index=done,
+                        total=len(caption_jobs), file=job.media.name)
                 try:
                     info = fut.result()
                 except Exception as e:
