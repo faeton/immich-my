@@ -439,7 +439,18 @@ class _ProcessLog:
             self.failed += 1
             self.last_error = s.split("FAILED:", 1)[1].strip()
         elif s.startswith("caption:") or 'caption: "' in s:
-            snip = s.split('caption:', 1)[1].strip().strip('"').rstrip("…").strip('"')
+            # The line is the per-asset summary: `→ … | caption: "snippet…"
+            # (0.5s)`. Pull the FIRST double-quoted span after `caption:` so
+            # the trailing ` (0.5s)` timing and any sibling parts are dropped;
+            # keep the `…` since it signals the snippet was truncated at 60c.
+            after = s.split('caption:', 1)[1]
+            i = after.find('"')
+            if i != -1:
+                j = after.find('"', i + 1)
+                snip = after[i + 1: j] if j != -1 else after[i + 1:]
+            else:
+                snip = after  # no quotes (legacy/standalone form)
+            snip = snip.strip()
             if snip:
                 self.last = snip
 
