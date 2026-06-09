@@ -215,6 +215,12 @@ IMMY_CAPTIONER_MODEL=qwen2.5-vl-7b-instruct \
   .venv/bin/immy process ~/Media/Trips/<trip> --with-captions
 ```
 
+Captions are journaled per model id (`caption:<model>`), so a swap
+re-captions the whole trip by default. If you only want to fill gaps and
+keep the captions made by the previous model, add `--captions-fill-missing`
+(the `tools/overnight.py --captions` wrapper passes this by default; use
+`tools/overnight.py --recaption-all` to force a full re-caption).
+
 Env vars win over `config.yml`. Supported overrides:
 
 - `IMMY_CAPTIONER_ENDPOINT`
@@ -237,3 +243,12 @@ Env vars win over `config.yml`. Supported overrides:
   LM Studio's load dialog to 8192 or 16384.
 - **Postgres connection refused** — Immich's compose stack isn't
   running on the NAS, or the SSH tunnel to port 15432 is down.
+- **`captioner preflight FAILED`** (from `tools/overnight.py --captions`)
+  — the wrapper probes the VLM before starting and refuses to run if the
+  endpoint is unreachable or the configured model isn't downloaded, so a
+  dead backend can't silently no-op every caption while still reporting
+  "Done". Fix the cause, or set `IMMY_SKIP_VLM_PREFLIGHT=1` to override.
+  An unloaded-but-downloaded model is fine — LM Studio JIT-loads it.
+- **Run ends with `⚠ ZERO captions generated despite a clean exit`** —
+  every caption call failed (look for `caption… FAILED:` in `process.log`);
+  the VLM went down mid-run or the model errors on every image.

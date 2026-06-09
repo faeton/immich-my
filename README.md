@@ -43,9 +43,9 @@ uv run pytest
 
 ## Batch wrappers
 
-Two non-interactive batch scripts under `tools/` wrap `immy` for
-overnight runs over every trip under `~/Media/Trips`. Both preflight,
-log to `~/.immy/*-logs/`, and skip work already done:
+Non-interactive batch wrappers under `tools/` drive `immy` over every
+trip under `~/Media/Trips`. They preflight, log to `~/.immy/*-logs/`,
+and skip work already done:
 
 - `tools/process-all-trips.sh` — runs the full `immy process` pipeline
   (derivatives + CLIP + faces + transcripts + captions). Defaults to
@@ -57,6 +57,17 @@ log to `~/.immy/*-logs/`, and skip work already done:
   `rsync --partial --append --inplace`, so a dropped connection on a
   multi-GB video resumes on rerun rather than restarting. Skips trips
   already logged as promoted.
+- `tools/overnight.py` — pipelined wrapper that overlaps a single
+  `immy process` stream with a parallel `immy promote` upload pool, so
+  the laptop transcodes trip B while trip A uploads. `--captions` runs
+  the VLM captioner (and preflights LM Studio first — it refuses to start
+  if the endpoint is down or the model isn't downloaded, rather than
+  silently captioning nothing); by default it fills only never-captioned
+  assets across a model swap (`--recaption-all` forces a full re-caption).
+  `--reprocess` revisits every trip to backfill missing phases;
+  `--no-upload` / `--no-process` split the CPU and network sides;
+  `--status` reports only. A live dashboard shows per-trip progress and
+  truthful caption generated/failed counts.
 
 Local prerequisites:
 - `exiftool`

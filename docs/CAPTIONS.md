@@ -56,6 +56,17 @@ edits — swap `IMMY_CAPTIONER_ENDPOINT` / `IMMY_CAPTIONER_MODEL` per trip.
   resume). Pass `--recaption` to force regeneration. Offline mode uses
   a tighter guard — `prior_caption.model == config.model` — so model
   upgrades still fire.
+- `--captions-fill-missing` flips that last behavior: an asset that
+  already has a caption from **any** model (read from the per-trip
+  journal, or the offline cache) is kept, and only never-captioned
+  assets hit the VLM. Use it when a model swap shouldn't redo work
+  that's already good. `--recaption` still overrides it. Captions with
+  empty/whitespace text are never treated as "already done" — they fall
+  through to the VLM.
+- A caption call that errors no longer fails silently: with the default
+  `on_caption_error=skip`, `immy process` logs `caption… FAILED: <reason>`
+  (e.g. a connection error to a down VLM) so a run can't report success
+  while writing zero captions.
 
 ## Making captions searchable
 
@@ -132,6 +143,12 @@ The `AI: ` prefix is stable across models. To swap models mid-project,
 edit `captioner.model` in config.yml or pass `IMMY_CAPTIONER_MODEL=…`
 and re-run `immy process --with-captions`. Only AI-captioned and empty
 descriptions are overwritten; user text survives.
+
+The per-trip journal keys captions as `caption:<model-id>`, so by default
+a model swap marks every prior caption stale and re-captions the whole
+trip — what you want for a quality upgrade, expensive when you only meant
+to fill gaps. Add `--captions-fill-missing` to keep captions from a prior
+model and caption only never-captioned assets instead.
 
 `.audit/process.yml` records the model name alongside each caption so
 you can audit which images were captioned by which backend:
