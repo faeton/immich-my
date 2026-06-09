@@ -476,6 +476,20 @@ class ProcessResult:
     caption: dict | None = None  # {"text": str, "model": str, "prompt_tokens", "completion_tokens"}
 
 
+@dataclass
+class _CaptionJob:
+    """A deferred VLM caption, collected during the sequential pass and run
+    later through the caption worker pool (only when caption_workers > 1).
+    `result_idx` is the index into the trip's `results` list whose `.caption`
+    the pool patches once the call returns."""
+    result_idx: int
+    asset_id: str
+    cs_hex: str
+    media: Path
+    preview: Path | None
+    require_preview: bool
+
+
 def process_trip(
     trip_folder: Path,
     conn: psycopg.Connection | None,
@@ -490,6 +504,7 @@ def process_trip(
     recaption: bool = False,
     caption_fill_missing_only: bool = False,
     captioner_config: captions_mod.CaptionerConfig | None = None,
+    caption_workers: int = 1,
     transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
     faces_model: str = faces_mod.DEFAULT_MODEL,
@@ -526,12 +541,14 @@ def process_trip(
     rows = read_folder(trip_folder)
 
     # DJI drones write every clip as a paired `.MP4` master + `.LRF`
-    # low-res proxy sharing a stem. The LRF is not user-visible content
-    # — it's there to accelerate ffmpeg decode of the master. Drop
-    # paired LRFs from ingest entirely; unpaired orphans fall through
-    # (the user should see them as normal so they can investigate).
+    # low-res proxy sharing a stem. The LRF is never a library asset:
+    # for a paired LRF the master carries the content (and gets its own
+    # 720 px transcode), and an orphan LRF is a stray low-res proxy with
+    # no content of its own. Drop *all* LRFs from ingest. The proxy
+    # index is built first, from the full file list, so paired masters
+    # still find their sibling LRF to accelerate ffmpeg decode.
     dji_proxy_index = dji_mod.build_proxy_index(r.path for r in rows)
-    rows = [r for r in rows if not dji_mod.is_paired_proxy(r.path, dji_proxy_index)]
+    rows = [r for r in rows if not dji_mod.is_proxy(r.path)]
 
     # Cameras in RAW+JPEG mode (DJI Mavic, Sony α, Canon, Nikon, Fuji)
     # write `<stem>.DNG/ARW/CR3/…` plus `<stem>.JPG` — the JPG is the
@@ -601,6 +618,20 @@ def process_trip(
     def _emit(msg: str) -> None:
         if progress is not None:
             progress(msg)
+
+    # Caption worker pool (opt-in): when caption_workers > 1 the per-asset
+    # VLM call is deferred into `caption_jobs` and run concurrently after the
+    # sequential pass — LM Studio batches the requests, filling the GPU idle
+    # gaps between images. The default (workers == 1) keeps the inline
+    # synchronous path untouched. Only the HTTP call runs off-thread; every
+    # sink/journal/results mutation stays on this thread (see the pool block
+    # after the loop), so no locks are needed.
+    parallel_captions = (
+        caption_workers > 1
+        and compute_captions
+        and captioner_config is not None
+    )
+    caption_jobs: list[_CaptionJob] = []
 
     # Heartbeat: live `.audit/.progress` file external watchers can read
     # (e.g. tools/promote-all-trips.sh's Ctrl+T trap). One write per file
@@ -1097,7 +1128,33 @@ def process_trip(
                 caption_info.setdefault("cached", True)
                 _emit(f"    caption… [kept, prior {prior_caption.get('model', '?')}]")
 
-        if caption_eligible and caption_info is None:
+        if caption_eligible and caption_info is None and parallel_captions:
+            # Parallel path: defer the VLM call to the post-loop pool. Hoist
+            # the two guards `_process_caption` applies before its HTTP call
+            # (lines below) so we never queue a job that would no-op — that
+            # keeps the `(VLM @)` attempt count honest for the overnight
+            # dashboard (which derives `captioned = attempted - failed`).
+            existing = sink.get_description(asset.id)
+            if existing and not captions_mod.is_ai_description(existing):
+                pass  # user-typed / Whisper description wins — nothing to do
+            elif asset.asset_type == "VIDEO" and (
+                caption_preview is None or not caption_preview.is_file()
+            ):
+                pass  # video with no poster still — nothing safe to caption
+            else:
+                # `results.append(...)` for THIS asset is the very next
+                # statement, so its index is the current len(results).
+                caption_jobs.append(_CaptionJob(
+                    result_idx=len(results),
+                    asset_id=asset.id,
+                    cs_hex=cs_hex,
+                    media=exif_row.path,
+                    preview=caption_preview,
+                    require_preview=asset.asset_type == "VIDEO",
+                ))
+            # caption_info stays None for now; the summary line below omits
+            # the caption and the pool patches results[idx].caption later.
+        elif caption_eligible and caption_info is None:
             _emit(f"    caption… (VLM @ {captioner_config.model})")
             try:
                 caption_info = _phase(
@@ -1181,6 +1238,95 @@ def process_trip(
                 journal.flush()
                 raise
         journal.flush()
+
+    # --- caption worker pool (only when caption_workers > 1) ---------------
+    # The sequential pass above did everything but the VLM calls; run them
+    # now, N at a time, against the (batching) LM Studio endpoint. Workers
+    # touch ONLY `captions.caption()` (pure HTTP); every sink/journal/results
+    # mutation below runs on this thread as each future completes, so the
+    # not-thread-safe journal needs no lock. Captions land in completion
+    # order (not asset order); a Ctrl-C drops the still-running ones, which
+    # simply regenerate on resume (their journal `caption` entry is absent).
+    if parallel_captions and caption_jobs:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
+        def _vlm_only(job: _CaptionJob) -> dict | None:
+            # Pure: HTTP + the same poster guard `_process_caption` applies.
+            # Re-check the preview here too — it can vanish between the
+            # sequential pass and this call. No sink/journal access.
+            if job.require_preview and (
+                job.preview is None or not job.preview.is_file()
+            ):
+                return None
+            result = captions_mod.caption(
+                job.media, config=captioner_config, preview=job.preview,
+            )
+            return {
+                "text": result.text,
+                "model": result.model,
+                "prompt_tokens": result.prompt_tokens,
+                "completion_tokens": result.completion_tokens,
+            }
+
+        hb.write(step="caption")
+        _emit(
+            f"  ⠿ captioning {len(caption_jobs)} asset(s) "
+            f"with {caption_workers} workers (VLM @ {captioner_config.model})"
+        )
+        ex = ThreadPoolExecutor(max_workers=caption_workers)
+        futs = {ex.submit(_vlm_only, j): j for j in caption_jobs}
+        try:
+            for fut in as_completed(futs):
+                job = futs[fut]
+                try:
+                    info = fut.result()
+                except Exception as e:
+                    if on_caption_error == "raise":
+                        raise
+                    # Pair the attempt + FAILED lines on the main thread so
+                    # the overnight tail counts attempted/failed correctly.
+                    _emit(f"    caption… (VLM @ {captioner_config.model})")
+                    reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
+                    _emit(f"    caption… FAILED: {reason}")
+                    continue
+                if not info:
+                    # Poster vanished after the sequential-pass guard — no
+                    # call was made, so emit nothing (keep the count honest).
+                    continue
+                # Re-check the user-text guard on the main thread: a non-AI
+                # description (hand edit / Whisper excerpt / concurrent sync)
+                # may have landed between the sequential-pass enqueue and now.
+                # The sequential path re-reads inside `_process_caption` right
+                # before its call; mirror that here so we don't journal/count a
+                # caption whose write `update_description_if_ai_or_empty` would
+                # silently no-op. This read is serialized with the writes below
+                # (all main-thread), so it stays safe for the online sink too.
+                existing = sink.get_description(job.asset_id)
+                if existing and not captions_mod.is_ai_description(existing):
+                    continue  # user/Whisper text wins — don't record or count
+                _emit(f"    caption… (VLM @ {captioner_config.model})")
+                description = captions_mod.format_description(info["text"])
+                sink.update_description_if_ai_or_empty(job.asset_id, description)
+                sink.record_caption(job.asset_id, info)
+                journal.mark_done(
+                    job.cs_hex, "caption", CAPTION_VERSION, meta=info,
+                )
+                results[job.result_idx].caption = info
+                snippet = info["text"][:60].replace("\n", " ")
+                _emit(f'    {job.media.name} | caption: "{snippet}…"')
+                if commit_per_asset:
+                    sink.commit()
+                journal.flush()
+        except KeyboardInterrupt:
+            # Cancel queued work; threads already inside a urllib call can't
+            # be force-stopped (they unwind on their own timeout). Persist
+            # whatever already committed, then propagate.
+            ex.shutdown(wait=False, cancel_futures=True)
+            journal.flush()
+            raise
+        finally:
+            ex.shutdown(wait=False)
+
     # Successful exit: drop the heartbeat. On exception we deliberately
     # leave the last-known state on disk — `updated_at` tells watchers
     # the run died, and the file pinpoints which asset was in flight.
@@ -1430,9 +1576,10 @@ def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
     caller can log a skip without re-walking.
 
     The check is one `stat()` per file — orders of magnitude cheaper than
-    `read_folder()` (which spawns exiftool over every file). Paired DJI
-    `.LRF` proxies are filtered before counting because they aren't
-    ingested as standalone assets, so the marker doesn't list them.
+    `read_folder()` (which spawns exiftool over every file). All DJI
+    `.LRF` proxies (paired and orphan) are filtered before counting
+    because they're never ingested as standalone assets, so the marker
+    doesn't list them — this must match `process_trip`'s ingest filter.
 
     Trusts the marker. If a file is hand-edited without bumping mtime, a
     re-run will skip it; pass `--force` (or delete the marker) to redo.
@@ -1449,8 +1596,7 @@ def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
         return False, 0
     expected = marker.get("assets") or []
     files = list(_iter_media(trip_folder))
-    proxy_index = _dji.build_proxy_index(files)
-    files = [f for f in files if not _dji.is_paired_proxy(f, proxy_index)]
+    files = [f for f in files if not _dji.is_proxy(f)]
     raw_index = _raw.build_raw_index(files)
     files = [f for f in files if not _raw.is_paired_preview(f, raw_index)]
     if len(files) != len(expected):

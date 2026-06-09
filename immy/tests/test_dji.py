@@ -33,8 +33,9 @@ def test_classify_unknown_returns_none():
 
 
 def test_build_proxy_index_pairs_by_stem():
-    # Orphan LRFs are intentionally dropped from the index so they
-    # stay in the ingest row list and the user sees them.
+    # Orphan LRFs are excluded from the index because there's no master
+    # to accelerate. (Ingest drops them too — see is_proxy — but that's
+    # a separate concern from this paired-only acceleration index.)
     paths = [
         Path("/trip/DJI_20250614122012_0002_D.MP4"),
         Path("/trip/DJI_20250614122012_0002_D.LRF"),
@@ -92,19 +93,19 @@ def test_pairing_is_directory_scoped():
     assert dji.proxy_for(Path("/trip-a/DJI_0001.MP4"), idx) is None
 
 
-def test_is_paired_proxy_true_for_paired_lrf():
-    paths = [
-        Path("/trip/DJI_0001.MP4"),
-        Path("/trip/DJI_0001.LRF"),
-    ]
-    idx = dji.build_proxy_index(paths)
-    assert dji.is_paired_proxy(Path("/trip/DJI_0001.LRF"), idx) is True
+def test_is_proxy_true_for_paired_lrf():
+    # A paired LRF is dropped at ingest — the master MP4 is the asset.
+    assert dji.is_proxy(Path("/trip/DJI_0001.LRF")) is True
+    assert dji.is_proxy(Path("/trip/DJI_0001.lrf")) is True
 
 
-def test_is_paired_proxy_false_for_orphan_lrf():
-    # Orphan LRF with no matching master is dropped from the index,
-    # so is_paired_proxy returns False — the caller keeps it in the
-    # row list so the user can see the stray proxy.
-    paths = [Path("/trip/DJI_0001.LRF")]
-    idx = dji.build_proxy_index(paths)
-    assert dji.is_paired_proxy(Path("/trip/DJI_0001.LRF"), idx) is False
+def test_is_proxy_true_for_orphan_lrf():
+    # An orphan LRF (no master) is also dropped — it's a stray low-res
+    # proxy with no content of its own, never a library asset.
+    assert dji.is_proxy(Path("/trip/DJI_0001.LRF")) is True
+
+
+def test_is_proxy_false_for_master_and_image():
+    assert dji.is_proxy(Path("/trip/DJI_0001.MP4")) is False
+    assert dji.is_proxy(Path("/trip/DJI_0001.MOV")) is False
+    assert dji.is_proxy(Path("/trip/IMG_0001.jpg")) is False

@@ -54,10 +54,11 @@ def build_proxy_index(
     """Map `(parent, stem_lower)` → LRF path, but only for pairs where
     a sibling `.mp4`/`.mov` master also exists.
 
-    Orphan LRFs (no matching master in the same directory) are
-    intentionally excluded so `is_paired_proxy` returns False for them
-    — the caller keeps them in the row list so the user can see and
-    investigate stray proxies.
+    This index drives transcode *acceleration* (`proxy_for`): a master
+    looks itself up to find the sibling LRF ffmpeg should decode from.
+    Orphan LRFs (no matching master) are excluded because there's no
+    master to accelerate. Ingest-time dropping of LRFs is a separate
+    concern — see `is_proxy`, which drops paired and orphan alike.
 
     If two LRFs somehow share a key the first by sort order wins,
     matching the Insta360 helper's behavior.
@@ -90,18 +91,16 @@ def proxy_for(
     return index.get(hit[1])
 
 
-def is_paired_proxy(
-    path: Path, index: dict[tuple[str, str], Path],
-) -> bool:
-    """True if `path` is an LRF proxy that has a sibling master in the
-    index — i.e. it should be skipped at ingest time because the master
-    carries the content and the LRF only exists to accelerate ffmpeg.
+def is_proxy(path: Path) -> bool:
+    """True if `path` is a DJI `.LRF` proxy — paired or orphan.
 
-    An orphan LRF (no matching MP4 in the same directory) returns False
-    — callers may still want to surface it so the user notices stray
-    proxies, but it won't be in `index` either way.
+    LRFs never belong in the library: a paired LRF is just a low-res
+    decode accelerator for its master MP4 (which is the real asset and
+    still gets its own 720 px playback transcode), and an orphan LRF is
+    a stray proxy with no content of its own. Both are dropped at
+    ingest. The transcode acceleration is unaffected — `proxy_for` reads
+    the proxy index, which is built from the full file list *before* this
+    drop, so a master still finds its sibling LRF to decode from.
     """
     hit = classify(path)
-    if hit is None or hit[0] != "proxy":
-        return False
-    return hit[1] in index
+    return hit is not None and hit[0] == "proxy"

@@ -947,6 +947,7 @@ def _run_one_trip(
     caption_fill_missing_only: bool,
     transcode_videos: bool,
     captioner_config,
+    caption_workers: int,
     clip_model: str,
     transcript_model: str,
     transcript_prompt: str | None,
@@ -992,12 +993,12 @@ def _run_one_trip(
         from . import dji as _dji
         from . import raw as _raw
         rows = _read(folder)
-        # Match process_trip's filter: paired DJI `.LRF` proxies are
-        # consumed as ffmpeg input for their master, not ingested as
-        # standalone assets. Same for camera-baked JPEG previews next
-        # to a sibling RAW (DJI DNG+JPG, Sony ARW+JPG, …).
-        _dji_idx = _dji.build_proxy_index(r.path for r in rows)
-        rows = [r for r in rows if not _dji.is_paired_proxy(r.path, _dji_idx)]
+        # Match process_trip's filter: all DJI `.LRF` proxies are
+        # dropped (paired ones are consumed as ffmpeg input for their
+        # master; orphans are stray low-res proxies) — never ingested as
+        # standalone assets. Same for camera-baked JPEG previews next to
+        # a sibling RAW (DJI DNG+JPG, Sony ARW+JPG, …).
+        rows = [r for r in rows if not _dji.is_proxy(r.path)]
         _raw_idx = _raw.build_raw_index(r.path for r in rows)
         rows = [r for r in rows if not _raw.is_paired_preview(r.path, _raw_idx)]
         console.print(f"[yellow]dry-run[/yellow] would process {len(rows)} file(s)")
@@ -1027,6 +1028,7 @@ def _run_one_trip(
             recaption=recaption,
             caption_fill_missing_only=caption_fill_missing_only,
             captioner_config=captioner_config,
+            caption_workers=caption_workers,
             transcode_videos=transcode_videos,
             clip_model=clip_model,
             transcript_model=transcript_model,
@@ -1107,6 +1109,10 @@ def process(
     captions_fill_missing: bool = typer.Option(
         False, "--captions-fill-missing",
         help="Caption only assets with NO caption yet (any model). Keeps captions made by a previous model id intact across a captioner-model bump, instead of redoing them. Ignored under --recaption.",
+    ),
+    caption_workers: int = typer.Option(
+        1, "--caption-workers",
+        help="Concurrent VLM caption requests per trip (default 1 = sequential). >1 fans the HTTP calls across a thread pool — LM Studio batches them, filling the GPU idle gaps between images (~1.3x at 2, ~1.6x at 3). Only the caption call is parallelized; derivatives/CLIP/faces stay sequential.",
     ),
     transcode_videos: bool = typer.Option(
         True, "--transcode/--no-transcode",
@@ -1256,8 +1262,9 @@ def process(
     if with_transcripts:
         phases.append("transcripts")
     if with_captions:
+        workers_note = f", {caption_workers}w" if caption_workers > 1 else ""
         phases.append(
-            f"captions({captioner_config.model if captioner_config else '?'})"
+            f"captions({captioner_config.model if captioner_config else '?'}{workers_note})"
         )
     if shared_library is not None:
         console.print(
@@ -1305,6 +1312,7 @@ def process(
                 caption_fill_missing_only=captions_fill_missing,
                 transcode_videos=transcode_videos,
                 captioner_config=captioner_config,
+                caption_workers=caption_workers,
                 clip_model=clip_model,
                 transcript_model=transcript_model,
                 transcript_prompt=transcript_prompt,

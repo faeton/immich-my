@@ -488,6 +488,8 @@ def main() -> None:
     ap.add_argument("patterns", nargs="*", help="trip name(s)/glob(s); default: all pending")
     ap.add_argument("-P", "--promote-workers", type=int, default=4, help="concurrent upload streams (default 4)")
     ap.add_argument("--captions", action="store_true", help="also run the LM Studio VLM captioner (slow); fills only never-captioned assets by default")
+    ap.add_argument("--caption-workers", type=int, default=1, metavar="N",
+                    help="with --captions: run N concurrent VLM requests per trip (default 1). LM Studio batches them, filling GPU idle gaps (~1.3x at 2, ~1.6x at 3); derivatives/CLIP/faces stay sequential")
     ap.add_argument("--recaption-all", action="store_true", help="with --captions: re-caption everything under the current model, even assets already captioned by a previous model (default: keep them)")
     ap.add_argument("--no-transcode", action="store_true", help="skip the 720p web transcode")
     ap.add_argument("--force", action="store_true", help="redo trips already promoted")
@@ -564,7 +566,7 @@ def main() -> None:
 
     sizes = {t.name: _size_gb(t) for t in trips}
     total_gb = sum(sizes.values())
-    cap = "  +captions" if args.captions else ""
+    cap = ("  +captions" + (f"×{args.caption_workers}" if args.caption_workers > 1 else "")) if args.captions else ""
     tc = "no-transcode" if args.no_transcode else "transcode"
     if args.no_upload:
         mode = f"CPU only · 1 process ({tc}{cap}), no upload"
@@ -580,6 +582,8 @@ def main() -> None:
     proc_flags.append("--no-transcode" if args.no_transcode else "--transcode")
     if args.captions:
         proc_flags.append("--with-captions")
+        if args.caption_workers > 1:
+            proc_flags += ["--caption-workers", str(args.caption_workers)]
         # Default: keep captions made by a previous model id, only fill the
         # never-captioned ones — a captioner-model bump shouldn't redo work
         # that's already good. `--recaption-all` opts into a full re-caption.

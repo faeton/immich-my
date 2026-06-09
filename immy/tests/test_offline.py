@@ -21,8 +21,10 @@ from unittest.mock import MagicMock
 import pytest
 import yaml
 
+from immy import captions as captions_mod
 from immy import offline as offline_mod
 from immy import process as process_mod
+from immy.journal import Journal
 from immy.pg import LibraryInfo
 
 
@@ -216,6 +218,177 @@ def test_sync_does_not_clobber_concurrent_caption(tmp_path: Path):
     # And a follow-up drain pushes it.
     summary = offline_mod.sync_trip(target, conn, library=LIB)
     assert summary["synced"] == 1
+
+
+# --- Phase 3b parallel caption pool (--caption-workers > 1) ----------------
+
+_CFG = captions_mod.CaptionerConfig(endpoint="http://test.invalid/v1", model="test-vlm")
+
+
+def _fake_caption_factory(calls: list[str], fail_on: tuple[str, ...] = ()):
+    """A stand-in for `captions.caption` that encodes the source filename in
+    the text, so a wrong result_idx mapping (caption on the wrong asset)
+    fails the assertion. Records every call for concurrency/idempotence
+    assertions; raises for names in `fail_on` to exercise the skip path."""
+    def _fake(media, *, config, preview=None):
+        name = Path(media).name
+        calls.append(name)
+        if name in fail_on:
+            raise captions_mod.CaptionError(f"boom {name}")
+        return captions_mod.CaptionResult(
+            text=f"desc::{name}", model=config.model,
+            prompt_tokens=1, completion_tokens=2,
+        )
+    return _fake
+
+
+def _descriptions_by_name(target: Path) -> dict[str, str]:
+    out: dict[str, str] = {}
+    for p in (target / ".audit" / "offline").glob("*.yml"):
+        data = yaml.safe_load(p.read_text())
+        name = Path(data["asset"]["original_path"]).name
+        out[name] = (data.get("exif") or {}).get("description")
+    return out
+
+
+def test_caption_workers_parallel_records_each_asset(tmp_path: Path, monkeypatch):
+    """N>1 fans the VLM calls across a pool yet lands each caption on the
+    correct asset (result_idx mapping), persists it to the offline YAML, and
+    marks the journal so a resume skips it."""
+    target = tmp_path / "clock-drift-simple"
+    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+    calls: list[str] = []
+    monkeypatch.setattr(process_mod.captions_mod, "caption",
+                        _fake_caption_factory(calls))
+
+    sink = offline_mod.OfflineSink(target, LIB)
+    results = process_mod.process_trip(
+        target, None, LIB, sink=sink,
+        compute_captions=True, captioner_config=_CFG, caption_workers=3,
+    )
+
+    imgs = {Path(r.container_path).name: r for r in results
+            if Path(r.container_path).name.endswith(".JPG")}
+    assert len(imgs) == 4
+    # Each result carries ITS OWN caption (mapping is correct, not crossed).
+    for name, r in imgs.items():
+        assert r.caption is not None and r.caption["text"] == f"desc::{name}"
+    # Every eligible image hit the VLM exactly once, in parallel.
+    assert sorted(calls) == sorted(imgs)
+    # Persisted to the offline cache with the AI: prefix.
+    descs = _descriptions_by_name(target)
+    for name in imgs:
+        assert descs[name] == f"AI: desc::{name}"
+
+    # Resume: a second pass over the same trip must skip every caption
+    # (journal marked done) — no new VLM calls.
+    calls.clear()
+    sink2 = offline_mod.OfflineSink(target, LIB)
+    process_mod.process_trip(
+        target, None, LIB, sink=sink2,
+        compute_captions=True, captioner_config=_CFG, caption_workers=3,
+    )
+    assert calls == [], "captions already journaled must not re-run"
+
+
+def test_caption_workers_parallel_matches_sequential(tmp_path: Path, monkeypatch):
+    """The parallel pool (N=3) produces the same per-asset descriptions as
+    the untouched sequential path (N=1)."""
+    def _run(workers: int) -> dict[str, str]:
+        target = tmp_path / f"trip-{workers}"
+        shutil.copytree(FIXTURES / "clock-drift-simple", target)
+        monkeypatch.setattr(process_mod.captions_mod, "caption",
+                            _fake_caption_factory([]))
+        sink = offline_mod.OfflineSink(target, LIB)
+        process_mod.process_trip(
+            target, None, LIB, sink=sink,
+            compute_captions=True, captioner_config=_CFG, caption_workers=workers,
+        )
+        return _descriptions_by_name(target)
+
+    assert _run(1) == _run(3)
+
+
+def test_caption_workers_pool_isolates_failures(tmp_path: Path, monkeypatch):
+    """A VLM error on one asset (on_caption_error='skip', the default) must
+    not abort the pool: the other assets still get captioned, and the failed
+    one is left without a caption (regenerated on a later run)."""
+    target = tmp_path / "clock-drift-simple"
+    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+    calls: list[str] = []
+    monkeypatch.setattr(process_mod.captions_mod, "caption",
+                        _fake_caption_factory(calls, fail_on=("DSC_0002.JPG",)))
+
+    sink = offline_mod.OfflineSink(target, LIB)
+    results = process_mod.process_trip(
+        target, None, LIB, sink=sink,
+        compute_captions=True, captioner_config=_CFG, caption_workers=3,
+    )
+
+    by_name = {Path(r.container_path).name: r for r in results}
+    assert by_name["DSC_0002.JPG"].caption is None       # failed → no caption
+    for name in ("DSC_0001.JPG", "DSC_0003.JPG", "DSC_0004.JPG"):
+        assert by_name[name].caption["text"] == f"desc::{name}"
+    # The failed asset has no journal caption entry, so a rerun retries it.
+    j = Journal.load(target)
+    caption_workers_done = sum(
+        1 for rec in j.entries.values() if "caption" in rec
+    )
+    assert caption_workers_done == 3
+    # And on disk: the failed asset's entry has no description and no caption
+    # block — nothing was half-written for it.
+    for p in (target / ".audit" / "offline").glob("*.yml"):
+        data = yaml.safe_load(p.read_text())
+        if Path(data["asset"]["original_path"]).name == "DSC_0002.JPG":
+            assert not (data.get("exif") or {}).get("description")
+            assert "caption" not in data
+
+
+def test_caption_workers_rechecks_user_text_before_recording(tmp_path: Path, monkeypatch):
+    """The TOCTOU guard: a non-AI description (hand edit / Whisper / concurrent
+    sync) that lands AFTER the sequential-pass enqueue but before the pool
+    records must NOT be journaled or counted as an AI caption — matching the
+    sequential path, which re-reads `get_description` right before its call.
+    We simulate that by flipping `get_description` to return user text once the
+    pool starts: phase 1 sees empty (enqueues + calls the VLM), phase 3 sees
+    the user text and skips recording."""
+    target = tmp_path / "clock-drift-simple"
+    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+
+    sink = offline_mod.OfflineSink(target, LIB)
+    real_get = sink.get_description
+    state = {"in_pool": False}
+    calls: list[str] = []
+
+    def _fake_get(asset_id: str):
+        # Once the pool is running, pretend a user description appeared.
+        return "hand-typed note" if state["in_pool"] else real_get(asset_id)
+
+    def _fake_caption(media, *, config, preview=None):
+        state["in_pool"] = True  # we're now past the sequential pass
+        calls.append(Path(media).name)
+        return captions_mod.CaptionResult(
+            text=f"desc::{Path(media).name}", model=config.model,
+            prompt_tokens=1, completion_tokens=2,
+        )
+
+    monkeypatch.setattr(sink, "get_description", _fake_get)
+    monkeypatch.setattr(process_mod.captions_mod, "caption", _fake_caption)
+
+    results = process_mod.process_trip(
+        target, None, LIB, sink=sink,
+        compute_captions=True, captioner_config=_CFG, caption_workers=3,
+    )
+
+    imgs = [Path(r.container_path).name for r in results
+            if Path(r.container_path).name.endswith(".JPG")]
+    # The VLM ran for every image (phase-1 guard saw empty descriptions)...
+    assert sorted(calls) == sorted(imgs)
+    # ...but the phase-3 re-check saw the user text and recorded NONE of them.
+    assert all(r.caption is None for r in results
+               if Path(r.container_path).name.endswith(".JPG"))
+    j = Journal.load(target)
+    assert sum(1 for rec in j.entries.values() if "caption" in rec) == 0
 
 
 def test_derive_container_root_from_marker(tmp_path: Path):
