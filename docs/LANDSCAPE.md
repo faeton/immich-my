@@ -46,7 +46,7 @@ Sources:
 | Gap | How we fill it |
 |---|---|
 | Whisper transcripts | `whisper.cpp` / `faster-whisper` in sidecar, result → `asset.description` via API |
-| AI captions for search | `moondream2` or BLIP-2 in sidecar, appended to description |
+| AI captions for search | local VLM via LM Studio (Gemma / Qwen-VL), any OpenAI-compat backend, appended to description |
 | Event / trip clustering | DBSCAN on `(time, lat, lon)` → albums via `POST /api/albums` |
 | 360 `.insv/.insp` support | `telemetry-parser` + Insta360 CLI; harvest `.lrv` proxies |
 | DJI telemetry | `dji-srt-parser` → XMP sidecar |

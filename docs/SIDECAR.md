@@ -817,7 +817,7 @@ points. Split by host along the Metal line:
 | `sidecar-worker bloat_detector` | Syno | bits/pixel/frame scoring — detection only, no transcode |
 | `sidecar-worker transcoder` | Mac | `hevc_videotoolbox`, only after per-folder confirm (see [feedback_transcode_confirm](../)) |
 | `sidecar-worker whisper` | Mac | `whisper.cpp` Metal → `.srt` sidecar |
-| `sidecar-worker captioner` | Mac | moondream2 / BLIP → description prefix |
+| `sidecar-worker captioner` | Mac | local VLM via LM Studio (Gemma / Qwen-VL) → description prefix |
 | `sidecar-worker clip_sync`, `face_sync` | Mac | Push embeddings/results to Immich via REST |
 | `sidecar-web` | Syno | FastAPI: `/gap` + `/transcode` confirm UIs |
 

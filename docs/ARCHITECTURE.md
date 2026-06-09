@@ -18,7 +18,7 @@ touches remote originals. Enrichment is idempotent and queue-based.
                        │    • preview extractor                  │
                        │    • 360 / DJI preprocess               │
                        │    • whisper.cpp (Metal)                │
-                       │    • captioner (moondream / BLIP)       │
+                       │    • captioner (LM Studio VLM)          │
                        │    • event clustering                   │
                        │    • gap-fill web UI                    │
                        │    • osxphotos / icloudpd pullers       │
@@ -121,7 +121,7 @@ via Immich REST. Idempotent — re-running is a no-op.
 |---|---|---|---|
 | CLIP embedder | poster frame | 768-d vector → smart-search | MLX on Mac, ONNX on Syno |
 | Whisper | proxy audio track | `.srt` sidecar + description | `whisper.cpp` Metal on Mac |
-| Captioner | poster frame | description prefix "AI: …" | `moondream2` / BLIP-2 on Mac |
+| Captioner | poster frame | description prefix "AI: …" | local VLM via LM Studio (Gemma / Qwen-VL), any OpenAI-compat backend |
 | Face detect + embed | poster frame | faces table | Apple Vision + ArcFace on Mac, InsightFace on Syno |
 
 ## Event clustering
