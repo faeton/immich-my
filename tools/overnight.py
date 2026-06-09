@@ -111,21 +111,47 @@ def _vlm_preflight() -> tuple[list[str], str]:
     import urllib.request
     import urllib.error
 
+    def _get(url: str):
+        # Returns (body, None) on a clean 2xx JSON, or (None, error_str).
+        # connect/refused → real blocker; HTTP status (404 etc.) → endpoint
+        # is up but this path isn't supported (e.g. not LM Studio).
+        try:
+            with urllib.request.urlopen(url, timeout=5) as r:
+                return (json.loads(r.read()), None)
+        except urllib.error.HTTPError as e:
+            return (None, f"HTTP {e.code}")
+        except (urllib.error.URLError, OSError, json.JSONDecodeError,
+                ValueError) as e:
+            return (None, f"{e.__class__.__name__}: {getattr(e, 'reason', e)}")
+
     endpoint, want = _captioner_target()
     base = endpoint.rstrip("/")
     if base.endswith("/v1"):
         base = base[:-3]
+    base = base.rstrip("/")
     # LM Studio's /api/v0/models lists every DOWNLOADED model with per-model
     # `state` (loaded vs not-loaded); /v1/models can't tell us either fact.
-    url = f"{base.rstrip('/')}/api/v0/models"
-    try:
-        with urllib.request.urlopen(url, timeout=5) as r:
-            body = json.loads(r.read())
-    except (urllib.error.URLError, OSError, json.JSONDecodeError) as e:
-        return ([f"VLM endpoint unreachable at {endpoint} ({e.__class__.__name__}: "
-                 f"{getattr(e, 'reason', e)}). Captions cannot generate — "
-                 f"start LM Studio (or your backend)."], "")
-    items = body.get("data") or []
+    body, err = _get(f"{base}/api/v0/models")
+    if body is None and err and err.startswith("HTTP"):
+        # Endpoint answered but isn't LM Studio (no /api/v0). Fall back to the
+        # OpenAI-standard /v1/models for liveness; we then can't verify the
+        # download catalog, so only a reachability check is possible.
+        v1, v1err = _get(f"{base}/v1/models")
+        if v1 is None:
+            return ([f"VLM endpoint unreachable at {endpoint} ({v1err}). "
+                     f"Captions cannot generate — start your backend."], "")
+        ids = {m.get("id") for m in (v1.get("data") or [])
+               if isinstance(m, dict)}
+        if want and ids and want not in ids:
+            return ([f"Configured captioner '{want}' is not served by "
+                     f"{endpoint} (offers: {', '.join(sorted(filter(None, ids))) or 'none'})."], "")
+        return ([], f"endpoint up (non-LM-Studio); can't verify load state "
+                    f"for '{want or 'auto'}' — will attempt on first request.")
+    if body is None:
+        return ([f"VLM endpoint unreachable at {endpoint} ({err}). "
+                 f"Captions cannot generate — start LM Studio (or your backend)."], "")
+
+    items = [m for m in (body.get("data") or []) if isinstance(m, dict)]
     available = {m.get("id") for m in items}            # downloaded → JIT-loadable
     loaded = {m.get("id") for m in items if m.get("state") == "loaded"}
     if not want:
@@ -137,7 +163,7 @@ def _vlm_preflight() -> tuple[list[str], str]:
                     f"(immy will use the loaded/auto-detected one).")
     if want not in available:
         return ([f"Configured captioner '{want}' is NOT downloaded in LM Studio "
-                 f"(available: {', '.join(sorted(available)) or 'none'}). JIT can't "
+                 f"(available: {', '.join(sorted(filter(None, available))) or 'none'}). JIT can't "
                  f"load what isn't there — pull '{want}' or repoint "
                  f"ml.captioner.model in {CONFIG_PATH.name}."], "")
     if want in loaded:
@@ -360,6 +386,7 @@ class _ProcessLog:
         self.assets = 0      # asset header lines seen
         self.last = ""       # most recent caption text
         self.recent: list[str] = []
+        self._buf = ""       # trailing partial line carried across polls
 
     @property
     def captioned(self) -> int:
@@ -379,23 +406,42 @@ class _ProcessLog:
             return
         if not chunk:
             return
-        for raw in chunk.decode("utf-8", "replace").splitlines():
-            s = raw.strip()
-            if not s:
-                continue
-            self.recent.append(s)
-            if s.startswith("[") and "]" in s and "/" in s.split("]", 1)[0]:
-                self.assets += 1
-            elif "caption… (VLM @" in s:
-                self.attempted += 1
-            elif "caption… FAILED:" in s:
-                self.failed += 1
-                self.last_error = s.split("FAILED:", 1)[1].strip()
-            elif s.startswith("caption:") or 'caption: "' in s:
-                snip = s.split('caption:', 1)[1].strip().strip('"').rstrip("…").strip('"')
-                if snip:
-                    self.last = snip
+        # Carry the trailing unterminated line to the next poll so a record
+        # split across a read boundary (mid-flush) is matched whole, never
+        # dropped — same approach as _ByteMeter. The final `plog.poll()`
+        # after the child exits flushes whatever remains.
+        text = self._buf + chunk.decode("utf-8", "replace")
+        ends_newline = text.endswith(("\n", "\r"))
+        lines = text.splitlines()
+        self._buf = "" if ends_newline else (lines.pop() if lines else "")
+        for raw in lines:
+            self._consume(raw)
         self.recent = self.recent[-6:]
+
+    def flush(self) -> None:
+        """Account for any trailing line not yet newline-terminated. Call
+        after the child exits so a final write without a newline isn't lost."""
+        if self._buf:
+            self._consume(self._buf)
+            self._buf = ""
+        self.recent = self.recent[-6:]
+
+    def _consume(self, raw: str) -> None:
+        s = raw.strip()
+        if not s:
+            return
+        self.recent.append(s)
+        if s.startswith("[") and "]" in s and "/" in s.split("]", 1)[0]:
+            self.assets += 1
+        elif "caption… (VLM @" in s:
+            self.attempted += 1
+        elif "caption… FAILED:" in s:
+            self.failed += 1
+            self.last_error = s.split("FAILED:", 1)[1].strip()
+        elif s.startswith("caption:") or 'caption: "' in s:
+            snip = s.split('caption:', 1)[1].strip().strip('"').rstrip("…").strip('"')
+            if snip:
+                self.last = snip
 
 
 def discover(patterns: list[str], *, force: bool, smallest_first: bool = False) -> list[Path]:
@@ -487,19 +533,18 @@ def main() -> None:
     # down/mismatched backend silently no-ops every caption yet the run
     # still ends "Done" — the exact confusion this guard exists to kill.
     if args.captions and not args.no_process:
-        reasons, note = _vlm_preflight()
-        if reasons:
-            print("captioner preflight FAILED — captions would be skipped:")
-            for r in reasons:
-                print(f"  ✗ {r}")
-            if os.environ.get("IMMY_SKIP_VLM_PREFLIGHT") == "1":
-                print("  (IMMY_SKIP_VLM_PREFLIGHT=1 set — continuing anyway)\n")
-            else:
+        if os.environ.get("IMMY_SKIP_VLM_PREFLIGHT") == "1":
+            print("captioner preflight skipped (IMMY_SKIP_VLM_PREFLIGHT=1).")
+        else:
+            reasons, note = _vlm_preflight()
+            if reasons:
+                print("captioner preflight FAILED — captions would be skipped:")
+                for r in reasons:
+                    print(f"  ✗ {r}")
                 print("\nRefusing to start a caption run against a dead backend. "
                       "Fix the above, or set IMMY_SKIP_VLM_PREFLIGHT=1 to override.",
                       file=sys.stderr)
                 sys.exit(2)
-        else:
             print(f"captioner preflight OK — {note}")
 
     run_id = time.strftime("%Y%m%d-%H%M%S")
@@ -768,7 +813,8 @@ def main() -> None:
     if args.no_upload:
         rc = process_proc.poll() if process_proc else 0
         state = "completed" if rc == 0 else f"exited rc={rc}"
-        plog.poll()  # drain any tail written after the loop's last poll
+        plog.poll()   # drain any tail written after the loop's last poll
+        plog.flush()  # account for a final line with no trailing newline
         print(f"\n\nDone (CPU only). process stage {state}.  logs {run_dir}")
         if args.captions:
             # "completed" only means the child exited — it says nothing about

@@ -963,3 +963,36 @@ def test_caption_recaptions_on_model_bump_without_fill_missing(tmp_path: Path, m
 
     assert called["n"] == 1  # version bump → re-captioned
     assert results[0].caption["text"] == "NEW"
+
+
+def test_caption_fill_missing_falls_through_on_empty_prior(tmp_path: Path, monkeypatch):
+    """fill-missing must NOT keep an empty/whitespace prior caption — an
+    asset journaled with blank text still gets sent to the VLM."""
+    from immy import captions as captions_mod
+    from immy import journal as journal_mod
+
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+
+    cs = _cs_hex_for(target / "DJI_0001.JPG", target)
+    j = journal_mod.Journal.load(target)
+    j.mark_done(cs, "caption", "caption:old-model-v1",
+                meta={"text": "   ", "model": "old-model-v1"})  # blank
+    j.flush()
+
+    called = {"n": 0}
+    monkeypatch.setattr(
+        process_mod, "_process_caption",
+        lambda *a, **k: called.__setitem__("n", called["n"] + 1) or {"text": "NEW", "model": "new-model-v2"},
+    )
+    cfg = captions_mod.CaptionerConfig(model="new-model-v2",
+                                       endpoint="http://example.invalid/v1")
+
+    results = process_mod.process_trip(
+        target, _caption_conn(), LIB,
+        compute_captions=True, caption_fill_missing_only=True,
+        captioner_config=cfg,
+    )
+
+    assert called["n"] == 1  # blank prior → re-captioned, not kept
+    assert results[0].caption["text"] == "NEW"

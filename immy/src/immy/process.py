@@ -1080,13 +1080,21 @@ def process_trip(
             and not recaption
             and caption_fill_missing_only
         ):
+            # Only KEEP a prior caption that actually has usable text — an
+            # empty/whitespace/garbage journal entry must fall through to the
+            # VLM, not be treated as "already done".
+            def _usable(meta) -> bool:
+                return isinstance(meta, dict) and bool(str(meta.get("text", "")).strip())
+
             prior = journal.get(cs_hex, "caption")
-            if prior and prior.get("meta"):
-                caption_info = dict(prior["meta"])
+            prior_meta = prior.get("meta") if prior else None
+            if _usable(prior_meta):
+                caption_info = dict(prior_meta)
                 caption_info.setdefault("cached", True)
                 _emit(f"    caption… [kept, prior {prior.get('version', '?')}]")
-            elif prior_caption:  # offline cache had one under another model id
-                caption_info = prior_caption
+            elif _usable(prior_caption):  # offline cache had one under another model id
+                caption_info = dict(prior_caption)
+                caption_info.setdefault("cached", True)
                 _emit(f"    caption… [kept, prior {prior_caption.get('model', '?')}]")
 
         if caption_eligible and caption_info is None:
