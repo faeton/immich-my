@@ -745,6 +745,13 @@ def main() -> None:
                 live = None  # (trip, hb) with the freshest heartbeat
                 for t in to_process:
                     hb = _read_heartbeat(t)
+                    # `.progress` files persist across runs — a heartbeat
+                    # left by an interrupted run would win "freshest" here
+                    # and put a ghost trip (flagged stuck) on the dashboard
+                    # until this run reaches its first slow step. Only
+                    # heartbeats written after run_start count.
+                    if hb and hb["_age"] > el:
+                        continue
                     if hb and (live is None or hb["_age"] < live[1]["_age"]):
                         live = (t, hb)
                 cached = sum(_offline_count(t) for t in to_process)

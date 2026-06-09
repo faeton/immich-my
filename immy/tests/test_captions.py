@@ -97,6 +97,76 @@ def test_caption_rejects_empty_model_output(tmp_path: Path):
             captions.caption(src, config=cfg)
 
 
+def test_caption_retries_invalid_image_with_reencode(tmp_path: Path):
+    """A staged preview whose byte stream the server can't decode (LM
+    Studio: HTTP 400 `Invalid image detected at index 0`) is retried
+    once with a pyvips decode→re-encode — recoverable pixels in a
+    damaged container shouldn't fail the asset."""
+    pytest.importorskip("pyvips")
+    src = tmp_path / "preview.jpeg"
+    _tiny_jpeg(src)
+
+    cfg = captions.CaptionerConfig(endpoint="http://example.invalid/v1")
+    ok = {"choices": [{"message": {"content": "recovered"}}], "usage": {}}
+    sent_uris: list[str] = []
+
+    def fake_post(url, payload, *, api_key, timeout_s):
+        sent_uris.append(
+            payload["messages"][0]["content"][1]["image_url"]["url"]
+        )
+        if len(sent_uris) == 1:
+            raise captions.CaptionError(
+                "HTTP 400 from http://example.invalid/v1/chat/completions:"
+                ' {"error":"Invalid image detected at index 0 "}'
+            )
+        return ok
+
+    with patch.object(captions, "_post_json", side_effect=fake_post):
+        result = captions.caption(src, config=cfg)
+
+    assert result.text == "recovered"
+    assert len(sent_uris) == 2
+    # The retry must send different bytes — a re-encoded stream, not the
+    # same verbatim payload the server already rejected.
+    assert sent_uris[0] != sent_uris[1]
+    assert sent_uris[1].startswith("data:image/jpeg;base64,")
+
+
+def test_caption_does_not_retry_other_errors(tmp_path: Path):
+    """Auth/model/transport failures aren't image problems — no retry."""
+    src = tmp_path / "preview.jpeg"
+    _tiny_jpeg(src)
+    cfg = captions.CaptionerConfig(endpoint="http://example.invalid/v1")
+    boom = captions.CaptionError("HTTP 500 from x: model crashed")
+    with patch.object(
+        captions, "_post_json", side_effect=boom,
+    ) as posted:
+        with pytest.raises(captions.CaptionError):
+            captions.caption(src, config=cfg)
+    assert posted.call_count == 1
+
+
+def test_caption_does_not_retry_when_already_reencoded(tmp_path: Path):
+    """A non-JPEG source already went through the pyvips re-encode on
+    the first attempt — a retry would send identical bytes, so an
+    invalid-image rejection is terminal."""
+    pytest.importorskip("pyvips")
+    src = tmp_path / "original.png"
+    from PIL import Image
+
+    Image.new("RGB", (2, 2), color=(255, 255, 255)).save(src, "PNG")
+    cfg = captions.CaptionerConfig(endpoint="http://example.invalid/v1")
+    boom = captions.CaptionError(
+        'HTTP 400 from x: {"error":"Invalid image detected at index 0 "}'
+    )
+    with patch.object(
+        captions, "_post_json", side_effect=boom,
+    ) as posted:
+        with pytest.raises(captions.CaptionError):
+            captions.caption(src, config=cfg)
+    assert posted.call_count == 1
+
+
 def test_caption_prefers_preview_when_available(tmp_path: Path):
     """When a staged preview JPEG exists it's used as the caption source
     — saves the pyvips re-encode we'd otherwise pay on HEIC/RAW originals

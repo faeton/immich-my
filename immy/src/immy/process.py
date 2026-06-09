@@ -1180,7 +1180,7 @@ def process_trip(
                 # naive log-tailers count it as "generated"). Emit the reason
                 # so callers can tell "captioned" from "tried and failed".
                 reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
-                _emit(f"    caption… FAILED: {reason}")
+                _emit(f"    {exif_row.path.name} | caption… FAILED: {reason}")
                 caption_info = None
         results.append(ProcessResult(
             asset_id=asset.id,
@@ -1296,7 +1296,7 @@ def process_trip(
                     # the overnight tail counts attempted/failed correctly.
                     _emit(f"    caption… (VLM @ {captioner_config.model})")
                     reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
-                    _emit(f"    caption… FAILED: {reason}")
+                    _emit(f"    {job.media.name} | caption… FAILED: {reason}")
                     continue
                 if not info:
                     # Poster vanished after the sequential-pass guard — no

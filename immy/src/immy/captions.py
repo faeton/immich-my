@@ -112,16 +112,21 @@ class CaptionerConfig:
     timeout_s: float = DEFAULT_TIMEOUT_S
 
 
-def _encode_image(source: Path) -> str:
+def _encode_image(source: Path, *, force_reencode: bool = False) -> str:
     """Return a `data:image/jpeg;base64,...` URI.
 
     If `source` is already a JPEG we send its bytes verbatim — no re-encode
     tax on the preview files `derivatives.py` already staged. Otherwise
     (original is a HEIC/RAW/PNG and we don't have a staged preview) we
     pyvips-resize to PREVIEW_LONG_EDGE_PX and JPEG-encode in memory.
+
+    `force_reencode` routes a JPEG through the pyvips branch anyway —
+    the recovery path for staged previews whose byte stream is damaged
+    (e.g. a non-truncating double write) but whose pixels still decode:
+    one decode→re-encode round-trip yields a clean stream.
     """
     suffix = source.suffix.lower()
-    if suffix in (".jpg", ".jpeg"):
+    if suffix in (".jpg", ".jpeg") and not force_reencode:
         data = source.read_bytes()
     else:
         # Silence libvips warnings before the (lazy) import; see the same
@@ -207,6 +212,14 @@ def _post_json(
         raise CaptionError(f"non-JSON response from {url}: {e}") from e
 
 
+def _is_invalid_image_rejection(e: CaptionError) -> bool:
+    """True when the server refused the request because it couldn't
+    decode the image itself (LM Studio: HTTP 400 `Invalid image detected
+    at index N`) — as opposed to auth, model, or transport failures."""
+    msg = str(e).lower()
+    return "http 400" in msg and "invalid image" in msg
+
+
 def caption(
     media: Path,
     *,
@@ -220,6 +233,10 @@ def caption(
     to `media` when None.
     """
     source = preview if preview is not None and preview.is_file() else media
+    # JPEGs go over the wire verbatim — which also means a damaged byte
+    # stream goes over verbatim. Tracked so the retry below knows a
+    # re-encode would actually send different bytes.
+    sent_verbatim = source.suffix.lower() in (".jpg", ".jpeg")
     image_data_uri = _encode_image(source)
 
     url = config.endpoint.rstrip("/") + "/chat/completions"
@@ -234,11 +251,28 @@ def caption(
         }],
         "max_tokens": config.max_tokens,
     }
-    response = _post_json(
-        url, payload,
-        api_key=config.api_key,
-        timeout_s=config.timeout_s,
-    )
+    try:
+        response = _post_json(
+            url, payload,
+            api_key=config.api_key,
+            timeout_s=config.timeout_s,
+        )
+    except CaptionError as e:
+        # LM Studio's image decoder is strict; PIL/libvips are lenient.
+        # A staged preview with a damaged byte stream (premature EOI,
+        # stale tail from a non-truncating double write) decodes fine
+        # everywhere except here. The pixels are still recoverable, so
+        # retry once with a decode→re-encode round-trip before giving up.
+        if not (sent_verbatim and _is_invalid_image_rejection(e)):
+            raise
+        payload["messages"][0]["content"][1]["image_url"]["url"] = (
+            _encode_image(source, force_reencode=True)
+        )
+        response = _post_json(
+            url, payload,
+            api_key=config.api_key,
+            timeout_s=config.timeout_s,
+        )
 
     try:
         text = response["choices"][0]["message"]["content"]
