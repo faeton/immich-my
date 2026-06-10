@@ -156,13 +156,15 @@ def main() -> None:
         trips = sorted(d for d in TRIPS_ROOT.iterdir()
                        if d.is_dir() and not d.name.startswith("."))
 
+    print(f"reading offline sink for {len(trips)} trip(s)…", flush=True)
     sink, vid_owned = collect_local_truth(trips)
-    print(f"local truth: {len(sink)} assets across {len(trips)} trip(s)")
+    print(f"local truth: {len(sink)} assets")
 
     plan, review = [], []
     for typ in ("VIDEO", "IMAGE"):
         page = 1
         while True:
+            print(f"  scanning server {typ.lower()}s, page {page}…", flush=True)
             r = api(url, key, "POST", "/api/search/metadata",
                     {"type": typ, "size": 1000, "page": page, "withExif": True})
             for a in r["assets"]["items"]:
@@ -213,6 +215,8 @@ def main() -> None:
                 })
             conn.commit()
             pushed += 1
+            print(f"  [{pushed}/{len(plan)}] {row['name']}: "
+                  f"{row['db'][:40]!r} -> {row['sink'][:60]!r}", flush=True)
     finally:
         conn.close()
     (work / "applied.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
