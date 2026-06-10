@@ -111,9 +111,51 @@ def repetition_loop_indexes(texts: list[str], min_run: int = LOOP_MIN_RUN) -> se
     return drop
 
 
+# The third failure mode lives *inside* a single cue: the decoder loops
+# on one word and emits it dozens of times within one segment («селфи»
+# ×55 packed into a 30 s cue) — invisible to the cue-level collapse
+# above, which only compares whole cues. Genuine speech repeats a word
+# at most a few times («ну, ну, ну», «давай-давай-давай»); 5 keeps
+# clear of that while real loops run 20-50+.
+WORD_LOOP_MIN_RUN = 5
+
+_WORD_TRAIL = ".,!?…\"'«»“”‘’()[]:;"
+
+
+def collapse_word_runs(text: str, min_run: int = WORD_LOOP_MIN_RUN) -> str:
+    """Collapse runs of `min_run`+ consecutive identical words within a
+    cue to their first occurrence. Words compare case-insensitively with
+    surrounding punctuation stripped, so «девочкой, девочкой, девочкой»
+    forms one run. Returns `text` unchanged when no run qualifies.
+    """
+    words = text.split()
+    if len(words) < min_run:
+        return text
+    out: list[str] = []
+    collapsed_any = False
+    i = 0
+    while i < len(words):
+        norm = words[i].strip(_WORD_TRAIL).lower()
+        j = i + 1
+        if norm:
+            while j < len(words) and words[j].strip(_WORD_TRAIL).lower() == norm:
+                j += 1
+        if j - i >= min_run:
+            out.append(words[i])
+            collapsed_any = True
+        else:
+            out.extend(words[i:j])
+        i = j
+    if not collapsed_any:
+        return text
+    return " ".join(out).rstrip(" ,")
+
+
 __all__ = [
     "HALLUCINATION_PATTERNS",
     "LOOP_MIN_RUN",
+    "WORD_LOOP_MIN_RUN",
+    "collapse_word_runs",
     "is_hallucination",
     "repetition_loop_indexes",
 ]

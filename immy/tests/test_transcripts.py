@@ -102,6 +102,33 @@ def test_repetition_loop_indexes_ignores_blank_runs():
     assert repetition_loop_indexes(["", "", "", "", ""]) == set()
 
 
+def test_collapse_word_runs_in_cue_loop():
+    # Word-level decode loop inside a single cue: «девочкой» ×54 packed
+    # into one segment. Punctuation/case differences don't break the run.
+    from immy.hallucinations import collapse_word_runs
+
+    text = "Какая девочка, " + ", ".join(["девочкой"] * 54)
+    assert collapse_word_runs(text) == "Какая девочка, девочкой"
+    # Real speech repeats survive — below WORD_LOOP_MIN_RUN.
+    assert collapse_word_runs("ну, ну, ну, поехали") == "ну, ну, ну, поехали"
+    assert collapse_word_runs("давай давай давай давай") == "давай давай давай давай"
+    # No qualifying run → text returned unchanged.
+    assert collapse_word_runs("обычная фраза без повторов") == "обычная фраза без повторов"
+
+
+def test_format_srt_collapses_word_runs_in_cue():
+    text = "Смотри, с кем " + " ".join(["селфи"] * 55)
+    segments = [
+        {"start": 0.0, "end": 1.0, "text": "перед"},
+        {"start": 1.0, "end": 31.0, "text": text},
+        {"start": 31.0, "end": 32.0, "text": "после"},
+    ]
+    out = format_srt(segments)
+    assert out.count("селфи") == 1
+    assert "перед" in out
+    assert "после" in out
+
+
 def test_speech_intervals_inverts_silences(monkeypatch, tmp_path):
     # Pins the VideoInfo attribute contract (`duration_s` — an upstream
     # rename to `duration_seconds` once silently killed every transcript

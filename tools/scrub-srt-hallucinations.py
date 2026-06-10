@@ -6,10 +6,13 @@ YouTube outros, applause/music tags) on silent or noisy audio — none of
 which was actually said in the source video. This script walks every
 trip under TRIPS_ROOT, parses each `<stem>.<lang>.srt` sidecar, and:
 
-  1. Drops cues whose normalised text matches a known-hallucination
-     pattern (regex or exact phrase, case-insensitive).
-  2. If anything remains, rewrites the sidecar with renumbered cues.
-  3. If nothing remains, deletes the sidecar AND clears the matching
+  1. Collapses word-level decode loops inside a cue («селфи» ×55 in one
+     segment) to their first occurrence.
+  2. Drops cues whose normalised text matches a known-hallucination
+     pattern (regex or exact phrase, case-insensitive), and decode-loop
+     cue repeats (same cue ≥6× consecutively) past the first.
+  3. If anything remains, rewrites the sidecar with renumbered cues.
+  4. If nothing remains, deletes the sidecar AND clears the matching
      `transcript` journal entry + invalidates the trip's `y_processed`
      marker so the next `immy process --with-transcripts` run
      re-transcribes the asset.
@@ -33,7 +36,11 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IMMY_SRC = SCRIPT_DIR.parent / "immy" / "src"
 sys.path.insert(0, str(IMMY_SRC))
 
-from immy.hallucinations import is_hallucination, repetition_loop_indexes  # noqa: E402
+from immy.hallucinations import (  # noqa: E402
+    collapse_word_runs,
+    is_hallucination,
+    repetition_loop_indexes,
+)
 from immy.journal import Journal, journal_path  # noqa: E402
 from immy.process import marker_path  # noqa: E402
 
@@ -96,7 +103,15 @@ def scrub_file(srt: Path, apply: bool) -> tuple[int, int, bool]:
         return (0, 0, False)
     kept: list[dict] = []
     removed = 0
+    word_runs_collapsed = 0
     for cue in cues:
+        # Word-level loops inside one cue («селфи» ×55 in a 30 s
+        # segment) are invisible to the cue-level collapse — squash
+        # them first so the cue keeps its real prefix.
+        new_lines = [collapse_word_runs(l) for l in cue["lines"]]
+        if new_lines != cue["lines"]:
+            cue = {**cue, "lines": new_lines}
+            word_runs_collapsed += 1
         # A cue with multiple text lines is hallucination only if EVERY
         # line is hallucinated — otherwise we'd drop legit lines that
         # happen to share a cue with junk.
@@ -107,8 +122,9 @@ def scrub_file(srt: Path, apply: bool) -> tuple[int, int, bool]:
         kept.append(cue)
     kept, loop_removed = collapse_repetition_loops(kept)
     removed += loop_removed
-    if removed == 0:
+    if removed == 0 and word_runs_collapsed == 0:
         return (0, len(cues), False)
+    removed += word_runs_collapsed  # collapsed-in-place cues count as scrubbed
     if not kept:
         if apply:
             srt.unlink()

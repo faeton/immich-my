@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import video as video_mod
-from .hallucinations import is_hallucination, repetition_loop_indexes
+from .hallucinations import collapse_word_runs, is_hallucination, repetition_loop_indexes
 
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
@@ -142,9 +142,10 @@ def format_srt(segments: list[dict]) -> str:
     "Продолжение следует", YouTube-outro thanks, etc.) are also dropped
     so the sidecar reflects only what was actually said. Decode-loop
     repeats (the same cue stuck on repeat for the rest of the clip)
-    collapse to their first occurrence.
+    collapse to their first occurrence, and so do word-level loops
+    inside a single cue («селфи» ×55 packed into one segment).
     """
-    texts = [str(seg.get("text", "")).strip() for seg in segments]
+    texts = [collapse_word_runs(str(seg.get("text", "")).strip()) for seg in segments]
     loop_drop = repetition_loop_indexes(texts)
     lines: list[str] = []
     index = 1
