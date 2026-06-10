@@ -4,6 +4,43 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-11 — Immich metadata refresh destroys descriptions
+
+### Findings
+
+- **Immich v2 rebuilds `asset_exif` from file tags on metadata
+  extraction and overwrites every field not in `lockedProperties`.**
+  Descriptions written via direct SQL carry no lock and no sidecar →
+  a library scan after the 9-trip upload wiped 338 synced descriptions,
+  replacing them with camera-embedded junk: '' (videos), 'default'
+  (DJI), 'DCIM\…' paths or the file's own name (Insta360).
+- **Video descriptions ignore XMP sidecars entirely** (v2.7.5 source:
+  video path reads only `videoTags.Description || Comment` from the
+  container). `PUT /api/assets` is self-defeating for videos —
+  SidecarWrite unconditionally unlocks the field, then queues
+  re-extraction: 197 API-pushed video descriptions were wiped again
+  within minutes. Images survive (photo path prefers sidecar tags).
+- The only durable, non-file-mutating mechanism for video descriptions
+  is appending `'description'` to `asset_exif."lockedProperties"` via
+  SQL in the same statement as the write — no job cycle unlocks it.
+- Confirmed with Codex (immich source review) + Grok consults.
+
+### Changed
+
+- All immy description writes now also lock the field; camera
+  boilerplate is treated as overwritable by every guard
+  (`captions.is_camera_boilerplate`).
+- Captions/transcript excerpts are mirrored into the local
+  `basename.xmp` (`_mirror_description_to_xmp`) — image-path protection
+  that travels with promote's rsync; skipped when the DB guard refused
+  the write.
+- New `tools/reconcile-descriptions.py` — server-vs-sink description
+  diff; pushes diverged values (images via API, videos via SQL+lock);
+  dry-run by default, ambiguous cases never touched.
+- Offline-sink drain of the full library: 2 120 entries replayed
+  (argentina's 8 missing CLIP `.npy` regenerated from staged previews,
+  1 stale faces ref dropped); descriptions reconciled server-side.
+
 ## 2026-06-10 — full-library transcript run (overnight batch)
 
 ### Findings
