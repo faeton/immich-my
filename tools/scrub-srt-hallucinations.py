@@ -33,7 +33,7 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IMMY_SRC = SCRIPT_DIR.parent / "immy" / "src"
 sys.path.insert(0, str(IMMY_SRC))
 
-from immy.hallucinations import is_hallucination  # noqa: E402
+from immy.hallucinations import is_hallucination, repetition_loop_indexes  # noqa: E402
 from immy.journal import Journal, journal_path  # noqa: E402
 from immy.process import marker_path  # noqa: E402
 
@@ -77,6 +77,17 @@ def render_srt(cues: list[dict]) -> str:
     return "\n".join(out)
 
 
+def collapse_repetition_loops(cues: list[dict]) -> tuple[list[dict], int]:
+    """Drop decode-loop repeats (same cue stuck on repeat — see
+    `hallucinations.repetition_loop_indexes`). Returns (kept, removed)."""
+    texts = [" ".join(l for l in cue["lines"] if l.strip()) for cue in cues]
+    drop = repetition_loop_indexes(texts)
+    if not drop:
+        return (cues, 0)
+    kept = [cue for i, cue in enumerate(cues) if i not in drop]
+    return (kept, len(drop))
+
+
 def scrub_file(srt: Path, apply: bool) -> tuple[int, int, bool]:
     """Returns (cues_removed, cues_kept, file_deleted)."""
     text = srt.read_text(errors="replace")
@@ -94,6 +105,8 @@ def scrub_file(srt: Path, apply: bool) -> tuple[int, int, bool]:
             removed += 1
             continue
         kept.append(cue)
+    kept, loop_removed = collapse_repetition_loops(kept)
+    removed += loop_removed
     if removed == 0:
         return (0, len(cues), False)
     if not kept:

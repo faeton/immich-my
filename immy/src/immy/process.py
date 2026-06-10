@@ -1128,6 +1128,22 @@ def process_trip(
                 caption_info.setdefault("cached", True)
                 _emit(f"    caption… [kept, prior {prior_caption.get('model', '?')}]")
 
+        # Converge the journal on the cached/kept paths above: they all
+        # produce a caption without calling mark_done, so the journal
+        # permanently under-reports captions — every audit (and the
+        # journal-skip fast path) re-flags those assets forever. meta
+        # keeps the real `model`, so provenance survives; `cached` is a
+        # read-side flag, not data, and stays out of the journal.
+        if (
+            caption_eligible
+            and caption_info is not None
+            and not journal.is_done(cs_hex, "caption", CAPTION_VERSION)
+        ):
+            journal.mark_done(
+                cs_hex, "caption", CAPTION_VERSION,
+                meta={k: v for k, v in caption_info.items() if k != "cached"},
+            )
+
         if caption_eligible and caption_info is None and parallel_captions:
             # Parallel path: defer the VLM call to the post-loop pool. Hoist
             # the two guards `_process_caption` applies before its HTTP call

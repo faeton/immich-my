@@ -26,7 +26,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import video as video_mod
-from .hallucinations import is_hallucination
+from .hallucinations import is_hallucination, repetition_loop_indexes
 
 
 DEFAULT_MODEL = "mlx-community/whisper-large-v3-mlx"
@@ -140,15 +140,21 @@ def format_srt(segments: list[dict]) -> str:
     cues during long silences and they bloat the sidecar for no benefit.
     Cues that match a known hallucination pattern (DimaTorzok credits,
     "Продолжение следует", YouTube-outro thanks, etc.) are also dropped
-    so the sidecar reflects only what was actually said.
+    so the sidecar reflects only what was actually said. Decode-loop
+    repeats (the same cue stuck on repeat for the rest of the clip)
+    collapse to their first occurrence.
     """
+    texts = [str(seg.get("text", "")).strip() for seg in segments]
+    loop_drop = repetition_loop_indexes(texts)
     lines: list[str] = []
     index = 1
-    for seg in segments:
-        text = str(seg.get("text", "")).strip()
+    for i, seg in enumerate(segments):
+        text = texts[i]
         if not text:
             continue
         if is_hallucination(text):
+            continue
+        if i in loop_drop:
             continue
         start = _format_ts(float(seg.get("start", 0.0)))
         end = _format_ts(float(seg.get("end", 0.0)))

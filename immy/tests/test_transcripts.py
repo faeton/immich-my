@@ -45,6 +45,47 @@ def test_format_srt_millisecond_carry():
     assert ",1000" not in out
 
 
+def test_format_srt_collapses_repetition_loops():
+    # Whisper decode loop: same cue stuck on repeat. Only the first
+    # occurrence survives; surrounding real speech is untouched.
+    segments = [{"start": 0.0, "end": 1.0, "text": "перед циклом"}]
+    segments += [
+        {"start": 1.0 + i, "end": 2.0 + i, "text": "Добро пожаловать в Казахстан!"}
+        for i in range(10)
+    ]
+    segments += [{"start": 12.0, "end": 13.0, "text": "после цикла"}]
+    out = format_srt(segments)
+    assert out.count("Добро пожаловать в Казахстан!") == 1
+    assert "перед циклом" in out
+    assert "после цикла" in out
+
+
+def test_format_srt_keeps_short_repeats():
+    # 5 consecutive identical cues is below LOOP_MIN_RUN — could be a
+    # real chant/countdown, must survive intact.
+    segments = [
+        {"start": float(i), "end": float(i + 1), "text": "давай давай"}
+        for i in range(5)
+    ]
+    out = format_srt(segments)
+    assert out.count("давай давай") == 5
+
+
+def test_repetition_loop_indexes_separate_runs():
+    from immy.hallucinations import repetition_loop_indexes
+
+    # Two separate runs each collapse independently; the interleaved
+    # line breaks the run. Normalisation ignores case/punctuation.
+    texts = ["a!", "A", "a", "a.", "other", "b", "b", "b", "B!"]
+    assert repetition_loop_indexes(texts, min_run=3) == {1, 2, 3, 6, 7, 8}
+
+
+def test_repetition_loop_indexes_ignores_blank_runs():
+    from immy.hallucinations import repetition_loop_indexes
+
+    assert repetition_loop_indexes(["", "", "", "", ""]) == set()
+
+
 def test_excerpt_text_short_passthrough():
     assert excerpt_text("hello") == "hello"
 

@@ -70,4 +70,46 @@ def is_hallucination(line: str) -> bool:
     return any(p.search(norm) for p in HALLUCINATION_PATTERNS)
 
 
-__all__ = ["HALLUCINATION_PATTERNS", "is_hallucination"]
+# Whisper's other failure mode besides boilerplate: it gets stuck in a
+# decode loop and emits the same cue over and over for the rest of the
+# clip ("Добро пожаловать в Казахстан!" × 40 on wind noise). Real loops
+# run 10-40 repeats; 6 keeps clear of genuine chants/call-and-response,
+# which rarely produce even a handful of identical whole cues.
+LOOP_MIN_RUN = 6
+
+
+def repetition_loop_indexes(texts: list[str], min_run: int = LOOP_MIN_RUN) -> set[int]:
+    """Indexes of cues that are loop repeats: members of a run of
+    `min_run`+ consecutive identical (normalised) texts, except the
+    run's first cue — that one occurrence may genuinely have been said,
+    so it survives. Empty/whitespace texts never form runs.
+
+    Used by `transcripts.format_srt` at write time and by
+    `tools/scrub-srt-hallucinations.py` for previously-written SRTs.
+    """
+    drop: set[int] = set()
+    run_start = 0
+    run_norm: str | None = None
+    run_len = 0
+
+    def flush() -> None:
+        if run_norm is not None and run_len >= min_run:
+            drop.update(range(run_start + 1, run_start + run_len))
+
+    for i, text in enumerate(texts):
+        norm = _normalise(text)
+        if norm and norm == run_norm:
+            run_len += 1
+            continue
+        flush()
+        run_start, run_norm, run_len = i, (norm or None), 1
+    flush()
+    return drop
+
+
+__all__ = [
+    "HALLUCINATION_PATTERNS",
+    "LOOP_MIN_RUN",
+    "is_hallucination",
+    "repetition_loop_indexes",
+]
