@@ -4,6 +4,36 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-11 — mass "Error loading image": paused thumbnail queue
+
+### Findings
+
+- **4,961 assets across 16 trips had no thumbnail/preview `asset_file`
+  rows** (Svalbard 2,393; all five pacific trips; les-arcs; scotland;
+  both norways; several 2024 trips) — grid tiles and the full-screen
+  view both showed "Error loading image".
+- Root cause was a chain: these assets were registered while their
+  originals were still offline, so promote fell back to queueing
+  `regenerate-thumbnail` jobs for Immich to run server-side — but the
+  server's `thumbnailGeneration` queue was **paused**, with 8,821 jobs
+  silently accumulating. The fallback never executed.
+- The paused queue also broke **phone-app backups** (internal-storage
+  uploads, `libraryId IS NULL`): Immich is the only thumbnail generator
+  for those, so 9 iPhone HEICs sat with no derivatives at all.
+- ~640 server assets (DJI LRF/LRV proxies, HYPERLAPSE stills) are
+  offline+trashed — expected: their local sources were deliberately
+  deleted; the library scan retired them server-side.
+
+### Changed
+
+- `immy repair-thumbs` across all trips: 4,920 thumbnails+previews
+  regenerated locally and upserted (9,840 rows), 41 Svalbard assets had
+  no local source. Full-library probe after: 10 broken of 7,462.
+- Emptied the stale 8,821-job queue, queued regeneration for the 10
+  remaining (9 phone HEICs + 1), **resumed `thumbnailGeneration`** —
+  all verified loading. The queue must stay unpaused: promote's
+  offline-asset fallback and every future phone backup depend on it.
+
 ## 2026-06-11 — Immich metadata refresh destroys descriptions
 
 ### Findings
