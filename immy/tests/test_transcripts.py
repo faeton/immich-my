@@ -80,6 +80,20 @@ def test_repetition_loop_indexes_separate_runs():
     assert repetition_loop_indexes(texts, min_run=3) == {1, 2, 3, 6, 7, 8}
 
 
+def test_hallucination_substring_forms():
+    # User-confirmed: these are hallucinations in ANY form, including
+    # embedded mid-sentence — not just as whole lines.
+    from immy.hallucinations import is_hallucination
+
+    assert is_hallucination("Продолжение следует...")
+    assert is_hallucination("ну что ж, продолжение следует, друзья")
+    assert is_hallucination("Субтитры делал DimaTorzok")
+    assert is_hallucination("DimaTorzok")
+    assert is_hallucination("Дима Торжок")  # cyrillic surname alone
+    assert is_hallucination("Субтитры подготовлены каналом XYZ")
+    assert not is_hallucination("мы продолжаем следовать на север")
+
+
 def test_repetition_loop_indexes_ignores_blank_runs():
     from immy.hallucinations import repetition_loop_indexes
 

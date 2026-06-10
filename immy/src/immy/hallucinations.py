@@ -21,8 +21,12 @@ HALLUCINATION_PATTERNS: tuple[re.Pattern[str], ...] = (
     # Russian / Ukrainian — the DimaTorzok credit is the most common
     # hallucination on Russian-language footage; the rest are well-known
     # fansub boilerplate Whisper picked up from training data.
-    re.compile(r"^продолжение следует$"),
-    re.compile(r"^(субтитры|добавил субтитры).*(dimatorzok|торжок)"),
+    # Substring matches (no anchors): these two never occur in real
+    # dive/drone footage speech in any form — kill the whole cue even
+    # when Whisper embeds them mid-sentence.
+    re.compile(r"продолжение следует"),
+    re.compile(r"dimatorzok|торжок"),
+    re.compile(r"^(субтитры|добавил субтитры)\b.*"),
     re.compile(r"^субтитры (сделал|создал|создавал|делал|подогнал|подготовил)\b.*"),
     re.compile(r"^редактор субтитров\b.*"),
     re.compile(r"^корректор\b.*"),
