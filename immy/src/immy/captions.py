@@ -304,11 +304,32 @@ def is_ai_description(description: str | None) -> bool:
     return bool(description) and description.startswith(AI_PREFIX)
 
 
+def is_camera_boilerplate(description: str | None, file_name: str | None = None) -> bool:
+    """True for descriptions the *camera* embedded in the file — junk that
+    Immich's metadata refresh re-imports over our captions (2026-06: 338
+    assets clobbered after a library scan). DJI writes the literal
+    'default', Insta360 writes a DCIM path or the file's own name. These
+    are always safe to overwrite; they carry zero information.
+    """
+    d = (description or "").strip()
+    if not d:
+        return False
+    if d.lower() == "default":
+        return True
+    if d.startswith(("DCIM\\", "DCIM/")):
+        return True
+    if file_name:
+        stem = file_name.rsplit(".", 1)[0]
+        if d == file_name or d == stem:
+            return True
+    return False
+
+
 __all__ = [
     "AI_PREFIX",
     "DEFAULT_ENDPOINT", "DEFAULT_MODEL", "DEFAULT_PROMPT", "DEFAULT_MAX_TOKENS",
     "LM_STUDIO_PREFERRED_MODELS", "LM_STUDIO_FALLBACK_MODEL",
     "CaptionError", "CaptionResult", "CaptionerConfig",
     "caption", "detect_lm_studio_model",
-    "format_description", "is_ai_description",
+    "format_description", "is_ai_description", "is_camera_boilerplate",
 ]

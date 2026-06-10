@@ -152,8 +152,10 @@ class Sink(Protocol):
     def update_asset_dims(self, asset_id: str, width: int, height: int) -> None: ...
     def update_asset_duration(self, asset_id: str, duration: str) -> None: ...
     def get_description(self, asset_id: str) -> str | None: ...
-    def update_description_if_empty(self, asset_id: str, text: str) -> None: ...
-    def update_description_if_ai_or_empty(self, asset_id: str, text: str) -> None: ...
+    def update_description_if_empty(
+        self, asset_id: str, text: str, file_name: str | None = None) -> None: ...
+    def update_description_if_ai_or_empty(
+        self, asset_id: str, text: str, file_name: str | None = None) -> None: ...
     def clip_dim(self) -> int | None: ...
     def upsert_clip(self, asset_id: str, embedding: list[float], literal: str) -> None: ...
     def replace_faces(self, asset_id: str, width: int, height: int, rows: list[dict]) -> None: ...
@@ -221,16 +223,39 @@ _UPDATE_ASSET_DURATION = """
 UPDATE asset SET duration = %(duration)s WHERE id = %(id)s
 """
 
-_UPDATE_EXIF_DESCRIPTION_IF_EMPTY = """
-UPDATE asset_exif SET description = %(description)s
+# Both guards also treat camera-embedded boilerplate as overwritable:
+# Immich's metadata refresh re-imports file EXIF over our writes (DJI
+# embeds the literal 'default', Insta360 a DCIM path or the file's own
+# name), and without this escape a clobbered description could never be
+# repaired by a replay. `%(file_name)s` / `%(file_stem)s` may be NULL —
+# `description = NULL` is never true, so they simply don't match.
+#
+# Every write also appends 'description' to `lockedProperties` — Immich
+# v2's metadata refresh overwrites every UNLOCKED field from file tags,
+# and for videos the extraction reads only container tags (sidecar XMP
+# is images-only), so the lock is the sole mechanism that makes a video
+# description durable. Harmless extra safety for images.
+_LOCK_DESCRIPTION_SQL = """
+    "lockedProperties" = CASE
+      WHEN 'description' = ANY(coalesce("lockedProperties", '{}'))
+        THEN "lockedProperties"
+      ELSE array_append(coalesce("lockedProperties", '{}'), 'description')
+    END"""
+
+_UPDATE_EXIF_DESCRIPTION_IF_EMPTY = f"""
+UPDATE asset_exif SET description = %(description)s,{_LOCK_DESCRIPTION_SQL}
 WHERE "assetId" = %(asset_id)s
-  AND (description IS NULL OR description = '')
+  AND (description IS NULL OR description = ''
+       OR lower(description) = 'default' OR description LIKE 'DCIM%%'
+       OR description = %(file_name)s OR description = %(file_stem)s)
 """
 
-_UPDATE_EXIF_DESCRIPTION_IF_AI_OR_EMPTY = """
-UPDATE asset_exif SET description = %(description)s
+_UPDATE_EXIF_DESCRIPTION_IF_AI_OR_EMPTY = f"""
+UPDATE asset_exif SET description = %(description)s,{_LOCK_DESCRIPTION_SQL}
 WHERE "assetId" = %(asset_id)s
-  AND (description IS NULL OR description = '' OR description LIKE 'AI: %%')
+  AND (description IS NULL OR description = '' OR description LIKE 'AI: %%'
+       OR lower(description) = 'default' OR description LIKE 'DCIM%%'
+       OR description = %(file_name)s OR description = %(file_stem)s)
 """
 
 
@@ -298,18 +323,26 @@ class PgSink:
             row = cur.fetchone()
         return row[0] if row else None
 
-    def update_description_if_empty(self, asset_id: str, text: str) -> None:
+    def update_description_if_empty(
+        self, asset_id: str, text: str, file_name: str | None = None,
+    ) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
                 _UPDATE_EXIF_DESCRIPTION_IF_EMPTY,
-                {"asset_id": asset_id, "description": text},
+                {"asset_id": asset_id, "description": text,
+                 "file_name": file_name,
+                 "file_stem": file_name.rsplit(".", 1)[0] if file_name else None},
             )
 
-    def update_description_if_ai_or_empty(self, asset_id: str, text: str) -> None:
+    def update_description_if_ai_or_empty(
+        self, asset_id: str, text: str, file_name: str | None = None,
+    ) -> None:
         with self.conn.cursor() as cur:
             cur.execute(
                 _UPDATE_EXIF_DESCRIPTION_IF_AI_OR_EMPTY,
-                {"asset_id": asset_id, "description": text},
+                {"asset_id": asset_id, "description": text,
+                 "file_name": file_name,
+                 "file_stem": file_name.rsplit(".", 1)[0] if file_name else None},
             )
 
     def clip_dim(self) -> int | None:
@@ -548,18 +581,25 @@ class OfflineSink:
         _, entry = self._entry_for(asset_id)
         return entry.get("exif", {}).get("description") or None
 
-    def update_description_if_empty(self, asset_id: str, text: str) -> None:
+    def update_description_if_empty(
+        self, asset_id: str, text: str, file_name: str | None = None,
+    ) -> None:
+        from .captions import is_camera_boilerplate
         hex_key, entry = self._entry_for(asset_id)
         current = entry.get("exif", {}).get("description") or ""
-        if not current and text != current:
+        if (not current or is_camera_boilerplate(current, file_name)) and text != current:
             entry["exif"]["description"] = text
             self._mark_dirty(entry)
             self._flush(hex_key)
 
-    def update_description_if_ai_or_empty(self, asset_id: str, text: str) -> None:
+    def update_description_if_ai_or_empty(
+        self, asset_id: str, text: str, file_name: str | None = None,
+    ) -> None:
+        from .captions import is_camera_boilerplate
         hex_key, entry = self._entry_for(asset_id)
         current = entry.get("exif", {}).get("description") or ""
-        if (not current or current.startswith("AI: ")) and text != current:
+        if (not current or current.startswith("AI: ")
+                or is_camera_boilerplate(current, file_name)) and text != current:
             entry["exif"]["description"] = text
             self._mark_dirty(entry)
             self._flush(hex_key)
@@ -855,8 +895,11 @@ def _replay_entry(
             # Captions land via AI-only guard; transcripts land via empty
             # guard. We can't distinguish perfectly at replay time, so
             # prefer the AI-or-empty variant — it's a superset of empty.
+            fname = asset_raw.get("original_file_name")
             cur.execute(_UPDATE_EXIF_DESCRIPTION_IF_AI_OR_EMPTY, {
                 "asset_id": asset_id, "description": description,
+                "file_name": fname,
+                "file_stem": fname.rsplit(".", 1)[0] if fname else None,
             })
 
     offline_root = offline_dir(trip_folder)

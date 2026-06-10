@@ -32,6 +32,23 @@ def test_format_and_detect_ai_description():
     assert not captions.is_ai_description(None)
 
 
+def test_is_camera_boilerplate():
+    # Camera-embedded junk that Immich's metadata refresh re-imports over
+    # our captions: DJI writes 'default', Insta360 a DCIM path or the
+    # file's own name. All overwritable; real text never is.
+    f = captions.is_camera_boilerplate
+    assert f("default", "DJI_0011.JPG")
+    assert f("Default", None)
+    assert f("DCIM\\Camera01\\IMG_20260226_072521_00_010.ins", None)
+    assert f("DCIM/Camera01/x", None)
+    assert f("IMG_20250502_095157_00_006.insp", "IMG_20250502_095157_00_006.insp")
+    assert f("IMG_20250502_095157_00_006", "IMG_20250502_095157_00_006.insp")
+    assert not f("a user-typed description", "DJI_0011.JPG")
+    assert not f("AI: a dog on a hillside", "DJI_0011.JPG")
+    assert not f("", "DJI_0011.JPG")
+    assert not f(None, None)
+
+
 def test_encode_image_passes_jpeg_through(tmp_path: Path):
     src = tmp_path / "sample.jpg"
     _tiny_jpeg(src)

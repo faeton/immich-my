@@ -42,6 +42,7 @@ from . import journal as journal_mod
 from . import offline as offline_mod
 from . import pg as pg_mod
 from . import raw as raw_mod
+from . import sidecar as sidecar_mod
 from . import transcripts as transcripts_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
@@ -1327,11 +1328,14 @@ def process_trip(
                 # silently no-op. This read is serialized with the writes below
                 # (all main-thread), so it stays safe for the online sink too.
                 existing = sink.get_description(job.asset_id)
-                if existing and not captions_mod.is_ai_description(existing):
+                if (existing and not captions_mod.is_ai_description(existing)
+                        and not captions_mod.is_camera_boilerplate(existing, job.media.name)):
                     continue  # user/Whisper text wins — don't record or count
                 _emit(f"    caption… (VLM @ {captioner_config.model})")
                 description = captions_mod.format_description(info["text"])
-                sink.update_description_if_ai_or_empty(job.asset_id, description)
+                sink.update_description_if_ai_or_empty(
+                    job.asset_id, description, file_name=job.media.name)
+                _mirror_description_to_xmp(sink, job.asset_id, job.media, description)
                 sink.record_caption(job.asset_id, info)
                 journal.mark_done(
                     job.cs_hex, "caption", CAPTION_VERSION, meta=info,
@@ -1357,6 +1361,31 @@ def process_trip(
     # the run died, and the file pinpoints which asset was in flight.
     hb.clear()
     return results
+
+
+def _mirror_description_to_xmp(
+    sink: Sink, asset_id: str, media: Path, text: str,
+) -> None:
+    """Bake a freshly-written description into the local `.xmp` sidecar.
+
+    Immich's metadata refresh rebuilds `asset_exif` from file tags and
+    overwrites every unlocked field — sidecar tags win the merge, so a
+    `dc:description` in our `basename.xmp` is what makes captions and
+    transcript excerpts survive library rescans (2026-06: a scan wiped
+    338 synced descriptions that lived only in the DB). Promote rsyncs
+    the sidecar with the originals, so the protection travels.
+
+    Only mirrors when the sink write actually landed — the SQL guards
+    may have refused (user-typed text wins), and baking the rejected
+    text into the sidecar would clobber that user text on the next scan.
+    """
+    current = (sink.get_description(asset_id) or "").strip()
+    if current != text.strip():
+        return
+    try:
+        sidecar_mod.write(media, {"Description": text})
+    except Exception as e:  # exiftool missing/failed — never kill the run
+        print(f"    !! xmp description mirror failed for {media.name}: {e}")
 
 
 def _process_transcript(
@@ -1400,7 +1429,9 @@ def _process_transcript(
                 )
                 if plain:
                     excerpt = transcripts_mod.excerpt_text(plain)
-                    sink.update_description_if_empty(asset_id, excerpt)
+                    sink.update_description_if_empty(
+                        asset_id, excerpt, file_name=media.name)
+                    _mirror_description_to_xmp(sink, asset_id, media, excerpt)
             except OSError:
                 pass
             return {"path": str(sib), "language": sib.suffixes[-2].lstrip(".")}
@@ -1436,7 +1467,9 @@ def _process_transcript(
         # Transcripts use the empty-guard (not the AI-guard) so a user
         # description never gets clobbered, but we also don't want to
         # overwrite a prior AI caption with a transcript excerpt.
-        sink.update_description_if_empty(asset_id, result.excerpt)
+        sink.update_description_if_empty(
+            asset_id, result.excerpt, file_name=media.name)
+        _mirror_description_to_xmp(sink, asset_id, media, result.excerpt)
     return {"path": str(result.srt_path), "language": result.language}
 
 
@@ -1474,7 +1507,8 @@ def _process_caption(
        `--recaption` to force a re-run.
     """
     existing = sink.get_description(asset_id)
-    if existing and not captions_mod.is_ai_description(existing):
+    if (existing and not captions_mod.is_ai_description(existing)
+            and not captions_mod.is_camera_boilerplate(existing, media.name)):
         return None
 
     if require_preview and (preview is None or not preview.is_file()):
@@ -1482,7 +1516,8 @@ def _process_caption(
 
     result = captions_mod.caption(media, config=config, preview=preview)
     description = captions_mod.format_description(result.text)
-    sink.update_description_if_ai_or_empty(asset_id, description)
+    sink.update_description_if_ai_or_empty(asset_id, description, file_name=media.name)
+    _mirror_description_to_xmp(sink, asset_id, media, description)
     return {
         "text": result.text,
         "model": result.model,
