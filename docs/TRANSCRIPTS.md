@@ -33,6 +33,12 @@ Anti-hallucination measures, validated by A/B on the worst loopers (2026-06):
   credits), and decode loops (the same cue ≥ 6× consecutively) collapse to
   the first occurrence. If nothing survives the scrub the clip is journaled
   `whisper-hallucination` and no sidecar is written.
+- word-level loop collapse (`collapse_word_runs`): a decoder loop packed
+  into a *single* cue («селфи» ×55 inside one 30 s segment) is invisible
+  to the cue-level collapse — runs of ≥ 5 identical words (case- and
+  punctuation-insensitive) within a cue squash to the first occurrence.
+  `tools/scrub-srt-hallucinations.py` applies the same collapse to
+  previously-written sidecars.
 
 ## Engine bench (2026-06-10)
 

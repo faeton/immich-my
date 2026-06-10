@@ -4,6 +4,35 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-10 — library-wide verification sweep, in-cue word loops
+
+### Findings
+
+- **Library sweep** (`tools/verify-transcripts.py`, 165 sidecars / 98
+  unique audio tracks): 24 low-agreement files judged, 6 drops suggested,
+  4 of them over-drops on human review (the judge's known failure mode —
+  real conversation with one garbled line). 2 genuine silence
+  hallucinations dropped («До встречи!» ×4 over 2 min; "Thank you." ×5 on
+  30 s-aligned cues).
+- **In-cue word loops**: a decoder loop packed into a *single* cue
+  («селфи» ×55, «девочкой» ×54 inside one segment) is invisible to the
+  cue-level collapse, which needs ≥ 6 identical consecutive cues. Found in
+  3 of the 4 over-dropped files.
+- **Twin sidecars from different vintages diverge**: one Peru clip's
+  judged sidecar was truncated at 1:56 while its LRV twin held the full
+  14-minute conversation — the verifier's "A is a subset of B" reason was
+  literally correct. Twin groups deserve a consistency pass when judged.
+
+### Changed
+
+- `feat(hallucinations)`: `collapse_word_runs()` — runs of ≥ 5 identical
+  words (case-/punctuation-insensitive) within a cue collapse to the
+  first occurrence, at `format_srt` write time and in
+  `tools/scrub-srt-hallucinations.py` for existing sidecars.
+- 8 sidecars hand-cleaned across 4 twin groups (la-manga, NZ, Peru ×2):
+  in-cue loops truncated, the truncated Peru twin replaced with its full
+  LRV transcript, garbage-only cues removed.
+
 ## 2026-06-10 — ASR engine bench, worst-80 redo, dual-engine verification
 
 ### Findings
