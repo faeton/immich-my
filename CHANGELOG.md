@@ -4,6 +4,39 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-10 — full-library transcript run (overnight batch)
+
+### Findings
+
+- **Full sweep complete**: all 61 trips through `immy process --offline
+  --with-transcripts --with-captions --captions-fill-missing`. 676 new
+  sidecars (350 en / 300 ru / 26 uk), 3 122 gated skips (DJI denylist,
+  Tesla dashcam no-audio, silent clips), zero errors. Library now at
+  100 % coverage on every phase including captions; `immy bloat` scan
+  found zero transcode candidates.
+- **"Wood Wood"** is a new Whisper noise hallucination on water/splash
+  audio (la-manga, blue-lagoon, peru) — emitted as runs of identical
+  sub-second cues.
+- **Blank segments defeated the loop collapse**: `format_srt` computed
+  decode-loop runs over the raw segment list, where Whisper's interleaved
+  blank segments break a run of identical cues — "Wood Wood" ×7 survived
+  write-time scrub. 792 such cues landed across 67 fresh sidecars before
+  the fix.
+- **Stale transcript journal entries hide real gaps**: 88 entries pointed
+  at sidecars deleted long ago. 57 were intentional (Insta360 twin dedup
+  keeps only the `_00_` master), 5 belong to arbiter-dropped groups
+  (stay dormant by design), 26 were genuine orphans — among them the 18
+  antarctica clips journaled as Faroese/Nynorsk by a pre-constrained-
+  detect run in April.
+
+### Changed
+
+- `fix(transcripts)`: loop detection now runs on the non-empty cue
+  stream, matching the written SRT's view.
+- Post-run scrub applied: 792 loop cues removed from 67 new sidecars.
+- 26 orphaned journal entries cleared and re-transcribed under the
+  constrained ru/en/uk language detect.
+
 ## 2026-06-10 — library-wide verification sweep, in-cue word loops
 
 ### Findings
