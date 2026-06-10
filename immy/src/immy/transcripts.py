@@ -146,7 +146,16 @@ def format_srt(segments: list[dict]) -> str:
     inside a single cue («селфи» ×55 packed into one segment).
     """
     texts = [collapse_word_runs(str(seg.get("text", "")).strip()) for seg in segments]
-    loop_drop = repetition_loop_indexes(texts)
+    # Detect decode loops on the non-empty cue stream, the way the cues
+    # will actually sit in the written SRT. Whisper interleaves blank
+    # segments through silence, and computing runs over the raw list
+    # let blanks break a run of identical cues — "Wood Wood" ×7 around
+    # silent gaps sailed through (2026-06, la-manga/blue-lagoon).
+    nonempty = [i for i, t in enumerate(texts) if t]
+    loop_drop = {
+        nonempty[j]
+        for j in repetition_loop_indexes([texts[i] for i in nonempty])
+    }
     lines: list[str] = []
     index = 1
     for i, seg in enumerate(segments):

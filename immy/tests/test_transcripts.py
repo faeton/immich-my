@@ -116,6 +116,19 @@ def test_collapse_word_runs_in_cue_loop():
     assert collapse_word_runs("обычная фраза без повторов") == "обычная фраза без повторов"
 
 
+def test_format_srt_collapses_loops_across_blank_segments():
+    # Whisper interleaves blank segments through silence; a loop of
+    # identical cues separated by blanks must still collapse.
+    segments = []
+    for i in range(7):
+        segments.append({"start": 2.0 * i, "end": 2.0 * i + 1, "text": "Wood Wood"})
+        segments.append({"start": 2.0 * i + 1, "end": 2.0 * i + 2, "text": ""})
+    segments.append({"start": 14.0, "end": 15.0, "text": "real speech"})
+    out = format_srt(segments)
+    assert out.count("Wood Wood") == 1
+    assert "real speech" in out
+
+
 def test_format_srt_collapses_word_runs_in_cue():
     text = "Смотри, с кем " + " ".join(["селфи"] * 55)
     segments = [
