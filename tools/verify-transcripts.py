@@ -48,6 +48,13 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 IMMY_SRC = SCRIPT_DIR.parent / "immy" / "src"
 sys.path.insert(0, str(IMMY_SRC))
 
+# Needs immy's deps (numpy, yaml, mlx-whisper) — re-exec under the immy
+# venv when launched with a bare system python.
+_VENV_PY = SCRIPT_DIR.parent / "immy" / ".venv" / "bin" / "python"
+if _VENV_PY.is_file() and Path(sys.executable).resolve() != _VENV_PY.resolve():
+    os.execv(str(_VENV_PY), [str(_VENV_PY), str(Path(__file__).resolve()),
+                             *sys.argv[1:]])
+
 import yaml  # noqa: E402
 
 from immy import offline as offline_mod  # noqa: E402
