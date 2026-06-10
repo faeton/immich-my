@@ -13,17 +13,19 @@ This tool compares the server's descriptions against the local offline
 sink (source of truth) and re-pushes diverged ones. The durable path
 differs by asset type (verified against immich v2.7.5 source):
 
-- IMAGE: `PUT /api/assets/{id}` — Immich writes the description, locks
-  the field, and bakes it into an .xmp sidecar; the photo extraction
-  path prefers sidecar tags, so the text survives future refreshes.
-- VIDEO: the API route is SELF-DEFEATING — SidecarWrite unconditionally
-  unlocks the field and queues re-extraction, and the video extraction
-  path reads ONLY container tags (`videoTags.Description || Comment`),
-  ignoring sidecars. (2026-06: 197 video descriptions pushed via PUT
-  were wiped again within minutes.) The only non-file-mutating durable
-  mechanism is direct SQL: set `description` and append 'description'
-  to `asset_exif."lockedProperties"` in one statement — no job cycle
-  runs, and any future metadata refresh respects the lock.
+- In theory `PUT /api/assets/{id}` is the blessed path: Immich writes
+  the description, locks the field, and bakes it into an .xmp sidecar
+  that the photo extraction path prefers. In practice the API route is
+  SELF-DEFEATING on this deployment for BOTH types: SidecarWrite
+  unconditionally unlocks the field and queues re-extraction; the video
+  path reads ONLY container tags (sidecars are images-only), and the
+  image sidecar write itself fails against the NAS, so re-extraction
+  re-imports embedded camera junk. (2026-06: 197 video then 124 image
+  descriptions pushed via PUT were wiped again within minutes.)
+- The durable, non-file-mutating mechanism is direct SQL: set
+  `description` and append 'description' to
+  `asset_exif."lockedProperties"` in one statement — no job cycle runs,
+  and any future metadata refresh skips locked fields.
 
 Safety rule: a server description is only overwritten when it is
 empty, 'AI: '-prefixed, camera boilerplate ('default', 'DCIM\\...',
@@ -64,7 +66,7 @@ if _VENV_PY.is_file() and Path(sys.executable).resolve() != _VENV_PY.resolve():
 import yaml  # noqa: E402
 
 from immy.captions import is_ai_description, is_camera_boilerplate  # noqa: E402
-from immy.config import load_config as load_immy_config  # noqa: E402
+from immy.config import load as load_immy_config  # noqa: E402
 from immy.journal import Journal, journal_path  # noqa: E402
 from immy import pg as pg_mod  # noqa: E402
 
@@ -183,9 +185,7 @@ def main() -> None:
 
     (work / "plan.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
     (work / "review.json").write_text(json.dumps(review, ensure_ascii=False, indent=1))
-    n_vid = sum(1 for r in plan if r["type"] == "VIDEO")
-    print(f"would update: {len(plan)} ({n_vid} video via SQL+lock, "
-          f"{len(plan) - n_vid} image via API)  ·  review (untouched): {len(review)}")
+    print(f"would update: {len(plan)} via SQL+lock  ·  review (untouched): {len(review)}")
     for row in review[:10]:
         print(f"  REVIEW {row['name']}\n    DB:   {row['db'][:80]!r}\n    sink: {row['sink'][:80]!r}")
 
@@ -194,37 +194,29 @@ def main() -> None:
             print(f"\ndry run — plan at {work / 'plan.json'}; re-run with --apply to push.")
         return
 
-    conn = None
-    if n_vid:
-        cfg = load_immy_config(Path(args.config))
-        if cfg.pg is None:
-            sys.exit("video updates need `pg:` in the immy config (description lock is SQL-only)")
-        conn = pg_mod.connect(cfg.pg)
-        with conn.cursor() as cur:
-            cur.execute(_SQL_HAS_LOCK_COLUMN)
-            if cur.fetchone() is None:
-                sys.exit('asset_exif."lockedProperties" not found — Immich too old/new '
-                         "for the lock-based video path; aborting before any write.")
+    cfg = load_immy_config(Path(args.config))
+    if cfg.pg is None:
+        sys.exit("`pg:` missing from the immy config (description lock is SQL-only)")
+    conn = pg_mod.connect(cfg.pg)
+    with conn.cursor() as cur:
+        cur.execute(_SQL_HAS_LOCK_COLUMN)
+        if cur.fetchone() is None:
+            sys.exit('asset_exif."lockedProperties" not found — Immich too old/new '
+                     "for the lock-based path; aborting before any write.")
 
-    pushed_api = pushed_sql = 0
+    pushed = 0
     try:
         for row in plan:
-            if row["type"] == "VIDEO":
-                with conn.cursor() as cur:
-                    cur.execute(_SQL_SET_AND_LOCK, {
-                        "asset_id": row["id"], "description": row["sink"],
-                    })
-                conn.commit()
-                pushed_sql += 1
-            else:
-                api(url, key, "PUT", f"/api/assets/{row['id']}", {"description": row["sink"]})
-                pushed_api += 1
+            with conn.cursor() as cur:
+                cur.execute(_SQL_SET_AND_LOCK, {
+                    "asset_id": row["id"], "description": row["sink"],
+                })
+            conn.commit()
+            pushed += 1
     finally:
-        if conn is not None:
-            conn.close()
+        conn.close()
     (work / "applied.json").write_text(json.dumps(plan, ensure_ascii=False, indent=1))
-    print(f"pushed {pushed_sql} video description(s) via SQL+lock, "
-          f"{pushed_api} image description(s) via API.")
+    print(f"pushed {pushed} description(s) via SQL+lock.")
 
 
 if __name__ == "__main__":
