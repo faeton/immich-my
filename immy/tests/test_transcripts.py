@@ -86,6 +86,35 @@ def test_repetition_loop_indexes_ignores_blank_runs():
     assert repetition_loop_indexes(["", "", "", "", ""]) == set()
 
 
+def test_speech_intervals_inverts_silences(monkeypatch, tmp_path):
+    # Pins the VideoInfo attribute contract (`duration_s` — an upstream
+    # rename to `duration_seconds` once silently killed every transcript
+    # via on_transcript_error="skip") and the silence-inversion logic,
+    # without ffmpeg: probe + silencedetect output are both faked.
+    import subprocess
+    from types import SimpleNamespace
+
+    from immy import transcripts as t
+
+    stderr = (
+        "[silencedetect @ 0x0] silence_start: 2.0\n"
+        "[silencedetect @ 0x0] silence_end: 8.0 | silence_duration: 6.0\n"
+    )
+    monkeypatch.setattr(t.shutil, "which", lambda _: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(
+        t.subprocess, "run",
+        lambda *a, **k: subprocess.CompletedProcess(a, 0, stdout="", stderr=stderr),
+    )
+    monkeypatch.setattr(
+        t.video_mod, "probe",
+        lambda _: SimpleNamespace(duration_s=10.0),
+    )
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"")
+    result = t.speech_intervals(media)
+    assert result == (10.0, [(0.0, 2.0), (8.0, 10.0)])
+
+
 def test_excerpt_text_short_passthrough():
     assert excerpt_text("hello") == "hello"
 

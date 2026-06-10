@@ -296,7 +296,7 @@ def speech_intervals(
         info = video_mod.probe(media)
     except video_mod.VideoProbeError:
         return None
-    total = float(info.duration_seconds or 0.0)
+    total = float(info.duration_s or 0.0)
     if total <= 0:
         return None
     starts = [float(m.group(1)) for m in _SILENCE_START.finditer(proc.stderr or "")]
@@ -392,7 +392,15 @@ def detect_language_constrained(
         _, probs_list = _detect(m, mel, tokenizer)
     except Exception:
         return None
-    probs = probs_list[0] if probs_list else {}
+    # mlx-whisper's detect_language returns a list of dicts for batched
+    # mel input but a bare dict for a single spectrogram (its `single`
+    # path) — and we always pass one window. Indexing the dict with [0]
+    # raised KeyError past the except above, which silently killed every
+    # transcript via on_transcript_error="skip" (mlx-whisper 0.4.3).
+    if isinstance(probs_list, dict):
+        probs = probs_list
+    else:
+        probs = probs_list[0] if probs_list else {}
     if not probs:
         return candidates[0] if candidates else None
     best = max(candidates, key=lambda c: float(probs.get(c, 0.0)))
@@ -432,9 +440,16 @@ def transcribe(
     # the same fansub-style boilerplate for the rest of the file.
     # Disabling cross-chunk priming costs minor consistency on rare
     # proper nouns but eliminates the runaway-credit cascades.
+    # `hallucination_silence_threshold` (needs word_timestamps) makes the
+    # decoder skip silent gaps >2 s when a window looks hallucinated —
+    # the other half of the loop fix. A/B on the three worst loopers
+    # (2026-06): max identical-run 17→15, 12→8, and +16 unique real cues
+    # on a 14-min clip, at a modest word-timestamp compute cost.
     kwargs: dict = {
         "path_or_hf_repo": model,
         "condition_on_previous_text": False,
+        "word_timestamps": True,
+        "hallucination_silence_threshold": 2.0,
     }
     if language:
         kwargs["language"] = language
