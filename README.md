@@ -68,6 +68,14 @@ and skip work already done:
   `--no-upload` / `--no-process` split the CPU and network sides;
   `--status` reports only. A live dashboard shows per-trip progress and
   truthful caption generated/failed counts.
+- `tools/verify-transcripts.py` — dual-engine transcript quality check:
+  re-transcribes every `.srt` sidecar with an independent engine (GigaAM-v3
+  for Russian on CPU, Whisper for English on GPU), scores word-level
+  agreement, sends low scorers to an LM Studio judge, and (after human
+  review of the verdicts) drops hallucination-only sidecars. See
+  [docs/TRANSCRIPTS.md](docs/TRANSCRIPTS.md).
+- `tools/audit-journal.py` — true per-trip enrichment coverage keyed the
+  way the pipeline keys it (path-hash journal), with stale-key pruning.
 
 Local prerequisites:
 - `exiftool`
@@ -165,7 +173,7 @@ Docs grouped by role:
 - **Design** — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SIDECAR.md](docs/SIDECAR.md).
 - **Operations** — [docs/DEPLOY.md](docs/DEPLOY.md), [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md).
 - **Current work** — [docs/ROADMAP.md](docs/ROADMAP.md), [docs/REVIEW-RECOMMENDATIONS.md](docs/REVIEW-RECOMMENDATIONS.md).
-- **Feature guides** — [docs/CAPTIONS.md](docs/CAPTIONS.md), [docs/LANDSCAPE.md](docs/LANDSCAPE.md).
+- **Feature guides** — [docs/CAPTIONS.md](docs/CAPTIONS.md), [docs/TRANSCRIPTS.md](docs/TRANSCRIPTS.md), [docs/LANDSCAPE.md](docs/LANDSCAPE.md).
 - **Reference** — [docs/IMMICH-INGEST.md](docs/IMMICH-INGEST.md), [docs/archive/](docs/archive/) (historical phase plan).
 - **Personal backlog** — [raw/](raw/).
 
