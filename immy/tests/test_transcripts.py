@@ -89,6 +89,8 @@ def test_hallucination_substring_forms():
     assert is_hallucination("ну что ж, продолжение следует, друзья")
     assert is_hallucination("Субтитры делал DimaTorzok")
     assert is_hallucination("DimaTorzok")
+    assert is_hallucination("dimatorzok")  # matching is case-insensitive
+    assert is_hallucination("СУБТИТРЫ ДЕЛАЛ DIMATORZOK")
     assert is_hallucination("Дима Торжок")  # cyrillic surname alone
     assert is_hallucination("Субтитры подготовлены каналом XYZ")
     assert not is_hallucination("мы продолжаем следовать на север")
