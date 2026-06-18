@@ -104,6 +104,36 @@ def test_caption_request_shape_and_response_parse(tmp_path: Path):
     )
 
 
+def test_caption_extra_body_merged_into_payload(tmp_path: Path):
+    # The N5/Ollama gemma4 fix: extra_body keys land at the payload top
+    # level. Unset (default None) the payload must be byte-identical to
+    # the LM Studio path — no stray keys.
+    src = tmp_path / "sample.jpg"
+    _tiny_jpeg(src)
+    fake_response = {
+        "model": "m", "choices": [{"message": {"content": "x"}}],
+    }
+    captured: dict = {}
+
+    def fake_post(url, payload, *, api_key, timeout_s):
+        captured["payload"] = payload
+        return fake_response
+
+    # default: no extra keys
+    with patch.object(captions, "_post_json", side_effect=fake_post):
+        captions.caption(src, config=captions.CaptionerConfig(model="m"))
+    assert "reasoning_effort" not in captured["payload"]
+    assert set(captured["payload"]) == {"model", "messages", "max_tokens"}
+
+    # with extra_body: merged verbatim at top level
+    cfg = captions.CaptionerConfig(
+        model="m", extra_body={"reasoning_effort": "none"},
+    )
+    with patch.object(captions, "_post_json", side_effect=fake_post):
+        captions.caption(src, config=cfg)
+    assert captured["payload"]["reasoning_effort"] == "none"
+
+
 def test_caption_rejects_empty_model_output(tmp_path: Path):
     src = tmp_path / "sample.jpg"
     _tiny_jpeg(src)

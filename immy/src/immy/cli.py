@@ -1258,6 +1258,7 @@ def process(
             api_key=api_key,
             prompt=prompt,
             max_tokens=max_tokens,
+            extra_body=(ml.captioner_extra if ml else None),
         )
     phases: list[str] = []
     if compute:

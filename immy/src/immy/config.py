@@ -33,6 +33,10 @@ Shape:
         api_key_env: OPENAI_API_KEY  # env-var *name*, not the key value
         prompt: "Describe this photo in one short sentence."
         max_tokens: 80
+        extra_body:                  # merged verbatim into the request;
+          reasoning_effort: none     # Ollama gemma4 needs this or content
+                                     # comes back empty (answer goes to a
+                                     # `reasoning` field instead)
 
 Missing config file is not an error for `audit`; `promote` checks what it
 needs and raises a clear message if `originals_root` is absent.
@@ -43,6 +47,7 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import yaml
 
@@ -120,6 +125,10 @@ class MLConfig:
     captioner_api_key_env: str | None = None
     captioner_prompt: str | None = None
     captioner_max_tokens: int | None = None
+    # Provider-specific payload knobs merged verbatim into the request.
+    # On the N5, set `extra_body: {reasoning_effort: none}` so Ollama's
+    # gemma4 returns plain `content` instead of an empty string + `reasoning`.
+    captioner_extra: dict[str, Any] | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +229,10 @@ def load(path: Path | None = None) -> Config:
             captioner_max_tokens=(
                 int(cap_raw["max_tokens"])
                 if cap_raw.get("max_tokens") else None
+            ),
+            captioner_extra=(
+                dict(cap_raw["extra_body"])
+                if isinstance(cap_raw.get("extra_body"), dict) else None
             ),
         )
 

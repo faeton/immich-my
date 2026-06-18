@@ -45,6 +45,7 @@ import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 DEFAULT_ENDPOINT = "http://localhost:1234/v1"  # LM Studio default
@@ -110,6 +111,13 @@ class CaptionerConfig:
     prompt: str = DEFAULT_PROMPT
     max_tokens: int = DEFAULT_MAX_TOKENS
     timeout_s: float = DEFAULT_TIMEOUT_S
+    # Extra top-level fields merged verbatim into the request payload.
+    # Provider-specific knobs that don't fit the common shape live here so
+    # the default (LM Studio / OpenAI) path stays byte-identical when unset.
+    # The one that matters on the N5: Ollama serves gemma4 with thinking on
+    # by default, which dumps the answer into a `reasoning` field and leaves
+    # `content` empty — `{"reasoning_effort": "none"}` restores plain content.
+    extra_body: dict[str, Any] | None = None
 
 
 def _encode_image(source: Path, *, force_reencode: bool = False) -> str:
@@ -251,6 +259,8 @@ def caption(
         }],
         "max_tokens": config.max_tokens,
     }
+    if config.extra_body:
+        payload.update(config.extra_body)
     try:
         response = _post_json(
             url, payload,

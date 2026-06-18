@@ -40,6 +40,29 @@ ml:
     assert cfg.ml.whisper_backend == "mlx"
 
 
+def test_captioner_extra_body_parsed(tmp_path):
+    cfg = config_mod.load(_write(tmp_path, """
+ml:
+  captioner:
+    endpoint: http://n5:11434/v1
+    model: gemma4
+    extra_body:
+      reasoning_effort: none
+"""))
+    assert cfg.ml is not None
+    assert cfg.ml.captioner_extra == {"reasoning_effort": "none"}
+
+
+def test_captioner_extra_body_absent_is_none(tmp_path):
+    cfg = config_mod.load(_write(tmp_path, """
+ml:
+  captioner:
+    model: gemma4
+"""))
+    assert cfg.ml is not None
+    assert cfg.ml.captioner_extra is None
+
+
 def test_no_ml_block_yields_none(tmp_path):
     cfg = config_mod.load(_write(tmp_path, "originals_root: /tmp/x\n"))
     assert cfg.ml is None
