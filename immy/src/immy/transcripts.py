@@ -369,12 +369,15 @@ def transcribe(
     lang_candidates: tuple[str, ...] | None = DEFAULT_LANG_CANDIDATES,
     prompt: str | None = None,
     backend: str = "mlx",
+    endpoint: str | None = None,
 ) -> TranscriptResult | HallucinationOnly | None:
     """Transcribe one video; write the .srt sidecar; return the excerpt.
 
     Thin wrapper over the pluggable ASR layer. `backend` selects the inference
-    engine — "mlx" (default; unchanged Mac behavior) is the only one wired;
-    "whispercpp"/"qwen-asr" are Phase 2/5 (see raw/IMMY-ON-N5.md). Language
+    engine — "mlx" (default; unchanged Mac behavior) and "whispercpp" (Phase 2;
+    HTTP to a whisper-server at `endpoint`) are wired; "qwen-asr" is Phase 5
+    (see raw/IMMY-ON-N5.md). `endpoint` is the backend's HTTP URL when it speaks
+    HTTP (whispercpp); ignored by the in-process mlx path. Language
     detection, SRT render/scrub, and sidecar writing are shared across backends
     in `asr.runner`.
 
@@ -387,7 +390,7 @@ def transcribe(
     """
     from .asr import registry, runner
 
-    be = registry.get_backend(backend)
+    be = registry.get_backend(backend, endpoint=endpoint)
     return runner.transcribe_media(
         media, be,
         model=model,

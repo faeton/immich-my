@@ -88,6 +88,51 @@ def materialize_region_wavs(
     return out
 
 
+def materialize_wav(
+    media: Path,
+    dst: Path,
+    *,
+    start_s: float | None = None,
+    dur_s: float | None = None,
+    sample_rate: int = 16_000,
+) -> Path:
+    """Decode `media` to a mono 16k s16le WAV at `dst` (the format whisper.cpp
+    wants). Optional `start_s`/`dur_s` extract just a window — used for the
+    whole-file path (no window) and the language-probe path (first ~30 s).
+    Raises if ffmpeg is missing or the decode fails.
+    """
+    if shutil.which("ffmpeg") is None:
+        raise RuntimeError("ffmpeg not found; required to decode audio for ASR")
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    args = ["ffmpeg", "-nostdin", "-hide_banner", "-y"]
+    if start_s is not None:
+        args += ["-ss", f"{start_s:.3f}"]
+    if dur_s is not None:
+        args += ["-t", f"{dur_s:.3f}"]
+    args += [
+        "-i", str(media),
+        "-vn", "-ac", "1", "-ar", str(sample_rate),
+        "-c:a", "pcm_s16le", str(dst),
+    ]
+    subprocess.run(args, capture_output=True, check=True)
+    return dst
+
+
+def clamp_language(detected: str | None, candidates: tuple[str, ...]) -> str | None:
+    """Constrain a free-form detected language to the configured candidate set.
+
+    whisper.cpp / Qwen will happily report `welsh` or `nynorsk` for noisy or
+    music-only audio; on a known-multilingual library that's always wrong.
+    Returns `detected` when it's already a candidate, else the first candidate
+    (the safe default). None in → None out (caller falls back to auto).
+    """
+    if detected is None:
+        return None
+    if not candidates:
+        return detected
+    return detected if detected in candidates else candidates[0]
+
+
 def merge_segments(
     per_region: list[tuple[float, list[dict]]],
 ) -> list[dict]:
@@ -109,4 +154,7 @@ def merge_segments(
     return merged
 
 
-__all__ = ["build_speech_plan", "materialize_region_wavs", "merge_segments"]
+__all__ = [
+    "build_speech_plan", "materialize_region_wavs", "materialize_wav",
+    "clamp_language", "merge_segments",
+]

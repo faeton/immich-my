@@ -168,10 +168,16 @@ def test_registry_mlx_resolves():
 
 
 def test_registry_unimplemented_backends_raise():
-    with pytest.raises(NotImplementedError):
-        registry.get_backend("whispercpp")
+    # qwen-asr is still Phase 5; whispercpp is now wired (Phase 2).
     with pytest.raises(NotImplementedError):
         registry.get_backend("qwen-asr")
+
+
+def test_registry_whispercpp_wired():
+    from immy.asr.whispercpp_backend import WhisperCppBackend
+    be = registry.get_backend("whispercpp", endpoint="http://n5:8090")
+    assert isinstance(be, WhisperCppBackend)
+    assert be.name == "whispercpp"
 
 
 def test_registry_unknown_backend_raises():

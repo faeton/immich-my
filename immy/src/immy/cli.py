@@ -952,6 +952,7 @@ def _run_one_trip(
     transcript_model: str,
     transcript_prompt: str | None,
     transcript_backend: str = "mlx",
+    transcript_endpoint: str | None = None,
     force: bool = False,
 ) -> bool:
     """Run the full pipeline for one trip folder. Returns True on success.
@@ -1035,6 +1036,7 @@ def _run_one_trip(
             transcript_model=transcript_model,
             transcript_prompt=transcript_prompt,
             transcript_backend=transcript_backend,
+            transcript_endpoint=transcript_endpoint,
             progress=_progress,
         )
         # process_trip commits per asset by default (commit_per_asset=True),
@@ -1212,6 +1214,9 @@ def process(
     transcript_backend = os.environ.get("IMMY_WHISPER_BACKEND") or (
         config.ml.whisper_backend if config.ml is not None else "mlx"
     )
+    transcript_endpoint = os.environ.get("IMMY_WHISPER_ENDPOINT") or (
+        config.ml.whisper_endpoint if config.ml is not None else None
+    )
     captioner_config: captions_mod.CaptionerConfig | None = None
     if with_captions:
         ml = config.ml
@@ -1325,6 +1330,7 @@ def process(
                 transcript_model=transcript_model,
                 transcript_prompt=transcript_prompt,
                 transcript_backend=transcript_backend,
+                transcript_endpoint=transcript_endpoint,
                 force=force,
             )
             if success:

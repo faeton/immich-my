@@ -13,14 +13,17 @@ from .base import AsrBackend
 KNOWN_BACKENDS = ("mlx", "whispercpp", "qwen-asr")
 
 
-def get_backend(name: str = "mlx", **kwargs) -> AsrBackend:
+def get_backend(name: str = "mlx", *, endpoint: str | None = None) -> AsrBackend:
     if name == "mlx":
         from .mlx_backend import MlxWhisperBackend
         return MlxWhisperBackend()
-    if name in ("whispercpp", "qwen-asr"):
+    if name == "whispercpp":
+        from .whispercpp_backend import WhisperCppBackend
+        return WhisperCppBackend(endpoint=endpoint or "")
+    if name == "qwen-asr":
         raise NotImplementedError(
             f"whisper_backend {name!r} is not implemented yet "
-            f"(Phase 2/5 — see raw/IMMY-ON-N5.md); only 'mlx' is wired."
+            f"(Phase 5 — see raw/IMMY-ON-N5.md); 'mlx' and 'whispercpp' are wired."
         )
     raise ValueError(
         f"unknown whisper_backend {name!r}; expected one of {KNOWN_BACKENDS}"
