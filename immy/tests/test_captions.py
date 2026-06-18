@@ -134,6 +134,20 @@ def test_caption_extra_body_merged_into_payload(tmp_path: Path):
     assert captured["payload"]["reasoning_effort"] == "none"
 
 
+def test_caption_diagnoses_reasoning_leak(tmp_path: Path):
+    # gemma4-on-Ollama trap: answer in `reasoning`, `content` empty. The error
+    # must name the fix (extra_body reasoning_effort:none), not be generic.
+    src = tmp_path / "s.jpg"
+    _tiny_jpeg(src)
+    leak = {
+        "model": "gemma4",
+        "choices": [{"message": {"content": "", "reasoning": "Let me think..."}}],
+    }
+    with patch.object(captions, "_post_json", return_value=leak):
+        with pytest.raises(captions.CaptionError, match="reasoning"):
+            captions.caption(src, config=captions.CaptionerConfig(model="gemma4"))
+
+
 def test_caption_rejects_empty_model_output(tmp_path: Path):
     src = tmp_path / "sample.jpg"
     _tiny_jpeg(src)

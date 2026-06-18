@@ -285,11 +285,22 @@ def caption(
         )
 
     try:
-        text = response["choices"][0]["message"]["content"]
+        message = response["choices"][0]["message"]
+        text = message["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise CaptionError(f"unexpected response shape: {response}") from e
     text = str(text or "").strip()
     if not text:
+        # The reasoning-leak trap: a model with thinking on (e.g. gemma4 on
+        # Ollama's /v1) returns its answer in a `reasoning` field and leaves
+        # `content` empty. Diagnose it specifically — the fix is config, not
+        # code (set captioner.extra_body: {reasoning_effort: none}).
+        if isinstance(message, dict) and str(message.get("reasoning") or "").strip():
+            raise CaptionError(
+                "empty caption: model put its answer in a 'reasoning' field "
+                "(thinking enabled). Set captioner.extra_body: "
+                "{reasoning_effort: none} for this endpoint."
+            )
         raise CaptionError("empty caption in model response")
 
     usage = response.get("usage") or {}

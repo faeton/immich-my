@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import subprocess
 import urllib.request
 import uuid
 from pathlib import Path
@@ -134,7 +135,13 @@ class WhisperCppBackend:
                 "whisper_backend 'whispercpp' needs ml.whisper_endpoint "
                 "(the whisper-server URL, e.g. http://n5:8090)"
             )
-        self.endpoint = endpoint.rstrip("/")
+        # Accept either the base URL ("http://n5:8090") or the full route
+        # ("http://n5:8090/inference") — `_inference` appends "/inference", so
+        # strip a trailing one to avoid "/inference/inference".
+        ep = endpoint.rstrip("/")
+        if ep.endswith("/inference"):
+            ep = ep[: -len("/inference")]
+        self.endpoint = ep
         self.timeout_s = timeout_s
         self.sample_rate = sample_rate
 
@@ -208,7 +215,10 @@ class WhisperCppBackend:
                     start_s=start, dur_s=30.0, sample_rate=self.sample_rate,
                 )
                 payload = self._inference(wav, language="auto", prompt=None)
-        except (WhisperCppError, RuntimeError, OSError):
+        except (WhisperCppError, RuntimeError, OSError, subprocess.SubprocessError):
+            # ffmpeg probe (materialize_wav, check=True) raises
+            # CalledProcessError — a probe failure must fall back to full-pass
+            # auto-detect, never abort ASR.
             return None
         detected = _lang_name_to_code(payload.get("language"))
         return plan_mod.clamp_language(detected, candidates)

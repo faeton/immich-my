@@ -42,6 +42,38 @@ def test_endpoint_required():
         registry.get_backend("whispercpp", endpoint=None)
 
 
+def test_endpoint_accepts_base_or_full_inference_url():
+    # base URL and the full /inference route must normalise to the same thing,
+    # so the client never builds ".../inference/inference"
+    assert WhisperCppBackend(endpoint="http://n5:8090").endpoint == "http://n5:8090"
+    assert (
+        WhisperCppBackend(endpoint="http://n5:8090/inference").endpoint
+        == "http://n5:8090"
+    )
+    assert (
+        WhisperCppBackend(endpoint="http://n5:8090/inference/").endpoint
+        == "http://n5:8090"
+    )
+
+
+def test_detect_language_returns_none_on_ffmpeg_failure(tmp_path: Path, monkeypatch):
+    # materialize_wav runs ffmpeg with check=True → CalledProcessError on a
+    # bad probe; detect_language must swallow it and fall back to auto.
+    import subprocess as _sp
+
+    from immy.asr import plan as plan_mod
+    media = tmp_path / "clip.mp4"
+    media.write_bytes(b"\x00")
+    be = WhisperCppBackend(endpoint="http://n5:8090")
+
+    def boom(*a, **k):
+        raise _sp.CalledProcessError(1, ["ffmpeg"])
+
+    monkeypatch.setattr(plan_mod, "materialize_wav", boom)
+    assert be.detect_language(
+        media, candidates=("en", "ru"), model="m") is None
+
+
 def test_lang_name_to_code():
     assert _lang_name_to_code("english") == "en"
     assert _lang_name_to_code("Russian") == "ru"

@@ -20,12 +20,12 @@ def test_ml_built_without_clip_model(tmp_path):
     cfg = config_mod.load(_write(tmp_path, """
 ml:
   whisper_backend: whispercpp
-  whisper_endpoint: http://n5:8080/inference
+  whisper_endpoint: http://n5:8090
   whisper_model: large-v3
 """))
     assert cfg.ml is not None
     assert cfg.ml.whisper_backend == "whispercpp"
-    assert cfg.ml.whisper_endpoint == "http://n5:8080/inference"
+    assert cfg.ml.whisper_endpoint == "http://n5:8090"
     assert cfg.ml.whisper_model == "large-v3"
     assert cfg.ml.clip_model is None
 
