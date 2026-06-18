@@ -1,9 +1,9 @@
-"""Backend selection (Phase 1).
+"""Backend selection.
 
-`get_backend("mlx")` is the only wired backend today; "whispercpp" and
-"qwen-asr" are reserved names that raise a clear NotImplementedError so a
-config typo or premature use on the NAS fails loudly instead of silently
-falling back to the Apple-only path.
+All three backends are wired: "mlx" (Apple, in-process; Phase 1), "whispercpp"
+and "qwen-asr" (both HTTP to an `/inference` verbose_json server — whisper-server
+and the Qwen shim respectively; Phase 2/5). The HTTP backends need `endpoint`.
+An unknown name raises ValueError so a config typo fails loudly.
 """
 
 from __future__ import annotations
@@ -21,10 +21,8 @@ def get_backend(name: str = "mlx", *, endpoint: str | None = None) -> AsrBackend
         from .whispercpp_backend import WhisperCppBackend
         return WhisperCppBackend(endpoint=endpoint or "")
     if name == "qwen-asr":
-        raise NotImplementedError(
-            f"whisper_backend {name!r} is not implemented yet "
-            f"(Phase 5 — see raw/IMMY-ON-N5.md); 'mlx' and 'whispercpp' are wired."
-        )
+        from .whispercpp_backend import QwenAsrBackend
+        return QwenAsrBackend(endpoint=endpoint or "")
     raise ValueError(
         f"unknown whisper_backend {name!r}; expected one of {KNOWN_BACKENDS}"
     )

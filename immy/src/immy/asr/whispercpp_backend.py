@@ -254,4 +254,16 @@ class WhisperCppBackend:
         )
 
 
-__all__ = ["WhisperCppBackend", "WhisperCppError"]
+class QwenAsrBackend(WhisperCppBackend):
+    """Qwen3-ASR (quality tier) over the SAME `/inference` verbose_json
+    contract — served by the shim in `raw/qwen-asr-shim/` which wraps the
+    `qwen3-asr-cpu` model in FastAPI. The wire format is identical to
+    whisper-server, so the only difference is the name (and the endpoint the
+    config points at). Qwen is the multilingual/no-hallucination champion;
+    whisper.cpp stays the fast-EN option.
+    """
+
+    name = "qwen-asr"
+
+
+__all__ = ["WhisperCppBackend", "QwenAsrBackend", "WhisperCppError"]
