@@ -508,6 +508,8 @@ def process_trip(
     caption_workers: int = 1,
     transcode_videos: bool = True,
     clip_model: str = clip_mod.DEFAULT_MODEL,
+    clip_backend: str = "mlx",
+    clip_endpoint: str | None = None,
     faces_model: str = faces_mod.DEFAULT_MODEL,
     transcript_model: str = transcripts_mod.DEFAULT_MODEL,
     transcript_prompt: str | None = None,
@@ -588,7 +590,7 @@ def process_trip(
         journal = Journal.load(trip_folder)
     INGEST_VERSION = "v1"
     DERIV_VERSION = journal_mod.DERIVATIVES_VERSION
-    CLIP_VERSION = journal_mod.clip_version(clip_model)
+    CLIP_VERSION = journal_mod.clip_version(clip_model, clip_backend)
     FACES_VERSION = journal_mod.faces_version(faces_model)
     TRANSCRIPT_VERSION = journal_mod.transcript_version(transcript_model)
     CAPTION_VERSION = (
@@ -941,7 +943,10 @@ def process_trip(
                 try:
                     def _do_clip() -> None:
                         nonlocal clip_embedded
-                        embedding = clip_mod.embed_image(preview, clip_model)
+                        embedding = clip_mod.embed(
+                            preview, model_name=clip_model,
+                            backend=clip_backend, endpoint=clip_endpoint,
+                        )
                         if expected_dim is not None and len(embedding) != expected_dim:
                             raise RuntimeError(
                                 f"CLIP dim mismatch: model {clip_model!r} produced "

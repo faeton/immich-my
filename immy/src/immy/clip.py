@@ -19,7 +19,11 @@ See docs/IMMICH-INGEST.md §4.3.
 
 from __future__ import annotations
 
+import json
+import mimetypes
 import os
+import urllib.request
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,8 @@ import numpy as np
 
 
 DEFAULT_MODEL = "ViT-B-32__openai"
+DEFAULT_BACKEND = "mlx"            # mlx (Apple) | immich-ml (NAS HTTP)
+KNOWN_BACKENDS = ("mlx", "immich-ml")
 
 # mlx-clip's `mlx_clip(model_dir)` interprets its first arg as a local path
 # and downloads/converts weights *into that path* if missing. Default to a
@@ -112,6 +118,112 @@ def embed_image(image_path: Path, model_name: str = DEFAULT_MODEL) -> list[float
     return _l2_normalize(arr).tolist()
 
 
+class ClipBackendError(RuntimeError):
+    """An HTTP CLIP backend (immich-ml) was unreachable or returned a shape we
+    couldn't parse. Distinct from `ClipUnavailable` (mlx/model not installed)."""
+
+
+def embed_image_via_immich_ml(
+    image_path: Path,
+    *,
+    model_name: str = DEFAULT_MODEL,
+    endpoint: str,
+    timeout_s: float = 120.0,
+) -> list[float]:
+    """L2-normalized CLIP image embedding from an Immich ML server.
+
+    POSTs the preview JPEG to `{endpoint}/predict` (multipart) with the
+    Immich pipeline-request shape and parses the visual embedding back.
+
+    Contract verified against Immich v2.7.5 (2026-06-18):
+      request : entries=`{"clip":{"visual":{"modelName":<m>,"options":{}}}}`
+                + image=<bytes>
+      response: {"clip": "<json-string of [float,...]>", "imageHeight",
+                "imageWidth"} — note `clip` is a JSON STRING that needs a
+                second parse; the vector is already unit-norm but we
+                re-normalize defensively to match the mlx path exactly.
+    """
+    entries = json.dumps(
+        {"clip": {"visual": {"modelName": model_name, "options": {}}}}
+    )
+    boundary = uuid.uuid4().hex
+    crlf = b"\r\n"
+    ctype = mimetypes.guess_type(image_path.name)[0] or "image/jpeg"
+    body = crlf.join([
+        f"--{boundary}".encode(),
+        b'Content-Disposition: form-data; name="entries"',
+        b"", entries.encode("utf-8"),
+        f"--{boundary}".encode(),
+        (
+            'Content-Disposition: form-data; name="image"; '
+            f'filename="{image_path.name}"'
+        ).encode(),
+        f"Content-Type: {ctype}".encode(),
+        b"", image_path.read_bytes(),
+        f"--{boundary}--".encode(), b"",
+    ])
+    req = urllib.request.Request(
+        endpoint.rstrip("/") + "/predict",
+        data=body,
+        headers={"Content-Type": f"multipart/form-data; boundary={boundary}"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+    except Exception as e:  # URLError, timeout, JSON decode
+        raise ClipBackendError(
+            f"immich-ml /predict at {endpoint} failed: {e}"
+        ) from e
+    clip = payload.get("clip")
+    # `clip` is double-encoded (a JSON string) on v2.7.x; tolerate a plain
+    # list too in case a future version stops stringifying it.
+    if isinstance(clip, str):
+        try:
+            clip = json.loads(clip)
+        except ValueError as e:
+            raise ClipBackendError(
+                f"immich-ml returned unparseable clip string: {clip[:80]!r}"
+            ) from e
+    if not isinstance(clip, list) or not clip:
+        raise ClipBackendError(
+            f"immich-ml response missing clip embedding: {str(payload)[:120]}"
+        )
+    arr = np.asarray(clip, dtype=np.float32).flatten()
+    return _l2_normalize(arr).tolist()
+
+
+def embed(
+    image_path: Path,
+    *,
+    model_name: str = DEFAULT_MODEL,
+    backend: str = DEFAULT_BACKEND,
+    endpoint: str | None = None,
+) -> list[float]:
+    """Backend dispatch for a single image embedding.
+
+    "mlx" (default, Apple Silicon, in-process) | "immich-ml" (HTTP to an
+    Immich ML server at `endpoint`). The two are NOT interchangeable vectors —
+    different implementations of the "same" model name produce different
+    embeddings, so the journal version encodes the backend (see
+    `journal.clip_version`) and switching backends re-embeds.
+    """
+    if backend == "mlx":
+        return embed_image(image_path, model_name)
+    if backend == "immich-ml":
+        if not endpoint:
+            raise ClipBackendError(
+                "clip_backend 'immich-ml' needs ml.immich_ml_url "
+                "(the Immich ML server URL, e.g. http://n5:3003)"
+            )
+        return embed_image_via_immich_ml(
+            image_path, model_name=model_name, endpoint=endpoint,
+        )
+    raise ClipBackendError(
+        f"unknown clip_backend {backend!r}; expected one of {KNOWN_BACKENDS}"
+    )
+
+
 def to_pgvector_literal(embedding: list[float]) -> str:
     """Render a float list as a pgvector string literal.
 
@@ -123,7 +235,8 @@ def to_pgvector_literal(embedding: list[float]) -> str:
 
 
 __all__ = [
-    "DEFAULT_MODEL", "MODEL_REPO",
-    "ClipUnavailable",
-    "get_model", "embed_image", "to_pgvector_literal",
+    "DEFAULT_MODEL", "DEFAULT_BACKEND", "KNOWN_BACKENDS", "MODEL_REPO",
+    "ClipUnavailable", "ClipBackendError",
+    "get_model", "embed_image", "embed_image_via_immich_ml", "embed",
+    "to_pgvector_literal",
 ]

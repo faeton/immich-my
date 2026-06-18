@@ -949,6 +949,8 @@ def _run_one_trip(
     captioner_config,
     caption_workers: int,
     clip_model: str,
+    clip_backend: str = "mlx",
+    clip_endpoint: str | None = None,
     transcript_model: str,
     transcript_prompt: str | None,
     transcript_backend: str = "mlx",
@@ -1033,6 +1035,8 @@ def _run_one_trip(
             caption_workers=caption_workers,
             transcode_videos=transcode_videos,
             clip_model=clip_model,
+            clip_backend=clip_backend,
+            clip_endpoint=clip_endpoint,
             transcript_model=transcript_model,
             transcript_prompt=transcript_prompt,
             transcript_backend=transcript_backend,
@@ -1205,6 +1209,12 @@ def process(
         if (config.ml is not None and config.ml.clip_model)
         else clip_mod.DEFAULT_MODEL
     )
+    clip_backend = os.environ.get("IMMY_CLIP_BACKEND") or (
+        config.ml.clip_backend if config.ml is not None else "mlx"
+    )
+    clip_endpoint = os.environ.get("IMMY_IMMICH_ML_URL") or (
+        config.ml.immich_ml_url if config.ml is not None else None
+    )
     transcript_model = transcripts_mod.DEFAULT_MODEL
     if config.ml is not None and config.ml.whisper_model:
         transcript_model = config.ml.whisper_model
@@ -1327,6 +1337,8 @@ def process(
                 captioner_config=captioner_config,
                 caption_workers=caption_workers,
                 clip_model=clip_model,
+                clip_backend=clip_backend,
+                clip_endpoint=clip_endpoint,
                 transcript_model=transcript_model,
                 transcript_prompt=transcript_prompt,
                 transcript_backend=transcript_backend,

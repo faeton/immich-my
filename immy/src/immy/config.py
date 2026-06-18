@@ -24,6 +24,8 @@ Shape:
       container_root: /data                       # IMMICH_MEDIA_LOCATION in the container
     ml:                              # optional; Y.3 CLIP defaults
       clip_model: ViT-B-32__openai   # must match Immich's configured model
+      clip_backend: mlx              # mlx (Apple) | immich-ml (NAS HTTP)
+      immich_ml_url: http://n5:3003  # required when clip_backend: immich-ml
       whisper_prompt: "English, Russian, Ukrainian."  # biases auto-detect
       captioner:                     # optional; Phase 3b VLM captions
         endpoint: http://localhost:1234/v1   # LM Studio default; OpenAI/
@@ -106,6 +108,12 @@ class MLConfig:
     """
 
     clip_model: str | None = None
+    # CLIP inference engine. "mlx" (default) embeds in-process on Apple
+    # Silicon; "immich-ml" POSTs the preview to an Immich ML server (the NAS
+    # path — no GPU/weights on the immy side). `immich_ml_url` is that
+    # server's URL (e.g. http://n5:3003), required when clip_backend=immich-ml.
+    clip_backend: str = "mlx"
+    immich_ml_url: str | None = None
     whisper_model: str | None = None
     whisper_prompt: str | None = None
     # ASR inference engine. "mlx" (default) is the Apple-Silicon path; "whispercpp"
@@ -206,6 +214,11 @@ def load(path: Path | None = None) -> Config:
         cap_raw = ml_raw.get("captioner") or {}
         ml = MLConfig(
             clip_model=str(ml_raw["clip_model"]) if ml_raw.get("clip_model") else None,
+            clip_backend=str(ml_raw.get("clip_backend") or "mlx"),
+            immich_ml_url=(
+                str(ml_raw["immich_ml_url"])
+                if ml_raw.get("immich_ml_url") else None
+            ),
             whisper_model=str(whisper) if whisper else None,
             whisper_backend=str(ml_raw.get("whisper_backend") or "mlx"),
             whisper_endpoint=(

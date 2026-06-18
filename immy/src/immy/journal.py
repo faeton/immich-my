@@ -131,8 +131,13 @@ class Journal:
 DERIVATIVES_VERSION = "v1"  # bump on layout/format changes
 
 
-def clip_version(model: str) -> str:
-    return f"clip:{model}"
+def clip_version(model: str, backend: str = "mlx") -> str:
+    # mlx keeps the bare `clip:{model}` form so existing Mac journals don't
+    # re-embed; other backends (immich-ml) get a distinct version because the
+    # same model name yields different vectors per implementation.
+    if backend == "mlx":
+        return f"clip:{model}"
+    return f"clip:{backend}/{model}"
 
 
 def faces_version(model: str) -> str:
