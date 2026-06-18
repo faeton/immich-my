@@ -511,6 +511,7 @@ def process_trip(
     faces_model: str = faces_mod.DEFAULT_MODEL,
     transcript_model: str = transcripts_mod.DEFAULT_MODEL,
     transcript_prompt: str | None = None,
+    transcript_backend: str = "mlx",
     on_derivative_error: str = "skip",  # 'skip' | 'raise'
     on_clip_error: str = "skip",        # 'skip' | 'raise'
     on_faces_error: str = "skip",       # 'skip' | 'raise'
@@ -1013,6 +1014,7 @@ def process_trip(
                     lambda: _process_transcript(
                         sink, asset.id, exif_row.path, transcript_model,
                         make=make, prompt=transcript_prompt,
+                        backend=transcript_backend,
                     ),
                     "transcript", timings,
                 )
@@ -1396,6 +1398,7 @@ def _process_transcript(
     *,
     make: str | None = None,
     prompt: str | None = None,
+    backend: str = "mlx",
 ) -> dict | None:
     """Transcribe a video and write the excerpt into `asset_exif.description`.
 
@@ -1454,7 +1457,8 @@ def _process_transcript(
     speech_s = transcripts_mod.speech_seconds(media)
     if speech_s is not None and speech_s < transcripts_mod.SPEECH_MIN_SECONDS:
         return {"skipped": f"silent-sweep ({speech_s:.1f}s speech)"}
-    result = transcripts_mod.transcribe(media, model=model, prompt=prompt)
+    result = transcripts_mod.transcribe(
+        media, model=model, prompt=prompt, backend=backend)
     if result is None:
         return {"skipped": "whisper-empty"}
     if isinstance(result, transcripts_mod.HallucinationOnly):

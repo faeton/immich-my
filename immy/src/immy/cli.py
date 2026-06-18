@@ -951,6 +951,7 @@ def _run_one_trip(
     clip_model: str,
     transcript_model: str,
     transcript_prompt: str | None,
+    transcript_backend: str = "mlx",
     force: bool = False,
 ) -> bool:
     """Run the full pipeline for one trip folder. Returns True on success.
@@ -1033,6 +1034,7 @@ def _run_one_trip(
             clip_model=clip_model,
             transcript_model=transcript_model,
             transcript_prompt=transcript_prompt,
+            transcript_backend=transcript_backend,
             progress=_progress,
         )
         # process_trip commits per asset by default (commit_per_asset=True),
@@ -1197,13 +1199,18 @@ def process(
             "[yellow]note:[/yellow] --with-faces needs derivatives. Skipping faces."
         )
     clip_model = (
-        config.ml.clip_model if config.ml is not None else clip_mod.DEFAULT_MODEL
+        config.ml.clip_model
+        if (config.ml is not None and config.ml.clip_model)
+        else clip_mod.DEFAULT_MODEL
     )
     transcript_model = transcripts_mod.DEFAULT_MODEL
     if config.ml is not None and config.ml.whisper_model:
         transcript_model = config.ml.whisper_model
     transcript_prompt = os.environ.get("IMMY_WHISPER_PROMPT") or (
         config.ml.whisper_prompt if config.ml is not None else None
+    )
+    transcript_backend = os.environ.get("IMMY_WHISPER_BACKEND") or (
+        config.ml.whisper_backend if config.ml is not None else "mlx"
     )
     captioner_config: captions_mod.CaptionerConfig | None = None
     if with_captions:
@@ -1316,6 +1323,7 @@ def process(
                 clip_model=clip_model,
                 transcript_model=transcript_model,
                 transcript_prompt=transcript_prompt,
+                transcript_backend=transcript_backend,
                 force=force,
             )
             if success:

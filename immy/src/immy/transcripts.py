@@ -22,10 +22,14 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
-from dataclasses import dataclass
 from pathlib import Path
 
 from . import video as video_mod
+from .asr.types import (  # re-exported: stable public surface for process.py + tests
+    HALLUCINATION_ONLY,
+    HallucinationOnly,
+    TranscriptResult,
+)
 from .hallucinations import collapse_word_runs, is_hallucination, repetition_loop_indexes
 
 
@@ -81,39 +85,13 @@ REGION_PAD_SECONDS = 0.75
 TRANSCRIBE_MAKE_DENYLIST = ("dji",)
 
 
-try:
-    import mlx_whisper  # type: ignore
-except ImportError:
-    mlx_whisper = None  # mlx-whisper is Apple Silicon only; guard at call site
-
-
-@dataclass(frozen=True)
-class TranscriptResult:
-    srt_path: Path
-    language: str
-    excerpt: str
-
-
-# Sentinel returned by `transcribe()` when Whisper produced text but it
-# was entirely hallucinated boilerplate (DimaTorzok credits etc.). The
-# pipeline distinguishes this from "Whisper produced no text at all"
-# (silent clip) so `process.py` can record a meaningful skip reason
-# instead of a bare empty result.
-class HallucinationOnly:
-    """Marker class — `transcribe()` returns this instance when every
-    Whisper segment was filtered as a known hallucination."""
-    __slots__ = ()
-
-
-HALLUCINATION_ONLY = HallucinationOnly()
-
-
-def _require_mlx_whisper() -> None:
-    if mlx_whisper is None:
-        raise RuntimeError(
-            "mlx-whisper is unavailable; install it via `uv sync` on Apple "
-            "Silicon (mlx-whisper is x86-unsupported upstream)."
-        )
+# Inference + the result/marker types now live under `immy/asr/`:
+#   TranscriptResult, HallucinationOnly, HALLUCINATION_ONLY → asr.types
+#   mlx-whisper call + constrained language ID            → asr.mlx_backend
+#   render/scrub/sidecar orchestration                    → asr.runner
+# This module keeps the portable, backend-neutral helpers (silence/speech
+# detection, SRT rendering, hallucination scrub, sidecar naming) and exposes
+# `transcribe` / `detect_language_constrained` as thin compat wrappers.
 
 
 def _format_ts(seconds: float) -> str:
@@ -370,51 +348,17 @@ def detect_language_constrained(
     model: str = DEFAULT_MODEL,
     seek_s: float = SILENCE_SEEK_SECONDS,
 ) -> str | None:
-    """Pick the most-likely language *from the candidate set*.
+    """Compat wrapper — constrained language ID via the mlx backend.
 
-    Whisper's auto-detect sees every supported language and on noisy /
-    near-silent clips often locks onto a low-resource one (`fo`, `nn`,
-    `ja`). This runs the same language head but renormalises the
-    softmax over `candidates` only, so the answer is always one the
-    user actually speaks. Returns None if mlx-whisper or its internals
-    aren't available — caller should then fall back to auto-detect.
+    Kept under this name for callers/tests that import it; the implementation
+    moved to `asr.mlx_backend.MlxWhisperBackend.detect_language`. `seek_s` is
+    forwarded so the public signature stays honest.
     """
-    _require_mlx_whisper()
-    try:
-        from mlx_whisper.audio import (
-            SAMPLE_RATE, N_SAMPLES, load_audio, log_mel_spectrogram, pad_or_trim,
-        )
-        from mlx_whisper.decoding import detect_language as _detect
-        from mlx_whisper.load_models import load_model
-        from mlx_whisper.tokenizer import get_tokenizer
-    except ImportError:
-        return None
-    try:
-        m = load_model(model)
-        audio = load_audio(str(media))
-        # 30 s window starting after the intro — matches the chunk size
-        # the language head was trained on. Bare slice is fine; pad_or_trim
-        # handles short tails by zero-padding.
-        start = int(max(seek_s, 0.0) * SAMPLE_RATE)
-        audio = audio[start : start + N_SAMPLES]
-        mel = log_mel_spectrogram(pad_or_trim(audio, N_SAMPLES), n_mels=m.dims.n_mels)
-        tokenizer = get_tokenizer(m.is_multilingual, num_languages=m.num_languages)
-        _, probs_list = _detect(m, mel, tokenizer)
-    except Exception:
-        return None
-    # mlx-whisper's detect_language returns a list of dicts for batched
-    # mel input but a bare dict for a single spectrogram (its `single`
-    # path) — and we always pass one window. Indexing the dict with [0]
-    # raised KeyError past the except above, which silently killed every
-    # transcript via on_transcript_error="skip" (mlx-whisper 0.4.3).
-    if isinstance(probs_list, dict):
-        probs = probs_list
-    else:
-        probs = probs_list[0] if probs_list else {}
-    if not probs:
-        return candidates[0] if candidates else None
-    best = max(candidates, key=lambda c: float(probs.get(c, 0.0)))
-    return best
+    from .asr.mlx_backend import MlxWhisperBackend
+
+    return MlxWhisperBackend().detect_language(
+        media, candidates=candidates, model=model, seek_s=seek_s,
+    )
 
 
 def transcribe(
@@ -424,92 +368,32 @@ def transcribe(
     language: str | None = None,
     lang_candidates: tuple[str, ...] | None = DEFAULT_LANG_CANDIDATES,
     prompt: str | None = None,
+    backend: str = "mlx",
 ) -> TranscriptResult | HallucinationOnly | None:
-    """Transcribe one video; write the .srt sidecar; return excerpt.
+    """Transcribe one video; write the .srt sidecar; return the excerpt.
 
-    Returns None when Whisper produced no text (silent clip, or a
-    language Whisper couldn't latch onto). Caller is expected to have
-    pre-checked `has_audio(media)` — we don't re-probe here to avoid
-    the duplicate ffprobe call when the caller already did it.
+    Thin wrapper over the pluggable ASR layer. `backend` selects the inference
+    engine — "mlx" (default; unchanged Mac behavior) is the only one wired;
+    "whispercpp"/"qwen-asr" are Phase 2/5 (see raw/IMMY-ON-N5.md). Language
+    detection, SRT render/scrub, and sidecar writing are shared across backends
+    in `asr.runner`.
 
-    `prompt` is passed through as Whisper's `initial_prompt`. Best use
-    is a short phrase in the language(s) you expect — it biases the
-    tokenizer toward the right vocabulary and script for mixed-language
-    corpora where auto-detect would otherwise land on a close neighbour
-    (e.g. Russian vs Ukrainian, or German vs Dutch).
+    Returns None when the backend produced no text (silent clip / undetectable
+    language) and HALLUCINATION_ONLY when every segment was boilerplate. Caller
+    is expected to have pre-checked `has_audio(media)`.
+
+    `prompt` is passed through as the decoder's `initial_prompt` — a short phrase
+    in the expected language(s) biases tokenisation toward the right script.
     """
-    _require_mlx_whisper()
-    if language is None and lang_candidates:
-        language = detect_language_constrained(
-            media, candidates=lang_candidates, model=model,
-        )
-    # `condition_on_previous_text=False` breaks the main hallucination
-    # feedback loop: by default Whisper feeds each chunk's transcript as
-    # the prompt for the next chunk, so once a single "Продолжение
-    # следует" appears, the next chunk sees it and locks into outputting
-    # the same fansub-style boilerplate for the rest of the file.
-    # Disabling cross-chunk priming costs minor consistency on rare
-    # proper nouns but eliminates the runaway-credit cascades.
-    # `hallucination_silence_threshold` (needs word_timestamps) makes the
-    # decoder skip silent gaps >2 s when a window looks hallucinated —
-    # the other half of the loop fix. A/B on the three worst loopers
-    # (2026-06): max identical-run 17→15, 12→8, and +16 unique real cues
-    # on a 14-min clip, at a modest word-timestamp compute cost.
-    kwargs: dict = {
-        "path_or_hf_repo": model,
-        "condition_on_previous_text": False,
-        "word_timestamps": True,
-        "hallucination_silence_threshold": 2.0,
-    }
-    if language:
-        kwargs["language"] = language
-    if prompt:
-        kwargs["initial_prompt"] = prompt
-    # For long, sparse-speech files (e.g. a 60-min hike with 2 min of
-    # actual chatter), hand Whisper the speech-only timeline via
-    # `clip_timestamps`. Inference cost then scales with speech duration,
-    # not file duration, and SRT cue stamps stay correct in the original
-    # video timeline (Whisper's chunker handles the offset internally).
-    intervals_info = speech_intervals(media, pad_s=REGION_PAD_SECONDS)
-    if intervals_info is not None:
-        total, intervals = intervals_info
-        speech_total = sum(e - s for s, e in intervals)
-        if (
-            total >= REGION_MIN_DURATION_SECONDS
-            and speech_total > 0
-            and speech_total / total < REGION_MAX_SPEECH_FRACTION
-            and len(intervals) >= 1
-        ):
-            # Flat [s0,e0,s1,e1,...] — mlx_whisper accepts list[float].
-            kwargs["clip_timestamps"] = [
-                round(v, 3) for s, e in intervals for v in (s, e)
-            ]
-    result = mlx_whisper.transcribe(str(media), **kwargs)
-    segments = result.get("segments") or []
-    full_text = str(result.get("text") or "").strip()
-    if not full_text:
-        return None
-    detected_lang = str(result.get("language") or language or DEFAULT_LANG_CODE)
-    # Render the SRT first — `format_srt` drops hallucinated cues — and
-    # check whether anything survived. If every segment Whisper emitted
-    # was boilerplate (the typical "60 minutes of wind, but Whisper
-    # produced 200 'DimaTorzok' lines" case), skip writing the sidecar
-    # and signal HALLUCINATION_ONLY so the caller can journal a
-    # meaningful skip reason instead of a fake-positive transcript.
-    srt_body = format_srt(segments)
-    if not srt_body.strip():
-        return HALLUCINATION_ONLY
-    # Rebuild the excerpt from the cleaned SRT so the description doesn't
-    # leak hallucinated text into Immich either.
-    clean_text = srt_to_plaintext(srt_body)
-    if not clean_text:
-        return HALLUCINATION_ONLY
-    dst = sidecar_path(media, detected_lang)
-    dst.write_text(srt_body, encoding="utf-8")
-    return TranscriptResult(
-        srt_path=dst,
-        language=detected_lang,
-        excerpt=excerpt_text(clean_text),
+    from .asr import registry, runner
+
+    be = registry.get_backend(backend)
+    return runner.transcribe_media(
+        media, be,
+        model=model,
+        language=language,
+        lang_candidates=lang_candidates,
+        prompt=prompt,
     )
 
 

@@ -100,9 +100,15 @@ class MLConfig:
     single language. Also overridable via the `IMMY_WHISPER_PROMPT` env var.
     """
 
-    clip_model: str
+    clip_model: str | None = None
     whisper_model: str | None = None
     whisper_prompt: str | None = None
+    # ASR inference engine. "mlx" (default) is the Apple-Silicon path; "whispercpp"
+    # and "qwen-asr" are the NAS backends (Phase 2/5, see raw/IMMY-ON-N5.md).
+    # `whisper_endpoint` points at a whisper.cpp / qwen-asr-serve HTTP server when
+    # the chosen backend speaks HTTP rather than running in-process.
+    whisper_backend: str = "mlx"
+    whisper_endpoint: str | None = None
     # Captioner (Phase 3b). Any field None → captioner falls back to the
     # module-level defaults in `captions.py` (LM Studio on localhost,
     # Qwen2.5-VL-7B, no auth). Point at OpenAI/Anthropic/Gemini by
@@ -180,13 +186,23 @@ def load(path: Path | None = None) -> Config:
 
     ml_raw = data.get("ml") or {}
     ml = None
-    if ml_raw.get("clip_model"):
+    # Build MLConfig whenever an `[ml]` block exists at all — not only when
+    # `clip_model` is set. A transcript/caption-only NAS deployment legitimately
+    # omits clip_model (CLIP is delegated to Immich's ML server there), and it
+    # must still pick up whisper_backend etc. instead of silently defaulting to
+    # "mlx" and failing at inference time.
+    if ml_raw:
         whisper = ml_raw.get("whisper_model")
         prompt = ml_raw.get("whisper_prompt")
         cap_raw = ml_raw.get("captioner") or {}
         ml = MLConfig(
-            clip_model=str(ml_raw["clip_model"]),
+            clip_model=str(ml_raw["clip_model"]) if ml_raw.get("clip_model") else None,
             whisper_model=str(whisper) if whisper else None,
+            whisper_backend=str(ml_raw.get("whisper_backend") or "mlx"),
+            whisper_endpoint=(
+                str(ml_raw["whisper_endpoint"])
+                if ml_raw.get("whisper_endpoint") else None
+            ),
             whisper_prompt=str(prompt) if prompt else None,
             captioner_endpoint=(
                 str(cap_raw["endpoint"]) if cap_raw.get("endpoint") else None
