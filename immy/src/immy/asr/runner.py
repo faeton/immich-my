@@ -9,6 +9,7 @@ the mlx path produces identical output; only the inference call is now pluggable
 from __future__ import annotations
 
 from pathlib import Path
+from typing import Callable
 
 from .base import AsrBackend
 from .types import HALLUCINATION_ONLY, HallucinationOnly, TranscriptResult
@@ -22,6 +23,7 @@ def transcribe_media(
     language: str | None = None,
     lang_candidates: tuple[str, ...] | None = None,
     prompt: str | None = None,
+    sidecar_path: Callable[[Path, str], Path] | None = None,
 ) -> TranscriptResult | HallucinationOnly | None:
     """Transcribe one video via `backend`; write the .srt; return the excerpt.
 
@@ -51,7 +53,11 @@ def transcribe_media(
     clean_text = t.srt_to_plaintext(srt_body)
     if not clean_text:
         return HALLUCINATION_ONLY
-    dst = t.sidecar_path(media, detected_lang)
+    # `sidecar_path` redirects the .srt off a read-only originals mount (NAS);
+    # unset → t.sidecar_path (sibling of the media, the Mac path, unchanged).
+    resolve = sidecar_path if sidecar_path is not None else t.sidecar_path
+    dst = resolve(media, detected_lang)
+    dst.parent.mkdir(parents=True, exist_ok=True)
     dst.write_text(srt_body, encoding="utf-8")
     return TranscriptResult(
         srt_path=dst,

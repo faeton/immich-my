@@ -49,11 +49,13 @@ from .exif import ExifRow, MEDIA_EXTS, read_folder
 from .heartbeat import Heartbeat
 from .journal import Journal
 from .offline import Sink
+from .paths import WritablePaths, resolve_writable_paths
 from .pg import LibraryInfo
-from .state import AUDIT_DIR
+from .state import AUDIT_DIR, Y_MARKER_FILENAME
 
 
-Y_MARKER_FILENAME = "y_processed.yml"
+# Y_MARKER_FILENAME now lives in state.py (imported above) so leaf modules
+# can reference it without importing process.py.
 
 VIDEO_EXTS = {
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mts", ".m2ts",
@@ -523,6 +525,7 @@ def process_trip(
     progress: Callable[[str], None] | None = None,
     journal: Journal | None = None,
     commit_per_asset: bool = True,
+    paths: WritablePaths | None = None,
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
     per-file results. Caller is responsible for transaction boundaries —
@@ -586,8 +589,13 @@ def process_trip(
     # ON CONFLICT path returns inserted=False on resume. Without it the
     # enrichers would skip a half-finished asset because they currently
     # gate on `inserted`.
+    # Resolve writable targets once. Unset roots → `<trip>/.audit` + sidecars
+    # beside the media (Mac path, byte-identical). NAS passes a WritablePaths
+    # rooted off the read-only originals so nothing is written under them.
+    if paths is None:
+        paths = resolve_writable_paths(trip_folder)
     if journal is None:
-        journal = Journal.load(trip_folder)
+        journal = Journal.load_path(paths.journal_path)
     INGEST_VERSION = "v1"
     DERIV_VERSION = journal_mod.DERIVATIVES_VERSION
     CLIP_VERSION = journal_mod.clip_version(clip_model, clip_backend)
@@ -642,7 +650,8 @@ def process_trip(
     # (e.g. tools/promote-all-trips.sh's Ctrl+T trap). One write per file
     # + per phase; cheap (~200 B atomic rename) compared to derivative /
     # CLIP / Whisper work that surrounds it.
-    hb = Heartbeat.for_trip(trip_folder, phase="process")
+    hb = Heartbeat.for_trip(
+        trip_folder, phase="process", path=paths.heartbeat_path)
 
     def _phase(fn, label: str, timings: dict) -> Any:
         hb.write(step=label)
@@ -768,7 +777,7 @@ def process_trip(
             compute_derivatives and we_own and derivs is None
             and asset.asset_type in ("IMAGE", "VIDEO")
         ):
-            base = derivatives_mod.staged_dir(trip_folder)
+            base = paths.derivatives_dir
             kinds = ["thumbnail", "preview"]
             if asset.asset_type == "VIDEO":
                 kinds.append("encoded_video")
@@ -889,6 +898,7 @@ def process_trip(
                         derivative_source=proxy,
                         preproc_vf=dewarp,
                         mirror_from=mirror,
+                        staging_dir=paths.derivatives_dir,
                     ),
                     "derivatives", timings,
                 )
@@ -1022,6 +1032,7 @@ def process_trip(
                         make=make, prompt=transcript_prompt,
                         backend=transcript_backend,
                         endpoint=transcript_endpoint,
+                        paths=paths,
                     ),
                     "transcript", timings,
                 )
@@ -1189,6 +1200,7 @@ def process_trip(
                         captioner_config, preview=caption_preview,
                         recaption=recaption,
                         require_preview=asset.asset_type == "VIDEO",
+                        paths=paths,
                     ),
                     "caption", timings,
                 )
@@ -1344,7 +1356,9 @@ def process_trip(
                 description = captions_mod.format_description(info["text"])
                 sink.update_description_if_ai_or_empty(
                     job.asset_id, description, file_name=job.media.name)
-                _mirror_description_to_xmp(sink, job.asset_id, job.media, description)
+                _mirror_description_to_xmp(
+                    sink, job.asset_id, job.media, description,
+                    xmp_path=paths.xmp_path(job.media))
                 sink.record_caption(job.asset_id, info)
                 journal.mark_done(
                     job.cs_hex, "caption", CAPTION_VERSION, meta=info,
@@ -1374,6 +1388,7 @@ def process_trip(
 
 def _mirror_description_to_xmp(
     sink: Sink, asset_id: str, media: Path, text: str,
+    *, xmp_path: Path | None = None,
 ) -> None:
     """Bake a freshly-written description into the local `.xmp` sidecar.
 
@@ -1392,7 +1407,7 @@ def _mirror_description_to_xmp(
     if current != text.strip():
         return
     try:
-        sidecar_mod.write(media, {"Description": text})
+        sidecar_mod.write(media, {"Description": text}, xmp_path=xmp_path)
     except Exception as e:  # exiftool missing/failed — never kill the run
         print(f"    !! xmp description mirror failed for {media.name}: {e}")
 
@@ -1407,6 +1422,7 @@ def _process_transcript(
     prompt: str | None = None,
     backend: str = "mlx",
     endpoint: str | None = None,
+    paths: WritablePaths | None = None,
 ) -> dict | None:
     """Transcribe a video and write the excerpt into `asset_exif.description`.
 
@@ -1427,7 +1443,14 @@ def _process_transcript(
 
     Only after all five pass do we pay the ~1–5× realtime Whisper cost.
     """
-    for sib in media.parent.glob(f"{media.stem}.*.srt"):
+    # Sidecar lookup/write redirect off :ro originals when `paths` is set;
+    # unset → media-sibling behavior (Mac path, unchanged).
+    xmp_for = paths.xmp_path(media) if paths is not None else None
+    existing_srts = (
+        paths.srt_glob(media) if paths is not None
+        else list(media.parent.glob(f"{media.stem}.*.srt"))
+    )
+    for sib in existing_srts:
         if sib.is_file():
             # Backfill the DB description from the sidecar when it's still
             # empty — catches the case where an earlier pass wrote the
@@ -1442,7 +1465,8 @@ def _process_transcript(
                     excerpt = transcripts_mod.excerpt_text(plain)
                     sink.update_description_if_empty(
                         asset_id, excerpt, file_name=media.name)
-                    _mirror_description_to_xmp(sink, asset_id, media, excerpt)
+                    _mirror_description_to_xmp(
+                        sink, asset_id, media, excerpt, xmp_path=xmp_for)
             except OSError:
                 pass
             return {"path": str(sib), "language": sib.suffixes[-2].lstrip(".")}
@@ -1466,7 +1490,8 @@ def _process_transcript(
     if speech_s is not None and speech_s < transcripts_mod.SPEECH_MIN_SECONDS:
         return {"skipped": f"silent-sweep ({speech_s:.1f}s speech)"}
     result = transcripts_mod.transcribe(
-        media, model=model, prompt=prompt, backend=backend, endpoint=endpoint)
+        media, model=model, prompt=prompt, backend=backend, endpoint=endpoint,
+        sidecar_path=(paths.srt_path if paths is not None else None))
     if result is None:
         return {"skipped": "whisper-empty"}
     if isinstance(result, transcripts_mod.HallucinationOnly):
@@ -1481,7 +1506,8 @@ def _process_transcript(
         # overwrite a prior AI caption with a transcript excerpt.
         sink.update_description_if_empty(
             asset_id, result.excerpt, file_name=media.name)
-        _mirror_description_to_xmp(sink, asset_id, media, result.excerpt)
+        _mirror_description_to_xmp(
+            sink, asset_id, media, result.excerpt, xmp_path=xmp_for)
     return {"path": str(result.srt_path), "language": result.language}
 
 
@@ -1494,6 +1520,7 @@ def _process_caption(
     preview: Path | None = None,
     recaption: bool = False,
     require_preview: bool = False,
+    paths: WritablePaths | None = None,
 ) -> dict | None:
     """Caption one image and write the prefixed description to the DB.
 
@@ -1529,7 +1556,9 @@ def _process_caption(
     result = captions_mod.caption(media, config=config, preview=preview)
     description = captions_mod.format_description(result.text)
     sink.update_description_if_ai_or_empty(asset_id, description, file_name=media.name)
-    _mirror_description_to_xmp(sink, asset_id, media, description)
+    _mirror_description_to_xmp(
+        sink, asset_id, media, description,
+        xmp_path=(paths.xmp_path(media) if paths is not None else None))
     return {
         "text": result.text,
         "model": result.model,
@@ -1570,7 +1599,9 @@ def _process_faces(
     return len(rows)
 
 
-def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
+def write_marker(
+    trip_folder: Path, results: list[ProcessResult], *, marker: Path | None = None,
+) -> Path:
     """Drop `.audit/y_processed.yml` so `immy promote` knows to skip the
     library-scan POST (the rows are already there) and to pick up any
     staged derivatives for rsync + `asset_file` INSERTs.
@@ -1579,7 +1610,8 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
     and `immy promote` (upload). Extending the schema is safe — promote
     ignores keys it doesn't recognise.
     """
-    marker = trip_folder / AUDIT_DIR / Y_MARKER_FILENAME
+    marker = marker if marker is not None else (
+        trip_folder / AUDIT_DIR / Y_MARKER_FILENAME)
     marker.parent.mkdir(parents=True, exist_ok=True)
     assets = []
     for r in results:
@@ -1625,9 +1657,10 @@ def write_marker(trip_folder: Path, results: list[ProcessResult]) -> Path:
     return marker
 
 
-def read_marker(trip_folder: Path) -> dict | None:
-    """Parse `.audit/y_processed.yml`. Returns None if marker is absent."""
-    path = marker_path(trip_folder)
+def read_marker(trip_folder: Path, *, marker: Path | None = None) -> dict | None:
+    """Parse `.audit/y_processed.yml`. Returns None if marker is absent.
+    `marker` overrides the default location (NAS state root)."""
+    path = marker if marker is not None else marker_path(trip_folder)
     if not path.is_file():
         return None
     return yaml.safe_load(path.read_text()) or {}
@@ -1641,7 +1674,9 @@ def is_processed(trip_folder: Path) -> bool:
     return marker_path(trip_folder).is_file()
 
 
-def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
+def is_trip_fully_cached(
+    trip_folder: Path, *, marker: Path | None = None,
+) -> tuple[bool, int]:
     """True when `.audit/y_processed.yml` exists, the count of ingestable
     media files matches the marker, and no source file has been modified
     since the marker was written. Returns `(cached, file_count)` so the
@@ -1660,13 +1695,13 @@ def is_trip_fully_cached(trip_folder: Path) -> tuple[bool, int]:
     from . import dji as _dji
     from . import raw as _raw
 
-    marker = read_marker(trip_folder)
-    if not marker:
+    marker_data = read_marker(trip_folder, marker=marker)
+    if not marker_data:
         return False, 0
-    processed_at = marker.get("processed_at")
+    processed_at = marker_data.get("processed_at")
     if not isinstance(processed_at, (int, float)):
         return False, 0
-    expected = marker.get("assets") or []
+    expected = marker_data.get("assets") or []
     files = list(_iter_media(trip_folder))
     files = [f for f in files if not _dji.is_proxy(f)]
     raw_index = _raw.build_raw_index(files)

@@ -8,6 +8,14 @@ Resolution order:
 Shape:
 
     originals_root: /mnt/incoming/originals-test
+    state_root: /scratch/immy-state  # optional; where `process` writes journal/
+                                     # marker/heartbeat/staged-derivatives/offline
+                                     # cache. Unset → `<trip>/.audit/` (Mac path).
+                                     # Set on the NAS so originals can be :ro.
+                                     # Env override: IMMY_STATE_ROOT.
+    sidecars_root: /library/sidecars # optional; where `.srt`/`.xmp` sidecars go.
+                                     # Unset → next to the media (Mac path).
+                                     # Env override: IMMY_SIDECARS_ROOT.
     notes_filename: TRIP.md          # optional; used by notes.py too
     immich:                          # optional; promote skips API if missing
       url: https://nas-media.example.ts.net:2283
@@ -148,6 +156,11 @@ class Config:
     ml: MLConfig | None
     notes_filename: str | None
     source: Path | None  # which file this came from, for error messages
+    # Writable roots for NAS mode (:ro originals). Unset → Mac behavior
+    # (state under `<trip>/.audit`, sidecars next to media). Placed last with
+    # defaults so existing positional/keyword constructions stay valid.
+    state_root: Path | None = None
+    sidecars_root: Path | None = None
 
 
 def _resolve_path(explicit: Path | None) -> Path | None:
@@ -172,6 +185,13 @@ def load(path: Path | None = None) -> Config:
 
     root_raw = data.get("originals_root")
     root = Path(root_raw).expanduser() if root_raw else None
+
+    # Writable roots (NAS mode). YAML key, overridden by env var. Unset → None,
+    # which keeps the Mac path under `<trip>/.audit` + sidecars-beside-media.
+    sr_raw = os.environ.get("IMMY_STATE_ROOT") or data.get("state_root")
+    state_root = Path(sr_raw).expanduser() if sr_raw else None
+    sc_raw = os.environ.get("IMMY_SIDECARS_ROOT") or data.get("sidecars_root")
+    sidecars_root = Path(sc_raw).expanduser() if sc_raw else None
 
     imm = data.get("immich") or {}
     immich = None
@@ -257,4 +277,6 @@ def load(path: Path | None = None) -> Config:
         ml=ml,
         notes_filename=data.get("notes_filename"),
         source=resolved,
+        state_root=state_root,
+        sidecars_root=sidecars_root,
     )

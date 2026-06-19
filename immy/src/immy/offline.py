@@ -44,7 +44,7 @@ import yaml
 
 from . import pg as pg_mod
 from .pg import LibraryInfo
-from .state import AUDIT_DIR
+from .state import AUDIT_DIR, Y_MARKER_FILENAME
 
 
 OFFLINE_DIR_NAME = "offline"
@@ -501,10 +501,14 @@ class OfflineSink:
         trip_folder: Path,
         library: LibraryInfo,
         clip_dim: int | None = None,
+        *,
+        offline_root: Path | None = None,
     ) -> None:
         self.trip_folder = trip_folder
         self.library = library
-        self.root = offline_dir(trip_folder)
+        # `offline_root` (NAS) redirects the spool off the read-only
+        # originals; unset → the historical `<trip>/.audit/offline/` path.
+        self.root = offline_root if offline_root is not None else offline_dir(trip_folder)
         self.root.mkdir(parents=True, exist_ok=True)
         _embeddings_dir(self.root).mkdir(parents=True, exist_ok=True)
         # Bag of (checksum_hex → dict) held open for the duration of one

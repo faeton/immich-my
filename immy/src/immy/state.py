@@ -20,6 +20,10 @@ import yaml
 AUDIT_DIR = ".audit"
 STATE_FILENAME = "state.yml"
 LOG_FILENAME = "audit.jsonl"
+# Marker `immy process` drops so `immy promote` knows the rows already exist.
+# Lives here (not in process.py) so leaf modules — paths.py, offline.py — can
+# import the filename without importing process.py (which would be a cycle).
+Y_MARKER_FILENAME = "y_processed.yml"
 
 
 @dataclass

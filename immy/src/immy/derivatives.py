@@ -440,6 +440,7 @@ def compute_for_asset(
     derivative_source: Path | None = None,
     preproc_vf: str | None = None,
     mirror_from: DerivativeResult | None = None,
+    staging_dir: Path | None = None,
 ) -> DerivativeResult:
     """Stage thumbnail + preview (and for videos, optional encoded_video)
     for one asset.
@@ -457,7 +458,9 @@ def compute_for_asset(
     second sibling is a ~100ms probe instead of a 20+ s transcode.
     Master is still probed so DB dims/duration reflect this asset.
     """
-    base = staged_dir(trip_folder)
+    # `staging_dir` redirects derivative staging off a read-only originals
+    # mount (NAS); unset → the default `<trip>/.audit/derivatives` (Mac path).
+    base = staging_dir if staging_dir is not None else staged_dir(trip_folder)
 
     if asset_type == "VIDEO" and mirror_from is not None:
         return _mirror_video_derivatives(

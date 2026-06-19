@@ -955,6 +955,9 @@ def _run_one_trip(
     transcript_prompt: str | None,
     transcript_backend: str = "mlx",
     transcript_endpoint: str | None = None,
+    originals_root: Path | None = None,
+    state_root: Path | None = None,
+    sidecars_root: Path | None = None,
     force: bool = False,
 ) -> bool:
     """Run the full pipeline for one trip folder. Returns True on success.
@@ -964,13 +967,24 @@ def _run_one_trip(
     committed are durable. The caller handles Ctrl-C by letting it
     propagate out — we rollback in `finally` regardless.
     """
+    # Resolve every writable target once. Unset roots → `<trip>/.audit` +
+    # sidecars beside the media (Mac path, byte-identical). NAS passes
+    # state_root/sidecars_root so nothing is written under the :ro originals.
+    paths = process_mod.resolve_writable_paths(
+        folder,
+        originals_root=originals_root,
+        state_root=state_root,
+        sidecars_root=sidecars_root,
+    )
+
     # Cheap skip: if the trip was fully processed previously and no source
     # file has been touched since, don't fork exiftool over thousands of
     # files just to re-confirm everything is cached. One stat() per file vs.
     # an exiftool spawn — saves ~all the wall-clock on a "scan all trips"
     # batch when most trips are already done. Pass --force to override.
     if not dry_run and not force:
-        cached, count = process_mod.is_trip_fully_cached(folder)
+        cached, count = process_mod.is_trip_fully_cached(
+            folder, marker=paths.marker_path)
         if cached:
             console.print(
                 f"\n[dim][cached][/dim] {folder.name}: "
@@ -979,7 +993,8 @@ def _run_one_trip(
             return True
 
     if offline:
-        sink: offline_mod.Sink = offline_mod.OfflineSink(folder, library)
+        sink: offline_mod.Sink = offline_mod.OfflineSink(
+            folder, library, offline_root=paths.offline_dir)
     else:
         sink = offline_mod.PgSink(conn)
 
@@ -1042,6 +1057,7 @@ def _run_one_trip(
             transcript_backend=transcript_backend,
             transcript_endpoint=transcript_endpoint,
             progress=_progress,
+            paths=paths,
         )
         # process_trip commits per asset by default (commit_per_asset=True),
         # so the trip-level commit here is a defensive no-op for the
@@ -1069,7 +1085,7 @@ def _run_one_trip(
     face_count = sum(r.faces_detected for r in results)
     transcript_count = sum(1 for r in results if r.transcript)
     caption_count = sum(1 for r in results if r.caption)
-    process_mod.write_marker(folder, results)
+    process_mod.write_marker(folder, results, marker=paths.marker_path)
     tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
     tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
     tail += f", [cyan]{face_count} face(s)[/cyan]" if face_count else ""
@@ -1343,6 +1359,9 @@ def process(
                 transcript_prompt=transcript_prompt,
                 transcript_backend=transcript_backend,
                 transcript_endpoint=transcript_endpoint,
+                originals_root=config.originals_root,
+                state_root=config.state_root,
+                sidecars_root=config.sidecars_root,
                 force=force,
             )
             if success:

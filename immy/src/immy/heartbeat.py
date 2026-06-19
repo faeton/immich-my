@@ -56,8 +56,12 @@ class Heartbeat:
     _state: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
-    def for_trip(cls, trip_folder: Path, phase: str) -> "Heartbeat":
-        p = heartbeat_path(trip_folder)
+    def for_trip(
+        cls, trip_folder: Path, phase: str, *, path: Path | None = None,
+    ) -> "Heartbeat":
+        # `path` redirects the heartbeat off a read-only originals mount (NAS);
+        # unset → the default `<trip>/.audit/.progress` (Mac path, unchanged).
+        p = path if path is not None else heartbeat_path(trip_folder)
         p.parent.mkdir(parents=True, exist_ok=True)
         hb = cls(path=p, phase=phase)
         hb.write(step="starting")

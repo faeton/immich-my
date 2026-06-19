@@ -370,6 +370,7 @@ def transcribe(
     prompt: str | None = None,
     backend: str = "mlx",
     endpoint: str | None = None,
+    sidecar_path: "Callable[[Path, str], Path] | None" = None,
 ) -> TranscriptResult | HallucinationOnly | None:
     """Transcribe one video; write the .srt sidecar; return the excerpt.
 
@@ -397,6 +398,7 @@ def transcribe(
         language=language,
         lang_candidates=lang_candidates,
         prompt=prompt,
+        sidecar_path=sidecar_path,
     )
 
 

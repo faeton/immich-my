@@ -59,7 +59,13 @@ class Journal:
 
     @classmethod
     def load(cls, trip_folder: Path) -> "Journal":
-        p = journal_path(trip_folder)
+        """Load from the default `<trip>/.audit/journal.yml`."""
+        return cls.load_path(journal_path(trip_folder))
+
+    @classmethod
+    def load_path(cls, p: Path) -> "Journal":
+        """Load from an explicit path — lets a caller redirect the journal
+        off a read-only originals mount (NAS) via WritablePaths.journal_path."""
         if not p.is_file():
             return cls(path=p)
         data = yaml.safe_load(p.read_text()) or {}

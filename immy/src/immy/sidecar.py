@@ -25,15 +25,22 @@ def _sidecar_path(media: Path) -> Path:
     return media.with_suffix(".xmp")
 
 
-def write(media: Path, patch: dict[str, object]) -> Path:
+def write(
+    media: Path, patch: dict[str, object], *, xmp_path: Path | None = None,
+) -> Path:
     """Write `patch` into the XMP sidecar for `media`. Returns sidecar path.
 
     `patch` keys are exiftool tag names (e.g. `GPSLatitude`, `GPSLatitudeRef`,
     `DateTimeOriginal`, `HierarchicalSubject`). Values are stringified.
     List values become repeated assignments (`=`) which overwrite the list
     in the sidecar — idempotent when the same list is re-applied.
+
+    `xmp_path` overrides the destination so the sidecar can be written away
+    from a read-only originals mount (NAS); unset → `media`'s sibling `.xmp`
+    (the Mac path, unchanged).
     """
-    sidecar = _sidecar_path(media)
+    sidecar = xmp_path if xmp_path is not None else _sidecar_path(media)
+    sidecar.parent.mkdir(parents=True, exist_ok=True)
     # Clean up stale exiftool temp from a prior interrupted/failed run —
     # otherwise exiftool refuses with "File already exists: ..._exiftool_tmp".
     stale_tmp = sidecar.with_name(sidecar.name + "_exiftool_tmp")

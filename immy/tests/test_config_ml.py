@@ -66,3 +66,32 @@ ml:
 def test_no_ml_block_yields_none(tmp_path):
     cfg = config_mod.load(_write(tmp_path, "originals_root: /tmp/x\n"))
     assert cfg.ml is None
+
+
+def test_state_roots_default_none(tmp_path):
+    # Mac path: omit the keys → both None → process writes <trip>/.audit.
+    cfg = config_mod.load(_write(tmp_path, "originals_root: /tmp/x\n"))
+    assert cfg.state_root is None
+    assert cfg.sidecars_root is None
+
+
+def test_state_roots_from_yaml(tmp_path):
+    cfg = config_mod.load(_write(tmp_path, """
+originals_root: /originals
+state_root: /scratch/immy-state
+sidecars_root: /library/sidecars
+"""))
+    assert cfg.state_root == Path("/scratch/immy-state")
+    assert cfg.sidecars_root == Path("/library/sidecars")
+
+
+def test_state_roots_env_overrides_yaml(tmp_path, monkeypatch):
+    monkeypatch.setenv("IMMY_STATE_ROOT", "/env/state")
+    monkeypatch.setenv("IMMY_SIDECARS_ROOT", "/env/side")
+    cfg = config_mod.load(_write(tmp_path, """
+originals_root: /originals
+state_root: /yaml/state
+sidecars_root: /yaml/side
+"""))
+    assert cfg.state_root == Path("/env/state")
+    assert cfg.sidecars_root == Path("/env/side")
