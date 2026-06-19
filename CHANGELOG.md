@@ -4,6 +4,43 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-19 — backup automation: nightly n5→vv mirror (Phase 3)
+
+### Added
+
+- **`immy/deploy/n5/backup/`** — `nightly-mirror.sh` + `mirror.env.example` +
+  `README.md`. Self-contained nightly job implementing Phase 3 of the primary
+  swap: perm self-heal (originals → `faeton:faeton 755/644`) → `pg_dumpall`
+  (verified, with a `RESTORE-RECIPE.txt`) → atomic ZFS-snapshot rsync of
+  `originals/` + `media/{library,profile,upload}/` to vv → push dump to `vv:db/`.
+  `flock` (no overlap), Healthchecks dead-man's-switch (`/start` + success +
+  `/fail` with log tail), `--max-delete=200` guard, `DRY_RUN` toggle.
+
+### Findings
+
+- **Native TrueNAS tools can't own this**: ZFS Replication needs a ZFS receiver
+  and vv is a Synology (btrfs); SCALE Rsync Tasks have no pre/post hooks (can't
+  sequence dump/perm/ping around the copy); `pg_dump` has no native task. So the
+  orchestration is a script, run by a **native Cron Job** (id 3, `0 5 * * *`,
+  user `faeton`); existing Periodic Snapshot Tasks stay independent.
+- **Run as faeton + `sudo`, not root**: faeton's vv ssh key already works, so we
+  avoid setting up root→vv auth; `sudo` covers zfs/docker/chown. Pushing as
+  faeton@vv (no `--numeric-ids`) lands files owned by vv's own faeton — the perm
+  story vv wants, for free.
+- **`media/library` is `0777`** (Immich chmods everything world-readable), so a
+  faeton-run mirror reads it fine — the perm self-heal only needs `originals/`.
+- **Config-file vs env footgun**: sourcing `mirror.env` (which carries
+  `DRY_RUN=0`) clobbered a `DRY_RUN=1` passed on the command line, so the first
+  "dry-run" did a full live mirror. Fixed: the CLI/env `DRY_RUN` is captured
+  before sourcing and wins. (Pipeline thereby validated live end-to-end.)
+
+### Deployed
+
+- Installed to `n5:/mnt/tank/scripts/immich-mirror/` (faeton-owned; lock + logs
+  live beside the script). Cron job id 3 materialized in `/etc/cron.d/middlewared`.
+  **TODO (user):** paste the Healthchecks check URL into `mirror.env` (`HC_URL=`)
+  — until then a *missed* run won't alert.
+
 ## 2026-06-19 — immy runs on the N5; read-only-originals refactor
 
 ### Findings

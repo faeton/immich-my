@@ -29,6 +29,7 @@ build/
 # Local scratch
 *.log
 .env
+mirror.env
 .immy/
 
 # Personal notes, scratch scripts, TODO drafts. Not for publication.
