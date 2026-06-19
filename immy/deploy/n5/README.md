@@ -26,11 +26,17 @@ the image. CLIP → Immich ML, captions → Ollama/gemma4, ASR → qwen-asr shim
 ssh n5
 sudo mkdir -p /mnt/flash/immy/scratch
 
-# Copy the deploy files + package source to the NAS (from the repo root):
-#   rsync -a --delete immy/ n5:/mnt/flash/immy/src-immy/   # package (for build)
-#   cp immy/deploy/n5/compose.yaml  /mnt/flash/immy/compose.yaml
-#   cp immy/deploy/n5/run-batch.sh  /mnt/flash/immy/run-batch.sh && chmod +x ...
-#   cp immy/deploy/n5/config.example.yml /mnt/flash/immy/config.yml   # then edit
+# Sync the package (incl. deploy/n5) to the NAS. Keep the deploy/n5 layout so
+# the compose file's `build.context: ../..` resolves to the package dir. Exclude
+# the gitignored MLX weights (mlx-community/, ~578M) — not needed in the image.
+# From the repo root:
+#   rsync -a --delete --exclude .venv --exclude .git --exclude tests \
+#     --exclude mlx-community --exclude '__pycache__' --exclude uv.lock \
+#     immy/ n5:/mnt/flash/immy/src-immy/
+#   cp /mnt/flash/immy/src-immy/deploy/n5/config.example.yml /mnt/flash/immy/config.yml  # then edit
+#
+# Use this compose file for every command below:
+#   CF=/mnt/flash/immy/src-immy/deploy/n5/compose.yaml
 
 # Fill in /mnt/flash/immy/config.yml:
 #  - pg.password   = immich_postgres POSTGRES_PASSWORD
@@ -49,31 +55,34 @@ sudo docker network connect ix-immich_default ollama
 sudo docker network connect ix-immich_default qwen-asr-shim
 
 # Build the image (compose build.context points at the package dir):
-sudo docker compose -f /mnt/flash/immy/compose.yaml build
+sudo docker compose -f $CF build
 ```
-
-> Note: `compose.yaml`'s `build.context: ../..` assumes it sits at
-> `<pkgdir>/deploy/n5/compose.yaml`. When deploying the compose file flat into
-> `/mnt/flash/immy/`, either keep the `deploy/n5/` layout there too, or change
-> `context:` to wherever the package source landed (e.g. `./src-immy`).
 
 ## Smoke test (no DB writes)
 
 ```sh
-# 1. image runs + immy imports cleanly
-sudo docker compose -f /mnt/flash/immy/compose.yaml run --rm immy --help
+CF=/mnt/flash/immy/src-immy/deploy/n5/compose.yaml
 
-# 2. reachability from inside the network (ML + PG by name, host services via gateway)
-sudo docker compose -f /mnt/flash/immy/compose.yaml run --rm --entrypoint sh immy -c '
-  python -c "import urllib.request as u; print(\"ML:\", u.urlopen(\"http://immich_machine_learning:3003/ping\", timeout=5).read())" ;
-  python -c "import socket; s=socket.create_connection((\"database\",5432),5); print(\"PG: ok\"); s.close()" ;
-  python -c "import urllib.request as u; print(\"OLLAMA:\", u.urlopen(\"http://host.docker.internal:11434/api/version\", timeout=5).read())" ;
-  python -c "import urllib.request as u; print(\"ASR:\", u.urlopen(\"http://host.docker.internal:8091/ping\", timeout=5).read())"
+# 1. image runs + immy imports cleanly
+sudo docker compose -f $CF run --rm immy --help
+
+# 2. reachability from inside the network — all four by CONTAINER NAME
+sudo docker compose -f $CF run --rm --entrypoint sh immy -c '
+  python3 -c "import urllib.request as u; print(\"ML  :\", u.urlopen(\"http://immich_machine_learning:3003/ping\", timeout=8).read())" ;
+  python3 -c "import socket; s=socket.create_connection((\"database\",5432),8); print(\"PG  : ok\"); s.close()" ;
+  python3 -c "import urllib.request as u; print(\"OLLM:\", u.urlopen(\"http://ollama:11434/api/version\", timeout=8).read())" ;
+  python3 -c "import urllib.request as u; print(\"ASR :\", u.urlopen(\"http://qwen-asr-shim:8091/ping\", timeout=8).read())"
 '
 
 # 3. dry-run a real trip — reports would-insert rows, writes nothing
-./run-batch.sh /originals/<trip> --dry-run
+/mnt/flash/immy/run-batch.sh /originals/<trip> --dry-run
 ```
+
+> **Not yet safe for a real (non-dry-run) write.** Reviewed 2026-06-19 (codex+grok):
+> originals are mounted `:ro` but `process` writes `.audit/` (journal, heartbeat,
+> marker, staged derivatives, `.srt`) next to the trip, and `process` alone does
+> not publish `asset_file` rows. A real run needs the write-path decisions in
+> raw/IMMY-ON-N5.md resolved first.
 
 ## Real runs
 

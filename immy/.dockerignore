@@ -1,12 +1,7 @@
-# Keep the build context small + reproducible: ship only pyproject + src.
-.venv
-.git
-mlx-community
-uv.lock
-__pycache__
-*.pyc
-.pytest_cache
-tests
-deploy
-*.egg-info
-.DS_Store
+# Allowlist: send ONLY what the build needs to the docker daemon. Anything not
+# explicitly unignored below (config.yml with secrets, .env, scratch, logs, the
+# 578M mlx-community/ weights, tests, deploy) stays out of the build context.
+**
+!pyproject.toml
+!src
+!src/**
