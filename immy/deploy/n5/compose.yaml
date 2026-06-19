@@ -38,6 +38,9 @@ services:
       - /mnt/flash/immich/thumbs:/data/thumbs
       # Fast scratch for region WAVs / staged previews.
       - /mnt/flash/immy/scratch:/scratch
+      # Phase 6.1 writable roots — keep immy off the :ro originals.
+      - /mnt/flash/immy/state:/scratch/immy-state
+      - /mnt/flash/immy/sidecars:/sidecars
     networks:
       - ix-immich_default
     # Batch tool, not a service: `docker compose run` overrides this command.

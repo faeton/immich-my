@@ -8,7 +8,11 @@
 # the checksum it computes (sha1("path:"+originalPath)) matches a future Immich
 # library scan and the rows are idempotent.
 
-originals_root: /originals
+originals_root: /originals       # :ro mount of the live library — never written
+
+# Phase 6.1: redirect ALL immy writes off the read-only originals.
+state_root: /scratch/immy-state  # journal, marker, heartbeat, staged previews
+sidecars_root: /sidecars         # .srt / .xmp sidecars (mirror media layout)
 
 immich:
   # `process` needs library_id to anchor originalPath to the library's

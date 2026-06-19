@@ -8,12 +8,14 @@
 #   ./run-batch.sh /originals/2026-bali --dry-run          # safe: no DB writes
 #   ./run-batch.sh /originals/2026-bali --with-captions --with-transcripts
 #
-# CLIP + derivatives are on by default. Faces are forced OFF: the lean NAS
-# image omits onnxruntime/insightface, so face detection runs on the Mac, not
-# here. (Put --with-faces in your extra flags only if you've added those deps.)
+# NAS enrichment scope = CAPTIONS + TRANSCRIPTS. Immich keeps doing its own
+# CLIP/faces/thumbnails (its ML is on by default), so we run --no-clip
+# --no-faces here. Captions/transcripts that already exist (by DB AI-prefix /
+# existing .srt sidecar) are skipped automatically — so this is safe to re-run
+# and the Mac and NAS won't redo each other's work.
 set -eu
 
-COMPOSE="${IMMY_COMPOSE:-/mnt/flash/immy/compose.yaml}"
+COMPOSE="${IMMY_COMPOSE:-/mnt/flash/immy/src-immy/deploy/n5/compose.yaml}"
 
 exec sudo docker compose -f "$COMPOSE" run --rm immy \
-  process --no-faces "$@"
+  process --with-captions --with-transcripts --no-clip --no-faces "$@"
