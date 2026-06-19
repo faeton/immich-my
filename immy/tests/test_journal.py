@@ -228,7 +228,7 @@ def test_process_trip_recaption_ignores_journal(tmp_path: Path, monkeypatch):
     )
 
     called: dict = {"n": 0}
-    def _fake_caption(media, *, config, preview=None):
+    def _fake_caption(media, *, config, preview=None, context=None):
         called["n"] += 1
         return MagicMock(text="fresh", model=config.model,
                          prompt_tokens=1, completion_tokens=2)

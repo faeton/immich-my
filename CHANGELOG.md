@@ -4,6 +4,59 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-19 — SRT telemetry pipeline (`immy srt`)
+
+### Added
+
+- **Full DJI `.SRT` track parser** (`srt.py`): `parse_track()` →
+  per-frame `SrtFrame` (t, lat/lon, `rel_alt`/`abs_alt`, iso/shutter/fnum/
+  ev/focal_len). Handles the combined `[rel_alt: .. abs_alt: ..]` bracket,
+  legacy `[altitude:]`, and `GPS(...)`. `first_valid_fix()` skips `(0,0)`
+  pre-lock frames (the takeoff point). `parse()` keeps its first-fix API
+  (streams cues, early-stops) so `dates`/`backfill_dates`/`rules.dji_srt`
+  are unchanged — and now gain the 0,0-skip for free.
+- **Track sidecars** (`track.py`): `<stem>.gpx` (GPX 1.1, round-trips
+  through `rules.geotag_from_gpx`) + `<stem>.track.json` (per-frame
+  telemetry + summary). Placed via new `WritablePaths.gpx_path` /
+  `track_json_path` — on the NAS they mirror under `sidecars_root`, never
+  beside the `:ro` originals.
+- **`immy srt` CLI group**: `track` (emit sidecars), `geotag` (durable DB
+  GPS from takeoff fix, dry-run by default, `--write` to apply), and
+  `verify-channel` (the empirical probe below).
+- **Durable video geotag** (`srtgeo.py`): `UPDATE asset_exif` lat/lon +
+  append `latitude`/`longitude` to `lockedProperties` — mirrors how
+  descriptions are made refresh-proof. Idempotent (skips assets that
+  already carry DB coords); triggers Immich's reverse-geocode.
+- **Caption context** (`captions.caption(context=…)`): drone clips now feed
+  `~{rel_alt} m above ground` + place (notes `location.name`, else cached
+  reverse-geocode) into the VLM prompt. Threaded through both caption paths
+  in `process.py`; non-drone media stays byte-identical.
+- 22 new tests (`test_srt`, `test_track`, `test_srtgeo` + caption-context);
+  multi-frame DJI fixture. 466 pass.
+
+### Findings
+
+- **verify-channel result (run live on n5, DJI_0073.MP4)**: for VIDEO
+  assets a metadata refresh **clobbers an unlocked `asset_exif` GPS to
+  NULL** (Immich re-reads container tags, finds none — XMP sidecars are
+  images-only). An `UPDATE` **+ `lockedProperties` lock with tokens
+  `latitude`/`longitude` survives**. So the XMP-sidecar geotag from the old
+  `dji-gps-from-srt` audit rule never reaches the DB for drone videos —
+  `srt geotag`'s lock is the only durable channel. Probe is non-destructive
+  (restores the asset).
+- **First live run (2024-02-peru-bolivia)**: 230 NULL-GPS drone clips tagged
+  from their SRT takeoff fix; GPS landed + locked, **survives refresh
+  (gps_lost=0)** → map pins now work.
+- **Open: locked coords are NOT auto reverse-geocoded.** Triggering
+  `refresh-metadata` on the 230 left `country`/`city` NULL after 2 min —
+  Immich skips the GPS path (incl. reverse-geocode) for locked fields. So
+  route/country queries still need a geocode step. Likely fix: write coords
+  via the Immich **asset-update API** (`PUT /api/assets/{id}`), which treats
+  it as a user edit (reverse-geocodes + locks in one) — unverified, needs a
+  decision before switching `srt geotag`'s channel. Alternative: reverse-
+  geocode ourselves and write `country`/`state`/`city` directly. The 230
+  already carry correct locked coords either way.
+
 ## 2026-06-19 — backup automation: nightly n5→vv mirror (Phase 3)
 
 ### Added

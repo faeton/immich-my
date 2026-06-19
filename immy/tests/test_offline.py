@@ -230,7 +230,7 @@ def _fake_caption_factory(calls: list[str], fail_on: tuple[str, ...] = ()):
     the text, so a wrong result_idx mapping (caption on the wrong asset)
     fails the assertion. Records every call for concurrency/idempotence
     assertions; raises for names in `fail_on` to exercise the skip path."""
-    def _fake(media, *, config, preview=None):
+    def _fake(media, *, config, preview=None, context=None):
         name = Path(media).name
         calls.append(name)
         if name in fail_on:
@@ -364,7 +364,7 @@ def test_caption_workers_rechecks_user_text_before_recording(tmp_path: Path, mon
         # Once the pool is running, pretend a user description appeared.
         return "hand-typed note" if state["in_pool"] else real_get(asset_id)
 
-    def _fake_caption(media, *, config, preview=None):
+    def _fake_caption(media, *, config, preview=None, context=None):
         state["in_pool"] = True  # we're now past the sequential pass
         calls.append(Path(media).name)
         return captions_mod.CaptionResult(
@@ -453,7 +453,7 @@ def test_offline_resume_skips_captioned_files(tmp_path: Path, monkeypatch):
 
     calls = {"n": 0}
 
-    def fake_caption(media, *, config, preview=None):
+    def fake_caption(media, *, config, preview=None, context=None):
         calls["n"] += 1
         return captions_mod.CaptionResult(
             text="a cat on a roof", model=config.model,

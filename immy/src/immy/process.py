@@ -491,6 +491,7 @@ class _CaptionJob:
     media: Path
     preview: Path | None
     require_preview: bool
+    context: str | None = None
 
 
 def process_trip(
@@ -1181,6 +1182,7 @@ def process_trip(
             else:
                 # `results.append(...)` for THIS asset is the very next
                 # statement, so its index is the current len(results).
+                from . import srtgeo as _srtgeo
                 caption_jobs.append(_CaptionJob(
                     result_idx=len(results),
                     asset_id=asset.id,
@@ -1188,11 +1190,16 @@ def process_trip(
                     media=exif_row.path,
                     preview=caption_preview,
                     require_preview=asset.asset_type == "VIDEO",
+                    context=_srtgeo.caption_context_for(
+                        exif_row.path, trip_folder),
                 ))
             # caption_info stays None for now; the summary line below omits
             # the caption and the pool patches results[idx].caption later.
         elif caption_eligible and caption_info is None:
             _emit(f"    caption… (VLM @ {captioner_config.model})")
+            from . import srtgeo as _srtgeo
+            _caption_context = _srtgeo.caption_context_for(
+                exif_row.path, trip_folder)
             try:
                 caption_info = _phase(
                     lambda: _process_caption(
@@ -1201,6 +1208,7 @@ def process_trip(
                         recaption=recaption,
                         require_preview=asset.asset_type == "VIDEO",
                         paths=paths,
+                        context=_caption_context,
                     ),
                     "caption", timings,
                 )
@@ -1298,6 +1306,7 @@ def process_trip(
                 return None
             result = captions_mod.caption(
                 job.media, config=captioner_config, preview=job.preview,
+                context=job.context,
             )
             return {
                 "text": result.text,
@@ -1521,6 +1530,7 @@ def _process_caption(
     recaption: bool = False,
     require_preview: bool = False,
     paths: WritablePaths | None = None,
+    context: str | None = None,
 ) -> dict | None:
     """Caption one image and write the prefixed description to the DB.
 
@@ -1553,7 +1563,8 @@ def _process_caption(
     if require_preview and (preview is None or not preview.is_file()):
         return None  # video with no poster still — nothing safe to caption
 
-    result = captions_mod.caption(media, config=config, preview=preview)
+    result = captions_mod.caption(
+        media, config=config, preview=preview, context=context)
     description = captions_mod.format_description(result.text)
     sink.update_description_if_ai_or_empty(asset_id, description, file_name=media.name)
     _mirror_description_to_xmp(

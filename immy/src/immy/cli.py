@@ -59,6 +59,9 @@ process_mod = _LazyModule("process")
 promote_mod = _LazyModule("promote")
 pg_mod = _LazyModule("pg")
 snapshot_mod = _LazyModule("snapshot")
+srt_mod = _LazyModule("srt")
+srtgeo_mod = _LazyModule("srtgeo")
+track_mod = _LazyModule("track")
 transcripts_mod = _LazyModule("transcripts")
 from .config import load as load_config
 from .exif import has_valid_gps as has_gps, read_folder
@@ -675,6 +678,190 @@ for _name in ("promote", "push", "pub"):
 
 
 # --- `immy bloat` subcommands ---------------------------------------------
+
+srt_app = typer.Typer(
+    help="DJI .SRT telemetry — track sidecars, durable geotag, channel probe.",
+    no_args_is_help=True,
+)
+
+
+def _srt_pg_setup(config_path: Path | None):
+    """Load config and open a (conn, library) pair for DB-touching srt
+    commands. Exits with a clear message when pg/immich config is missing or
+    unreachable — same contract as `process`."""
+    config = load_config(config_path)
+    if config.immich is None or config.pg is None:
+        console.print(
+            "[red]srt geotag/verify-channel need both `pg:` and "
+            "`immich.library_id` in immy config.[/red]"
+        )
+        raise typer.Exit(code=2)
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    try:
+        library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+    except LookupError as e:
+        console.print(f"[red]{e}[/red]")
+        conn.close()
+        raise typer.Exit(code=2)
+    return config, conn, library
+
+
+@srt_app.command("track")
+def srt_track(
+    folders: list[Path] = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Trip folder(s) to scan for drone clips with sibling .SRT.",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Emit `<stem>.gpx` + `<stem>.track.json` for every media file with a
+    DJI `.SRT` sibling. Writes through WritablePaths, so on the NAS the
+    sidecars land under `sidecars_root`, never beside the :ro originals."""
+    config = load_config(config_path)
+    total = 0
+    for folder in folders:
+        paths = process_mod.resolve_writable_paths(
+            folder,
+            originals_root=config.originals_root,
+            state_root=config.state_root,
+            sidecars_root=config.sidecars_root,
+        )
+        for media in sorted(_iter_media_with_srt(folder)):
+            frames = srt_mod.parse_track(srt_mod.find_sibling(media))
+            if not frames:
+                continue
+            gpx = paths.gpx_path(media)
+            tj = paths.track_json_path(media)
+            track_mod.write_gpx(frames, gpx, name=media.stem)
+            track_mod.write_json(frames, tj)
+            fixes = sum(1 for f in frames if f.has_fix())
+            console.print(
+                f"  {media.name}: {len(frames)} frames, {fixes} fixes "
+                f"→ {gpx.name}, {tj.name}"
+            )
+            total += 1
+    console.print(f"\n[green]wrote track sidecars for {total} clip(s)[/green]")
+
+
+def _iter_media_with_srt(folder: Path):
+    """Yield media files under `folder` that have a sibling DJI `.SRT`."""
+    for row in read_folder(folder):
+        if srt_mod.find_sibling(row.path) is not None:
+            yield row.path
+
+
+@srt_app.command("geotag")
+def srt_geotag(
+    folders: list[Path] = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Trip folder(s) whose drone clips need GPS from their .SRT.",
+    ),
+    write: bool = typer.Option(
+        False, "--write",
+        help="Apply the durable DB write (default: dry-run report).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Write each drone clip's first valid fix (takeoff point) into Immich's
+    `asset_exif.latitude/longitude` via the durable, lock-protected channel,
+    so a metadata refresh can't clobber it. Idempotent: assets already
+    carrying DB coords are skipped. Triggers Immich's reverse-geocode."""
+    config, conn, library = _srt_pg_setup(config_path)
+    tagged = would = no_asset = 0
+    try:
+        for folder in folders:
+            console.print(f"\n[bold]srt geotag[/bold] {folder}")
+            rows = read_folder(folder)
+            outcomes = srtgeo_mod.geotag_folder(
+                conn, library, folder, rows,
+                write=write, emit=lambda m: console.print(m, highlight=False),
+            )
+            if write:
+                conn.commit()
+            f_tagged = sum(1 for o in outcomes if o.status == "tagged")
+            f_would = sum(1 for o in outcomes if o.status == "would-tag")
+            f_no_asset = sum(1 for o in outcomes if o.status == "no-asset")
+            tagged += f_tagged; would += f_would; no_asset += f_no_asset
+            console.print(
+                f"  [dim]{folder.name}: tagged={f_tagged} would-tag={f_would} "
+                f"no-asset={f_no_asset}[/dim]"
+            )
+    finally:
+        conn.close()
+    if write:
+        console.print(f"\n[green]tagged {tagged} clip(s)[/green]")
+    else:
+        console.print(
+            f"\n[green]would tag {would} clip(s)[/green] "
+            f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
+        )
+
+
+@srt_app.command("verify-channel")
+def srt_verify_channel(
+    asset: str = typer.Argument(
+        ..., help="Asset UUID, or an originalFileName to resolve via the API "
+                  "(use a drone VIDEO already in Immich).",
+    ),
+    refresh_wait: float = typer.Option(
+        40.0, "--refresh-wait",
+        help="Seconds to wait for the metadata-refresh job to land.",
+    ),
+    lock_tokens: str = typer.Option(
+        "latitude,longitude", "--lock-tokens",
+        help="Comma-separated lockedProperties tokens to test for the lock.",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Empirically prove which DB write survives an Immich metadata refresh
+    for a VIDEO: write a sentinel coord unlocked vs. locked, trigger
+    refresh-metadata, and report which survived. Restores the asset after."""
+    config, conn, library = _srt_pg_setup(config_path)
+    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key)
+    asset_id = asset if srtgeo_mod.is_uuid(asset) else client.find_asset_id(asset)
+    if not asset_id:
+        console.print(f"[red]could not resolve asset:[/red] {asset}")
+        conn.close()
+        raise typer.Exit(code=2)
+    tokens = tuple(t.strip() for t in lock_tokens.split(",") if t.strip())
+    console.print(
+        f"[bold]verify-channel[/bold] asset={asset_id} "
+        f"lock_tokens={tokens} wait={refresh_wait}s"
+    )
+    try:
+        results = srtgeo_mod.verify_channel(
+            conn, client, asset_id,
+            refresh_wait_s=refresh_wait, lock_tokens=tokens,
+        )
+    finally:
+        conn.close()
+    table = Table(title="channel survival after refresh-metadata")
+    table.add_column("channel"); table.add_column("survived")
+    table.add_column("final coords"); table.add_column("lockedProperties after")
+    for r in results:
+        table.add_row(
+            r.channel,
+            "[green]YES[/green]" if r.survived else "[red]no[/red]",
+            f"{r.final[0]}, {r.final[1]}",
+            ", ".join(r.locked_after) or "—",
+        )
+    console.print(table)
+    winner = next((r.channel for r in results if r.survived), None)
+    if winner:
+        console.print(f"[green]→ durable channel: {winner}[/green]")
+    else:
+        console.print(
+            "[yellow]neither channel survived — try different --lock-tokens "
+            "or inspect Immich's lockedProperties enum.[/yellow]"
+        )
+
+
+app.add_typer(srt_app, name="srt")
+
 
 bloat_app = typer.Typer(
     help="Phase 2c — detect oversized deliveries, batch-confirm, HEVC transcode.",

@@ -104,6 +104,22 @@ class ImmichClient:
                 body={"assetIds": asset_ids[i:i + 1000], "name": "regenerate-thumbnail"},
             )
 
+    def refresh_metadata(self, asset_ids: list[str]) -> None:
+        """Queue a metadata re-extraction for specific assets.
+
+        `POST /api/assets/jobs` with name `refresh-metadata` — the same job
+        Immich's "Refresh metadata" admin action runs. Used by the
+        `srt verify-channel` probe to prove which GPS write survives a
+        refresh (Immich re-reads file/container tags and overwrites every
+        UNLOCKED `asset_exif` field). Batched + fire-and-forget (204)."""
+        if not asset_ids:
+            return
+        for i in range(0, len(asset_ids), 1000):
+            self._request(
+                "POST", "/api/assets/jobs",
+                body={"assetIds": asset_ids[i:i + 1000], "name": "refresh-metadata"},
+            )
+
     def find_asset_id(
         self,
         original_file_name: str,

@@ -63,6 +63,17 @@ class WritablePaths:
             return media.with_suffix(".xmp")
         return self._sidecar_dir_for(media) / f"{media.stem}.xmp"
 
+    def gpx_path(self, media: Path) -> Path:
+        """`foo.MP4` → `foo.gpx`. Sibling of the media (Mac) or under the
+        sidecars mirror (NAS). DJI telemetry `.SRT` is the input, never
+        clobbered."""
+        return self._sidecar_dir_for(media) / f"{media.stem}.gpx"
+
+    def track_json_path(self, media: Path) -> Path:
+        """`foo.MP4` → `foo.track.json`. The compound suffix keeps it clear
+        of any other JSON sidecar and of the media stem."""
+        return self._sidecar_dir_for(media) / f"{media.stem}.track.json"
+
     def srt_glob(self, media: Path) -> list[Path]:
         """Existing `<stem>.*.srt` sidecars for `media` — searched next to
         the media (default) or in the sidecars mirror (NAS)."""

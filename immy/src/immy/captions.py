@@ -233,12 +233,17 @@ def caption(
     *,
     config: CaptionerConfig,
     preview: Path | None = None,
+    context: str | None = None,
 ) -> CaptionResult:
     """Generate a caption for one image asset.
 
     `preview` is the staged 1440 px JPEG from `derivatives.py` — pass it
     when you have it to skip the in-memory pyvips re-encode. Falls back
     to `media` when None.
+
+    `context` is an optional grounding hint appended to the configured
+    prompt — e.g. drone altitude + reverse-geocoded place for aerial
+    clips. When None the request is byte-identical to a context-free run.
     """
     source = preview if preview is not None and preview.is_file() else media
     # JPEGs go over the wire verbatim — which also means a damaged byte
@@ -247,13 +252,17 @@ def caption(
     sent_verbatim = source.suffix.lower() in (".jpg", ".jpeg")
     image_data_uri = _encode_image(source)
 
+    prompt_text = config.prompt
+    if context:
+        prompt_text = f"{config.prompt}\n\nContext: {context}"
+
     url = config.endpoint.rstrip("/") + "/chat/completions"
     payload = {
         "model": config.model,
         "messages": [{
             "role": "user",
             "content": [
-                {"type": "text", "text": config.prompt},
+                {"type": "text", "text": prompt_text},
                 {"type": "image_url", "image_url": {"url": image_data_uri}},
             ],
         }],

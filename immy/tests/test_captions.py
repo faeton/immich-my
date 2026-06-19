@@ -104,6 +104,34 @@ def test_caption_request_shape_and_response_parse(tmp_path: Path):
     )
 
 
+def test_caption_context_appended_only_when_given(tmp_path: Path):
+    src = tmp_path / "sample.jpg"
+    _tiny_jpeg(src)
+    cfg = captions.CaptionerConfig(
+        endpoint="http://example.invalid/v1", model="m",
+        api_key=None, prompt="describe", max_tokens=10,
+    )
+    fake_response = {"model": "m", "choices": [{"message": {"content": "x"}}]}
+
+    def run(context):
+        captured: dict = {}
+
+        def fake_post(url, payload, *, api_key, timeout_s):
+            captured["payload"] = payload
+            return fake_response
+
+        with patch.object(captions, "_post_json", side_effect=fake_post):
+            captions.caption(src, config=cfg, context=context)
+        return captured["payload"]["messages"][0]["content"][0]["text"]
+
+    # No context → byte-identical to the bare prompt.
+    assert run(None) == "describe"
+    # Context → appended after the prompt.
+    assert run("aerial drone shot, ~30 m above ground.") == (
+        "describe\n\nContext: aerial drone shot, ~30 m above ground."
+    )
+
+
 def test_caption_extra_body_merged_into_payload(tmp_path: Path):
     # The N5/Ollama gemma4 fix: extra_body keys land at the payload top
     # level. Unset (default None) the payload must be byte-identical to
