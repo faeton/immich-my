@@ -1,0 +1,12 @@
+# Keep the build context small + reproducible: ship only pyproject + src.
+.venv
+.git
+mlx-community
+uv.lock
+__pycache__
+*.pyc
+.pytest_cache
+tests
+deploy
+*.egg-info
+.DS_Store

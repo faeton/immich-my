@@ -1,0 +1,44 @@
+# immy config for the N5 container (Phase 6). Copy to /mnt/flash/immy/config.yml
+# on the NAS and fill in the real PG password — the live file is NOT in git.
+#
+# Path model inside the container:
+#   /originals          <- /mnt/tank/immich/originals (the external library, :ro)
+#   /data, /data/thumbs <- mirror immich_server's media mounts
+# immy anchors originalPath to the library's importPath read from the DB, so
+# the checksum it computes (sha1("path:"+originalPath)) matches a future Immich
+# library scan and the rows are idempotent.
+
+originals_root: /originals
+
+pg:
+  host: database            # alias of immich_postgres on ix-immich_default
+  port: 5432                # internal port (host-published as 15432)
+  user: postgres
+  password: REPLACE_ME      # = immich_postgres POSTGRES_PASSWORD
+  database: immich
+
+media:
+  host_root: /data          # immy's own view of the media tree
+  container_root: /data     # == Immich IMMICH_MEDIA_LOCATION -> asset_file.path prefix
+
+ml:
+  clip_model: ViT-B-32__openai      # MUST match Immich's configured CLIP model
+  clip_backend: immich-ml           # delegate CLIP to Immich's own ML container
+  immich_ml_url: http://immich_machine_learning:3003
+
+  # Ollama + the qwen-asr shim live on the host bridge with published ports.
+  # Reaching them via host.docker.internal (host-gateway) is flaky — the
+  # published-port hairpin NAT resets HTTP responses back to a container on
+  # ix-immich_default. So attach them to ix-immich_default once (see README)
+  # and address them by container name, same as ML + PG.
+  whisper_backend: qwen-asr         # PRIMARY ASR (whisper.cpp shim is fast-EN fallback)
+  whisper_endpoint: http://qwen-asr-shim:8091
+  whisper_prompt: "English, Russian, Ukrainian."
+
+  captioner:
+    endpoint: http://ollama:11434/v1                 # Ollama OpenAI-compat
+    model: gemma4
+    prompt: "Describe this photo in one short sentence."
+    max_tokens: 80
+    extra_body:
+      reasoning_effort: none        # or gemma4 returns empty content + a `reasoning` field

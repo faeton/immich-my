@@ -1,0 +1,49 @@
+# Dockerfile.immy — immy as a thin HTTP orchestrator on the N5 (Phase 6).
+#
+# immy carries NO GPU, weights, or ML runtime here: CLIP is delegated to
+# Immich's own ML container over HTTP, captions to Ollama, ASR to the
+# qwen-asr shim. So we install ONLY the cross-platform core deps and the
+# media toolchain (ffmpeg/ffprobe, exiftool, libvips) — deliberately
+# OMITTING onnxruntime / insightface / opencv (local face+ONNX path) and
+# the Apple-only mlx-* packages. Every one of those is imported lazily
+# inside its function (verified), so the container imports and runs the
+# caption/ASR/CLIP-over-HTTP paths without them. If someone invokes the
+# local face path in here it will ImportError clearly — by design.
+#
+# Build context is the `immy/` package dir (see deploy/n5/compose.yaml).
+
+FROM python:3.12-slim
+
+# Media toolchain: ffmpeg gives ffmpeg+ffprobe; libimage-exiftool-perl gives
+# /usr/bin/exiftool (pyexiftool shells out to it); libvips42 is the runtime
+# pyvips loads via ctypes.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ffmpeg \
+        libvips42 \
+        libimage-exiftool-perl \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# Lean runtime deps — kept in sync with the non-marker, non-heavy entries of
+# pyproject.toml [project.dependencies]. We install these explicitly and then
+# install immy itself with --no-deps so pip never pulls onnxruntime/insightface.
+RUN pip install --no-cache-dir \
+        "typer>=0.12" \
+        "pyexiftool>=0.5" \
+        "pyyaml>=6.0" \
+        "rich>=13.7" \
+        "timezonefinder>=6.5" \
+        "psycopg[binary]>=3.2" \
+        "pyvips>=2.2" \
+        "numpy>=1.26"
+
+WORKDIR /app
+COPY pyproject.toml ./
+COPY src ./src
+RUN pip install --no-cache-dir --no-deps .
+
+# Scratch for region WAVs / staged previews; mounted to fast storage in compose.
+ENV IMMY_SCRATCH=/scratch
+WORKDIR /work
+ENTRYPOINT ["immy"]
+CMD ["--help"]

@@ -1,0 +1,48 @@
+# immy on the N5 — standalone compose that JOINS Immich's existing docker
+# network (Phase 6). This is intentionally NOT folded into the TrueNAS-managed
+# ix-immich stack (TrueNAS regenerates that file) and NOT a TrueNAS "custom
+# app" (that re-introduces the managed-layer interference). It's a plain
+# compose project deployed to /mnt/flash/immy/, invoked as a one-shot batch
+# job via `docker compose run --rm` (see run-batch.sh) — no idle daemon.
+#
+# Why join the network at all: Immich's ML container has NO published port
+# (immich_machine_learning:3003 is reachable only on ix-immich_default). That
+# CLIP path is the sole reason immy must be on this network. Postgres is also
+# reachable here by the alias `database`. Ollama + the qwen-asr shim are
+# attached to this same network (one-time `docker network connect`, see README)
+# so immy addresses ALL four backends by container name. The host-gateway path
+# (host.docker.internal) proved flaky: the published-port hairpin NAT resets
+# HTTP responses back to a container on ix-immich_default.
+#
+#   sudo docker compose -f /mnt/flash/immy/compose.yaml build
+#   sudo docker compose -f /mnt/flash/immy/compose.yaml run --rm immy --help
+
+name: immy
+
+services:
+  immy:
+    build:
+      context: ../..            # the immy/ package dir
+      dockerfile: Dockerfile.immy
+    image: immy:latest
+    environment:
+      IMMY_CONFIG: /config/config.yml
+    volumes:
+      # immy config lives on flash, outside git (it holds the PG password).
+      - /mnt/flash/immy/config.yml:/config/config.yml:ro
+      # Originals are read-only — an enrichment pass must never mutate sources.
+      - /mnt/tank/immich/originals:/originals:ro
+      # Mirror immich_server's media mounts EXACTLY so the derivative paths
+      # immy writes line up with what Immich serves (container_root=/data).
+      - /mnt/tank/immich/media:/data
+      - /mnt/flash/immich/thumbs:/data/thumbs
+      # Fast scratch for region WAVs / staged previews.
+      - /mnt/flash/immy/scratch:/scratch
+    networks:
+      - ix-immich_default
+    # Batch tool, not a service: `docker compose run` overrides this command.
+    command: ["--help"]
+
+networks:
+  ix-immich_default:
+    external: true            # created by the TrueNAS-managed Immich app
