@@ -10,6 +10,16 @@
 
 originals_root: /originals
 
+immich:
+  # `process` needs library_id to anchor originalPath to the library's
+  # importPath (read from the DB). url must be resolvable from INSIDE the
+  # container — use the container name immich_server:2283, NOT the tailnet
+  # hostname (which the container can't resolve). api_key + library_id are the
+  # same values as your Mac config's immich: block.
+  url: http://immich_server:2283
+  api_key: REPLACE_ME
+  library_id: REPLACE_ME      # External Library UUID (Admin -> Libraries)
+
 pg:
   host: database            # alias of immich_postgres on ix-immich_default
   port: 5432                # internal port (host-published as 15432)

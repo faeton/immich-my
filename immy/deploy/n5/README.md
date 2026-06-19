@@ -32,8 +32,12 @@ sudo mkdir -p /mnt/flash/immy/scratch
 #   cp immy/deploy/n5/run-batch.sh  /mnt/flash/immy/run-batch.sh && chmod +x ...
 #   cp immy/deploy/n5/config.example.yml /mnt/flash/immy/config.yml   # then edit
 
-# Put the real PG password in /mnt/flash/immy/config.yml (POSTGRES_PASSWORD of
-# the immich_postgres container). This file is intentionally NOT in git.
+# Fill in /mnt/flash/immy/config.yml:
+#  - pg.password   = immich_postgres POSTGRES_PASSWORD
+#  - immich.api_key + immich.library_id = same as your Mac config's immich:
+#    block (process needs library_id to anchor originalPath; url stays the
+#    internal immich_server:2283).
+# This file is intentionally NOT in git.
 
 # Attach Ollama + the qwen-asr shim to Immich's network so immy can reach them
 # by container name. (The host.docker.internal/host-gateway path is unreliable:
