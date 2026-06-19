@@ -4,6 +4,43 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-19 — immy runs on the N5; read-only-originals refactor
+
+### Findings
+
+- **Immich's ML container has no published port** (`immich_machine_learning:3003`,
+  internal-only on `ix-immich_default`) — so to use Immich's own CLIP, immy must
+  run *inside* that docker network, not over the tailnet. That's the whole reason
+  for packaging immy as a container on the NAS.
+- **`host.docker.internal` (host-gateway) is unreliable here**: reaching a
+  published port from a container on `ix-immich_default` hits a hairpin-NAT bug —
+  TCP connects but HTTP responses get reset. Fix: address every backend by
+  container name on the shared network (attach Ollama + the qwen-asr shim to it).
+- **`process` wrote all state under the trip folder** (`.audit/` journal, marker,
+  heartbeat, staged derivatives; `.srt`/`.xmp` next to media) — fatal on the NAS
+  where originals are a read-only mount of the live external library. Even a
+  captions-only run failed, because the caption `.xmp` mirror wrote beside originals.
+- **Scope decision** (codex+grok review): on the NAS immy does **captions +
+  transcripts only**; Immich keeps doing its own CLIP/faces/thumbnails (ML on by
+  default). Cross-machine dedup (Mac ⇄ NAS) already works via the DB AI-prefix
+  check and existing-`.srt` detection — no new queue needed yet.
+
+### Changed
+
+- **Phase 6 — packaging** (`immy/Dockerfile.immy`, `immy/deploy/n5/`): standalone
+  compose that joins `ix-immich_default`, lean image (`--no-deps`, no onnx/mlx),
+  one-shot `docker compose run --rm`. Not folded into the TrueNAS-managed stack.
+- **Phase 6.1 — writable-state refactor**: new `state_root` / `sidecars_root`
+  config (env `IMMY_STATE_ROOT` / `IMMY_SIDECARS_ROOT`) + `immy/paths.py`
+  resolver threaded through every write site. Unset = Mac path **byte-identical**;
+  set = state → `state_root`, sidecars → `sidecars_root`, originals stay read-only.
+- `run-batch.sh` defaults to `--with-captions --with-transcripts --no-clip --no-faces`.
+- 444 tests (+9: defaults-match invariant, NAS-mode redirect, a `chmod 0555`
+  read-only-trip proof). Verified on the N5: build, four-backend reachability,
+  dry-run with `originalPath` anchored correctly.
+- The heavy opportunistic-worker queue (claim ledger, `immy worker pull`, GPU
+  scheduler) is **deferred** until the consolidation import waves need it.
+
 ## 2026-06-11 — mass "Error loading image": paused thumbnail queue
 
 ### Findings
