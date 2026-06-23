@@ -35,6 +35,7 @@ import yaml
 from . import captions as captions_mod
 from . import clip as clip_mod
 from . import derivatives as derivatives_mod
+from . import devices as devices_mod
 from . import dji as dji_mod
 from . import faces as faces_mod
 from . import insta360 as insta360_mod
@@ -264,11 +265,27 @@ def build_rows(
     mod_dt_raw = exif_row.get("EXIF:ModifyDate", "QuickTime:ModifyDate")
     mod_dt_parsed = _parse_exif_datetime(mod_dt_raw)
 
+    # Resolve the capture device. DJI video leaves Make/Model empty and
+    # writes the model into the mp4 Encoder atom; DJI stills report a bare
+    # module code (FC4170…). devices.resolve fills + friendly-maps both.
+    make, model = devices_mod.resolve(
+        _str(exif_row.get("EXIF:Make", "QuickTime:Make")),
+        _str(exif_row.get("EXIF:Model", "QuickTime:Model")),
+        _str(exif_row.get("ItemList:Encoder", "QuickTime:Encoder")),
+    )
+    # GO2 video is plain `.mp4` (VID_/PRO_VID_…) with no device metadata and
+    # no vendor trailer, so exif.py's `.insv` detection never sees it. Tag it
+    # from the filename: an Insta360-named `.mp4` is a GO2 (the X-series
+    # writes `.insv` masters, handled via the trailer in exif.py).
+    if make is None and insta360_mod.classify(exif_row.path) is not None:
+        make = "Insta360"
+        if model is None and exif_row.path.suffix.lower() == ".mp4":
+            model = "Insta360 GO 2"
     exif = AssetExifRow(
         asset_id=asset_id,
         description="",
-        make=_str(exif_row.get("EXIF:Make", "QuickTime:Make")),
-        model=_str(exif_row.get("EXIF:Model", "QuickTime:Model")),
+        make=make,
+        model=model,
         lens_model=_str(exif_row.get("EXIF:LensModel", "Composite:LensID")),
         orientation=_str(exif_row.get("EXIF:Orientation")),
         exif_image_width=_int(exif_row.get(
@@ -863,15 +880,18 @@ def process_trip(
                     insta360_mod.proxy_for(exif_row.path, proxy_index)
                     or dji_mod.proxy_for(exif_row.path, dji_proxy_index)
                 )
-            # De-warp only applies to the master file. When we have a
-            # proxy (LRV), it's already the camera's stitched
-            # equirectangular preview — feeding it through v360 would
-            # double-warp. No proxy + recognised Insta360 master →
-            # single-lens fisheye → flat perspective crop.
-            dewarp = (
-                insta360_mod.dewarp_vf(exif_row.path)
-                if asset.asset_type == "VIDEO" and proxy is None else None
-            )
+            # De-warp decision:
+            #  - GO2 PRO (PureView) is an upright circular fisheye whose LRV
+            #    is itself a downscaled fisheye, so we de-warp even when a
+            #    proxy exists — the proxy just makes the v360 pass cheaper.
+            #  - Otherwise de-warp only the bare master: an X-series LRV is
+            #    already a stitched equirect, and feeding it through v360
+            #    would double-warp.
+            dewarp = None
+            if asset.asset_type == "VIDEO":
+                dewarp = insta360_mod.go2_dewarp_vf(exif_row.path)
+                if dewarp is None and proxy is None:
+                    dewarp = insta360_mod.dewarp_vf(exif_row.path)
             # Videos hit the expensive path here: full ffmpeg H.264
             # transcode of the encoded_video derivative. Images just do
             # pyvips thumb+preview, much cheaper.
@@ -880,12 +900,15 @@ def process_trip(
                 label = "thumb+preview"
             elif mirror:
                 label = "mirror from sibling"
-            elif proxy:
-                label = f"transcode via {proxy.suffix.lstrip('.').upper()} proxy"
-            elif dewarp:
-                label = "transcode + fisheye de-warp"
             else:
-                label = "transcode"
+                extra = []
+                if proxy:
+                    extra.append(
+                        f"via {proxy.suffix.lstrip('.').upper()} proxy")
+                if dewarp:
+                    extra.append("fisheye de-warp")
+                label = "transcode" + (
+                    " + " + " + ".join(extra) if extra else "")
             _emit(f"    derivatives… ({label})")
             try:
                 result = _phase(
