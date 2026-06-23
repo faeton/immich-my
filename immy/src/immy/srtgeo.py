@@ -22,6 +22,7 @@ from pathlib import Path
 
 import psycopg
 
+from . import geocode as geocode_mod
 from . import srt
 from .exif import ExifRow, has_valid_gps
 from .immich import ImmichClient
@@ -101,6 +102,36 @@ def read_gps(
         float(lon) if lon is not None else None,
         list(locked or []),
     )
+
+
+_UPDATE_PLACE_SQL = """
+UPDATE asset_exif SET country = %(country)s, state = %(state)s, city = %(city)s
+WHERE "assetId" = %(asset_id)s
+"""
+
+_READ_PLACE_SQL = (
+    'SELECT country, state, city FROM asset_exif WHERE "assetId" = %s'
+)
+
+
+def write_place(
+    conn: psycopg.Connection, asset_id: str, place: geocode_mod.Place,
+) -> int:
+    """Write country/state/city for one asset. Not locked: `country`/`state`/
+    `city` aren't lockable tokens, and Immich's refresh only writes them when
+    it reads GPS *from the file* (never the case for our locked drone clips),
+    so an unlocked place persists untouched."""
+    with conn.cursor() as cur:
+        cur.execute(_UPDATE_PLACE_SQL, {
+            "asset_id": asset_id,
+            "country": place.country, "state": place.state, "city": place.city,
+        })
+        return cur.rowcount
+
+
+def read_place(conn: psycopg.Connection, asset_id: str):
+    row = conn.execute(_READ_PLACE_SQL, (asset_id,)).fetchone()
+    return (None, None, None) if row is None else tuple(row)
 
 
 # --- verify-channel probe -------------------------------------------------
@@ -263,11 +294,52 @@ def geotag_folder(
             continue
         write_gps(conn, asset_id, fix.latitude, fix.longitude,
                   lock=True, lock_tokens=lock_tokens)
+        # Reverse-geocode the takeoff fix the same way Immich does, since it
+        # never will for these clips (no file GPS). Write country/state/city
+        # so route/country queries work.
+        place = geocode_mod.reverse_geocode(conn, fix.latitude, fix.longitude)
+        if not place.is_empty():
+            write_place(conn, asset_id, place)
         outcomes.append(GeotagOutcome(
             row.path, asset_id, fix.latitude, fix.longitude, status="tagged"))
         emit(f"  [tagged] {row.path.name} → "
-             f"({fix.latitude:.6f}, {fix.longitude:.6f})")
+             f"({fix.latitude:.6f}, {fix.longitude:.6f}) "
+             f"{place.city or ''}{', ' if place.city and place.country else ''}"
+             f"{place.country or ''}")
     return outcomes
+
+
+def geocode_located_missing(
+    conn: psycopg.Connection,
+    container_prefix: str,
+    *,
+    write: bool,
+    emit=lambda _msg: None,
+) -> int:
+    """Backfill country/state/city for assets that already carry coords but no
+    place — purely from the DB, no files needed. Scope is an `asset.originalPath`
+    prefix (e.g. a trip dir). Targets only rows we own (`latitude` locked) so we
+    never touch Immich's own geocodes. Returns the count geocoded."""
+    rows = conn.execute(
+        '''SELECT a.id, a."originalFileName", e.latitude, e.longitude
+           FROM asset a JOIN asset_exif e ON e."assetId" = a.id
+           WHERE a."originalPath" LIKE %s
+             AND e.latitude IS NOT NULL AND e.country IS NULL
+             AND 'latitude' = ANY(e."lockedProperties")''',
+        (container_prefix + "%",),
+    ).fetchall()
+    done = 0
+    for asset_id, fn, lat, lon in rows:
+        place = geocode_mod.reverse_geocode(conn, float(lat), float(lon))
+        if place.is_empty():
+            continue
+        if write:
+            write_place(conn, str(asset_id), place)
+        done += 1
+        emit(f"  [{'geocoded' if write else 'would-geocode'}] {fn} → "
+             f"{place.city or ''}{', ' if place.city and place.country else ''}"
+             f"{place.country or ''}")
+    return done
 
 
 # --- caption context ------------------------------------------------------

@@ -768,8 +768,9 @@ def srt_geotag(
 ) -> None:
     """Write each drone clip's first valid fix (takeoff point) into Immich's
     `asset_exif.latitude/longitude` via the durable, lock-protected channel,
-    so a metadata refresh can't clobber it. Idempotent: assets already
-    carrying DB coords are skipped. Triggers Immich's reverse-geocode."""
+    so a metadata refresh can't clobber it, AND reverse-geocode it (country/
+    state/city) from Immich's own geodata. Idempotent: assets already
+    carrying DB coords are skipped."""
     config, conn, library = _srt_pg_setup(config_path)
     tagged = would = no_asset = 0
     try:
@@ -799,6 +800,44 @@ def srt_geotag(
             f"\n[green]would tag {would} clip(s)[/green] "
             f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
         )
+
+
+@srt_app.command("geocode")
+def srt_geocode(
+    folder: Path = typer.Argument(
+        None, file_okay=False, resolve_path=True,
+        help="Trip folder; its name + library import path form the scope.",
+    ),
+    prefix: str = typer.Option(
+        None, "--prefix",
+        help="Scope by raw asset.originalPath prefix instead of a folder "
+             "(DB-only backfill — no files needed).",
+    ),
+    write: bool = typer.Option(
+        False, "--write", help="Apply (default: dry-run report)."),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Backfill country/state/city for clips we geotagged but Immich won't
+    geocode (locked coords / read-only originals), using Immich's own geodata
+    so place names match the rest of the library. Operates purely on DB coords
+    — pass a folder, or `--prefix` for assets whose files aren't mounted."""
+    config, conn, library = _srt_pg_setup(config_path)
+    if prefix is None and folder is None:
+        console.print("[red]pass a folder or --prefix[/red]")
+        conn.close(); raise typer.Exit(code=2)
+    scope = prefix if prefix is not None else (
+        f"{library.container_root}/{folder.name}/")
+    console.print(f"[bold]srt geocode[/bold] scope={scope}")
+    try:
+        n = srtgeo_mod.geocode_located_missing(
+            conn, scope, write=write,
+            emit=lambda m: console.print(m, highlight=False))
+        if write:
+            conn.commit()
+    finally:
+        conn.close()
+    verb = "geocoded" if write else "would geocode"
+    console.print(f"\n[green]{verb} {n} clip(s)[/green]")
 
 
 @srt_app.command("verify-channel")

@@ -31,8 +31,15 @@ continuously, so entries are dated rather than versioned.
   `~{rel_alt} m above ground` + place (notes `location.name`, else cached
   reverse-geocode) into the VLM prompt. Threaded through both caption paths
   in `process.py`; non-drone media stays byte-identical.
-- 22 new tests (`test_srt`, `test_track`, `test_srtgeo` + caption-context);
-  multi-frame DJI fixture. 466 pass.
+- **Reverse-geocode** (`geocode.py` + `immy srt geocode`): replicates Immich
+  v2.7.5 `MapRepository.reverseGeocode` against the *same* Postgres —
+  `geodata_places` nearest within 25 km (`earthdistance`), `naturalearth_countries`
+  polygon fallback — and maps `countryCode`→name via the vendored
+  i18n-iso-countries 7.6.0 'en' dataset. So drone clips get country/state/city
+  **identical** to the rest of the library, fully offline. `srt geotag` writes
+  place inline; `srt geocode [--prefix]` backfills from DB coords (no files).
+- 27 new tests (`test_srt`, `test_track`, `test_srtgeo`, geocode + caption-context);
+  multi-frame DJI fixture. 471 pass.
 
 ### Findings
 
@@ -47,15 +54,18 @@ continuously, so entries are dated rather than versioned.
 - **First live run (2024-02-peru-bolivia)**: 230 NULL-GPS drone clips tagged
   from their SRT takeoff fix; GPS landed + locked, **survives refresh
   (gps_lost=0)** → map pins now work.
-- **Open: locked coords are NOT auto reverse-geocoded.** Triggering
-  `refresh-metadata` on the 230 left `country`/`city` NULL after 2 min —
-  Immich skips the GPS path (incl. reverse-geocode) for locked fields. So
-  route/country queries still need a geocode step. Likely fix: write coords
-  via the Immich **asset-update API** (`PUT /api/assets/{id}`), which treats
-  it as a user edit (reverse-geocodes + locks in one) — unverified, needs a
-  decision before switching `srt geotag`'s channel. Alternative: reverse-
-  geocode ourselves and write `country`/`state`/`city` directly. The 230
-  already carry correct locked coords either way.
+- **Locked coords are never auto reverse-geocoded — confirmed in source.**
+  Immich v2.7.5 `metadata.service.ts` only geocodes coords read *fresh from
+  the file* (`if (hasGeo(fileExif))`), never the DB value; our drone videos
+  have no file GPS and read-only originals, so no Immich path (refresh *or*
+  the asset-update API) will ever geocode them. The `PUT /api/assets/{id}`
+  route is also destructive on `:ro` originals — it queues a `SidecarWrite`
+  that can't land and the live test *wiped* a good geotag (restored).
+- **Resolved by self-geocode from Immich's own geodata.** Cross-checked the
+  port against 1,500 already-geocoded assets: **country/state/city 100 % match**.
+  Backfilled the 230 peru-bolivia clips: country 100 % (Bolivia 163 / Peru 67),
+  city 97 (rest are >25 km from any geodata place → country-only, same cutoff
+  as Immich). GPS stays locked + intact.
 
 ## 2026-06-19 — backup automation: nightly n5→vv mirror (Phase 3)
 

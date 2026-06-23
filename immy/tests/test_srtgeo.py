@@ -173,3 +173,65 @@ def test_geotag_no_asset(tmp_path: Path):
 def test_is_uuid():
     assert srtgeo.is_uuid("dc68c016-1eba-4335-8638-a52596470ed2")
     assert not srtgeo.is_uuid("DJI_0001.MP4")
+
+
+# --- reverse geocode (vendored map + Immich-style query) ------------------
+
+def test_country_name_vendored_map():
+    from immy import geocode
+    assert geocode.country_name("PE") == "Peru"
+    assert geocode.country_name("BO") == "Bolivia"          # list → first
+    assert geocode.country_name("BOL") == "Bolivia"         # alpha-3
+    assert geocode.country_name("US") == "United States of America"
+    assert geocode.country_name(None) is None
+    assert geocode.country_name("ZZ") is None
+
+
+class _GeoConn:
+    """Fake conn for geocode: routes the nearest/fallback SELECTs."""
+
+    def __init__(self, nearest=None, fallback=None):
+        self.nearest = nearest      # (name, admin1, countryCode)
+        self.fallback = fallback    # (admin_a3,)
+
+    def execute(self, sql, params=None):
+        row = self.nearest if "geodata_places" in sql else (
+            self.fallback if "naturalearth_countries" in sql else None)
+
+        class _R:
+            def fetchone(_s):
+                return row
+        return _R()
+
+
+def test_reverse_geocode_nearest():
+    from immy import geocode
+    p = geocode.reverse_geocode(
+        _GeoConn(nearest=("Machupicchu", "Cuzco Department", "PE")), -13.16, -72.5)
+    assert (p.city, p.state, p.country) == ("Machupicchu", "Cuzco Department", "Peru")
+
+
+def test_reverse_geocode_fallback_country_only():
+    from immy import geocode
+    p = geocode.reverse_geocode(_GeoConn(nearest=None, fallback=("BOL",)), 0, 0)
+    assert (p.city, p.state, p.country) == (None, None, "Bolivia")
+
+
+def test_reverse_geocode_empty():
+    from immy import geocode
+    assert geocode.reverse_geocode(_GeoConn(), 0, 0).is_empty()
+
+
+def test_geotag_writes_place(tmp_path: Path, monkeypatch):
+    from immy import geocode
+    monkeypatch.setattr(
+        geocode, "reverse_geocode",
+        lambda conn, lat, lon, **k: geocode.Place(
+            country="Peru", state="Cuzco Department", city="Machupicchu"))
+    conn = _Conn(asset_id="aid", gps=(None, None))
+    rows = [_drone_row(tmp_path)]
+    srtgeo.geotag_folder(conn, _LIB, tmp_path, rows, write=True)
+    place_upd = [c for c in conn.calls
+                 if c[0].lstrip().upper().startswith("UPDATE") and "country" in c[0]]
+    assert place_upd and place_upd[0][1]["country"] == "Peru"
+    assert place_upd[0][1]["city"] == "Machupicchu"
