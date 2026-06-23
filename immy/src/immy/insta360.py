@@ -69,6 +69,21 @@ _DEWARP_BY_LENS = {
 _LENS_RE = re.compile(r"^(?:VID|LRV)_\d{8}_\d{6}_(?P<lens>\d{2})_", re.I)
 
 
+# GO2 "PureView"/PRO mode (`PRO_VID_*`) records a 1:1 **circular fisheye**
+# (e.g. 2688×2688) — verified on the real corpus. Unlike the X-series 360
+# masters it is recorded *upright* (no 90° axis rotation), and unlike the
+# X-series LRV the GO2 proxy is itself a downscaled fisheye, **not** a
+# stitched equirect. So PRO footage needs a single-lens fisheye→flat
+# de-warp for a recognisable tile — and it needs it even when an LRV proxy
+# exists (we de-warp the small proxy instead of the master). A centered
+# 120° flat crop (16:9) straightens verticals and keeps the lens-shadow
+# vignette off the frame.
+_GO2_DEWARP = (
+    "v360=input=fisheye:output=flat"
+    ":ih_fov=200:iv_fov=200:h_fov=120:v_fov=68:w=1280:h=720"
+)
+
+
 def classify(path: Path) -> tuple[str, Insta360Key] | None:
     """Return ("master"|"proxy", key) or None if the filename doesn't
     match the Insta360 naming scheme.
@@ -81,7 +96,13 @@ def classify(path: Path) -> tuple[str, Insta360Key] | None:
     key = parse_insta360(path)
     if key is None:
         return None
-    prefix = path.stem.split("_", 1)[0].upper()
+    # GO2 PRO mode prefixes the role with `PRO_` (PRO_VID_… / PRO_LRV_…).
+    # Strip it before reading the role so PRO masters/proxies classify like
+    # their plain counterparts.
+    stem = path.stem
+    if stem[:4].upper() == "PRO_":
+        stem = stem[4:]
+    prefix = stem.split("_", 1)[0].upper()
     role = "master" if prefix == "VID" else "proxy" if prefix == "LRV" else None
     if role is None:
         return None
@@ -105,7 +126,7 @@ def build_proxy_index(paths: Iterable[Path]) -> dict[tuple[str, str], Path]:
         role, key = hit
         if role != "proxy":
             continue
-        index.setdefault((key.timestamp, key.serial), path)
+        index.setdefault((key.pro, key.timestamp, key.serial), path)
     return index
 
 
@@ -119,7 +140,7 @@ def proxy_for(
     role, key = hit
     if role != "master":
         return None
-    return index.get((key.timestamp, key.serial))
+    return index.get((key.pro, key.timestamp, key.serial))
 
 
 def dewarp_vf(master_path: Path) -> str | None:
@@ -133,6 +154,12 @@ def dewarp_vf(master_path: Path) -> str | None:
     Non-masters, proxies, and unknown lens codes return None — the
     caller falls through to a plain pass-through encode.
     """
+    # X-series only: the lens-rotation profiles are calibrated for the
+    # 2880² dual-fisheye `.insv` masters. A GO2 records `.mp4` (handled by
+    # go2_dewarp_vf), and plain GO2 `VID_*.mp4` is already reframed 16:9 —
+    # the `_LENS_RE` would match it, so gate on the container extension.
+    if master_path.suffix.lower() != ".insv":
+        return None
     hit = classify(master_path)
     if hit is None or hit[0] != "master":
         return None
@@ -142,4 +169,29 @@ def dewarp_vf(master_path: Path) -> str | None:
     return _DEWARP_BY_LENS.get(m.group("lens"))
 
 
-__all__ = ["classify", "build_proxy_index", "proxy_for", "dewarp_vf"]
+def go2_dewarp_vf(path: Path) -> str | None:
+    """ffmpeg `-vf` for a GO2 PRO (PureView) square-fisheye file.
+
+    Returned for both `PRO_VID_*` masters **and** `PRO_LRV_*` proxies —
+    both are upright circular fisheyes. Both matter because the LRV is
+    itself ingested as an asset (the stack *primary*, so its own tile is
+    what's shown), and the master's derivative is built from that same
+    LRV. Callers apply this to the poster + encoded_video **even when a
+    proxy is present** (the GO2 LRV is a downscaled fisheye, not a
+    stitched equirect, so it too must be de-warped).
+
+    Plain `VID_*`/`LRV_*` GO2 footage is already a reframed 16:9
+    rectilinear clip — and an X-series LRV is a stitched equirect — so
+    those must NOT be de-warped and return None here.
+    """
+    # Require the full canonical role prefix AND a successful parse, so a
+    # stray name like `PRO_VIDEO_EXPORT.mp4` doesn't trip the filter.
+    if path.stem.upper().startswith(("PRO_VID_", "PRO_LRV_")) \
+            and classify(path) is not None:
+        return _GO2_DEWARP
+    return None
+
+
+__all__ = [
+    "classify", "build_proxy_index", "proxy_for", "dewarp_vf", "go2_dewarp_vf",
+]

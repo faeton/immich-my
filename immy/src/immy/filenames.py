@@ -20,8 +20,13 @@ _RE_DATE_FILENAME = re.compile(
 
 
 # Insta360: VID_YYYYMMDD_HHMMSS_00_NNN.insv / LRV_YYYYMMDD_HHMMSS_01_NNN.lrv
+# GO2 "PureView"/PRO mode prefixes the same scheme with `PRO_`
+# (PRO_VID_… square fisheye master + PRO_LRV_… proxy) — accept it so PRO
+# pairs date + de-warp like their plain counterparts. The `pro` flag is
+# part of the pairing key so a PRO clip never pairs with a plain proxy
+# that happens to share its timestamp+serial.
 _RE_INSTA360 = re.compile(
-    r"^(?P<kind>VID|LRV)_"
+    r"^(?P<pro>PRO_)?(?P<kind>VID|LRV)_"
     r"(?P<ts>\d{8}_\d{6})"
     r"_(?P<lens>\d{2})"
     r"_(?P<serial>\d+)$",
@@ -53,10 +58,14 @@ def parse_date(path: Path) -> FilenameDate | None:
 class Insta360Key:
     timestamp: str  # "YYYYMMDD_HHMMSS"
     serial: str
+    pro: bool = False  # GO2 PureView/PRO recording (PRO_ prefix)
 
 
 def parse_insta360(path: Path) -> Insta360Key | None:
     m = _RE_INSTA360.match(path.stem)
     if not m:
         return None
-    return Insta360Key(timestamp=m.group("ts"), serial=m.group("serial"))
+    return Insta360Key(
+        timestamp=m.group("ts"), serial=m.group("serial"),
+        pro=bool(m.group("pro")),
+    )
