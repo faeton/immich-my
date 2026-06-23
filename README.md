@@ -176,7 +176,7 @@ Docs grouped by role:
 - **Design** — [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/SIDECAR.md](docs/SIDECAR.md).
 - **Operations** — [docs/DEPLOY.md](docs/DEPLOY.md), [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md).
 - **Current work** — [docs/ROADMAP.md](docs/ROADMAP.md), [docs/REVIEW-RECOMMENDATIONS.md](docs/REVIEW-RECOMMENDATIONS.md).
-- **Feature guides** — [docs/CAPTIONS.md](docs/CAPTIONS.md), [docs/TRANSCRIPTS.md](docs/TRANSCRIPTS.md), [docs/LANDSCAPE.md](docs/LANDSCAPE.md).
+- **Feature guides** — [docs/CAPTIONS.md](docs/CAPTIONS.md), [docs/TRANSCRIPTS.md](docs/TRANSCRIPTS.md), [docs/TELEMETRY.md](docs/TELEMETRY.md), [docs/MATCH.md](docs/MATCH.md), [docs/LANDSCAPE.md](docs/LANDSCAPE.md).
 - **Reference** — [docs/IMMICH-INGEST.md](docs/IMMICH-INGEST.md), [docs/archive/](docs/archive/) (historical phase plan).
 - **Personal backlog** — [raw/](raw/).
 
@@ -191,6 +191,7 @@ Docs grouped by role:
 | [docs/archive/PLAN-2026-04-historical.md](docs/archive/PLAN-2026-04-historical.md) | Historical phased build plan (Phase 0/1/1b/Y/2a), kept for context |
 | [docs/REVIEW-RECOMMENDATIONS.md](docs/REVIEW-RECOMMENDATIONS.md) | Current engineering review, fixes, suggestions, and commit plan |
 | [docs/CAPTIONS.md](docs/CAPTIONS.md) | VLM captioner — supported backends, config, per-image cost table |
+| [docs/MATCH.md](docs/MATCH.md) | `immy match` — place an inbound dump against the library (offline dedup + trip placement) |
 | [docs/OFFLINE-RUNBOOK.md](docs/OFFLINE-RUNBOOK.md) | Step-by-step offline runbook — drive `immy` with LM Studio + a local VLM, no internet |
 | [docs/DEPLOY.md](docs/DEPLOY.md) | As-deployed operating manual: paths, compose, onboarding choices |
 | [docs/TESTING.md](docs/TESTING.md) | Acceptance tests per phase + ad-hoc smoke checks |

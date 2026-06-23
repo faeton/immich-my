@@ -4,6 +4,32 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-06-23 — `immy match` + snapshot v2
+
+### Added
+
+- **`immy match <inbound>`** (`match.py`, `cli.py`): read-only, fully offline
+  triage of a folder about to be imported. Reports per top-level **subfolder**
+  and per self-clustered **event**: which files are already in Immich (dedup
+  via the `find-duplicates` classifier), which belong to an existing trip
+  (`matched`/`extends`), and which are `new`. `⚠ spans multiple trips` flags a
+  folder that straddles trips. `--thorough` hashes every file (catches
+  renames); `--max-km`/`--max-gap-hours` tune placement. `--fast`/`--no-verify`
+  (`HashMode.FAST`) trusts a name+size hit and skips SHA1 — turns a ~2 TB
+  already-promoted tree from ~50 min (SHA1-bound) into ~2 min (exiftool-bound).
+- **Existing trips reconstructed offline** (`build_existing_trips`): every
+  snapshot album becomes a trip keyed by name, with **IQR-fenced date bounds**
+  + **median centroid / 90th-pct radius** so one misdated/mislocated asset
+  can't blow a trip's window to 9 years and date-match everything; un-albumed
+  assets are re-clustered with the `immy cluster` sweep.
+- **GPS-less fallback**: drone/video clips with no EXIF GPS are placed
+  **date-only** (labelled lower-confidence); tally points at `immy srt geotag`.
+- **Snapshot schema v2** (`snapshot.py`): `assets` gains `lat/lon/city/country`;
+  new `albums` + `album_assets` tables. `fetch_albums` keeps **every** album
+  (real albums are trip-named but carry no `immy-cluster` marker — marked-only
+  would drop them all). `require_schema` rejects v1; `find-duplicates` stays
+  v1-compatible. Docs: [docs/MATCH.md](docs/MATCH.md). Reviewed by Codex + Grok.
+
 ## 2026-06-19 — SRT telemetry pipeline (`immy srt`)
 
 ### Added

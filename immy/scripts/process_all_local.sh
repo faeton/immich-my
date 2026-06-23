@@ -16,6 +16,10 @@
 #
 # Run:  nohup zsh immy/scripts/process_all_local.sh > ~/process-$(date +%F).log 2>&1 &
 set -u
+# Detach stdin: this runs unattended in the background. Without it, any tool
+# that touches the tty gets SIGTTIN (job suspends), and a suspended+resumed
+# Python crashes at startup with "Bad file descriptor" initializing streams.
+exec < /dev/null
 export IMMY_CONFIG=/Users/faeton/Sites/immich-my/.immy/config.yml
 cd /Users/faeton/Sites/immich-my/immy
 TR=/Users/faeton/Media/Trips

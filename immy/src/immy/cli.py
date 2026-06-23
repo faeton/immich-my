@@ -2307,6 +2307,12 @@ def match(
         help="Hash every file for dedup (catches renames). Slow — reads the "
              "whole tree. Default hashes only on a name+size match.",
     ),
+    fast: bool = typer.Option(
+        False, "--fast/--no-fast", "--no-verify",
+        help="Trust a name+size match as a duplicate — skip SHA1 entirely. "
+             "Turns a ~2 TB already-promoted tree from ~50 min into ~2 min, "
+             "at the cost of missing a same-name-same-size-different-bytes file.",
+    ),
     max_km: float = typer.Option(
         clustering_mod.DEFAULT_MAX_KM, "--max-km",
         help="Distance a clip may sit from a trip and still count as part of it.",
@@ -2325,8 +2331,13 @@ def match(
     immy-cluster albums + raw points in the snapshot. Drone/video clips
     without EXIF GPS fall back to date-only placement (lower confidence).
 
-    Needs a v2 snapshot (`immy snapshot`).
+    Dedup hashes a file only when its (name, size) already matches the
+    snapshot (`--fast`/`--no-verify` skips even that; `--thorough` hashes
+    everything to catch renames). Needs a v2 snapshot (`immy snapshot`).
     """
+    if fast and thorough:
+        console.print("[red]--fast and --thorough are mutually exclusive[/red]")
+        raise typer.Exit(code=2)
     if not snapshot_path.exists():
         console.print(
             f"[red]snapshot not found:[/red] {snapshot_path}\n"
@@ -2357,9 +2368,14 @@ def match(
         )
 
         hash_mode = (
-            duplicates_mod.HashMode.THOROUGH if thorough
+            duplicates_mod.HashMode.FAST if fast
+            else duplicates_mod.HashMode.THOROUGH if thorough
             else duplicates_mod.HashMode.ON_MATCH
         )
+        if fast:
+            console.print(
+                "  [dim]--fast: trusting name+size for dedup (no SHA1)[/dim]"
+            )
         items = match_mod.scan_inbound(path, db, hash_mode=hash_mode)
         report = match_mod.build_report(
             items, trips, max_km=max_km, max_gap_hours=max_gap_hours,
