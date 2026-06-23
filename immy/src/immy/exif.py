@@ -83,6 +83,19 @@ def iter_media(folder: Path) -> Iterable[Path]:
             yield p
 
 
+def _persist_camera_cache(cache_path: Path, data: dict) -> None:
+    """Write the per-trip Insta360 camera cache, tolerating a read-only
+    tree. On the NAS the originals are mounted `:ro`, so `.audit/` can't be
+    created there — detection still applies in-memory for this run; we just
+    skip the cache (no override file, re-detected next run)."""
+    import json
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(json.dumps(data, indent=2))
+    except OSError:
+        pass
+
+
 def read_folder(folder: Path) -> list[ExifRow]:
     import sys
     import time
@@ -188,8 +201,7 @@ def read_folder(folder: Path) -> list[ExifRow]:
                         "serial": blobs[0].get("Trailer:SerialNumber"),
                         "sampled_from": sample.name,
                     }
-                    cache_path.parent.mkdir(parents=True, exist_ok=True)
-                    cache_path.write_text(json.dumps(camera, indent=2))
+                    _persist_camera_cache(cache_path, camera)
                     break
                 sys.stderr.write(
                     f"    no trailer in {sample.name}; trying next…\n"
@@ -215,12 +227,10 @@ def read_folder(folder: Path) -> list[ExifRow]:
             camera = {}
         camera.setdefault("make", "Insta360")
         if not cache_path.is_file():
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(
-                {"make": "Insta360", "model": camera.get("model"),
-                 "note": "hand-edit model to label this trip's camera"},
-                indent=2,
-            ))
+            _persist_camera_cache(cache_path, {
+                "make": "Insta360", "model": camera.get("model"),
+                "note": "hand-edit model to label this trip's camera",
+            })
         for f in insta_files:
             raw = by_path.get(f)
             if raw is None:
