@@ -17,7 +17,9 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 ## How it works (`immy` subcommands)
 `audit` (metadata fixes via XMP sidecars) · `process` (derivatives + CLIP + faces + captions +
 transcripts → inserts/writes Immich Postgres) · `promote` (upload a trip to an external library) ·
-`cluster` (geo-date albums) · `snapshot` / `find-duplicates` / `repair-thumbs`.
+`cluster` (geo-date albums) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
+reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
+`snapshot` / `find-duplicates` / `repair-thumbs`.
 
 Two run targets: the **Mac** (MLX, default) and the **N5 NAS** (HTTP backends — Ollama captions,
 Qwen-ASR, Immich's own CLIP). The same code runs both; backend is config-selected.

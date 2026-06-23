@@ -28,6 +28,7 @@ The main operational interface is `immy`:
 - `process` computes derivatives, CLIP, and faces, then inserts directly into Immich Postgres
 - `promote` uploads a curated trip into the external library and syncs the album
 - `cluster` groups geo-dated assets into events and auto-creates Immich albums
+- `srt` harvests DJI `.SRT` telemetry → GPX/JSON tracks, durable GPS, reverse-geocode
 - `snapshot` dumps the Immich library index to a portable SQLite file
 - `find-duplicates` scans any disk/folder and reports what's already in Immich
 
@@ -98,6 +99,8 @@ brew install exiftool ffmpeg vips
 - CLIP embeddings and face embeddings during ingest
 - Album sync on promote
 - Event clustering into auto-named albums (`immy cluster`)
+- DJI drone telemetry: GPX/JSON tracks, durable locked GPS, library-matched
+  reverse-geocode (`immy srt`, see `docs/TELEMETRY.md`)
 - Portable Immich library snapshot + external-disk duplicate scan
   (`immy snapshot`, `immy find-duplicates`)
 

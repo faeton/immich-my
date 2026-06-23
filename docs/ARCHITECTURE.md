@@ -124,6 +124,21 @@ via Immich REST. Idempotent — re-running is a no-op.
 | Captioner | poster frame | description prefix "AI: …" | local VLM via LM Studio (Gemma / Qwen-VL), any OpenAI-compat backend |
 | Face detect + embed | poster frame | faces table | Apple Vision + ArcFace on Mac, InsightFace on Syno |
 
+## Drone telemetry (SRT)
+
+DJI clips carry GPS/altitude/settings only in the sibling `.SRT`, never the
+video container. `immy srt` parses it and lands the data in Immich — see
+[TELEMETRY.md](TELEMETRY.md). Two findings shape the design:
+
+- **GPS for videos needs a locked DB write.** Immich reads only container tags
+  for videos (XMP is images-only), so the takeoff fix is written to
+  `asset_exif.latitude/longitude` with a `lockedProperties` lock — the only
+  channel proven (via `srt verify-channel`) to survive a metadata refresh.
+- **We reverse-geocode ourselves.** Immich only geocodes coords read fresh from
+  a file, never the DB value, and our originals are read-only — so `geocode.py`
+  replicates Immich's `reverseGeocode` against the same `geodata_places` table
+  (place names match the rest of the library; validated 100 % on 1,500 assets).
+
 ## Event clustering
 
 - Nightly cron on the Mac or Syno.
