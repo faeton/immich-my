@@ -54,6 +54,7 @@ captions_mod = _LazyModule("captions")
 clip_mod = _LazyModule("clip")
 clustering_mod = _LazyModule("clustering")
 duplicates_mod = _LazyModule("duplicates")
+match_mod = _LazyModule("match")
 offline_mod = _LazyModule("offline")
 process_mod = _LazyModule("process")
 promote_mod = _LazyModule("promote")
@@ -2038,6 +2039,12 @@ def snapshot(
         count = snapshot_mod.write_rows(
             db, snapshot_mod.fetch_rows(conn, library_id),
         )
+        # v2: marker (immy-cluster) albums so `immy match` can rebuild trips
+        # offline. Only albums carrying an `immy-cluster:` marker are kept.
+        albums = snapshot_mod.fetch_albums(conn)
+        album_ids = {a.album_id for a in albums}
+        membership = snapshot_mod.fetch_album_assets(conn, album_ids)
+        album_count = snapshot_mod.write_albums(db, albums, membership)
         snapshot_mod.write_meta(
             db,
             server_host=f"{config.pg.host}:{config.pg.port}",
@@ -2050,8 +2057,8 @@ def snapshot(
 
     size_mb = out.stat().st_size / (1024 * 1024)
     console.print(
-        f"  [green]✓[/green] {count:,} asset(s) → "
-        f"{size_mb:.1f} MB at [cyan]{out}[/cyan]"
+        f"  [green]✓[/green] {count:,} asset(s), {album_count:,} album(s)"
+        f" → {size_mb:.1f} MB at [cyan]{out}[/cyan]"
     )
 
 
@@ -2283,6 +2290,141 @@ def find_duplicates(
         f"\n[green]✓[/green] report: [cyan]{report_md}[/cyan] "
         f"(+ {report_json.name})"
     )
+
+
+@app.command("match")
+def match(
+    path: Path = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Inbound media root to place against the library.",
+    ),
+    snapshot_path: Path = typer.Option(
+        Path.home() / ".immy" / "library-snapshot.sqlite", "--snapshot",
+        help="v2 SQLite snapshot produced by `immy snapshot`.",
+    ),
+    thorough: bool = typer.Option(
+        False, "--thorough",
+        help="Hash every file for dedup (catches renames). Slow — reads the "
+             "whole tree. Default hashes only on a name+size match.",
+    ),
+    max_km: float = typer.Option(
+        clustering_mod.DEFAULT_MAX_KM, "--max-km",
+        help="Distance a clip may sit from a trip and still count as part of it.",
+    ),
+    max_gap_hours: float = typer.Option(
+        clustering_mod.DEFAULT_MAX_GAP_HOURS, "--max-gap-hours",
+        help="Date slack (hours) around a trip's range for placement.",
+    ),
+) -> None:
+    """Place an inbound media dump against the existing Immich library.
+
+    Read-only. For PATH (an inbound folder of about-to-be-imported media)
+    it reports, per top-level subfolder AND per self-clustered event:
+    which files are already in Immich (dedup), which belong to an existing
+    trip (matched/extends), and which are new — reconstructing trips from
+    immy-cluster albums + raw points in the snapshot. Drone/video clips
+    without EXIF GPS fall back to date-only placement (lower confidence).
+
+    Needs a v2 snapshot (`immy snapshot`).
+    """
+    if not snapshot_path.exists():
+        console.print(
+            f"[red]snapshot not found:[/red] {snapshot_path}\n"
+            "Run `immy snapshot` first (needs Immich DB access)."
+        )
+        raise typer.Exit(code=2)
+
+    db = snapshot_mod.open_for_read(snapshot_path)
+    try:
+        try:
+            snapshot_mod.require_schema(db)
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            raise typer.Exit(code=2)
+
+        assets = snapshot_mod.read_assets(db)
+        albums = snapshot_mod.read_albums(db)
+        membership = snapshot_mod.read_album_membership(db)
+        trips = match_mod.build_existing_trips(
+            assets, albums, membership,
+            max_gap_hours=max_gap_hours, max_km=max_km,
+        )
+        console.print(
+            f"[bold]match[/bold] {path} "
+            f"[dim](snapshot: {len(assets):,} assets, {len(trips)} trips — "
+            f"{sum(1 for t in trips if t.source == 'album')} albums + "
+            f"{sum(1 for t in trips if t.source == 'cluster')} clustered)[/dim]"
+        )
+
+        hash_mode = (
+            duplicates_mod.HashMode.THOROUGH if thorough
+            else duplicates_mod.HashMode.ON_MATCH
+        )
+        items = match_mod.scan_inbound(path, db, hash_mode=hash_mode)
+        report = match_mod.build_report(
+            items, trips, max_km=max_km, max_gap_hours=max_gap_hours,
+        )
+    finally:
+        db.close()
+
+    if report.total_files == 0:
+        console.print("[yellow]no media files found under PATH[/yellow]")
+        return
+
+    # --- grouping A: per subfolder ---
+    console.print("\n[bold]By subfolder[/bold]")
+    for fr in report.folders:
+        live = fr.total - fr.duplicates
+        bits = []
+        for verdict in ("matched", "extends", "new"):
+            n = fr.placements.get(verdict, 0)
+            if n:
+                bits.append(f"{n} {verdict}")
+        if fr.duplicates:
+            bits.append(f"[dim]{fr.duplicates} dup[/dim]")
+        span = " [magenta]⚠ spans multiple trips[/magenta]" if fr.spans_multiple else ""
+        trips_disp = ""
+        if fr.trips:
+            shown = ", ".join(sorted(fr.trips)[:3])
+            more = "…" if len(fr.trips) > 3 else ""
+            trips_disp = f"  [cyan]→ {shown}{more}[/cyan]"
+        console.print(
+            f"  [bold]{fr.subfolder}[/bold] "
+            f"[dim]({fr.total} files, {live} to place)[/dim]  "
+            f"{' · '.join(bits) or '[dim]—[/dim]'}{trips_disp}{span}"
+        )
+
+    # --- grouping B: self-clustered events ---
+    console.print("\n[bold]By event[/bold] [dim](self-clustered, GPS items)[/dim]")
+    if not report.events:
+        console.print("  [dim](no geo-clusterable events)[/dim]")
+    for ev in report.events:
+        s, e = ev.when_range
+        when = (
+            s.strftime("%Y-%m-%d") if s.date() == e.date()
+            else f"{s:%Y-%m-%d}–{e:%Y-%m-%d}"
+        )
+        color = {"matched": "green", "extends": "yellow",
+                 "new": "cyan", "duplicate": "dim"}.get(ev.placement.verdict, "white")
+        conf = "" if ev.placement.confidence == "geo" else f" [dim]({ev.placement.confidence})[/dim]"
+        console.print(
+            f"  [dim]{when}[/dim] {ev.size:>3} clip(s)  "
+            f"[{color}]{ev.placement.verdict}[/{color}] "
+            f"[dim]{ev.placement.reason}[/dim]{conf}"
+        )
+
+    # --- dedup tally + caveat ---
+    console.print(
+        f"\n[bold]{report.duplicates}/{report.total_files}[/bold] already in "
+        f"Immich · [bold]{report.total_files - report.duplicates}[/bold] to place"
+        + (f" · [dim]{report.gps_less} GPS-less (date-only)[/dim]"
+           if report.gps_less else "")
+    )
+    if report.gps_less:
+        console.print(
+            "  [dim]GPS-less clips (drone/video) placed by date window; their "
+            "coords live in .SRT — run `immy srt geotag` to lift confidence.[/dim]"
+        )
 
 
 @app.command("apple-people")
