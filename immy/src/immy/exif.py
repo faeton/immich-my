@@ -148,7 +148,11 @@ def read_folder(folder: Path) -> list[ExifRow]:
                 camera = json.loads(cache_path.read_text())
             except Exception:
                 camera = None
-        if not camera or not camera.get("model"):
+        # A persisted cache (even a model-less stub) is terminal — re-running
+        # the slow `-ee` trailer parse on every read_folder won't find a
+        # model the first sweep missed. Only (re)detect when there's no
+        # cache yet or it was corrupt.
+        if not camera:
             # Sample smallest .insv first (parse cost grows with size),
             # but try the next-smallest if the file lacks a trailer
             # (truncated / malformed). Cap attempts so a corrupt trip
@@ -201,15 +205,32 @@ def read_folder(folder: Path) -> list[ExifRow]:
         # times per audit (once per apply-pass) and the message becomes
         # noisy.
 
-        if camera and camera.get("model"):
-            for f in insta_files:
-                raw = by_path.get(f)
-                if raw is None:
-                    continue
-                if "EXIF:Model" in raw or "QuickTime:Model" in raw:
-                    continue
+        # Harden: even when no trailer model was found (GO2, truncated
+        # trailers), we still KNOW these are Insta360 files from the
+        # extension — set the make so they stay filterable, and persist a
+        # cache stub the user can hand-edit (`"model": "Insta360 ONE X2"`)
+        # to label the trip. A later run reads that override instead of
+        # re-sampling.
+        if not camera:
+            camera = {}
+        camera.setdefault("make", "Insta360")
+        if not cache_path.is_file():
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(
+                {"make": "Insta360", "model": camera.get("model"),
+                 "note": "hand-edit model to label this trip's camera"},
+                indent=2,
+            ))
+        for f in insta_files:
+            raw = by_path.get(f)
+            if raw is None:
+                continue
+            if not ("EXIF:Make" in raw or "QuickTime:Make" in raw):
+                raw["QuickTime:Make"] = camera.get("make", "Insta360")
+            if camera.get("model") and not (
+                "EXIF:Model" in raw or "QuickTime:Model" in raw
+            ):
                 raw["QuickTime:Model"] = camera["model"]
-                raw.setdefault("QuickTime:Make", camera.get("make", "Insta360"))
 
     rows: list[ExifRow] = []
     for f in files:
