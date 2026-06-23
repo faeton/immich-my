@@ -147,27 +147,94 @@ def test_promote_rsyncs_and_triggers_scan(config_file, dji_ready, monkeypatch):
     assert fake.scans == ["lib-1"]
 
 
-def test_rsync_never_uses_plain_append(tmp_path, monkeypatch):
-    # Plain --append trusts the destination prefix without verifying it and
-    # can silently corrupt media. We must never pass it; --inplace stays.
-    # --append-verify is allowed only when the local rsync supports it.
-    captured: dict = {}
+def test_rsync_two_pass_never_plain_append(tmp_path, monkeypatch):
+    # promote rsync runs two passes: a sidecar-correctness pass (NO
+    # --append-verify) then the bulk media pass (--append-verify when
+    # supported). Plain --append must never appear; --inplace/--partial always.
+    calls: list = []
 
     def fake_run(args):
-        captured["args"] = args
-        return MagicMock(stdout="", returncode=0)
+        calls.append(args)
+        return MagicMock(stdout="", stderr="", returncode=0)
 
     monkeypatch.setattr(promote_mod, "_run_streaming", fake_run)
     src = tmp_path / "trip"
     src.mkdir()
     promote_mod.rsync(src, tmp_path / "dest", dry_run=True)
 
-    args = captured["args"]
-    assert "--append" not in args
-    assert "--inplace" in args
-    assert "--partial" in args
-    if "--append-verify" in args:
-        assert promote_mod._rsync_supports("--append-verify")
+    assert len(calls) == 2
+    sidecar, bulk = calls
+    # Identify the sidecar pass by its include filter.
+    assert "--include=*/" in sidecar
+    assert any(a.startswith("--include=*.srt") for a in sidecar)
+    for args in calls:
+        assert "--append" not in args      # never the unverified variant
+        assert "--inplace" in args and "--partial" in args
+    # Sidecar pass must NOT append-verify (skips same-size/shorter edits).
+    assert "--append-verify" not in sidecar
+    # Bulk pass uses it when the local rsync supports it.
+    if promote_mod._rsync_supports("--append-verify"):
+        assert "--append-verify" in bulk
+
+
+def test_rsync_resyncs_edited_shorter_sidecar(tmp_path):
+    # The bug this guards: --append-verify silently skips a transcript whose
+    # new (source) copy is the same size or shorter than the stale dest, so an
+    # edited/re-generated `.ru.srt` would never overwrite the NAS copy. The
+    # sidecar pass must fix it. Real rsync to a local dest — no mocks.
+    src = tmp_path / "trip"
+    dst = tmp_path / "dest" / "trip"
+    src.mkdir(parents=True)
+    dst.mkdir(parents=True)
+    # stale, LONGER copy already on the "NAS"
+    (dst / "VID_001.ru.srt").write_text("OLD wrong line 1\nOLD wrong line 2\nextra\n")
+    # edited, SHORTER copy locally
+    (src / "VID_001.ru.srt").write_text("new fixed\n")
+    # an immutable media file alongside, to prove the bulk pass still copies
+    (src / "VID_001.mp4").write_bytes(b"\x00" * 4096)
+
+    promote_mod.rsync(src, dst, dry_run=False)
+
+    assert (dst / "VID_001.ru.srt").read_text() == "new fixed\n"
+    assert (dst / "VID_001.mp4").is_file()
+
+
+def test_rsync_resyncs_samesize_samemtime_sidecar(tmp_path):
+    # Hardest case: an edited transcript that is the SAME byte size AND has the
+    # SAME mtime as the stale dest (e.g. a prior rsync preserved the mtime).
+    # rsync's size+mtime quick-check would skip it; only --checksum on the
+    # sidecar pass catches the content difference.
+    import os
+    src = tmp_path / "trip"
+    dst = tmp_path / "dest" / "trip"
+    src.mkdir(parents=True)
+    dst.mkdir(parents=True)
+    (dst / "VID_001.ru.srt").write_text("AAAAAAAAAA\n")
+    (src / "VID_001.ru.srt").write_text("BBBBBBBBBB\n")  # same length, diff content
+    fixed_mtime = 1_700_000_000
+    os.utime(dst / "VID_001.ru.srt", (fixed_mtime, fixed_mtime))
+    os.utime(src / "VID_001.ru.srt", (fixed_mtime, fixed_mtime))
+
+    promote_mod.rsync(src, dst, dry_run=False)
+
+    assert (dst / "VID_001.ru.srt").read_text() == "BBBBBBBBBB\n"
+
+
+def test_rsync_never_leaks_audit_dir(tmp_path):
+    # `.audit/` must stay excluded in BOTH passes (the sidecar pass includes
+    # *.json, which would otherwise pull `.audit/*.json`).
+    src = tmp_path / "trip"
+    dst = tmp_path / "dest" / "trip"
+    (src / ".audit").mkdir(parents=True)
+    dst.mkdir(parents=True)
+    (src / ".audit" / "state.json").write_text("{}")
+    (src / "VID_001.ru.srt").write_text("hi\n")
+    (src / "VID_001.mp4").write_bytes(b"\x00" * 64)
+
+    promote_mod.rsync(src, dst, dry_run=False)
+
+    assert not (dst / ".audit").exists()
+    assert (dst / "VID_001.ru.srt").is_file()
 
 
 def test_promote_interrupt_stops_without_traceback(config_file, dji_ready, monkeypatch):

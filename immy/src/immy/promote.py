@@ -55,6 +55,20 @@ RSYNC_EXCLUDES = (
     "*.lrf",
 )
 
+# Small text sidecars that immy *rewrites in place*: rewritten XMP metadata,
+# per-language ASR transcripts (`*.ru.srt` / `*.en.srt` …), notes. Unlike the
+# immutable originals these can SHRINK or change at the same byte size, and
+# --append-verify silently skips any file whose dest is the same size or
+# larger (it only ever appends to files that grew). So a re-generated/edited
+# transcript would leave the stale copy on the NAS forever. They're tiny, so
+# we sync them in a separate correctness-first pass *without* --append-verify.
+# (DJI telemetry `.SRT` is immutable and byte-identical, so it just no-ops here.)
+_MUTABLE_SIDECAR_GLOBS = (
+    "*.srt", "*.SRT", "*.vtt", "*.VTT",
+    "*.xmp", "*.XMP",
+    "*.md", "*.json", "*.txt", "*.yml", "*.yaml",
+)
+
 
 @dataclass
 class InstaPair:
@@ -128,21 +142,76 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
     the full output into `CompletedProcess.stdout` for the itemized-
     changes parser downstream.
     """
-    # --partial keeps a half-copied file on interrupt; --inplace writes
-    # straight to the destination path (no temp+rename), avoiding doubled
-    # remote disk on a 50 GB file. We deliberately do NOT use plain
-    # --append: it trusts the existing destination prefix without verifying
-    # it, so a partial-but-different or size-matched-but-different file is
-    # silently accepted and corrupted. --append-verify checksums the prefix
-    # first, so we use it when the local rsync supports it (GNU rsync); on
-    # Apple's openrsync (no --append-verify) we fall back to plain
-    # --partial --inplace, whose delta-transfer checksum-verifies the
-    # existing blocks rather than blindly trusting them.
+    src = f"{str(folder).rstrip('/')}/"
+    target_str = str(target)
+    dst = target_str if ":" in target_str else f"{target_str.rstrip('/')}/"
+    # Local-only: ensure parent exists so rsync doesn't fail on a missing
+    # originals_root. Remote destinations (`user@host:/path`) are the
+    # caller's setup problem — we'd need ssh to mkdir remotely.
+    if ":" not in target_str:
+        target.parent.mkdir(parents=True, exist_ok=True)
+
+    # Pass 1 — mutable text sidecars, correctness over speed (NO --append-verify).
+    # An edited/shrunk transcript or rewritten XMP must overwrite the stale NAS
+    # copy; --append-verify would skip any same-size-or-shorter file. These are
+    # KB each, so a dedicated pass is nearly free. Filter rules are order-
+    # sensitive (first match wins): excludes first (drop `.audit/` etc. before
+    # the dir-recurse rule reaches them), then recurse all dirs, keep only the
+    # sidecar globs, drop the rest.
+    sidecar_args = _rsync_base_args(append_verify=False, dry_run=dry_run)
+    # --checksum (sidecars only — they're KB): rsync's default quick-check is
+    # size+mtime, which would still skip a same-size edit whose mtime happens
+    # to match the NAS copy (e.g. an earlier rsync preserved the source mtime).
+    # Full-content compare closes that hole. NEVER add this to the bulk pass —
+    # it would re-hash every multi-GB original.
+    sidecar_args.append("--checksum")
+    for pat in RSYNC_EXCLUDES:
+        sidecar_args.extend(["--exclude", pat])
+    sidecar_args.append("--include=*/")
+    for glob in _MUTABLE_SIDECAR_GLOBS:
+        sidecar_args.append(f"--include={glob}")
+    sidecar_args.append("--exclude=*")
+    sidecar_args.extend([src, dst])
+    sidecar_proc = _run_streaming(sidecar_args)
+
+    # Pass 2 — everything (bulk, immutable media), --append-verify ON so an
+    # interrupted multi-GB transfer resumes by appending the tail rather than
+    # re-reading the whole file. The sidecars synced in pass 1 now match on
+    # size+mtime, so rsync's quick-check skips them here before --append-verify
+    # could mishandle them.
+    main_args = _rsync_base_args(append_verify=True, dry_run=dry_run)
+    for pat in RSYNC_EXCLUDES:
+        main_args.extend(["--exclude", pat])
+    main_args.extend([src, dst])
+    main_proc = _run_streaming(main_args)
+
+    # Merge both passes' itemized output so the caller's changes parser sees
+    # sidecar updates too; carry the bulk pass's return code.
+    return subprocess.CompletedProcess(
+        main_proc.args, main_proc.returncode,
+        stdout=(sidecar_proc.stdout or "") + (main_proc.stdout or ""),
+        stderr=(getattr(sidecar_proc, "stderr", "") or "")
+        + (getattr(main_proc, "stderr", "") or ""),
+    )
+
+
+def _rsync_base_args(*, append_verify: bool, dry_run: bool) -> list[str]:
+    """Common rsync flags for both promote passes.
+
+    --partial keeps a half-copied file on interrupt; --inplace writes straight
+    to the destination path (no temp+rename), avoiding doubled remote disk on a
+    50 GB file. We deliberately do NOT use plain --append: it trusts the
+    existing destination prefix without verifying it, so a partial-but-different
+    or size-matched-but-different file is silently accepted and corrupted.
+    --append-verify checksums the prefix, so we use it (when the local rsync
+    supports it — GNU, not Apple's openrsync) for the bulk immutable-media pass.
+    It is NEVER used for the mutable-sidecar pass: it skips same-size-or-shorter
+    files, which is exactly the in-place edit case (see `_MUTABLE_SIDECAR_GLOBS`)."""
     args = [
         "rsync", "-a", "--itemize-changes", "--progress",
         "--partial", "--inplace",
     ]
-    if _rsync_supports("--append-verify"):
+    if append_verify and _rsync_supports("--append-verify"):
         args.append("--append-verify")
     # Opt-in tuning hooks. Unset → default promote is byte-for-byte unchanged;
     # tools/promote-parallel.py sets these per worker:
@@ -167,19 +236,7 @@ def rsync(folder: Path, target: Path, *, dry_run: bool) -> subprocess.CompletedP
     ssh_opts = os.environ.get("IMMY_RSYNC_SSH_OPTS")
     if ssh_opts:
         args.extend(["-e", f"ssh {ssh_opts}"])
-    for pat in RSYNC_EXCLUDES:
-        args.extend(["--exclude", pat])
-
-    src = f"{str(folder).rstrip('/')}/"
-    target_str = str(target)
-    dst = target_str if ":" in target_str else f"{target_str.rstrip('/')}/"
-    # Local-only: ensure parent exists so rsync doesn't fail on a missing
-    # originals_root. Remote destinations (`user@host:/path`) are the
-    # caller's setup problem — we'd need ssh to mkdir remotely.
-    if ":" not in target_str:
-        target.parent.mkdir(parents=True, exist_ok=True)
-    args.extend([src, dst])
-    return _run_streaming(args)
+    return args
 
 
 _RSYNC_FLAG_CACHE: dict[str, bool] = {}
