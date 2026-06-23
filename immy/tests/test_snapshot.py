@@ -77,9 +77,9 @@ def test_fetch_rows_handles_all_columns() -> None:
     dt = datetime(2024, 5, 1, 12, 0, tzinfo=timezone.utc)
     conn = _FakeConn([
         ("uuid-1", "DSC_0001.JPG", 4_123_456, b"\xaa" * 20,
-         dt, "IMAGE", "lib-1"),
+         dt, "IMAGE", "lib-1", 41.4, 2.1, "Barcelona", "Spain"),
         ("uuid-2", "clip.mp4", None, None,
-         None, "VIDEO", None),
+         None, "VIDEO", None, None, None, None, None),
     ])
     rows = list(snap.fetch_rows(conn))
     assert len(rows) == 2
@@ -89,11 +89,14 @@ def test_fetch_rows_handles_all_columns() -> None:
     assert rows[0].taken_at == dt.isoformat()
     assert rows[0].asset_type == "IMAGE"
     assert rows[0].library_id == "lib-1"
+    assert (rows[0].lat, rows[0].lon) == (41.4, 2.1)
+    assert (rows[0].city, rows[0].country) == ("Barcelona", "Spain")
     # NULLs survive as None, not crash.
     assert rows[1].size_bytes is None
     assert rows[1].checksum is None
     assert rows[1].taken_at is None
     assert rows[1].library_id is None
+    assert rows[1].lat is None and rows[1].country is None
 
 
 def test_fetch_rows_library_filter_passes_param() -> None:
@@ -128,7 +131,7 @@ def test_create_writes_schema(tmp_path: Path) -> None:
         tables = {r[0] for r in db.execute(
             "SELECT name FROM sqlite_master WHERE type='table'"
         )}
-        assert tables == {"assets", "meta"}
+        assert tables == {"assets", "meta", "albums", "album_assets"}
     finally:
         db.close()
 

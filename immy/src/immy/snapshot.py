@@ -26,7 +26,11 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterable
 
-SCHEMA_VERSION = 1
+# v2 adds the trip-relevant columns (lat/lon/city/country) + two tables so
+# `immy match` can reconstruct immy-cluster albums and place inbound media
+# fully offline. `find-duplicates` (the v1 consumer) reads only the assets
+# columns it always read, so a v2 file is backward-compatible for it.
+SCHEMA_VERSION = 2
 
 _CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -40,10 +44,29 @@ CREATE TABLE IF NOT EXISTS assets (
   checksum   BLOB,
   taken_at   TEXT,
   asset_type TEXT NOT NULL,
-  library_id TEXT
+  library_id TEXT,
+  -- v2: trip-placement columns, from asset_exif. Nullable — drone/video
+  -- often has no EXIF GPS (lives in .SRT), and not everything is geocoded.
+  lat        REAL,
+  lon        REAL,
+  city       TEXT,
+  country    TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_filename_size ON assets (filename, size_bytes);
 CREATE INDEX IF NOT EXISTS idx_checksum      ON assets (checksum);
+
+-- v2: only immy-cluster albums (those whose description carries an
+-- `immy-cluster:<key>` marker). marker_key is the parsed key.
+CREATE TABLE IF NOT EXISTS albums (
+  album_id   TEXT PRIMARY KEY,
+  name       TEXT,
+  marker_key TEXT
+);
+CREATE TABLE IF NOT EXISTS album_assets (
+  album_id TEXT NOT NULL,
+  asset_id TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_album_assets ON album_assets (album_id);
 
 CREATE TABLE IF NOT EXISTS meta (
   key   TEXT PRIMARY KEY,
@@ -64,7 +87,11 @@ SELECT
   a.checksum,
   e."dateTimeOriginal",
   a.type,
-  a."libraryId"
+  a."libraryId",
+  e.latitude,
+  e.longitude,
+  e.city,
+  e.country
 FROM asset a
 LEFT JOIN asset_exif e ON e."assetId" = a.id
 WHERE a."deletedAt" IS NULL
@@ -85,6 +112,10 @@ class AssetRow:
     taken_at: str | None
     asset_type: str
     library_id: str | None
+    lat: float | None = None
+    lon: float | None = None
+    city: str | None = None
+    country: str | None = None
 
 
 def decode_immich_checksum(raw) -> bytes | None:
@@ -128,7 +159,8 @@ def fetch_rows(conn, library_id: str | None = None) -> Iterable[AssetRow]:
         cur.itersize = 5000
         cur.execute(sql, params)
         for row in cur:
-            asset_id, filename, size, checksum, taken_at, asset_type, lib = row
+            (asset_id, filename, size, checksum, taken_at, asset_type, lib,
+             lat, lon, city, country) = row
             yield AssetRow(
                 asset_id=str(asset_id),
                 filename=str(filename) if filename is not None else "",
@@ -137,7 +169,66 @@ def fetch_rows(conn, library_id: str | None = None) -> Iterable[AssetRow]:
                 taken_at=_isoformat(taken_at),
                 asset_type=str(asset_type),
                 library_id=str(lib) if lib is not None else None,
+                lat=float(lat) if lat is not None else None,
+                lon=float(lon) if lon is not None else None,
+                city=str(city) if city is not None else None,
+                country=str(country) if country is not None else None,
             )
+
+
+@dataclass(frozen=True)
+class AlbumRow:
+    """One immy-cluster album in the snapshot."""
+
+    album_id: str
+    name: str
+    marker_key: str | None  # parsed immy-cluster key, or None (unmarked album)
+
+
+_SELECT_ALBUMS = """
+SELECT id, "albumName", description
+FROM album
+WHERE "deletedAt" IS NULL
+"""
+
+_SELECT_ALBUM_ASSETS = 'SELECT "albumId", "assetId" FROM album_asset'
+
+
+def fetch_albums(conn) -> list[AlbumRow]:
+    """Return every (non-deleted) album as a candidate trip, keyed by name.
+
+    `marker_key` is the parsed `immy-cluster:<key>` when the description
+    carries one, else None. Real-world albums are overwhelmingly trip-named
+    but carry NO marker (created by `promote`, not `cluster`), so filtering
+    to marked-only would drop them all — `match` would then ignore the
+    library's actual trip albums and re-synthesise trips from raw points,
+    losing the curated names. Callers use the album NAME as trip identity."""
+    from .clustering import extract_cluster_key
+    out: list[AlbumRow] = []
+    with conn.cursor() as cur:
+        cur.execute(_SELECT_ALBUMS)
+        for album_id, name, description in cur.fetchall():
+            out.append(AlbumRow(
+                album_id=str(album_id),
+                name=str(name) if name is not None else "",
+                marker_key=extract_cluster_key(description),
+            ))
+    return out
+
+
+def fetch_album_assets(
+    conn, album_ids: set[str],
+) -> list[tuple[str, str]]:
+    """`(album_id, asset_id)` membership, restricted to `album_ids` (the
+    marker albums). Immich has no per-library album scoping, so we filter
+    in Python against the album set we kept."""
+    if not album_ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(_SELECT_ALBUM_ASSETS)
+        return [
+            (str(a), str(s)) for a, s in cur.fetchall() if str(a) in album_ids
+        ]
 
 
 def create(path: Path) -> sqlite3.Connection:
@@ -163,25 +254,44 @@ def write_rows(db: sqlite3.Connection, rows: Iterable[AssetRow]) -> int:
     BATCH = 2000
     batch: list[tuple] = []
     cur = db.cursor()
+    placeholders = "(" + ", ".join("?" * 11) + ")"
+    insert = f"INSERT INTO assets VALUES {placeholders}"
     for r in rows:
         batch.append((
             r.asset_id, r.filename, r.size_bytes, r.checksum,
             r.taken_at, r.asset_type, r.library_id,
+            r.lat, r.lon, r.city, r.country,
         ))
         if len(batch) >= BATCH:
-            cur.executemany(
-                "INSERT INTO assets VALUES (?, ?, ?, ?, ?, ?, ?)", batch,
-            )
+            cur.executemany(insert, batch)
             db.commit()
             count += len(batch)
             batch.clear()
     if batch:
-        cur.executemany(
-            "INSERT INTO assets VALUES (?, ?, ?, ?, ?, ?, ?)", batch,
-        )
+        cur.executemany(insert, batch)
         db.commit()
         count += len(batch)
     return count
+
+
+def write_albums(
+    db: sqlite3.Connection,
+    albums: Iterable[AlbumRow],
+    membership: Iterable[tuple[str, str]],
+) -> int:
+    """Write the marker-album tables. Returns the album count."""
+    cur = db.cursor()
+    album_list = list(albums)
+    cur.executemany(
+        "INSERT INTO albums (album_id, name, marker_key) VALUES (?, ?, ?)",
+        [(a.album_id, a.name, a.marker_key) for a in album_list],
+    )
+    cur.executemany(
+        "INSERT INTO album_assets (album_id, asset_id) VALUES (?, ?)",
+        list(membership),
+    )
+    db.commit()
+    return len(album_list)
 
 
 def write_meta(db: sqlite3.Connection, *, server_host: str,
@@ -265,3 +375,58 @@ def match_checksum(db: sqlite3.Connection, checksum: bytes) -> list[SnapshotMatc
 def read_meta(db: sqlite3.Connection) -> dict[str, str]:
     """Return the full meta table as a dict."""
     return {k: v for k, v in db.execute("SELECT key, value FROM meta")}
+
+
+def schema_version(db: sqlite3.Connection) -> int:
+    """The snapshot's schema version (1 for pre-v2 files with no meta key)."""
+    try:
+        v = read_meta(db).get("schema_version", "1")
+        return int(v)
+    except (ValueError, sqlite3.Error):
+        return 1
+
+
+def require_schema(db: sqlite3.Connection, minimum: int = SCHEMA_VERSION) -> int:
+    """Raise if the snapshot predates `minimum`. Used by `immy match`, which
+    needs the v2 lat/lon + album tables."""
+    v = schema_version(db)
+    if v < minimum:
+        raise RuntimeError(
+            f"snapshot is v{v} but this needs v{minimum} — "
+            "re-run `immy snapshot` (needs Immich DB access)."
+        )
+    return v
+
+
+def read_assets(db: sqlite3.Connection) -> list[AssetRow]:
+    """Load every asset row from a snapshot (read side, for `match`)."""
+    cur = db.execute(
+        "SELECT asset_id, filename, size_bytes, checksum, taken_at,"
+        " asset_type, library_id, lat, lon, city, country FROM assets"
+    )
+    return [
+        AssetRow(
+            asset_id=r[0], filename=r[1], size_bytes=r[2], checksum=r[3],
+            taken_at=r[4], asset_type=r[5], library_id=r[6],
+            lat=r[7], lon=r[8], city=r[9], country=r[10],
+        )
+        for r in cur.fetchall()
+    ]
+
+
+def read_albums(db: sqlite3.Connection) -> list[AlbumRow]:
+    cur = db.execute("SELECT album_id, name, marker_key FROM albums")
+    return [
+        AlbumRow(album_id=r[0], name=r[1], marker_key=r[2])
+        for r in cur.fetchall()
+    ]
+
+
+def read_album_membership(db: sqlite3.Connection) -> dict[str, set[str]]:
+    """`album_id -> {asset_id, …}`."""
+    out: dict[str, set[str]] = {}
+    for album_id, asset_id in db.execute(
+        "SELECT album_id, asset_id FROM album_assets"
+    ):
+        out.setdefault(album_id, set()).add(asset_id)
+    return out
