@@ -151,16 +151,21 @@ def test_geotag_skips_existing_db_gps(tmp_path: Path):
     assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
 
 
-def test_geotag_skips_file_with_embedded_gps(tmp_path: Path):
+def test_geotag_ignores_file_gps_when_db_null(tmp_path: Path):
+    # The bug fix: a drone clip whose GPS lives only in the file (an `immy
+    # audit` dji-gps-from-srt XMP sidecar merged into the row, or an embedded
+    # container tag) but is NULL in the DB STILL needs tagging — Immich never
+    # ingests video XMP. The file-level GPS must NOT short-circuit; the DB
+    # decides. Here DB gps is (None, None), so we tag.
     media = tmp_path / "DJI_MULTI.MP4"
     media.write_bytes(b"")
     (tmp_path / "DJI_MULTI.SRT").write_text((FIXTURES / "DJI_MULTI.SRT").read_text())
     row = ExifRow(path=media, raw={
-        "Composite:GPSLatitude": "1.0", "Composite:GPSLongitude": "2.0",
+        "XMP:GPSLatitude": "1.0", "XMP:GPSLongitude": "2.0",
     })
-    conn = _Conn(asset_id="aid")
+    conn = _Conn(asset_id="aid", gps=(None, None))
     out = srtgeo.geotag_folder(conn, _LIB, tmp_path, [row], write=True)
-    assert out[0].status == "skip-has-gps"
+    assert out[0].status == "tagged"
 
 
 def test_geotag_no_asset(tmp_path: Path):

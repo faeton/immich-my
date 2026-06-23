@@ -24,7 +24,7 @@ import psycopg
 
 from . import geocode as geocode_mod
 from . import srt
-from .exif import ExifRow, has_valid_gps
+from .exif import ExifRow
 from .immich import ImmichClient
 from .pg import LibraryInfo
 
@@ -233,12 +233,16 @@ class GeotagOutcome:
 def _resolve_asset_id(
     conn: psycopg.Connection, library: LibraryInfo, container_path: str,
 ) -> str | None:
-    from . import process as process_mod
-    cs = process_mod.path_checksum(container_path)
+    # Match by `originalPath`, NOT by checksum: drone clips are ingested by
+    # Immich's own library scanner, which stores the file's content sha1 in
+    # `asset.checksum`. immy's `path_checksum` (sha1("path:"+path)) only ever
+    # lands on assets immy itself inserts (`process`/`promote`), so a checksum
+    # match silently finds nothing here. `container_path` is the same value
+    # `backfill_dates` matches on (`container_path_for` → `originalPath`).
     row = conn.execute(
         'SELECT id FROM asset WHERE "ownerId" = %s AND "libraryId" = %s '
-        "AND checksum = %s",
-        (library.owner_id, library.id, cs),
+        'AND "originalPath" = %s AND "deletedAt" IS NULL',
+        (library.owner_id, library.id, container_path),
     ).fetchone()
     return str(row[0]) if row else None
 
@@ -260,9 +264,12 @@ def geotag_folder(
     from . import process as process_mod
     outcomes: list[GeotagOutcome] = []
     for row in rows:
-        if has_valid_gps(row):
-            outcomes.append(GeotagOutcome(row.path, None, status="skip-has-gps"))
-            continue
+        # Deliberately NO file-level GPS pre-skip here. `immy audit` writes a
+        # `dji-gps-from-srt` XMP sidecar whose coords `read_folder` merges into
+        # the row, so the file *looks* located — but Immich never ingests video
+        # XMP, so the asset is still NULL in the DB and DOES need geotagging.
+        # The DB-presence check below (read_gps) is the real idempotency guard.
+        # Only drone clips (those with a sibling .SRT) get past find_sibling.
         srt_path = srt.find_sibling(row.path)
         if srt_path is None:
             continue  # not a drone clip; silent
