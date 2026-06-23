@@ -27,7 +27,7 @@ TRIPS=(
 for t in $TRIPS; do
   echo "################  $t  $(date '+%H:%M:%S')  ################"
   uv run immy audit --write --auto "$TR/$t" || { echo "AUDIT FAIL $t"; continue; }
-  uv run immy process --no-clip --no-faces "$TR/$t" || { echo "PROCESS FAIL $t"; continue; }
+  uv run immy process --no-clip --no-faces --with-captions --with-transcripts --force "$TR/$t" || { echo "PROCESS FAIL $t"; continue; }
   echo "DONE $t  $(date '+%H:%M:%S')"
 done
 echo "################  GROUP B ALL DONE  $(date '+%F %H:%M:%S')  ################"

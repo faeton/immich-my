@@ -7,9 +7,20 @@
 # Why split: process is CPU/GPU-bound (Mac MLX), promote is network-bound
 # (mobile 5-30 Mbps, often off-tailnet). Compute now, ship later.
 #
-#   --no-clip/--no-faces : let Immich's own ML backfill embeddings + faces
-#       after upload (avoids MLX-vs-immich-ml model mismatch). immy still
-#       makes the GO2-dewarped thumbnails + captions + transcripts locally.
+#   --no-clip/--no-faces : do NOT compute CLIP/faces locally — MLX embeddings
+#       live in a different vector space than n5's immich-ml and would break
+#       smart search (clip.py: "NOT interchangeable"). They get produced by n5's
+#       own immich-ml AFTER promote. NB: because immy pre-inserts asset rows,
+#       Immich's library scan won't auto-queue SmartSearch/FaceDetection — that
+#       pass must be triggered explicitly (clip_backend: immich-ml on n5, or the
+#       Immich admin "queue missing" jobs) or smart search stays silently empty.
+#   --with-captions --with-transcripts : run the LOCAL enrichment now — gemma
+#       VLM captions (LM Studio, pinned `gemma-4-31b-it`) + mlx-whisper ASR.
+#       Needs the `ml:` block in .immy/config.yml.
+#   --force : bypass the trip-level `is_trip_fully_cached` marker (the earlier
+#       derivatives-only pass wrote markers; without --force the whole trip is
+#       skipped before the caption/transcript phases run). Per-ASSET journal
+#       gating still holds, so cached derivatives are NOT re-transcoded.
 #
 # Safe to re-run: immy is idempotent (checksum-keyed journal). A killed run
 # resumes where it stopped; each trip is independent (a failure logs + moves on).
@@ -45,7 +56,7 @@ TRIPS=(
 for t in $TRIPS; do
   echo "################  $t  $(date '+%H:%M:%S')  ################"
   uv run immy audit --write --auto "$TR/$t" || { echo "AUDIT FAIL $t"; continue; }
-  uv run immy process --no-clip --no-faces "$TR/$t" || { echo "PROCESS FAIL $t"; continue; }
+  uv run immy process --no-clip --no-faces --with-captions --with-transcripts --force "$TR/$t" || { echo "PROCESS FAIL $t"; continue; }
   echo "DONE $t  $(date '+%H:%M:%S')"
 done
 echo "################  ALL DONE  $(date '+%F %H:%M:%S')  ################"
