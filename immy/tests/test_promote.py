@@ -82,6 +82,18 @@ class FakeClient:
         self.album_assets.append((album_id, list(asset_ids)))
         return [{"id": aid, "success": True} for aid in asset_ids]
 
+    # Tag surface -----------------------------------------------------------
+
+    def upsert_tags(self, names):
+        self.tags_upserted = getattr(self, "tags_upserted", [])
+        self.tags_upserted.append(list(names))
+        return {n: f"tag-{n}" for n in names}
+
+    def tag_assets(self, tag_id, asset_ids):
+        self.assets_tagged = getattr(self, "assets_tagged", [])
+        self.assets_tagged.append((tag_id, list(asset_ids)))
+        return [{"id": aid, "success": True} for aid in asset_ids]
+
 
 @pytest.fixture
 def config_file(tmp_path: Path, monkeypatch) -> tuple[Path, Path]:
@@ -549,6 +561,68 @@ def test_promote_updates_existing_album(config_file, dji_ready, monkeypatch):
     assert updated_id == "album-existing"
     assert "New body text." in body["description"]
     assert fake.album_assets  # assets added (idempotent on Immich side)
+
+
+def test_promote_into_album_merges_into_existing(config_file, dji_ready, monkeypatch):
+    """`--into-album X` adds THIS trip's assets (resolved from its own path) to
+    the existing album X, creates no folder-named album, and does NOT clobber
+    X's description with the source trip's notes."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+    notes = dji_ready / "README.md"
+    notes.write_text(notes.read_text() + "\nSource trip body — must NOT leak.\n")
+
+    existing = [{
+        "id": "album-anya",
+        "albumName": "2024-12-anya-beach-photoshop",
+        "description": "anya's own description",
+    }]
+    fake = FakeClient(indexed=_indexed_set(dji_ready), existing_albums=existing)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(
+        app, ["promote", str(dji_ready),
+              "--into-album", "2024-12-anya-beach-photoshop"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert fake.albums_created == []                 # no folder-named album
+    assert fake.albums_updated == []                 # description left alone
+    assert fake.album_assets                          # assets added to target
+    target_id, ids = fake.album_assets[0]
+    assert target_id == "album-anya" and ids          # the existing album
+
+
+def test_promote_applies_tags(config_file, dji_ready, monkeypatch):
+    """`--tag a --tag b` upserts both tags and attaches each to the trip's
+    assets."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(
+        app, ["promote", str(dji_ready),
+              "--tag", "post-edited", "--tag", "with-anya"],
+    )
+    assert result.exit_code == 0, result.stdout
+    assert fake.tags_upserted == [["post-edited", "with-anya"]]
+    tagged = {tid for tid, _ in fake.assets_tagged}
+    assert tagged == {"tag-post-edited", "tag-with-anya"}
+    for _, ids in fake.assets_tagged:
+        assert ids  # asset ids attached to each tag
+
+
+def test_promote_no_tags_leaves_tag_surface_untouched(config_file, dji_ready, monkeypatch):
+    """No --tag → no tag API calls (byte-identical to the pre-feature path)."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert not hasattr(fake, "tags_upserted")
+    assert not hasattr(fake, "assets_tagged")
 
 
 def test_promote_repairs_thumbnails_for_brought_online_assets(

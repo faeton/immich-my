@@ -383,6 +383,8 @@ def execute(
     client: ImmichClient | None = None,
     resurrect_deleted: bool = False,
     reembed: str = "none",
+    into_album: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict:
     """Run the plan. Returns a dict with summary counters; `promote` CLI
     formats it for the user. Separated from build_plan so tests can stub
@@ -462,6 +464,7 @@ def execute(
     hb.write(step="album sync")
     summary["album"] = _sync_album(
         client, plan, config, resurrect_deleted=resurrect_deleted,
+        into_album=into_album, tags=tags,
     )
 
     # CLIP + faces are NOT auto-queued for immy-inserted assets (the library
@@ -693,8 +696,20 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
 def _sync_album(
     client: ImmichClient, plan: Plan, config: Config,
     *, resurrect_deleted: bool = False,
+    into_album: str | None = None,
+    tags: list[str] | None = None,
 ) -> dict:
     """Create or update an Immich album named after the trip folder.
+
+    `into_album` overrides the album NAME (not the path): assets are still
+    resolved from THIS trip's `originalPath` prefix, but added to the named
+    (usually pre-existing) album instead of one named after the folder — the
+    merge case (promote `2024-12-ivan-photoshoot`'s files INTO the existing
+    `2024-12-anya-beach-photoshop` album). On a merge we do NOT push the source
+    trip's notes onto the target's description (it'd clobber the target's own).
+
+    `tags` (flat names, e.g. `post-edited` / `with-anya`) are upserted and
+    attached to every asset under this trip — marks merged/edited files.
 
     Resolves the asset list directly from Postgres via
     `originalPath LIKE '<container_root>/<trip>/%'`. The earlier
@@ -718,7 +733,8 @@ def _sync_album(
     assets as duplicates rather than failing. Never raises — album sync
     is a nice-to-have, shouldn't block the rest of promote.
     """
-    album_name = plan.folder.name
+    path_name = plan.folder.name          # where the FILES live (LIKE prefix)
+    album_name = into_album or path_name  # which album to add them to
     summary: dict = {
         "name": album_name,
         "status": "skipped",
@@ -730,7 +746,9 @@ def _sync_album(
 
     notes = resolve_notes(plan.folder)
     description: str | None = None
-    if notes is not None:
+    # On a merge, never overwrite the target album's description with the
+    # source trip's notes.
+    if notes is not None and into_album is None:
         body = notes_body(notes)
         description = body if body else None
 
@@ -748,7 +766,7 @@ def _sync_album(
     repair_ids: list[str] = []
     try:
         library = pg_mod.fetch_library_info(conn, config.immich.library_id)
-        prefix = f"{library.container_root.rstrip('/')}/{album_name}/"
+        prefix = f"{library.container_root.rstrip('/')}/{path_name}/"
         like = prefix + "%"
         with conn.cursor() as cur:
             # Assets that need a thumbnail (re)generation: registered while
@@ -840,22 +858,43 @@ def _sync_album(
                 detail=f"id={album_id}; {len(asset_ids)} asset(s)",
                 added=len(asset_ids),
             )
-            return summary
+        else:
+            album_id = existing.get("id")
+            if album_id is None:
+                summary.update(status="error", detail="existing album has no id")
+                return summary
 
-        album_id = existing.get("id")
-        if album_id is None:
-            summary.update(status="error", detail="existing album has no id")
-            return summary
-
-        if description is not None and existing.get("description") != description:
-            client.update_album(album_id, description=description)
-        results = client.add_assets_to_album(album_id, asset_ids)
-        added = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
-        summary.update(
-            status="updated",
-            detail=f"id={album_id}; {added}/{len(asset_ids)} new",
-            added=added,
-        )
+            if description is not None and existing.get("description") != description:
+                client.update_album(album_id, description=description)
+            results = client.add_assets_to_album(album_id, asset_ids)
+            added = sum(1 for r in results if isinstance(r, dict) and r.get("success"))
+            summary.update(
+                status="updated",
+                detail=f"id={album_id}; {added}/{len(asset_ids)} new",
+                added=added,
+            )
     except ImmichError as e:
         summary.update(status="error", detail=str(e))
+        return summary
+
+    # Tag the trip's assets (merge markers like `post-edited` / `with-anya`).
+    # Soft: a tag failure must not flip a successful album sync to error.
+    if tags and asset_ids:
+        tag_summary: dict = {"requested": list(tags)}
+        try:
+            ids = client.upsert_tags(list(tags))
+            applied = {}
+            for name in tags:
+                tid = ids.get(name)
+                if tid is None:
+                    applied[name] = "no-id"
+                    continue
+                res = client.tag_assets(tid, asset_ids)
+                applied[name] = sum(
+                    1 for r in res if isinstance(r, dict) and r.get("success")
+                )
+            tag_summary["applied"] = applied
+        except ImmichError as e:
+            tag_summary["error"] = str(e)
+        summary["tags"] = tag_summary
     return summary

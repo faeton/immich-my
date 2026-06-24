@@ -59,3 +59,37 @@ def test_trigger_reembed_swallows_job_error():
     out = promote_mod._trigger_reembed(fc, "missing")  # must not raise
     assert out["smartSearch"].startswith("error:")
     assert out["faceDetection"] == "queued"  # the other still fires
+
+
+# --- tag API request shapes ------------------------------------------------
+
+def test_upsert_tags_request_and_parse(monkeypatch):
+    calls = []
+    def fake_request(self, method, path, body=None):
+        calls.append((method, path, body))
+        return [{"id": "t1", "name": "post-edited"},
+                {"id": "t2", "name": "with-anya"}]
+    monkeypatch.setattr(ImmichClient, "_request", fake_request)
+    c = ImmichClient(url="http://x", api_key="k")
+    out = c.upsert_tags(["post-edited", "with-anya"])
+    assert calls == [("PUT", "/api/tags", {"tags": ["post-edited", "with-anya"]})]
+    assert out == {"post-edited": "t1", "with-anya": "t2"}
+
+
+def test_upsert_tags_empty_is_noop(monkeypatch):
+    monkeypatch.setattr(ImmichClient, "_request",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no call")))
+    assert ImmichClient(url="http://x", api_key="k").upsert_tags([]) == {}
+
+
+def test_tag_assets_request_shape(monkeypatch):
+    calls = []
+    monkeypatch.setattr(
+        ImmichClient, "_request",
+        lambda self, method, path, body=None: calls.append((method, path, body)) or
+        [{"id": i, "success": True} for i in body["ids"]],
+    )
+    c = ImmichClient(url="http://x", api_key="k")
+    res = c.tag_assets("t1", ["a", "b"])
+    assert calls == [("PUT", "/api/tags/t1/assets", {"ids": ["a", "b"]})]
+    assert [r["success"] for r in res] == [True, True]

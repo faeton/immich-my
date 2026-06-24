@@ -549,6 +549,8 @@ def _promote_impl(
     config_path: Path | None,
     resurrect_deleted: bool = False,
     reembed: str = "none",
+    into_album: str | None = None,
+    tags: list[str] | None = None,
 ) -> None:
     """Rsync + Immich library-scan + Insta360 stack calls.
 
@@ -596,6 +598,7 @@ def _promote_impl(
         summary = promote_mod.execute(
             plan, config, dry_run=dry_run, client=client,
             resurrect_deleted=resurrect_deleted, reembed=reembed,
+            into_album=into_album, tags=tags,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]interrupted[/yellow] — rsync stopped; scan/stack/album skipped.")
@@ -661,6 +664,14 @@ def _promote_impl(
             f"album [{colour}]{album['status']}[/{colour}] "
             f"{album['name']}: {album['detail']}{suffix}"
         )
+    tagsum = album.get("tags") if album else None
+    if tagsum:
+        if "error" in tagsum:
+            console.print(f"[red]tags failed:[/red] {tagsum['error']}")
+        else:
+            applied = tagsum.get("applied", {})
+            parts = ", ".join(f"{n}={v}" for n, v in applied.items())
+            console.print(f"[green]✓[/green] tagged: {parts}")
     reembed = summary.get("reembed")
     if reembed:
         queued = [q for q in ("smartSearch", "faceDetection")
@@ -684,6 +695,8 @@ def _promote(
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
     resurrect_deleted: bool = typer.Option(False, "--resurrect-deleted", help="Also un-delete (clear deletedAt) assets under this trip path. Off by default so album sync never undoes a soft-delete you made in Immich."),
     reembed: str = typer.Option("none", "--reembed", help="After scan, trigger Immich CLIP+faces jobs (immy-inserted assets are NOT auto-queued). 'missing'=new assets only; 'all'=reprocess whole library (one-time stale-index cleanup); 'none'=off (default). LIBRARY-WIDE — in a batch, pass it once on the last trip, not per-trip."),
+    into_album: str = typer.Option(None, "--into-album", help="Add this trip's assets to an EXISTING album of this name instead of one named after the folder (the merge case — e.g. promote ivan-photoshoot INTO anya-beach-photoshop). The target album's description is left untouched."),
+    tag: list[str] = typer.Option(None, "--tag", help="Tag this trip's assets with this flat tag name (repeatable). Used to mark merged/edited files, e.g. --tag post-edited --tag with-anya. Idempotent."),
 ) -> None:
     """Rsync trip into originals + trigger Immich scan + stack Insta360 pairs."""
     if reembed not in ("none", "missing", "all"):
@@ -691,6 +704,7 @@ def _promote(
     _promote_impl(
         folder, dry_run=dry_run, force=force, config_path=config_path,
         resurrect_deleted=resurrect_deleted, reembed=reembed,
+        into_album=into_album, tags=tag or None,
     )
 
 

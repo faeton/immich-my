@@ -305,6 +305,42 @@ class ImmichClient:
         )
         return resp if isinstance(resp, list) else []
 
+    # --- tags --------------------------------------------------------------
+
+    def upsert_tags(self, names: list[str]) -> dict[str, str]:
+        """Create tags by name and return `{name: id}`.
+
+        `PUT /api/tags` body `{tags:[…]}` is the idempotent bulk upsert: an
+        existing name comes back with its existing id (no duplicate — verified
+        against the live API, tag count unchanged). Pass FLAT names; Immich
+        treats `/` as a hierarchy separator, so `post-edited` / `with-anya`
+        stay single tags."""
+        if not names:
+            return {}
+        resp = self._request("PUT", "/api/tags", body={"tags": names})
+        out: dict[str, str] = {}
+        for t in resp or []:
+            if isinstance(t, dict) and t.get("name") and t.get("id"):
+                out[t["name"]] = t["id"]
+        return out
+
+    def tag_assets(self, tag_id: str, asset_ids: list[str]) -> list[dict]:
+        """`PUT /api/tags/{id}/assets` body `{ids}` — attach a tag to assets.
+        Idempotent like album-add (already-tagged → `success=false,
+        error='duplicate'`). Batched (request body cap) and returns the
+        per-asset result list."""
+        if not asset_ids:
+            return []
+        out: list[dict] = []
+        for i in range(0, len(asset_ids), 1000):
+            resp = self._request(
+                "PUT", f"/api/tags/{tag_id}/assets",
+                body={"ids": asset_ids[i:i + 1000]},
+            )
+            if isinstance(resp, list):
+                out.extend(resp)
+        return out
+
 
 def wait_for_asset(
     client: ImmichClient,
