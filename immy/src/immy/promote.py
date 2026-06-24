@@ -382,6 +382,7 @@ def execute(
     dry_run: bool,
     client: ImmichClient | None = None,
     resurrect_deleted: bool = False,
+    reembed: str = "none",
 ) -> dict:
     """Run the plan. Returns a dict with summary counters; `promote` CLI
     formats it for the user. Separated from build_plan so tests can stub
@@ -463,8 +464,42 @@ def execute(
         client, plan, config, resurrect_deleted=resurrect_deleted,
     )
 
+    # CLIP + faces are NOT auto-queued for immy-inserted assets (the library
+    # scan treats pre-inserted rows as known → no SmartSearch/FaceDetection job
+    # fires), so smart search stays empty unless we trigger it. `reembed`
+    # opts in: "missing" embeds only the new assets (safe per-promote default
+    # once enabled); "all" reprocesses the whole library (one-time index
+    # cleanup when stored vectors are a mix of model eras). "none" keeps the
+    # Mac/legacy path byte-identical.
+    if reembed != "none" and not dry_run:
+        summary["reembed"] = _trigger_reembed(client, reembed)
+
     hb.clear()
     return summary
+
+
+def _trigger_reembed(client: ImmichClient, mode: str) -> dict:
+    """Fire (and CHECK) the SmartSearch + FaceDetection queues. `mode` is
+    "missing" (force=False) or "all" (force=True). Reads queue stats first so
+    the summary can show what was pending; never raises out — a re-embed
+    failure shouldn't fail an otherwise-good promote."""
+    force = mode == "all"
+    out: dict = {"mode": mode, "force": force}
+    try:
+        jobs = client.get_jobs()
+        out["pending_before"] = {
+            q: (jobs.get(q, {}).get("jobCounts") or {})
+            for q in ("smartSearch", "faceDetection")
+        }
+    except ImmichError as e:
+        out["check_error"] = str(e)
+    for q in ("smartSearch", "faceDetection"):
+        try:
+            client.queue_job(q, force=force)
+            out[q] = "queued"
+        except ImmichError as e:
+            out[q] = f"error: {e}"
+    return out
 
 
 # --- Offline cache drain -------------------------------------------------

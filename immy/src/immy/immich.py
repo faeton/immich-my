@@ -87,6 +87,32 @@ class ImmichClient:
         """Fire-and-forget. Immich returns 204 and scans async in the background."""
         self._request("POST", f"/api/libraries/{library_id}/scan", body={})
 
+    def get_jobs(self) -> dict[str, Any]:
+        """`GET /api/jobs` → per-queue stats. Read before triggering a re-embed
+        so the summary can show what was pending: each value has `jobCounts`
+        (active/waiting/failed/…) and `queueStatus` (isActive/isPaused)."""
+        return self._request("GET", "/api/jobs") or {}
+
+    def queue_job(self, name: str, *, force: bool = False) -> None:
+        """Start a library-wide job. `PUT /api/jobs/{name}` body
+        `{command:"start", force}` — the same control the admin Jobs page uses
+        (the legacy run-queue route, still live in v2.7.x; returns 200).
+
+        `name` is a queue id, e.g. `smartSearch` (CLIP embeddings) or
+        `faceDetection`. `force=False` processes only assets MISSING that output
+        (the safe per-promote default — embeds the freshly-inserted assets that
+        Immich's library scan won't auto-queue because immy pre-inserted their
+        rows). `force=True` reprocesses EVERY asset — the one-time index cleanup
+        when the stored vectors are a heterogeneous mix of model eras.
+
+        NB: this is LIBRARY-WIDE, not per-trip — each call rescans the whole
+        library for work. In a batch promote, run it ONCE at the end, not per
+        trip (especially `force=True`)."""
+        self._request(
+            "PUT", f"/api/jobs/{name}",
+            body={"command": "start", "force": force},
+        )
+
     def regenerate_thumbnails(self, asset_ids: list[str]) -> None:
         """Queue thumbnail (re)generation for specific assets.
 

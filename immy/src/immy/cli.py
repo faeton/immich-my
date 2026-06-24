@@ -548,6 +548,7 @@ def _promote_impl(
     force: bool,
     config_path: Path | None,
     resurrect_deleted: bool = False,
+    reembed: str = "none",
 ) -> None:
     """Rsync + Immich library-scan + Insta360 stack calls.
 
@@ -590,7 +591,7 @@ def _promote_impl(
     try:
         summary = promote_mod.execute(
             plan, config, dry_run=dry_run, client=client,
-            resurrect_deleted=resurrect_deleted,
+            resurrect_deleted=resurrect_deleted, reembed=reembed,
         )
     except KeyboardInterrupt:
         console.print("\n[yellow]interrupted[/yellow] — rsync stopped; scan/stack/album skipped.")
@@ -656,6 +657,20 @@ def _promote_impl(
             f"album [{colour}]{album['status']}[/{colour}] "
             f"{album['name']}: {album['detail']}{suffix}"
         )
+    reembed = summary.get("reembed")
+    if reembed:
+        queued = [q for q in ("smartSearch", "faceDetection")
+                  if reembed.get(q) == "queued"]
+        if queued:
+            console.print(
+                f"[green]✓[/green] re-embed [{reembed['mode']}] queued: "
+                f"{', '.join(queued)} (Immich processes async)"
+            )
+        for q in ("smartSearch", "faceDetection"):
+            if str(reembed.get(q, "")).startswith("error"):
+                console.print(f"[red]re-embed {q} failed:[/red] {reembed[q]}")
+        if "check_error" in reembed:
+            console.print(f"[yellow]re-embed check skipped:[/yellow] {reembed['check_error']}")
 
 
 def _promote(
@@ -664,11 +679,14 @@ def _promote(
     force: bool = typer.Option(False, "--force", help="Promote even if HIGH findings are still pending."),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
     resurrect_deleted: bool = typer.Option(False, "--resurrect-deleted", help="Also un-delete (clear deletedAt) assets under this trip path. Off by default so album sync never undoes a soft-delete you made in Immich."),
+    reembed: str = typer.Option("none", "--reembed", help="After scan, trigger Immich CLIP+faces jobs (immy-inserted assets are NOT auto-queued). 'missing'=new assets only; 'all'=reprocess whole library (one-time stale-index cleanup); 'none'=off (default). LIBRARY-WIDE — in a batch, pass it once on the last trip, not per-trip."),
 ) -> None:
     """Rsync trip into originals + trigger Immich scan + stack Insta360 pairs."""
+    if reembed not in ("none", "missing", "all"):
+        raise typer.BadParameter("--reembed must be one of: none, missing, all")
     _promote_impl(
         folder, dry_run=dry_run, force=force, config_path=config_path,
-        resurrect_deleted=resurrect_deleted,
+        resurrect_deleted=resurrect_deleted, reembed=reembed,
     )
 
 
