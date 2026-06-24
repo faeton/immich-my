@@ -664,6 +664,12 @@ def _promote_impl(
             f"album [{colour}]{album['status']}[/{colour}] "
             f"{album['name']}: {album['detail']}{suffix}"
         )
+    if album and album.get("trashed_skipped"):
+        console.print(
+            f"[yellow]note:[/yellow] {album['trashed_skipped']} asset(s) under this "
+            "path are trashed (online soft-deletes, left as-is). "
+            "Pass [bold]--resurrect-deleted[/bold] to include them."
+        )
     tagsum = album.get("tags") if album else None
     if tagsum:
         if "error" in tagsum:

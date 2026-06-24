@@ -598,20 +598,31 @@ def _rsync_derivatives(src_root: Path, host_root: str) -> subprocess.CompletedPr
 
     Uses `-rt` instead of `-a` so we don't try to chmod/chown existing
     destination dirs: Immich's container runs as root and pre-creates
-    `thumbs/<userId>/` as root:root with drwxrwxrwx. We just need new
-    files to land there; preserving source perms would ask the server
-    to chmod a root-owned dir and fail with EPERM. Modes for newly
-    created files fall back to the user's umask (fine — Immich reads).
+    `thumbs/<userId>/` as root:root. We just need new files to land there;
+    preserving source perms would ask the server to chmod a root-owned dir
+    and fail with EPERM.
+
+    Writes as root on the NAS via `--rsync-path="sudo rsync"` (remote dst
+    only; sudo is NOPASSWD on n5). The nested hash dirs Immich creates under
+    `thumbs/<userId>/` (e.g. `f8/49/`) are root:root mode 0755, so an
+    unprivileged push fails `mkstemp … Permission denied` (EACCES) for every
+    file. Running the remote rsync as root both lands the files and keeps
+    them root-owned — exactly what Immich (also root) expects to read and
+    later overwrite on regen.
     """
     src = f"{str(src_root).rstrip('/')}/"
-    dst = host_root if ":" in host_root else f"{host_root.rstrip('/')}/"
+    remote = ":" in host_root
+    dst = host_root if remote else f"{host_root.rstrip('/')}/"
     args = [
         "rsync", "-rt", "--itemize-changes", "--progress",
         # `_posters/` is our local scratch (video poster JPEGs we feed
         # to pyvips); Immich never reads it, so don't pollute the NAS.
         "--exclude", "_posters/", "--exclude", "_posters/**",
-        src, dst,
     ]
+    if remote:
+        # immich-owned thumbs tree → run the far-side rsync under sudo.
+        args.append("--rsync-path=sudo rsync")
+    args += [src, dst]
     return _run_streaming(args)
 
 
@@ -742,6 +753,7 @@ def _sync_album(
         "added": 0,
         "resurrected": 0,
         "thumbs_repaired": 0,
+        "trashed_skipped": 0,
     }
 
     notes = resolve_notes(plan.folder)
@@ -769,13 +781,50 @@ def _sync_album(
         prefix = f"{library.container_root.rstrip('/')}/{path_name}/"
         like = prefix + "%"
         with conn.cursor() as cur:
+            if resurrect_deleted:
+                # Explicit opt-in: un-trash EVERYTHING under this path,
+                # including assets the user soft-deleted in the UI while they
+                # were online.
+                cur.execute(
+                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
+                    'WHERE "originalPath" LIKE %s '
+                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                    'AND ("isOffline" = true OR "deletedAt" IS NOT NULL)',
+                    (like, config.immich.library_id),
+                )
+            else:
+                # Default: clear the scanner's offline flag AND un-trash rows
+                # that are offline — Immich auto-trashes assets whose files
+                # stayed missing (the entire un-promoted backlog: rows were
+                # pre-inserted by `process`, files never reached the NAS until
+                # this promote, so the scanner marked them offline → trashed).
+                # An offline asset whose file we're uploading right now is
+                # coming BACK, so un-trashing it is correct. ONLINE-trashed
+                # rows (deliberate UI soft-deletes) are left alone — only
+                # `--resurrect-deleted` touches those.
+                # Known accepted edge (codex+grok-reviewed): if a user
+                # soft-deletes an ONLINE asset and its file later vanishes,
+                # Immich flips isOffline=true while keeping the old deletedAt;
+                # a subsequent promote would then un-trash it. Immich persists
+                # no "who trashed" signal to distinguish that from auto-trash,
+                # and it can't happen to the never-promoted backlog this fixes.
+                cur.execute(
+                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
+                    'WHERE "originalPath" LIKE %s '
+                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                    'AND "isOffline" = true',
+                    (like, config.immich.library_id),
+                )
+            summary["resurrected"] = cur.rowcount
+
             # Assets that need a thumbnail (re)generation: registered while
-            # their original was still offline, so Immich wrote a
-            # `__offline_placeholder__` thumb (or none) and never re-ran the
-            # job after the file landed. Captured BEFORE the UPDATE below
-            # clears isOffline. Clearing the flag alone doesn't re-queue
-            # derivative jobs, so without this the trip shows "Error loading
-            # image" on every tile forever.
+            # offline (Immich wrote a `__offline_placeholder__` thumb, or
+            # none) and never re-ran the job after the file landed. Captured
+            # AFTER the un-trash above so just-resurrected assets — which now
+            # have `deletedAt IS NULL` and a missing/placeholder thumb — are
+            # included; clearing the flags alone never re-queues derivative
+            # jobs, so without this the trip shows "Error loading image"
+            # forever.
             cur.execute(
                 'SELECT a.id FROM asset a '
                 'WHERE a."originalPath" LIKE %s '
@@ -791,25 +840,7 @@ def _sync_album(
                  "%__offline_placeholder__%"),
             )
             repair_ids = [str(r[0]) for r in cur.fetchall()]
-            if resurrect_deleted:
-                cur.execute(
-                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
-                    'WHERE "originalPath" LIKE %s '
-                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
-                    'AND ("isOffline" = true OR "deletedAt" IS NOT NULL)',
-                    (like, config.immich.library_id),
-                )
-            else:
-                # Default: only clear the scanner's offline flag. Leave
-                # user-soft-deleted rows (deletedAt) alone.
-                cur.execute(
-                    'UPDATE asset SET "isOffline" = false '
-                    'WHERE "originalPath" LIKE %s '
-                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
-                    'AND "isOffline" = true',
-                    (like, config.immich.library_id),
-                )
-            summary["resurrected"] = cur.rowcount
+
             cur.execute(
                 'SELECT id FROM asset '
                 'WHERE "originalPath" LIKE %s '
@@ -819,6 +850,18 @@ def _sync_album(
                 (like, config.immich.library_id),
             )
             asset_ids = [str(r[0]) for r in cur.fetchall()]
+
+            # Anything still trashed under this path is an ONLINE soft-delete
+            # we deliberately skipped — surface the count so a partial album
+            # is never silent. `--resurrect-deleted` would include them.
+            cur.execute(
+                'SELECT count(*) FROM asset '
+                'WHERE "originalPath" LIKE %s '
+                'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                'AND "deletedAt" IS NOT NULL',
+                (like, config.immich.library_id),
+            )
+            summary["trashed_skipped"] = int((cur.fetchone() or [0])[0])
         conn.commit()
     except Exception as e:
         conn.rollback()

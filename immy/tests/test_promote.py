@@ -498,6 +498,7 @@ def _enable_fake_album_pg(config_file: tuple[Path, Path], monkeypatch) -> MagicM
     cur.__exit__.return_value = False
     cur.rowcount = 0
     cur.fetchall.return_value = [("asset-1",)]
+    cur.fetchone.return_value = (0,)  # trashed_skipped count query
     fake_conn.cursor.return_value = cur
     monkeypatch.setattr(promote_mod.pg_mod, "connect", lambda cfg: fake_conn)
     monkeypatch.setattr(
@@ -561,6 +562,98 @@ def test_promote_updates_existing_album(config_file, dji_ready, monkeypatch):
     assert updated_id == "album-existing"
     assert "New body text." in body["description"]
     assert fake.album_assets  # assets added (idempotent on Immich side)
+
+
+def test_rsync_derivatives_runs_remote_as_root(monkeypatch):
+    """Remote thumbs dst → `--rsync-path=sudo rsync` (immich-owned dir, sudo
+    NOPASSWD on n5). Local dst → no sudo."""
+    seen = {}
+    monkeypatch.setattr(
+        promote_mod, "_run_streaming",
+        lambda args: seen.setdefault("args", args),
+    )
+    promote_mod._rsync_derivatives(Path("/x/.audit/derivatives"), "n5:/mnt/flash/immich")
+    assert "--rsync-path=sudo rsync" in seen["args"]
+    assert seen["args"][-1] == "n5:/mnt/flash/immich"  # remote dst kept verbatim
+
+    seen.clear()
+    promote_mod._rsync_derivatives(Path("/x/.audit/derivatives"), "/mnt/flash/immich")
+    assert "--rsync-path=sudo rsync" not in seen["args"]  # local → no sudo
+
+
+def _sql_recording_pg(config_file, monkeypatch, *, trashed_skipped=0):
+    """Fake pg whose cursor records every executed SQL string. fetchall →
+    one asset id; fetchone → the trashed_skipped count. Also enables the
+    `pg:` block in the config so `_sync_album` doesn't short-circuit."""
+    cfg_path, _ = config_file
+    data = yaml.safe_load(cfg_path.read_text()) or {}
+    data["pg"] = {"host": "127.0.0.1", "port": 15432,
+                  "user": "postgres", "password": "x", "database": "immich"}
+    cfg_path.write_text(yaml.safe_dump(data))
+    executed: list[str] = []
+    fake_conn = MagicMock()
+    fake_conn.closed = False
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.rowcount = 1
+    cur.fetchall.return_value = [("asset-1",)]
+    cur.fetchone.return_value = (trashed_skipped,)
+    cur.execute.side_effect = lambda sql, params=None: executed.append(" ".join(sql.split()))
+    fake_conn.cursor.return_value = cur
+    monkeypatch.setattr(promote_mod.pg_mod, "connect", lambda cfg: fake_conn)
+    monkeypatch.setattr(
+        promote_mod.pg_mod, "fetch_library_info",
+        lambda conn, lib_id: LibraryInfo(
+            id=lib_id, owner_id="o", container_root="/mnt/external/originals"),
+    )
+    return executed
+
+
+def test_default_promote_untrashes_offline_autotrash(config_file, dji_ready, monkeypatch):
+    """DEFAULT (no --resurrect-deleted): the un-trash UPDATE clears BOTH
+    isOffline and deletedAt, gated on isOffline=true (the offline-auto-trash
+    signature) — so the never-promoted backlog lands without the flag, while
+    online soft-deletes (deletedAt-only) are untouched."""
+    executed = _sql_recording_pg(config_file, monkeypatch)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    updates = [s for s in executed if s.startswith("UPDATE asset")]
+    assert len(updates) == 1
+    u = updates[0]
+    assert '"isOffline" = false' in u and '"deletedAt" = NULL' in u
+    assert '"isOffline" = true' in u            # gated on the offline signature
+    assert '"deletedAt" IS NOT NULL' not in u   # NOT the resurrect-all form
+
+
+def test_resurrect_deleted_untrashes_everything(config_file, dji_ready, monkeypatch):
+    """--resurrect-deleted broadens the UPDATE to also include online
+    soft-deletes (deletedAt IS NOT NULL)."""
+    executed = _sql_recording_pg(config_file, monkeypatch)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready), "--resurrect-deleted"])
+    assert result.exit_code == 0, result.stdout
+    u = [s for s in executed if s.startswith("UPDATE asset")][0]
+    assert '"deletedAt" IS NOT NULL' in u  # online soft-deletes included
+
+
+def test_promote_warns_on_trashed_skipped(config_file, dji_ready, monkeypatch):
+    """Residual online-trashed assets are surfaced, never silent."""
+    _sql_recording_pg(config_file, monkeypatch, trashed_skipped=4)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert "4 asset(s)" in result.stdout and "--resurrect-deleted" in result.stdout
 
 
 def test_promote_into_album_merges_into_existing(config_file, dji_ready, monkeypatch):
