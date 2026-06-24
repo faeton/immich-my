@@ -70,6 +70,13 @@ class ImmichConfig:
     url: str
     api_key: str
     library_id: str
+    # Optional ssh transport. When set, `ImmichClient` runs `curl` ON this host
+    # (via `ssh <ssh_host> curl …`) instead of opening sockets from the laptop.
+    # Needed for n5: the Immich API is localhost-bound (127.0.0.1:2283), the
+    # tailscale-IP TLS handshake fails, and SSH port-forwarding is disabled —
+    # so `url` is the n5-LOCAL address (http://127.0.0.1:2283) and curl reaches
+    # it from inside n5. Unset → direct urllib (the Mac/tailnet path, unchanged).
+    ssh_host: str | None = None
 
 
 @dataclass(frozen=True)
@@ -200,6 +207,7 @@ def load(path: Path | None = None) -> Config:
             url=str(imm["url"]).rstrip("/"),
             api_key=str(imm["api_key"]),
             library_id=str(imm["library_id"]),
+            ssh_host=(str(imm["ssh_host"]) if imm.get("ssh_host") else None),
         )
 
     pg_raw = data.get("pg") or {}

@@ -21,6 +21,8 @@ surface small and version-pin when it matters.
 from __future__ import annotations
 
 import json
+import shlex
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -56,8 +58,14 @@ class ImmichClient:
     url: str
     api_key: str
     timeout: float = DEFAULT_TIMEOUT
+    # When set, every request runs `curl` ON this host over ssh instead of
+    # opening a socket locally (see ImmichConfig.ssh_host). `url` is then the
+    # address as seen FROM ssh_host (e.g. http://127.0.0.1:2283).
+    ssh_host: str | None = None
 
     def _request(self, method: str, path: str, body: dict | None = None) -> Any:
+        if self.ssh_host:
+            return self._request_ssh(method, path, body)
         url = f"{self.url.rstrip('/')}{path}"
         data = json.dumps(body).encode() if body is not None else None
         headers = {
@@ -82,6 +90,64 @@ class ImmichClient:
             raise ImmichError(f"{method} {path} → {e.code}: {detail[:400]}") from e
         except urllib.error.URLError as e:
             raise ImmichError(f"{method} {path} → transport: {e.reason}") from e
+
+    def _request_ssh(self, method: str, path: str, body: dict | None = None) -> Any:
+        """Same contract as `_request`, but the HTTP call is made by `curl`
+        running on `self.ssh_host` (`ssh <host> curl …`). Used for n5, whose
+        Immich API is localhost-bound and not reachable from the laptop (no
+        port-forwarding, TLS handshake fails on the tailscale IP).
+
+        The request body is piped to curl over stdin (`--data-binary @-`) so JSON
+        never has to survive remote-shell quoting; the remote argv is otherwise
+        `shlex.quote`d into one command string (ssh joins args with bare spaces,
+        so pre-quoting is mandatory). A trailing `-w '\\n%{http_code}'` carries
+        the status out-of-band — curl exits 0 on HTTP 4xx/5xx (no `-f`), so we
+        read the code and mirror `_request`'s error/None/JSON behaviour."""
+        url = f"{self.url.rstrip('/')}{path}"
+        data = json.dumps(body).encode() if body is not None else None
+        curl = [
+            "curl", "-sS", "-X", method,
+            "-H", f"x-api-key: {self.api_key}",
+            "-H", "Accept: application/json",
+            "-w", "\n%{http_code}",
+        ]
+        if data is not None:
+            curl += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
+        curl.append(url)
+        remote = " ".join(shlex.quote(a) for a in curl)
+        ssh = [
+            "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
+            self.ssh_host, remote,
+        ]
+        try:
+            proc = subprocess.run(
+                ssh, input=data, capture_output=True,
+                timeout=self.timeout + 15,  # ssh connect/auth overhead
+            )
+        except subprocess.TimeoutExpired as e:
+            raise ImmichError(f"{method} {path} → transport: ssh timeout") from e
+        except OSError as e:  # ssh binary missing, etc.
+            raise ImmichError(f"{method} {path} → transport: {e}") from e
+        if proc.returncode != 0:
+            # ssh failure (255) or curl connect failure — not an HTTP status.
+            err = proc.stderr.decode(errors="replace").strip()
+            raise ImmichError(
+                f"{method} {path} → transport: ssh/curl rc={proc.returncode}: {err[:400]}"
+            )
+        out = proc.stdout.decode(errors="replace")
+        raw, _, code_s = out.rpartition("\n")
+        try:
+            code = int(code_s.strip())
+        except ValueError:
+            raise ImmichError(
+                f"{method} {path} → transport: no status from curl: {out[:200]}"
+            )
+        if not 200 <= code < 300:
+            raise ImmichError(f"{method} {path} → {code}: {raw[:400]}")
+        raw = raw.strip()
+        if not raw:
+            return None
+        return json.loads(raw)
 
     def scan_library(self, library_id: str) -> None:
         """Fire-and-forget. Immich returns 204 and scans async in the background."""

@@ -584,7 +584,11 @@ def _promote_impl(
 
     client: ImmichClient | None = None
     if config.immich is not None and not dry_run:
-        client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key)
+        client = ImmichClient(
+            url=config.immich.url,
+            api_key=config.immich.api_key,
+            ssh_host=config.immich.ssh_host,
+        )
     elif config.immich is None:
         console.print("[dim]no immich creds — rsync only, no scan or stacks.[/dim]")
 
@@ -879,7 +883,11 @@ def srt_verify_channel(
     for a VIDEO: write a sentinel coord unlocked vs. locked, trigger
     refresh-metadata, and report which survived. Restores the asset after."""
     config, conn, library = _srt_pg_setup(config_path)
-    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key)
+    client = ImmichClient(
+        url=config.immich.url,
+        api_key=config.immich.api_key,
+        ssh_host=config.immich.ssh_host,
+    )
     asset_id = asset if srtgeo_mod.is_uuid(asset) else client.find_asset_id(asset)
     if not asset_id:
         console.print(f"[red]could not resolve asset:[/red] {asset}")
@@ -1901,7 +1909,11 @@ def cluster(
     # Apply phase. Fetch every album once (small N in practice); build a
     # key→album map from descriptions, then per cluster either update
     # the matching album or create a fresh one.
-    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key)
+    client = ImmichClient(
+        url=config.immich.url,
+        api_key=config.immich.api_key,
+        ssh_host=config.immich.ssh_host,
+    )
     key_to_album: dict[str, dict] = {}
     existing = client._request("GET", "/api/albums")
     if isinstance(existing, list):
