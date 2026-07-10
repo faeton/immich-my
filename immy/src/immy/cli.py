@@ -2599,5 +2599,153 @@ def apple_people(
     )
 
 
+dedup_app = typer.Typer(
+    help="Cross-source dedup (iCloud + Google Takeout → library/originals). "
+    "Cascade: block → pHash → decide; CLIP confirm lands after calibration.",
+    no_args_is_help=True,
+)
+
+
+def _open_manifest(manifest_path: Path):
+    from .dedup import manifest as manifest_mod
+
+    return manifest_mod, manifest_mod.open_manifest(manifest_path)
+
+
+_MANIFEST_OPT = typer.Option(
+    ..., "--manifest", help="Path to manifest.sqlite (created if missing)."
+)
+
+
+@dedup_app.command("bootstrap")
+def dedup_bootstrap(
+    originals_root: Path = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="library/originals — the already-canonical Immich corpus.",
+    ),
+    manifest_path: Path = _MANIFEST_OPT,
+) -> None:
+    """Seed the manifest with everything already in library/originals as
+    `canonical` — the corpus new arrivals dedup against. Registers +
+    fingerprints in one go; no file is ever moved by this command."""
+    from .dedup import engine as engine_mod
+
+    manifest_mod, conn = _open_manifest(manifest_path)
+    result = manifest_mod.register(conn, "originals", originals_root)
+    console.print(
+        f"registered {result.new} new (+{result.already_known} known) from {originals_root}"
+    )
+    ok, failed = engine_mod.fingerprint_pending(
+        conn, source="originals", progress=_dedup_progress
+    )
+    conn.execute(
+        "UPDATE asset SET status=? WHERE source='originals' AND status=?",
+        (manifest_mod.CANONICAL, manifest_mod.FINGERPRINTED),
+    )
+    conn.commit()
+    console.print(f"[green]canonical corpus: {ok} fingerprinted[/green]"
+                  + (f", [red]{failed} failed[/red]" if failed else ""))
+
+
+@dedup_app.command("register")
+def dedup_register(
+    source: str = typer.Argument(help="Source name: icloud | google."),
+    root: Path = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Staging root to walk (e.g. staging/icloud).",
+    ),
+    manifest_path: Path = _MANIFEST_OPT,
+    min_age_hours: float = typer.Option(
+        0.0, "--min-age-hours",
+        help="Skip files younger than this (incremental settle gate — "
+        "icloudpd lands Live Photo pairs non-atomically).",
+    ),
+) -> None:
+    """Walk a staging source and register unseen media files (fast, fs-only)."""
+    manifest_mod, conn = _open_manifest(manifest_path)
+    result = manifest_mod.register(conn, source, root, min_age_hours=min_age_hours)
+    console.print(
+        f"[green]{result.new} new[/green], {result.already_known} already known, "
+        f"{result.skipped_young} skipped (younger than {min_age_hours}h)"
+    )
+
+
+def _dedup_progress(done: int, total: int) -> None:
+    console.print(f"  fingerprint {done}/{total}", highlight=False)
+
+
+@dedup_app.command("fingerprint")
+def dedup_fingerprint(
+    manifest_path: Path = _MANIFEST_OPT,
+    source: str = typer.Option(None, "--source", help="Limit to one source."),
+    batch_size: int = typer.Option(200, "--batch-size"),
+) -> None:
+    """Extract metadata (exiftool batch) + pHash for every registered asset.
+    Resumable: commits per batch, failed files land in status `error`."""
+    from .dedup import engine as engine_mod
+
+    _, conn = _open_manifest(manifest_path)
+    ok, failed = engine_mod.fingerprint_pending(
+        conn, source=source, batch_size=batch_size, progress=_dedup_progress
+    )
+    color = "red" if failed else "green"
+    console.print(f"[green]{ok} fingerprinted[/green], [{color}]{failed} failed[/{color}]")
+
+
+@dedup_app.command("cluster")
+def dedup_cluster(manifest_path: Path = _MANIFEST_OPT) -> None:
+    """Stage A+B: block by time/geo/stem, pHash-filter, form clusters."""
+    from .dedup import engine as engine_mod
+
+    _, conn = _open_manifest(manifest_path)
+    result = engine_mod.cluster(conn)
+    console.print(
+        f"universe {result['universe']} → {result['pairs_blocked']} blocked pairs → "
+        f"{result['pairs_confirmed']} confirmed → "
+        f"[green]{result['clusters_created']} new cluster(s)[/green]"
+    )
+    for warning in result["warnings"]:
+        console.print(f"[yellow]{warning}[/yellow]")
+
+
+@dedup_app.command("decide")
+def dedup_decide(manifest_path: Path = _MANIFEST_OPT) -> None:
+    """Stage D on pending clusters. CLIP-less v1: auto-merge needs strong
+    pHash + an agreeing metadata signal; guards (burst/Live/edited/crop)
+    and anything softer route to review. No files are moved — promote is
+    a separate, later command."""
+    from .dedup import engine as engine_mod
+
+    _, conn = _open_manifest(manifest_path)
+    counts = engine_mod.decide(conn)
+    console.print(
+        f"[green]auto {counts['auto']}[/green] · review {counts['review']} · "
+        f"kept_all {counts['kept_all']}"
+    )
+
+
+@dedup_app.command("status")
+def dedup_status(manifest_path: Path = _MANIFEST_OPT) -> None:
+    """Counts per source × status, cluster decisions, embedding cache."""
+    manifest_mod, conn = _open_manifest(manifest_path)
+    data = manifest_mod.stats(conn)
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("source")
+    statuses = sorted({s for per in data["assets"].values() for s in per})
+    for status in statuses:
+        table.add_column(status, justify="right")
+    for source, per in sorted(data["assets"].items()):
+        table.add_row(source, *(f"{per.get(s, 0):,}" or "" for s in statuses))
+    console.print(table)
+    if data["clusters"]:
+        console.print("clusters: " + " · ".join(
+            f"{decision}={count:,}" for decision, count in sorted(data["clusters"].items())
+        ))
+    console.print(f"cached embeddings: {data['embeddings']:,}")
+
+
+app.add_typer(dedup_app, name="dedup")
+
+
 if __name__ == "__main__":
     app()
