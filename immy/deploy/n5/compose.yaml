@@ -41,6 +41,12 @@ services:
       # Phase 6.1 writable roots — keep immy off the :ro originals.
       - /mnt/flash/immy/state:/scratch/immy-state
       - /mnt/flash/immy/sidecars:/sidecars
+      # Consolidation pipeline (`immy dedup`): staging sources are read-only
+      # (dedup never mutates them — promote, later, moves winners OUT);
+      # /state holds manifest.sqlite. Container paths are what the manifest
+      # records as asset paths, so keep these mounts stable across runs.
+      - /mnt/tank/media/staging:/staging:ro
+      - /mnt/tank/media/state:/state
     networks:
       - ix-immich_default
     # Batch tool, not a service: `docker compose run` overrides this command.
