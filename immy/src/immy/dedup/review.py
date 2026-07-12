@@ -321,7 +321,8 @@ def scene_chip(neighbor: tuple[str, int] | None) -> str:
     decision, cid = neighbor
     label = "merged" if decision == "auto" else "kept all"
     return (f"<span class='scene' title='a cluster shot within {SCENE_WINDOW_SECONDS}s "
-            f"is already decided'>same scene: you {label} (#{cid})</span>")
+            f"is already decided'>same scene: you {label} "
+            f"<a href='/cluster/{cid}'>#{cid}</a></span>")
 
 
 def pixel_chip(pixel_ncc: float | None, time_delta: float | None) -> str:
@@ -373,6 +374,9 @@ table.cat small{color:#777;font-weight:400}
             padding:1px 8px;font-size:.78rem;color:#9fc0dc}
 .scene{background:#33203a;border:1px solid #5f3f6f;border-radius:4px;
        padding:1px 8px;font-size:.75rem;color:#c9a0d0}
+.scene a{color:#e0b8e8}
+.twinchip{color:#7ab7ff;font-size:.72rem}
+.brow[data-twin]{border-left:6px solid #2f4a6f}
 .path{color:#888;word-break:break-all;font-size:.72rem;margin-top:3px}
 .score{color:var(--dim)}
 .actions{position:sticky;bottom:0;background:#111d;backdrop-filter:blur(4px);padding:12px 0;margin-top:14px;
@@ -625,6 +629,45 @@ def render_done(counts: dict) -> str:
     return _page("dedup review — done", body)
 
 
+def annotate_twin_groups(rows: list[dict]) -> None:
+    """Mark batch rows that are pixel-twins of each other (cross-cluster
+    pHash ≤ strong within ±5s). Incremental clustering splits one photo's
+    copies into per-source clusters (later runs can't join already-claimed
+    assets), so the reviewer meets literal mirror rows back to back — the
+    time sort makes them adjacent, this makes them act as ONE decision.
+    Sets row['twin'] = group id on rows with at least one partner."""
+    parent = list(range(len(rows)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    items = [
+        (idx, m.phash, m.epoch)
+        for idx, row in enumerate(rows)
+        for m in row["members"]
+        if m.phash is not None
+    ]
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            ri, pi, ti = items[i]
+            rj, pj, tj = items[j]
+            if ri == rj:
+                continue
+            if ti is not None and tj is not None and abs(ti - tj) > 5:
+                continue
+            if phash.hamming(pi, pj) <= HAMMING_STRONG:
+                parent[find(ri)] = find(rj)
+    sizes: dict[int, int] = {}
+    for idx in range(len(rows)):
+        sizes[find(idx)] = sizes.get(find(idx), 0) + 1
+    for idx, row in enumerate(rows):
+        root = find(idx)
+        row["twin"] = root if sizes[root] > 1 else None
+
+
 def render_categories(
     grid: dict[tuple[str, int | None], int], counts: dict
 ) -> str:
@@ -694,7 +737,15 @@ window.scrollTo(0, 0);
 
 document.addEventListener('click', ev => {
   const row = ev.target.closest('.brow');
-  if (row) row.classList.toggle('unchecked');
+  if (row) {
+    // Twin rows are the SAME photos split across per-source clusters —
+    // they toggle as one so the decision stays consistent.
+    const twin = row.dataset.twin;
+    const targets = twin !== undefined
+      ? document.querySelectorAll('.brow[data-twin="' + twin + '"]') : [row];
+    const uncheck = !row.classList.contains('unchecked');
+    targets.forEach(r => r.classList.toggle('unchecked', uncheck));
+  }
   updateCount();
 });
 function updateCount() {
@@ -771,11 +822,17 @@ def render_batch(rows: list[dict], counts: dict, filter_note: str = "") -> str:
             for m in row["members"]
         )
         sim = row["clip_cos_sim"]
+        twin = row.get("twin")
+        twin_attr = f' data-twin="{twin}"' if twin is not None else ""
+        twin_chip = (
+            "<br><span class='twinchip'>&#128279; same photos as linked rows "
+            "&mdash; toggles together</span>" if twin is not None else ""
+        )
         body_rows.append(f"""
-        <div class="brow" data-cid="{row['cluster_id']}" data-winner="{row['winner_id']}">
+        <div class="brow" data-cid="{row['cluster_id']}" data-winner="{row['winner_id']}"{twin_attr}>
           <div class="check">&#10003;</div>
           {thumbs}
-          <div class="bmeta">cluster {row['cluster_id']}<br>
+          <div class="bmeta">cluster {row['cluster_id']}{twin_chip}<br>
             cos {f"{sim:.6f}" if sim is not None else "—"}<br>
             {len(row['members'])} members<br>
             keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}<br>
@@ -1122,6 +1179,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     "signal": signals.get_signal(conn, cid),
                     "scene": scene_neighbor(conn, members),
                 })
+            annotate_twin_groups(rows)
             return render_batch(rows, _counts(conn), ", ".join(notes))
         finally:
             conn.close()
