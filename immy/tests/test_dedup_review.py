@@ -302,6 +302,27 @@ def test_pixel_chip_renders_when_signal_exists(client):
     assert "pixel 0.995" in page and "pixel same" in page
 
 
+def test_categories_page_cross_tabulates_queue(client):
+    c, db_path = client
+    _seed_signals(db_path, [(1, 0.95, 0.0), (2, 0.60, 4.0)])
+    page = c.get("/categories").get_data(as_text=True)
+    # both fixture clusters classify as phash-weak (no phash values seeded);
+    # they land in different pixel bands with filter links
+    assert "phash-weak" in page
+    assert "/batch?reason=phash-weak&amp;min_px=0.9" in page
+    assert "/batch?reason=phash-weak&amp;max_px=0.75" in page
+
+
+def test_batch_pixel_band_filter(client):
+    c, db_path = client
+    _seed_signals(db_path, [(1, 0.95, 0.0), (2, 0.60, 4.0)])
+    page = c.get("/batch?min_px=0.9").get_data(as_text=True)
+    assert 'data-cid="1"' in page and 'data-cid="2"' not in page
+    page = c.get("/batch?max_px=0.75").get_data(as_text=True)
+    assert 'data-cid="2"' in page and 'data-cid="1"' not in page
+    assert "filter:" in page
+
+
 def test_batch_enforces_originals_guard_per_cluster(client):
     c, db_path = client
     res = c.post("/api/decide-batch", json={"decisions": [

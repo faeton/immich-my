@@ -131,6 +131,41 @@ def _queue_ids(conn: sqlite3.Connection) -> list[int]:
     ]
 
 
+def _load_all_pending(
+    conn: sqlite3.Connection, skipped: set[int]
+) -> list[tuple[int, list[AssetLite], float | None]]:
+    """(cluster_id, members, pixel_ncc) for every pending queue cluster, in
+    queue order, members fetched in ONE query — the categories page and
+    filtered batch views classify the whole queue on each load (1-2k
+    clusters, a few ms of sqlite + pure-python grouping)."""
+    order = {cid: i for i, cid in enumerate(_queue_ids(conn))}
+    by_cluster: dict[int, list[AssetLite]] = {}
+    from .engine import ASSET_LITE_COLUMNS, asset_lite_from_row
+
+    # cluster.id makes bare `id` ambiguous in this 3-table join — qualify
+    # every asset column.
+    qualified = ", ".join(
+        f"asset.{column.strip()}" for column in ASSET_LITE_COLUMNS.split(",")
+    )
+    for row in conn.execute(
+        f"SELECT m.cluster_id, {qualified}"
+        "  FROM asset JOIN membership m ON m.asset_id = asset.id"
+        "  JOIN cluster c ON c.id = m.cluster_id"
+        " WHERE c.decision='review' AND c.clip_cos_sim IS NOT NULL"
+        " ORDER BY asset.id"
+    ):
+        by_cluster.setdefault(row[0], []).append(asset_lite_from_row(row[1:]))
+    try:
+        px = dict(conn.execute("SELECT cluster_id, pixel_ncc FROM review_signal"))
+    except sqlite3.OperationalError:
+        px = {}
+    return [
+        (cid, members, px.get(cid))
+        for cid, members in sorted(by_cluster.items(), key=lambda kv: order.get(kv[0], 1 << 30))
+        if cid not in skipped and len(members) >= 2
+    ]
+
+
 def _counts(conn: sqlite3.Connection) -> dict:
     remaining = conn.execute(
         "SELECT COUNT(*) FROM cluster WHERE decision='review' AND clip_cos_sim IS NOT NULL"
@@ -215,6 +250,38 @@ def default_winner(members: list[AssetLite]) -> AssetLite:
     return max(pool, key=winner_score)
 
 
+def reason_slug(members: list[AssetLite]) -> str:
+    """Primary category key derived from review_reason (first guard hit)."""
+    reason = review_reason(members)
+    for needle, slug in (
+        ("burst", "burst"), ("edited", "edited"), ("aspect", "aspect-crop"),
+        ("originals", "originals"), ("pHash weak", "phash-weak"),
+        ("metadata", "metadata"),
+    ):
+        if needle in reason:
+            return slug
+    return "other"
+
+
+# (label, min_px, max_px) — max exclusive; None = open-ended
+PX_BANDS = [
+    ("likely same frame", 0.90, None),
+    ("ambiguous upper", 0.85, 0.90),
+    ("ambiguous lower", 0.80, 0.85),
+    ("lean distinct", 0.75, 0.80),
+    ("likely distinct", None, 0.75),
+]
+
+
+def _band_of(px: float | None) -> int | None:
+    if px is None:
+        return None
+    for i, (_, lo, hi) in enumerate(PX_BANDS):
+        if (lo is None or px >= lo) and (hi is None or px < hi):
+            return i
+    return None
+
+
 def pixel_chip(pixel_ncc: float | None, time_delta: float | None) -> str:
     """Signal chip for the `dedup rescore` scores: green = pixels correlate
     like a same-frame re-export, blue = they diverge like distinct shots."""
@@ -255,6 +322,13 @@ h1{font-size:1.05rem;margin:0}
 .pixel{border-radius:4px;padding:1px 8px;font-size:.75rem;border:1px solid #444;color:#bbb}
 .pixel.same{background:#1d4620;border-color:#2f6f34;color:#9fdca4}
 .pixel.diff{background:#1d2f46;border-color:#2f4a6f;color:#9fc0dc}
+table.cat{border-collapse:collapse;margin-top:10px;font-size:.9rem}
+table.cat th,table.cat td{border:1px solid #333;padding:8px 14px;text-align:right}
+table.cat th{background:#181818;text-align:left}
+table.cat td a{font-weight:600}
+table.cat small{color:#777;font-weight:400}
+.filternote{background:#1d2f46;border:1px solid #2f4a6f;border-radius:4px;
+            padding:1px 8px;font-size:.78rem;color:#9fc0dc}
 .path{color:#888;word-break:break-all;font-size:.72rem;margin-top:3px}
 .score{color:var(--dim)}
 .actions{position:sticky;bottom:0;background:#111d;backdrop-filter:blur(4px);padding:12px 0;margin-top:14px;
@@ -467,7 +541,8 @@ def render_cluster(
       <span class="reason" title="which Stage D check routed this cluster to review">
         {html.escape(review_reason(members))}</span>
       {pixel_chip(*signal)}
-      <span class="modeswitch"><a href="/batch">batch mode &rarr;</a></span>
+      <span class="modeswitch"><a href="/categories">categories</a> &middot;
+        <a href="/batch">batch mode &rarr;</a></span>
     </header>
     {lock_note}
     <div class="cards">{''.join(cards)}</div>
@@ -504,6 +579,65 @@ def render_done(counts: dict) -> str:
     return _page("dedup review — done", body)
 
 
+def render_categories(
+    grid: dict[tuple[str, int | None], int], counts: dict
+) -> str:
+    """Cross-table of the pending queue: guard reason × pixel band, every
+    non-zero cell a link into batch mode filtered to that category."""
+    slugs = sorted({slug for slug, _ in grid}, key=lambda s: -sum(
+        n for (sl, _), n in grid.items() if sl == s))
+    def link(n, slug=None, band=None):
+        if not n:
+            return "<td>&middot;</td>"
+        params = []
+        if slug:
+            params.append(f"reason={slug}")
+        if band is not None:
+            _, lo, hi = PX_BANDS[band]
+            if lo is not None:
+                params.append(f"min_px={lo}")
+            if hi is not None:
+                params.append(f"max_px={hi}")
+        return f'<td><a href="/batch?{"&amp;".join(params)}">{n}</a></td>'
+
+    header = "".join(f"<th>{html.escape(label)}<br><small>{lo if lo is not None else ''}"
+                     f"&ndash;{hi if hi is not None else ''}</small></th>"
+                     for label, lo, hi in PX_BANDS) + "<th>unscored</th><th>total</th>"
+    rows = []
+    for slug in slugs:
+        cells = "".join(
+            link(grid.get((slug, band), 0), slug, band)
+            for band in range(len(PX_BANDS))
+        ) + link(grid.get((slug, None), 0), slug=slug)
+        total = sum(n for (sl, _), n in grid.items() if sl == slug)
+        rows.append(f"<tr><th>{html.escape(slug)}</th>{cells}"
+                    f"{link(total, slug=slug)}</tr>")
+    col_totals = "".join(
+        link(sum(n for (_, b), n in grid.items() if b == band), band=band)
+        for band in range(len(PX_BANDS))
+    ) + link(sum(n for (_, b), n in grid.items() if b is None))
+    grand = sum(grid.values())
+    rows.append(f"<tr><th>total</th>{col_totals}{link(grand)}</tr>")
+
+    body = f"""
+    <header>
+      <h1>review queue by category</h1>
+      <span class="progress">{counts['remaining']:,} image clusters pending
+        &middot; {counts['no_clip']:,} video/no-CLIP (v2)</span>
+      <span class="modeswitch"><a href="/">single</a> &middot; <a href="/batch">batch</a></span>
+    </header>
+    <table class="cat">
+      <tr><th>reason \\ pixel</th>{header}</tr>
+      {''.join(rows)}
+    </table>
+    <footer>Rows: which Stage D guard routed the cluster to review.
+      Columns: pixel-identity band from <code>dedup rescore</code>
+      (&ge;0.90 leans same-frame duplicate, &le;0.75 leans distinct shots).
+      Click any count to review exactly that slice in batch mode.</footer>
+    """
+    return _page("dedup review — categories", body)
+
+
 _BATCH_JS = """
 // A submitted page must come back at the top — the next batch starts there.
 history.scrollRestoration = 'manual';
@@ -533,7 +667,7 @@ async function submitBatch() {
     const out = await res.json();
     if (!res.ok) throw new Error(out.error || res.statusText);
     if (out.failed && out.failed.length) alert('some failed: ' + JSON.stringify(out.failed));
-    window.location.href = '/batch';
+    window.location.href = '/batch' + window.location.search;  // keep category filter
   } catch (e) {
     alert('batch failed: ' + e.message);
     inflight = false;
@@ -573,7 +707,7 @@ updateCount();
 """
 
 
-def render_batch(rows: list[dict], counts: dict) -> str:
+def render_batch(rows: list[dict], counts: dict, filter_note: str = "") -> str:
     """rows: [{cluster_id, clip_cos_sim, members, winner_id}] — compact
     one-line-per-cluster confirm view for the near-certain tail of the
     queue. Everything renders pre-checked; a click toggles a row off
@@ -607,7 +741,9 @@ def render_batch(rows: list[dict], counts: dict) -> str:
       <span class="progress">{counts['remaining']:,} remaining &middot;
         showing {len(rows)} &middot; green outline = keeper &middot;
         click a row to uncheck it</span>
-      <span class="modeswitch"><a href="/">&larr; single mode</a></span>
+      {f'<span class="filternote">filter: {html.escape(filter_note)} &middot; <a href="/batch">clear</a></span>' if filter_note else ''}
+      <span class="modeswitch"><a href="/categories">categories</a> &middot;
+        <a href="/">single mode</a></span>
     </header>
     <div>{''.join(body_rows)}</div>
     <div class="actions">
@@ -856,21 +992,51 @@ def create_app(manifest_path: Path, thumb_root: Path):
         finally:
             conn.close()
 
-    @app.get("/batch")
-    def batch_page():
+    @app.get("/categories")
+    def categories_page():
         conn = db()
         try:
-            pending = [cid for cid in _queue_ids(conn) if cid not in skipped]
-            if not pending:
+            grid: dict[tuple[str, int | None], int] = {}
+            for _cid, members, px in _load_all_pending(conn, skipped):
+                key = (reason_slug(members), _band_of(px))
+                grid[key] = grid.get(key, 0) + 1
+            return render_categories(grid, _counts(conn))
+        finally:
+            conn.close()
+
+    @app.get("/batch")
+    def batch_page():
+        args = request.args
+        min_px = args.get("min_px", type=float)
+        max_px = args.get("max_px", type=float)
+        reason = args.get("reason")
+        notes = []
+        if reason:
+            notes.append(reason)
+        if min_px is not None:
+            notes.append(f"px ≥ {min_px}")
+        if max_px is not None:
+            notes.append(f"px < {max_px}")
+        conn = db()
+        try:
+            selected = []
+            for cid, members, px in _load_all_pending(conn, skipped):
+                if min_px is not None and (px is None or px < min_px):
+                    continue
+                if max_px is not None and (px is None or px >= max_px):
+                    continue
+                if reason and reason_slug(members) != reason:
+                    continue
+                selected.append((cid, members, px))
+                if len(selected) >= BATCH_SIZE:
+                    break
+            if not selected:
                 return render_done(_counts(conn))
             rows = []
-            for cid in pending[:BATCH_SIZE]:
+            for cid, members, _px in selected:
                 sim = conn.execute(
                     "SELECT clip_cos_sim FROM cluster WHERE id=?", (cid,)
                 ).fetchone()[0]
-                members = load_cluster_members(conn, cid)
-                if not members:
-                    continue
                 rows.append({
                     "cluster_id": cid,
                     "clip_cos_sim": sim,
@@ -878,7 +1044,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     "winner_id": default_winner(members).id,
                     "signal": signals.get_signal(conn, cid),
                 })
-            return render_batch(rows, _counts(conn))
+            return render_batch(rows, _counts(conn), ", ".join(notes))
         finally:
             conn.close()
 
