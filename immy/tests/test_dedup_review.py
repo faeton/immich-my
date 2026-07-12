@@ -82,7 +82,7 @@ def test_index_serves_highest_clip_cluster_first(client):
     c, _ = client
     page = c.get("/").get_data(as_text=True)
     assert "cluster 1" in page
-    assert "0.9900" in page
+    assert "0.990000" in page
 
 
 def test_merge_writes_auto_and_advances_queue(client):

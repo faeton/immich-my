@@ -373,7 +373,9 @@ def render_cluster(
         "is a swap, not a promote; that stays a manual job)</p>"
         if locked else ""
     )
-    sim = f"{clip_cos_sim:.4f}" if clip_cos_sim is not None else "—"
+    # 6 decimals: a "1.0000" that is really 0.99996 is exactly the kind of
+    # doubt the reviewer needs resolved.
+    sim = f"{clip_cos_sim:.6f}" if clip_cos_sim is not None else "—"
     config = (
         f"const CLUSTER_ID = {cluster_id};"
         f" const DEFAULT_WINNER = {suggested.id};"
@@ -502,7 +504,7 @@ def render_batch(rows: list[dict], counts: dict) -> str:
           <div class="check">&#10003;</div>
           {thumbs}
           <div class="bmeta">cluster {row['cluster_id']}<br>
-            cos {f"{sim:.4f}" if sim is not None else "—"}<br>
+            cos {f"{sim:.6f}" if sim is not None else "—"}<br>
             {len(row['members'])} members<br>
             keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}
           </div>
