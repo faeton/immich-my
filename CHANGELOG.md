@@ -68,14 +68,48 @@ continuously, so entries are dated rather than versioned.
 
 - **`immy tags camera <trip> [--write]`**: backfills the Details panel's
   blank "Camera" row for DJI clips (`asset_exif.make`/`model`, empty because
-  the MP4 container carries neither) from the trip's notes `Gear/Camera/
-  <make> <model>` tag — same source `tags sync` resolves, split on the first
-  space. Verified live with a `srt verify-channel`-style probe first: unlike
-  GPS, Immich's metadata refresh doesn't clobber an *unlocked* make/model
-  write either (it only ever sets these fields from a fresh file read,
-  never nulls them when the file has none) — locked anyway as a safety net.
-  Never overwrites an asset that already has make or model set, so it can't
-  clobber Immich's own extraction for any non-DJI camera.
+  the MP4 container carries neither Make/Model nor an Encoder atom —
+  confirmed empty live, not assumed). Verified live with a
+  `srt verify-channel`-style probe first: unlike GPS, Immich's metadata
+  refresh doesn't clobber an *unlocked* make/model write either — locked
+  anyway as a safety net.
+
+  First version derived (make, model) by splitting the trip notes'
+  `Gear/Camera/<code>` tag on the first space — shipped, backfilled 1,813
+  assets, then the user immediately caught it: raw codes like `FC8282`
+  aren't human-readable, and this repo already has an owner-confirmed
+  friendly-name table (`devices.py`, from a June 23 commit — bypassed
+  entirely because this new code never looked for it). Rebuilt on
+  `devices.resolve()` instead: primary signal is the file's own raw EXIF/
+  Encoder; falls back to the notes gear tag (itself resolved through the
+  same table, not used raw) only when the file has no signal at all —
+  which is genuinely the common case for DJI video.
+
+  That surfaced a second, independent bug: `devices.py`'s friendly names
+  already included "DJI" (`("DJI", "DJI Air 3")`), and make is *also*
+  `"DJI"` — Immich concatenates make+model for display, so this rendered
+  as "DJI DJI Air 3". Pre-existing (9 assets already had it via the normal
+  `immy process` ingest path, dating to June); fixed at the root by
+  stripping the redundant prefix from every table entry.
+
+  Backfill made self-correcting in two directions once both bugs were
+  fixed: an asset already locked by a previous run of this command gets
+  silently re-corrected if the resolved value changed; an asset with an
+  *unlocked* existing value is left alone unless that value is itself a
+  known-raw code the table maps to something different (confident lookup,
+  never a guess). That upgrade path caught 632 more pre-existing assets
+  across the library carrying a raw code from before `devices.py` existed,
+  plus a previously-unmapped DJI video Encoder string (`"DJI Mini5Pro"`,
+  no space — 518 assets). ~130 assets remain stuck on a raw code behind a
+  pre-existing, unrelated data-integrity issue found along the way: 624
+  duplicate `asset` rows sharing an `originalPath` across the library make
+  asset resolution nondeterministic for those files — out of scope here,
+  belongs to the separate `immy dedup` pipeline.
+
+  Two independent AI reviews (Codex, Grok) on the *first* version of this
+  feature weren't run before the user caught the raw-code issue — a gap in
+  process, not tooling: reviews happened on the GPS/tags fix, this feature
+  shipped afterward without a fresh pass.
 - **Legacy tag cleanup**: found 78 malformed flat tags across the library
   with a literal `|` in their name (e.g. `Gear|Camera|DJI FC8282`) predating
   this session — a past bug (unrelated to the one above) that passed

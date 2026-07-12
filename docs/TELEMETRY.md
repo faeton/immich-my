@@ -122,12 +122,11 @@ tag. Idempotent — safe to re-run after adding new footage to a trip.
 
 ## Camera model for videos (`immy tags camera`)
 
-DJI's MP4 container carries no `Make`/`Model` tags at all — `immy`'s own
-`exiftool`-based read (`file_camera()` in `rules/trip_tags.py`) recovers the
-model via a filename-prefix fallback plus the trip's curated
-`Gear/Camera/DJI FC8282`-style notes tag, but Immich's own (lighter-weight)
-video metadata extraction never does, so the Details panel's "Camera" row
-sits blank for every DJI clip even after GPS and tags are fixed.
+DJI's MP4 container carries no `Make`/`Model` tags at all (confirmed empty
+live, not assumed — `EXIF:Make`/`Model` and `ItemList:Encoder`/`QuickTime:
+Encoder` are simply absent from real DJI video files), so Immich's Details
+panel "Camera" row sits blank for every DJI clip even after GPS and tags
+are fixed. DJI *stills* do carry a bare module code as Model (`FC8282`).
 
 Verified live 2026-07-12 with a `srt verify-channel`-style probe (write a
 sentinel `make`/`model`, trigger a real metadata refresh, observe): unlike
@@ -138,13 +137,34 @@ here, but `tags camera` locks anyway (`make`, `model` tokens), matching the
 GPS precedent as a safety net against a future Immich version behaving
 differently.
 
-`immy tags camera <trip> [--write]` reuses the *exact* per-file tag
-resolution `tags sync` uses (`tags_for_file`) — for each file it takes the
-resolved `Gear/Camera/<make> <model>` tag (if any) and splits it on the
-first space into `make`/`model`. Idempotent and non-destructive by
-construction: an asset that already has `make` OR `model` set (Immich's own
-extraction succeeded — any non-DJI camera) is left alone, so this can never
-clobber a value Immich read from the file itself.
+`immy tags camera <trip> [--write]` resolves every file through
+`devices.resolve()` — the SAME owner-confirmed friendly-name table `immy
+process` uses at ingest time (`devices.py`; module codes like `FC8282` →
+`"DJI Air 3"`) — never a raw code. Primary signal is the file's own raw
+EXIF/Encoder; for DJI video (which has none), it falls back to the trip's
+`Gear/Camera/<code>` notes tag, itself run through the same table rather
+than used raw. `make`/model` values in the table deliberately don't repeat
+"DJI" (Immich concatenates make+model for display; a `"DJI"` + `"DJI Air 3"`
+model would double up).
+
+Idempotent, in two directions: an asset we already locked gets silently
+re-corrected if the resolved value has since changed (the friendly-name
+table gaining an entry, or a stale earlier write of this same command). An
+asset with an *unlocked* existing value (Immich's own extraction) is left
+alone — unless that existing value is itself a known-raw code the table
+maps to something different, in which case it's upgraded: a confident
+lookup against data we already recognize, never a guess at data we don't.
+
+Found and fixed live 2026-07-12: 632 pre-existing assets across the library
+(predating `devices.py`'s existence) carried a raw module code this way,
+plus a still-undiscovered DJI video Encoder string (`"DJI Mini5Pro"`, no
+space — 518 assets) not yet in the table. ~130 assets remain stuck on a raw
+code because of a pre-existing, unrelated data-integrity issue: duplicate
+`asset` rows sharing the same `originalPath` (624 across the library) make
+`resolve_asset_id`'s un-ordered `SELECT` + `fetchone()` nondeterministic for
+those specific files — it may resolve to either duplicate on a given run.
+Out of scope here — that's what the separate dedup pipeline (`immy dedup`)
+exists to resolve.
 
 ## Caption context
 

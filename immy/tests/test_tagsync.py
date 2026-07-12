@@ -282,67 +282,156 @@ def test_tag_assets_failure_without_id_fails_whole_batch(tmp_path: Path):
     assert all(o.status == "tag-failed" for o in out)
 
 
-# --- camera_sync_folder: backfill asset_exif.make/model from the resolved
-# Gear/Camera tag, for files whose container carries neither (DJI MP4s) ----
+# --- camera_sync_folder: backfill asset_exif.make/model via devices.resolve
+# (never a raw module code), falling back to the notes gear tag — itself run
+# through devices.resolve — only when the file has no signal at all --------
 
-_DJI_FILENAME_ONLY_ROW = lambda trip: ExifRow(
-    path=trip / "DJI_0002.MP4", raw={})  # no EXIF Make/Model at all
+# A DJI still: real EXIF Model is the bare module code, exactly like a real
+# DJI JPG (confirmed live 2026-07-12: DJI video carries neither Make/Model
+# nor an Encoder atom, but stills do).
+_DJI_STILL_ROW = lambda trip: ExifRow(
+    path=trip / "DJI_0001.JPG", raw={"EXIF:Make": "DJI", "EXIF:Model": "FC8482"})
+
+# A DJI video: no EXIF/QuickTime Make/Model/Encoder at all — the case that
+# forces the notes-gear-tag fallback.
+_DJI_VIDEO_NO_SIGNAL_ROW = lambda trip: ExifRow(
+    path=trip / "DJI_0002.MP4", raw={})
+
+# A DJI video that DOES carry a real device Encoder atom.
+_DJI_VIDEO_ENCODER_ROW = lambda trip: ExifRow(
+    path=trip / "DJI_0003.MP4", raw={"ItemList:Encoder": "DJIMavic3Cine"})
+
+_NON_DJI_ROW = lambda trip: ExifRow(
+    path=trip / "IMG_0001.HEIC",
+    raw={"EXIF:Make": "Apple", "EXIF:Model": "iPhone 17 Pro"})
 
 
-def test_camera_written_from_filename_fallback_gear_match(tmp_path: Path):
-    # file_camera() falls back to bare "DJI" from the filename; tags_for_file
-    # substring-matches that against the notes' full "DJI FC8282" gear tag —
-    # camera_sync_folder must use the FULL matched tag, not the bare "DJI".
-    trip = _trip(tmp_path, notes=_NOTES)
-    conn = _Conn()
+def test_camera_still_resolves_friendly_name_without_notes(tmp_path: Path):
+    # No notes needed at all — real EXIF Model is enough.
+    trip = tmp_path / "no-notes-trip"
+    trip.mkdir()
     out = tagsync.camera_sync_folder(
-        conn, _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+        _Conn(), _LIB, trip, rows=[_DJI_STILL_ROW(trip)], write=True)
     assert out[0].status == "written"
-    assert (out[0].make, out[0].model) == ("DJI", "FC8282")
-    update = [c for c in conn.calls if c[0].lstrip().upper().startswith("UPDATE")]
-    assert update and update[0][1]["make"] == "DJI" and update[0][1]["model"] == "FC8282"
-    assert "lockedProperties" in update[0][0]
+    assert (out[0].make, out[0].model) == ("DJI", "Mini 4 Pro")
+
+
+def test_camera_non_dji_camera_passes_through_unchanged(tmp_path: Path):
+    trip = tmp_path / "no-notes-trip"
+    trip.mkdir()
+    out = tagsync.camera_sync_folder(
+        _Conn(), _LIB, trip, rows=[_NON_DJI_ROW(trip)], write=True)
+    assert out[0].status == "written"
+    assert (out[0].make, out[0].model) == ("Apple", "iPhone 17 Pro")
+
+
+def test_camera_video_encoder_atom_resolves_friendly_name(tmp_path: Path):
+    trip = tmp_path / "no-notes-trip"
+    trip.mkdir()
+    out = tagsync.camera_sync_folder(
+        _Conn(), _LIB, trip, rows=[_DJI_VIDEO_ENCODER_ROW(trip)], write=True)
+    assert out[0].status == "written"
+    assert (out[0].make, out[0].model) == ("DJI", "Mavic 3 Cine")
+
+
+def test_camera_video_no_file_signal_falls_back_to_notes_gear_tag(tmp_path: Path):
+    # No EXIF/Encoder signal at all — must fall back to the notes gear tag,
+    # AND resolve its module code through devices.resolve (friendly name,
+    # not the raw "FC8282").
+    trip = _trip(tmp_path, notes=_NOTES)
+    out = tagsync.camera_sync_folder(
+        _Conn(), _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=True)
+    assert out[0].status == "written"
+    assert (out[0].make, out[0].model) == ("DJI", "Air 3")
 
 
 def test_camera_dry_run_no_write(tmp_path: Path):
     trip = _trip(tmp_path, notes=_NOTES)
     conn = _Conn()
     out = tagsync.camera_sync_folder(
-        conn, _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=False)
+        conn, _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=False)
     assert out[0].status == "would-write"
     assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
 
 
-def test_camera_skips_asset_that_already_has_one(tmp_path: Path):
-    # Immich's own extraction already succeeded (any non-DJI camera) —
-    # never overwrite it.
+def test_camera_skips_asset_immich_already_extracted(tmp_path: Path):
+    # Unlocked existing value = Immich's own extraction of GENUINELY good
+    # data (not in devices.py's table, so resolve() is a no-op on it) —
+    # never touch it, even though our own resolution path would produce a
+    # different value from the notes gear tag.
     trip = _trip(tmp_path, notes=_NOTES)
-    conn = _Conn(camera={"id-DJI_0002.MP4": ("Existing", "Camera", [])})
+    conn = _Conn(camera={"id-DJI_0002.MP4": ("Some", "Other Camera", [])})
     out = tagsync.camera_sync_folder(
-        conn, _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+        conn, _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=True)
     assert out[0].status == "skip-has-camera"
     assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
 
 
-def test_camera_no_gear_tag_for_unrecognized_camera(tmp_path: Path):
+def test_camera_upgrades_preexisting_unlocked_raw_code(tmp_path: Path):
+    # Regression for the 2026-07-12 discovery: an asset processed BEFORE
+    # devices.py's friendly-name table existed carries a raw module code,
+    # unlocked, from Immich's/an older immy's own extraction. Since that
+    # exact code IS in our confirmed table, upgrading it is a confident
+    # lookup, not a guess — must correct it (and lock it going forward),
+    # unlike the genuinely-unknown case above.
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn(camera={"id-DJI_0002.MP4": ("DJI", "FC8482", [])})
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=True)
+    assert out[0].status == "written"
+    assert (out[0].make, out[0].model) == ("DJI", "Mini 4 Pro")
+    update = [c for c in conn.calls if c[0].lstrip().upper().startswith("UPDATE")]
+    assert update and update[0][1]["model"] == "Mini 4 Pro"
+    assert "lockedProperties" in update[0][0]
+
+
+def test_camera_upgrade_dry_run_reports_without_writing(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn(camera={"id-DJI_0002.MP4": ("DJI", "FC8482", [])})
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=False)
+    assert out[0].status == "would-write"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_camera_already_correct_and_locked_is_a_noop(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn(camera={
+        "id-DJI_0002.MP4": ("DJI", "Air 3", ["make", "model"])})
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=True)
+    assert out[0].status == "skip-has-camera"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_camera_corrects_our_own_stale_locked_value(tmp_path: Path):
+    # Regression: a prior run of this command wrote a raw code (the actual
+    # 2026-07-12 bug) or a since-superseded value. It's locked by US
+    # (lockedProperties has make+model), so re-running must correct it —
+    # unlike the Immich-owned case above.
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn(camera={
+        "id-DJI_0002.MP4": ("DJI", "FC8282", ["make", "model"])})
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=True)
+    assert out[0].status == "corrected"
+    assert (out[0].make, out[0].model) == ("DJI", "Air 3")
+    update = [c for c in conn.calls if c[0].lstrip().upper().startswith("UPDATE")]
+    assert update and update[0][1]["model"] == "Air 3"
+
+
+def test_camera_no_signal_anywhere(tmp_path: Path):
     trip = _trip(tmp_path, notes=_NOTES)
     row = ExifRow(path=trip / "random.mp4", raw={})  # no camera signal at all
     out = tagsync.camera_sync_folder(
         conn := _Conn(), _LIB, trip, rows=[row], write=True)
-    assert out[0].status == "no-gear-tag"
+    assert out[0].status == "no-signal"
     assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
-
-
-def test_camera_no_tags_in_notes_is_a_noop(tmp_path: Path):
-    trip = _trip(tmp_path, notes="---\n---\n")
-    out = tagsync.camera_sync_folder(
-        _Conn(), _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
-    assert out == []
 
 
 def test_camera_no_asset_skips(tmp_path: Path):
     trip = _trip(tmp_path, notes=_NOTES)
     out = tagsync.camera_sync_folder(
         _Conn(resolves=False), _LIB, trip,
-        rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+        rows=[_DJI_VIDEO_NO_SIGNAL_ROW(trip)], write=True)
     assert out[0].status == "no-asset"

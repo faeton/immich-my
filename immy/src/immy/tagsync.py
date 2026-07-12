@@ -30,6 +30,7 @@ from pathlib import Path
 
 import psycopg
 
+from . import devices as devices_mod
 from . import process as process_mod
 from .exif import ExifRow, read_folder
 from .immich import ImmichClient
@@ -102,8 +103,9 @@ class CameraSyncOutcome:
     asset_id: str | None
     make: str | None = None
     model: str | None = None
-    status: str = ""  # "written" | "would-write" | "skip-has-camera"
-                      # | "no-gear-tag" | "no-asset"
+    status: str = ""  # "written" | "corrected" | "would-write"
+                      # | "would-correct" | "skip-has-camera" | "no-signal"
+                      # | "no-asset"
 
 
 def trip_tags(trip_folder: Path) -> list[str]:
@@ -222,32 +224,56 @@ def camera_sync_folder(
     emit=lambda _msg: None,
 ) -> list[CameraSyncOutcome]:
     """Backfill `asset_exif.make`/`model` for files whose container carries
-    neither — the DJI-MP4 case — from the SAME `Gear/Camera/<make> <model>`
-    tag `tag_sync_folder` would resolve for that file, split on the first
-    space. Idempotent: an asset that already has make OR model (Immich's
-    own extraction succeeded, e.g. any non-DJI camera) is left untouched —
-    this never overwrites a value Immich read from the file itself."""
+    neither, resolving through `devices.resolve` (the SAME owner-confirmed
+    friendly-name table `immy process` uses at ingest time) so this never
+    writes a raw module code like "FC8282" — always make="DJI", model="Air 3"
+    (bare, no redundant "DJI" prefix — Immich concatenates make+model for
+    display, so "DJI"+"DJI Air 3" would render as "DJI DJI Air 3").
+
+    Primary signal is the file's own raw EXIF/QuickTime Make/Model or mp4
+    Encoder atom (works for DJI stills, and any video with a real encoder
+    atom). DJI *video* commonly carries none of those at all — confirmed
+    empirically, not assumed: `EXIF:Make`/`Model` and `ItemList:Encoder`/
+    `QuickTime:Encoder` are simply absent from these files. For that case
+    only, falls back to the trip's curated `Gear/Camera/<code>` notes tag
+    (via `rules.trip_tags.tags_for_file`) — but resolves ITS module code
+    through `devices.resolve` too, rather than using it raw.
+
+    Idempotent, and self-correcting in two ways: an asset we already locked
+    ourselves gets silently re-corrected if the newly-resolved value
+    differs (guards against a stale/wrong prior write of this same command,
+    or the friendly-name table gaining an entry after the fact). An asset
+    with an UNLOCKED existing value (Immich's own extraction) is left alone
+    *unless* that existing value is itself a known-raw code our table maps
+    to something different — a confident upgrade of data we already
+    recognize, never a guess at data we don't (see CHANGELOG 2026-07-12 for
+    why both guards exist)."""
     tags = trip_tags(trip_folder)
-    if not tags:
-        return []
     if rows is None:
         rows = read_folder(trip_folder)
 
     outcomes: list[CameraSyncOutcome] = []
     for row in rows:
-        cam = file_camera(row)
-        per_file = tags_for_file(cam, tags)
-        gear_tags = [t for t in per_file if t.startswith("Gear/Camera/")]
-        if not gear_tags:
-            outcomes.append(CameraSyncOutcome(row.path, None, status="no-gear-tag"))
+        raw_make = row.get("EXIF:Make", "QuickTime:Make", "QuickTime:AndroidMake")
+        raw_model = row.get("EXIF:Model", "QuickTime:Model", "QuickTime:AndroidModel")
+        raw_encoder = row.get("ItemList:Encoder", "QuickTime:Encoder")
+        make, model = devices_mod.resolve(raw_make, raw_model, raw_encoder)
+
+        if make is None and model is None and tags:
+            cam = file_camera(row)
+            gear_tags = [t for t in tags_for_file(cam, tags)
+                         if t.startswith("Gear/Camera/")]
+            if gear_tags:
+                parts = gear_tags[0].removeprefix("Gear/Camera/").strip().split(
+                    maxsplit=1)
+                notes_make = parts[0] if parts else None
+                notes_model = parts[1] if len(parts) > 1 else None
+                make, model = devices_mod.resolve(notes_make, notes_model)
+
+        if make is None and model is None:
+            outcomes.append(CameraSyncOutcome(row.path, None, status="no-signal"))
             continue
-        gear_value = gear_tags[0].removeprefix("Gear/Camera/").strip()
-        parts = gear_value.split(maxsplit=1)
-        make = parts[0] if parts else None
-        model = parts[1] if len(parts) > 1 else None
-        if not make:
-            outcomes.append(CameraSyncOutcome(row.path, None, status="no-gear-tag"))
-            continue
+
         cpath = process_mod.container_path_for(
             row.path, trip_folder, library.container_root)
         asset_id = resolve_asset_id(conn, library, cpath)
@@ -255,19 +281,41 @@ def camera_sync_folder(
             outcomes.append(CameraSyncOutcome(row.path, None, status="no-asset"))
             emit(f"  [no-asset] {row.path.name} — not in Immich library yet")
             continue
-        db_make, db_model, _ = read_camera(conn, asset_id)
-        if db_make or db_model:
+
+        db_make, db_model, locked = read_camera(conn, asset_id)
+        ours = all(t in locked for t in CAMERA_LOCK_TOKENS)
+        if (db_make or db_model) and not ours:
+            # Not locked by us — normally hands off (Immich's own
+            # extraction). Exception: if the value ALREADY THERE is itself
+            # a known-raw code our confirmed table maps to something
+            # different, upgrade it — a confident lookup against the same
+            # owner-confirmed table, not a guess. `devices.resolve` is a
+            # no-op pass-through for anything not in its table (e.g.
+            # "Apple"/"iPhone 17 Pro", "Canon"/"Canon EOS R6"), so this can
+            # never touch genuinely-good extracted data. Found live
+            # 2026-07-12: 632 assets across the library, predating the
+            # `devices.py` mapping's existence, carrying a raw DJI code
+            # this way.
+            upgraded = devices_mod.resolve(db_make, db_model)
+            if upgraded == (db_make, db_model):
+                outcomes.append(CameraSyncOutcome(
+                    row.path, asset_id, db_make, db_model, status="skip-has-camera"))
+                continue
+            make, model = upgraded
+        elif (db_make, db_model) == (make, model):
             outcomes.append(CameraSyncOutcome(
-                row.path, asset_id, db_make, db_model, status="skip-has-camera"))
+                row.path, asset_id, make, model, status="skip-has-camera"))
             continue
+
+        verb = "correct" if ours else "write"
         if not write:
-            outcomes.append(CameraSyncOutcome(
-                row.path, asset_id, make, model, status="would-write"))
-            emit(f"  [would-write] {row.path.name} → {make} {model or ''}".rstrip())
+            status = f"would-{verb}"
+            outcomes.append(CameraSyncOutcome(row.path, asset_id, make, model, status=status))
+            emit(f"  [{status}] {row.path.name} → {make} {model or ''}".rstrip())
             continue
         write_camera(conn, asset_id, make, model)
-        outcomes.append(CameraSyncOutcome(
-            row.path, asset_id, make, model, status="written"))
-        emit(f"  [written] {row.path.name} → {make} {model or ''}".rstrip())
+        status = "corrected" if ours else "written"
+        outcomes.append(CameraSyncOutcome(row.path, asset_id, make, model, status=status))
+        emit(f"  [{status}] {row.path.name} → {make} {model or ''}".rstrip())
 
     return outcomes

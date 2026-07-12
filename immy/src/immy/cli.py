@@ -1066,12 +1066,17 @@ def tags_camera(
     ),
     config_path: Path = typer.Option(None, "--config", help="immy config path."),
 ) -> None:
-    """Backfill the Immich Details panel's blank "Camera" row for files whose
-    container carries no Make/Model (the DJI-MP4 case — same blind spot as
-    GPS and tags) from the trip's notes `Gear/Camera/<make> <model>` tag.
-    Never overwrites a value Immich already extracted from the file itself."""
+    """Backfill the Immich Details panel's blank "Camera" row via
+    `devices.resolve` (the same owner-confirmed friendly-name table `immy
+    process` uses at ingest) — never a raw module code like "FC8282". Falls
+    back to the trip's notes `Gear/Camera/<code>` tag, itself resolved
+    through the same table, only when the file carries no usable EXIF/
+    Encoder signal at all (the common DJI-video case). Self-corrects an
+    asset it already wrote if the resolved value has since changed (e.g.
+    the friendly-name table gained an entry); never touches a value Immich
+    itself extracted from the file."""
     config, conn, library = _srt_pg_setup(config_path)
-    written = would = no_asset = no_gear = 0
+    written = corrected = would = no_asset = no_signal = 0
     try:
         for folder in folders:
             console.print(f"\n[bold]tags camera[/bold] {folder}")
@@ -1082,28 +1087,33 @@ def tags_camera(
             if write:
                 conn.commit()
             f_written = sum(1 for o in outcomes if o.status == "written")
-            f_would = sum(1 for o in outcomes if o.status == "would-write")
+            f_corrected = sum(1 for o in outcomes if o.status == "corrected")
+            f_would = sum(
+                1 for o in outcomes if o.status in ("would-write", "would-correct"))
             f_no_asset = sum(1 for o in outcomes if o.status == "no-asset")
-            f_no_gear = sum(1 for o in outcomes if o.status == "no-gear-tag")
-            written += f_written; would += f_would
-            no_asset += f_no_asset; no_gear += f_no_gear
+            f_no_signal = sum(1 for o in outcomes if o.status == "no-signal")
+            written += f_written; corrected += f_corrected; would += f_would
+            no_asset += f_no_asset; no_signal += f_no_signal
             if not outcomes:
                 console.print(
-                    "  [yellow]no `tags:` in this trip's notes — "
-                    "nothing to backfill[/yellow]")
+                    "  [yellow]nothing resolvable — no file-level camera "
+                    "signal and no notes gear tag[/yellow]")
             else:
                 console.print(
                     f"  [dim]{folder.name}: written={f_written} "
-                    f"would-write={f_would} no-asset={f_no_asset} "
-                    f"no-gear-tag={f_no_gear}[/dim]"
+                    f"corrected={f_corrected} would-write/correct={f_would} "
+                    f"no-asset={f_no_asset} no-signal={f_no_signal}[/dim]"
                 )
     finally:
         conn.close()
     if write:
-        console.print(f"\n[green]wrote camera for {written} asset(s)[/green]")
+        console.print(
+            f"\n[green]wrote camera for {written} asset(s), "
+            f"corrected {corrected}[/green]"
+        )
     else:
         console.print(
-            f"\n[green]would write camera for {would} asset(s)[/green] "
+            f"\n[green]would write/correct camera for {would} asset(s)[/green] "
             f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
         )
 

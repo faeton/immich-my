@@ -9,8 +9,13 @@ Make+Model fields — so immy backfills from the places they *do* write:
   clips carry a generic muxer string there (`Lavf…`, `libav…`) which is
   NOT a device — those are ignored.
 - **DJI stills** report a bare module code as Model (`FC4170`, `L2D-20c`).
-- Both get mapped to friendly names so "DJI Mini 4 Pro" is filterable,
-  not `FC4170`.
+- Both get mapped to friendly names so "Mini 4 Pro" is filterable, not
+  `FC4170` — model values here deliberately do NOT repeat "DJI" (make is
+  already `"DJI"`; Immich's own display just concatenates make + model,
+  same as "Apple" + "iPhone 17 Pro" — a `"DJI"` + `"DJI Mini 4 Pro"` model
+  would render as the redundant "DJI DJI Mini 4 Pro". Found live 2026-07-12:
+  9 assets already had this exact redundancy from the normal `immy process`
+  ingest path before this fix).
 
 Insta360 is handled separately in `exif.py` (vendor trailer, per-trip
 cache) because it needs a slow `-ee` trailer parse.
@@ -20,21 +25,24 @@ from __future__ import annotations
 
 import re
 
-# Module code (still EXIF Model) / mp4 Encoder string → (make, friendly model).
+# Module code (still EXIF Model) / mp4 Encoder string → (make, friendly model,
+# WITHOUT a redundant "DJI" prefix — see module docstring).
 # Verified against the real corpus; extend as new gear shows up.
 _DJI_MODELS: dict[str, tuple[str, str]] = {
     # Owner-confirmed gear (camera module code → drone/cam).
-    "FC3170": ("DJI", "DJI Mavic Air 2"),
-    "FC3582": ("DJI", "DJI Mini 3 Pro"),
-    "FC8482": ("DJI", "DJI Mini 4 Pro"),
-    "FC9313": ("DJI", "DJI Mini 5 Pro"),
-    "L2D-20c": ("DJI", "DJI Mavic 3"),       # Hasselblad (wide) cam on the Mavic 3
-    "FC4170": ("DJI", "DJI Mavic 3 Tele"),   # tele cam on the same Mavic 3 (diff focal length)
-    "AC002": ("DJI", "DJI Osmo Action 3"),   # action cam, not a drone
+    "FC3170": ("DJI", "Mavic Air 2"),
+    "FC3582": ("DJI", "Mini 3 Pro"),
+    "FC8282": ("DJI", "Air 3"),
+    "FC8482": ("DJI", "Mini 4 Pro"),
+    "FC9313": ("DJI", "Mini 5 Pro"),
+    "L2D-20c": ("DJI", "Mavic 3"),       # Hasselblad (wide) cam on the Mavic 3
+    "FC4170": ("DJI", "Mavic 3 Tele"),   # tele cam on the same Mavic 3 (diff focal length)
+    "AC002": ("DJI", "Osmo Action 3"),   # action cam, not a drone
     # Video Encoder atoms (DJI writes these instead of Make/Model).
-    "DJIMavic3Cine": ("DJI", "DJI Mavic 3 Cine"),
-    "DJI Mini4 Pro": ("DJI", "DJI Mini 4 Pro"),
-    "DJI Mini3 Pro": ("DJI", "DJI Mini 3 Pro"),
+    "DJIMavic3Cine": ("DJI", "Mavic 3 Cine"),
+    "DJI Mini4 Pro": ("DJI", "Mini 4 Pro"),
+    "DJI Mini3 Pro": ("DJI", "Mini 3 Pro"),
+    "DJI Mini5Pro": ("DJI", "Mini 5 Pro"),  # same drone as FC9313 (stills)
 }
 # Case-insensitive view so a lowercased/variant code still maps.
 _DJI_MODELS_CI = {k.lower(): v for k, v in _DJI_MODELS.items()}
