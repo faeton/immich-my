@@ -379,6 +379,54 @@ def test_twin_rows_are_linked_in_batch(tmp_path):
     assert "toggles together" in page
 
 
+def _twin_db(tmp_path):
+    """Two pending mirror clusters (google pair / icloud pair, pixel-twins)."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    for cid in (1, 2):
+        conn.execute(
+            "INSERT INTO cluster (id, decision, clip_cos_sim) VALUES (?, 'review', 0.96)",
+            (cid,),
+        )
+    rows = [
+        (1, "google", 1, "ff00ff00ff00ff00"), (3, "icloud", 2, "ff00ff00ff00ff01"),
+        (2, "google", 1, "0f0f0f0f0f0f0f0f"), (4, "icloud", 2, "0f0f0f0f0f0f0f0e"),
+    ]
+    for aid, source, cid, ph in rows:
+        conn.execute(
+            "INSERT INTO asset (id, source, path, status, media_type, format, phash,"
+            " taken_at, taken_src) VALUES (?, ?, ?, 'clustered', 'image', 'jpg', ?,"
+            " '2025-06-01T12:00:00', 'exif')",
+            (aid, source, f"/staging/{source}/IMG_{aid}.JPG", ph),
+        )
+        conn.execute("INSERT INTO membership (cluster_id, asset_id) VALUES (?, ?)", (cid, aid))
+    conn.commit()
+    conn.close()
+    return tmp_path / "m.sqlite"
+
+
+def test_single_mode_shows_mirror_chip_and_cascades_merge(tmp_path):
+    db_path = _twin_db(tmp_path)
+    app = review.create_app(db_path, tmp_path / "thumbs")
+    with app.test_client() as c:
+        assert "mirror clusters" in c.get("/cluster/1").get_data(as_text=True)
+        out = c.post("/api/decide/1", json={"action": "merge", "winner_asset_id": 1})
+        assert out.get_json()["twins"] == [2]
+    assert _decision(db_path, 1) == ("auto", 1)
+    # the icloud mirror merged too, keeping ITS OWN copy as winner
+    decision, winner = _decision(db_path, 2)
+    assert decision == "auto" and winner in (3, 4)
+
+
+def test_keep_all_cascades_to_mirror_cluster(tmp_path):
+    db_path = _twin_db(tmp_path)
+    app = review.create_app(db_path, tmp_path / "thumbs")
+    with app.test_client() as c:
+        out = c.post("/api/decide/1", json={"action": "keep_all"})
+        assert out.get_json()["twins"] == [2]
+    assert _decision(db_path, 1)[0] == "kept_all"
+    assert _decision(db_path, 2)[0] == "kept_all"
+
+
 def test_batch_pixel_band_filter(client):
     c, db_path = client
     _seed_signals(db_path, [(1, 0.95, 0.0), (2, 0.60, 4.0)])
