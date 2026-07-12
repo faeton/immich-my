@@ -227,10 +227,27 @@ class GeotagOutcome:
     lat: float | None = None
     lon: float | None = None
     status: str = ""  # "tagged" | "skip-has-gps" | "no-srt" | "no-fix"
-                      # | "no-asset" | "would-tag"
+                      # | "no-asset" | "would-tag" | "relocked" | "would-relock"
+                      # | "skip-mismatch"
 
 
-def _resolve_asset_id(
+# Meters of slop allowed between a DB coord and the SRT-computed fix before
+# `--relock` refuses to touch it (protects a location you pinned by hand in
+# the app). Generous: it's a sanity check, not a precision requirement — a
+# genuine immy-written coord matches the SRT fix almost exactly.
+_RELOCK_TOLERANCE_M = 2000.0
+
+
+def _haversine_m(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    from math import asin, cos, radians, sin, sqrt
+    r = 6_371_000.0
+    dlat, dlon = radians(lat2 - lat1), radians(lon2 - lon1)
+    a = (sin(dlat / 2) ** 2
+         + cos(radians(lat1)) * cos(radians(lat2)) * sin(dlon / 2) ** 2)
+    return 2 * r * asin(sqrt(a))
+
+
+def resolve_asset_id(
     conn: psycopg.Connection, library: LibraryInfo, container_path: str,
 ) -> str | None:
     # Match by `originalPath`, NOT by checksum: drone clips are ingested by
@@ -254,13 +271,22 @@ def geotag_folder(
     rows: list[ExifRow],
     *,
     write: bool,
+    relock: bool = False,
     lock_tokens: tuple[str, ...] = GPS_LOCK_TOKENS,
     emit=lambda _msg: None,
 ) -> list[GeotagOutcome]:
     """For every media row lacking a usable GPS fix that has a sibling DJI
     `.SRT`, write the first valid fix (takeoff point) to the Immich DB via
     the durable channel. Idempotent: assets already carrying coords in the
-    DB are skipped. `write=False` is a dry run."""
+    DB are skipped. `write=False` is a dry run.
+
+    `relock=True` additionally repairs assets that already carry coords but
+    were never locked (e.g. Immich's own scanner having read GPS off an
+    `.xmp` sidecar for a still, or a pre-lock version of this command) —
+    these are otherwise invisible to `geocode_located_missing`, which
+    requires the lock token as proof-of-ownership before touching a row. We
+    only relock when the existing DB coord is within `_RELOCK_TOLERANCE_M`
+    of the SRT-computed fix, so a location you pinned by hand is left alone."""
     from . import process as process_mod
     outcomes: list[GeotagOutcome] = []
     for row in rows:
@@ -279,7 +305,7 @@ def geotag_folder(
             continue
         cpath = process_mod.container_path_for(
             row.path, trip_folder, library.container_root)
-        asset_id = _resolve_asset_id(conn, library, cpath)
+        asset_id = resolve_asset_id(conn, library, cpath)
         if asset_id is None:
             outcomes.append(GeotagOutcome(
                 row.path, None, status="no-asset",
@@ -287,10 +313,36 @@ def geotag_folder(
             emit(f"  [no-asset] {row.path.name} — not in Immich library yet")
             continue
         # DB-presence idempotency: don't overwrite coords already there.
-        db_lat, db_lon, _ = read_gps(conn, asset_id)
+        db_lat, db_lon, locked = read_gps(conn, asset_id)
         if db_lat is not None and db_lon is not None:
+            already_locked = all(t in locked for t in lock_tokens)
+            if not (relock and not already_locked):
+                outcomes.append(GeotagOutcome(
+                    row.path, asset_id, db_lat, db_lon, status="skip-has-gps"))
+                continue
+            dist = _haversine_m(db_lat, db_lon, fix.latitude, fix.longitude)
+            if dist > _RELOCK_TOLERANCE_M:
+                outcomes.append(GeotagOutcome(
+                    row.path, asset_id, db_lat, db_lon, status="skip-mismatch"))
+                emit(f"  [skip-mismatch] {row.path.name} — DB coord "
+                     f"{dist:.0f}m from SRT fix; leaving alone")
+                continue
+            if not write:
+                outcomes.append(GeotagOutcome(
+                    row.path, asset_id, db_lat, db_lon, status="would-relock"))
+                emit(f"  [would-relock] {row.path.name} → "
+                     f"({db_lat:.6f}, {db_lon:.6f})")
+                continue
+            write_gps(conn, asset_id, db_lat, db_lon,
+                      lock=True, lock_tokens=lock_tokens)
+            place = geocode_mod.reverse_geocode(conn, db_lat, db_lon)
+            if not place.is_empty():
+                write_place(conn, asset_id, place)
             outcomes.append(GeotagOutcome(
-                row.path, asset_id, db_lat, db_lon, status="skip-has-gps"))
+                row.path, asset_id, db_lat, db_lon, status="relocked"))
+            emit(f"  [relocked] {row.path.name} → ({db_lat:.6f}, {db_lon:.6f}) "
+                 f"{place.city or ''}{', ' if place.city and place.country else ''}"
+                 f"{place.country or ''}")
             continue
         if not write:
             outcomes.append(GeotagOutcome(

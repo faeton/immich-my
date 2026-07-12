@@ -29,6 +29,7 @@ The main operational interface is `immy`:
 - `promote` uploads a curated trip into the external library and syncs the album
 - `cluster` groups geo-dated assets into events and auto-creates Immich albums
 - `srt` harvests DJI `.SRT` telemetry → GPX/JSON tracks, durable GPS, reverse-geocode
+- `tags sync` pushes a trip's notes tags (gear/camera, event, source) to Immich's native Tag API — the only channel that reaches video assets, which never read XMP
 - `snapshot` dumps the Immich library index to a portable SQLite file
 - `find-duplicates` scans any disk/folder and reports what's already in Immich
 

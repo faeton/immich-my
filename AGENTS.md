@@ -19,6 +19,8 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 transcripts → inserts/writes Immich Postgres) · `promote` (upload a trip to an external library) ·
 `cluster` (geo-date albums) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
 reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
+`tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — to Immich's native
+Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·
 `snapshot` / `find-duplicates` / `repair-thumbs`.
 
 Two run targets: the **Mac** (MLX, default) and the **N5 NAS** (HTTP backends — Ollama captions,

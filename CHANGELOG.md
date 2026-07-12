@@ -4,6 +4,66 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-07-12 — `srt geotag --relock` + `immy tags sync`
+
+### Found
+
+- **Drone/video clips silently missing location and gear tags in Immich.**
+  Root-caused live on n5: `asset_exif.latitude/longitude` was populated for
+  most DJI clips (map pin renders correctly) but `lockedProperties` was
+  empty and `country`/`state`/`city` were NULL — an unlocked, ungeocoded
+  state that falls through both existing safety nets (`srt geotag` skips
+  any row with *a* coord already; `srt geocode` requires the lock token as
+  proof-of-ownership before touching a row). Same video/XMP blind spot
+  (`docs/TELEMETRY.md`) also silently drops notes-derived tags
+  (`Gear/Camera/DJI FC8282`, trip/event tags) for every video asset — XMP
+  sidecars work for photos only, and `promote --tag` only pushes whatever
+  flat list was passed on that one invocation, not the trip's full notes
+  `tags:`.
+
+### Added
+
+- **`immy srt geotag --relock`** (`srtgeo.py`, `cli.py`): repairs clips that
+  already carry a DB coord but were never locked — locks + reverse-geocodes
+  them, but only when the existing DB coord is within 2 km of the
+  independently-computed `.SRT` fix (`_RELOCK_TOLERANCE_M`), so a location
+  pinned by hand in the app is left alone (`skip-mismatch`).
+- **`immy tags sync <trip> [--write]`** (new `tagsync.py`): pushes a trip's
+  full notes `tags:` to every one of its assets via Immich's native Tag API
+  — the durable, video-safe channel `trip-tags-from-notes`'s XMP write can't
+  reach. Per-file gear-tag matching (`rules/trip_tags.tags_for_file`, `_propose`) is
+  shared with the XMP rule so the two channels can't disagree.
+- **Library-wide backfill run**: **865 GPS relocks + 25 fresh geotags** across
+  the 30 trips with drone footage; **7,702 tag placements** across all 65
+  notes-bearing trips (distinct tagged assets in `tag_asset` went 5,332 → 7,489
+  — spot-checked via direct Postgres query, not just the CLI's own summary).
+
+### Fixed
+
+- **`ImmichClient.upsert_tags` silently dropped every hierarchical tag
+  attachment.** The first `tags sync --write` backfill reported "tagged 7,702
+  asset(s)" with exit 0 and zero errors — but `tag_asset` row counts hadn't
+  moved. Live `GET /api/tags` showed why: for a hierarchical tag (`Gear/
+  Camera/DJI FC8282`), Immich's response `name` field is just the leaf
+  segment (`"DJI FC8282"`); the full path lives in `value`. `upsert_tags`
+  keyed its `{name: id}` return by `name`, so every caller's lookup by the
+  full path missed, and the follow-up `tag_assets` call for that tag never
+  fired — while `upsert_tags` itself legitimately succeeded (the tag rows
+  really were created), so nothing surfaced as an error anywhere. Fixed to
+  key by `value` (falls back to `name` if absent). `tag_sync_folder` also no
+  longer marks a row `"tagged"` until *after* confirming the API actually
+  returned an id for every tag it needed (`"tag-failed"` otherwise) — this
+  exact gap (optimistic status before the write) was independently flagged
+  by a Codex pre-commit review before the root cause was even isolated. A
+  follow-up Codex pass on the fix itself then caught a second, narrower gap
+  in the same spirit: `tag_assets()`'s own per-asset response was still
+  unchecked, so a genuine attach failure (as opposed to `error="duplicate"`,
+  which is expected/idempotent) would've still read as `"tagged"`. Closed by
+  inspecting `tag_assets()`'s result too. Re-ran the full backfill after each
+  fix; verified via Postgres, not just the CLI's exit code — final state:
+  7,489 distinct assets carrying a native tag, `tag-failed=0` across all 65
+  trips.
+
 ## 2026-06-23 — `immy match` + snapshot v2
 
 ### Added

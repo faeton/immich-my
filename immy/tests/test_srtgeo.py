@@ -64,9 +64,10 @@ class _Cursor:
 class _Conn:
     """Minimal psycopg stand-in routing SELECTs by table name."""
 
-    def __init__(self, *, asset_id=None, gps=(None, None)):
+    def __init__(self, *, asset_id=None, gps=(None, None), locked=None):
         self.asset_id = asset_id
         self.gps = gps
+        self.locked = locked or []
         self.calls = []
         self.commits = 0
 
@@ -80,8 +81,8 @@ class _Conn:
         self.calls.append((sql, params))
         row = None
         if "asset_exif" in sql:  # read_gps
-            row = (self.gps[0], self.gps[1], [])
-        elif "FROM asset" in sql:  # _resolve_asset_id
+            row = (self.gps[0], self.gps[1], self.locked)
+        elif "FROM asset" in sql:  # resolve_asset_id
             row = (self.asset_id,) if self.asset_id else None
 
         class _R:
@@ -166,6 +167,62 @@ def test_geotag_ignores_file_gps_when_db_null(tmp_path: Path):
     conn = _Conn(asset_id="aid", gps=(None, None))
     out = srtgeo.geotag_folder(conn, _LIB, tmp_path, [row], write=True)
     assert out[0].status == "tagged"
+
+
+# --- --relock: repair unlocked-but-present coords -------------------------
+
+def test_geotag_relock_off_by_default_leaves_unlocked_gps_alone(tmp_path: Path):
+    # Same DB state a --relock run would repair, but relock=False (default):
+    # must behave exactly like the pre-existing skip-has-gps path.
+    conn = _Conn(asset_id="aid", gps=(41.385100, 2.173400), locked=[])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(conn, _LIB, tmp_path, rows, write=True)
+    assert out[0].status == "skip-has-gps"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_geotag_relock_dry_run_matching_coord(tmp_path: Path):
+    conn = _Conn(asset_id="aid", gps=(41.385100, 2.173400), locked=[])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=False, relock=True)
+    assert out[0].status == "would-relock"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_geotag_relock_writes_and_locks_matching_coord(tmp_path: Path):
+    conn = _Conn(asset_id="aid", gps=(41.385100, 2.173400), locked=[])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=True, relock=True)
+    assert out[0].status == "relocked"
+    update = [c for c in conn.calls if c[0].lstrip().upper().startswith("UPDATE")
+              and "latitude" in c[0]]
+    assert update and "lockedProperties" in update[0][0]
+    assert update[0][1]["lat"] == 41.385100 and update[0][1]["lon"] == 2.173400
+
+
+def test_geotag_relock_skips_coord_far_from_srt_fix(tmp_path: Path):
+    # A DB coord nowhere near the SRT fix is presumptively a location you
+    # pinned by hand in the app — --relock must not touch it.
+    conn = _Conn(asset_id="aid", gps=(0.0, 0.0), locked=[])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=True, relock=True)
+    assert out[0].status == "skip-mismatch"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_geotag_relock_skips_already_locked(tmp_path: Path):
+    # Already durable — nothing to repair, even with --relock.
+    conn = _Conn(
+        asset_id="aid", gps=(41.385100, 2.173400),
+        locked=["latitude", "longitude"])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=True, relock=True)
+    assert out[0].status == "skip-has-gps"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
 
 
 def test_geotag_no_asset(tmp_path: Path):

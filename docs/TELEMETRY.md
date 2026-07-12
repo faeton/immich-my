@@ -11,9 +11,10 @@ durably.
 | Command | What it does |
 |---|---|
 | `immy srt track <trip>` | Emit `<stem>.gpx` (GPX 1.1) + `<stem>.track.json` (full per-frame telemetry + summary) sidecars. |
-| `immy srt geotag <trip> [--write]` | Write the first valid fix (takeoff point) to `asset_exif.latitude/longitude` **with a lock**, then reverse-geocode country/state/city. Dry-run by default. |
-| `immy srt geocode <trip>|--prefix P [--write]` | Backfill country/state/city for already-located clips, purely from DB coords (no files needed). |
+| `immy srt geotag <trip> [--write] [--relock]` | Write the first valid fix (takeoff point) to `asset_exif.latitude/longitude` **with a lock**, then reverse-geocode country/state/city. Dry-run by default. `--relock` additionally repairs clips that already carry a DB coord but were never locked/geocoded (see below). |
+| `immy srt geocode <trip>|--prefix P [--write]` | Backfill country/state/city for already-located clips, purely from DB coords (no files needed). Only touches rows already carrying our lock token. |
 | `immy srt verify-channel <asset>` | One-off probe: prove which DB write survives an Immich metadata refresh for a video. Non-destructive (restores the asset). |
+| `immy tags sync <trip> [--write]` | Push the trip's notes `tags:` to every asset via Immich's **native Tag API** — the video-safe channel for tags XMP can't reach. See [Tags for videos](#tags-for-videos-immy-tags-sync) below. |
 
 Sidecars are written through `WritablePaths` (see [SIDECAR.md](SIDECAR.md)) — on
 the NAS they mirror under `sidecars_root`, never beside the read-only originals.
@@ -68,6 +69,55 @@ Validated against 1,500 already-geocoded assets: **country/state/city 100 %
 match**. `country`/`state`/`city` are not lockable tokens, but they don't need a
 lock — Immich's geo block only fires on file GPS, which these clips never have,
 so it never overwrites them.
+
+## Clips with a map pin but no place name (`--relock`)
+
+Found live on n5 (2026-07): a batch of drone clips across ~30 trips had
+`asset_exif.latitude/longitude` populated — sometimes exactly matching the
+`.SRT` first fix — but `lockedProperties` **empty** and `country` **NULL**.
+The Info panel drops a correct pin but shows "Add a location", because the
+place name was never written.
+
+Both existing commands silently skip these rows: `srt geotag`'s only
+idempotency check is "does the DB already have *a* coord" (it does, so it
+skips), and `srt geocode` requires the lock token as proof-of-ownership
+before touching a row (a deliberate guard against overwriting a location you
+pinned by hand in the app) — these rows aren't locked, so it skips them too.
+They fall through the gap between the two safety nets.
+
+`srt geotag --relock` closes it: for a row with an existing DB coord that is
+**not** locked, it computes the SRT's first-fix independently and only acts
+if the DB coord is within 2 km of that fix (`_RELOCK_TOLERANCE_M` in
+`srtgeo.py`) — close enough to be confidently immy/DJI-derived, not a manual
+pin. On a match it locks the existing coord and reverse-geocodes it in the
+same pass; anything farther than that is left untouched (`skip-mismatch`) as
+presumptively user-set.
+
+How these rows got unlocked coords in the first place wasn't fully
+reconstructed — the working theory is a partial/manual run predating the
+lock-on-write guarantee, or Immich's own scanner reading a `dji-gps-from-srt`
+`.xmp` sidecar for the small number of assets where its exiftool pass
+happens to touch XMP. Either way, `--relock` is the durable fix going
+forward: any row it can't confidently repair it leaves alone.
+
+## Tags for videos (`immy tags sync`)
+
+The same video/XMP blind spot documented above for GPS applies to tags. The
+`trip-tags-from-notes` audit rule writes the trip's notes `tags:`
+(`Gear/Camera/*`, `Events/*`, `Source/*`, …) to each file's `.xmp` sidecar —
+Immich reads that back for photos on its own library scan, never for videos.
+So a DJI/Insta360/GoPro clip's device tag never reaches Immich's UI or search
+unless pushed through the native Tag API directly (`PUT /api/tags` +
+`PUT /api/tags/{id}/assets` — the same API `promote --tag` uses for one-off
+merge markers like `post-edited`).
+
+`immy tags sync <trip> [--write]` is that push, applied to the *whole* trip's
+notes tag set (not just whatever a manual `--tag` invocation happened to
+pass): `tagsync.py` recomputes each file's tag set with the exact same
+per-camera matching logic the XMP rule uses (`rules/trip_tags.tags_for_file`,
+extracted so the two channels can't disagree), resolves each file to its
+Immich asset id the same way `srt geotag` does, and upserts + attaches every
+tag. Idempotent — safe to re-run after adding new footage to a trip.
 
 ## Caption context
 

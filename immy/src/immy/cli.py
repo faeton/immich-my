@@ -62,6 +62,7 @@ pg_mod = _LazyModule("pg")
 snapshot_mod = _LazyModule("snapshot")
 srt_mod = _LazyModule("srt")
 srtgeo_mod = _LazyModule("srtgeo")
+tagsync_mod = _LazyModule("tagsync")
 track_mod = _LazyModule("track")
 transcripts_mod = _LazyModule("transcripts")
 from .config import load as load_config
@@ -807,41 +808,61 @@ def srt_geotag(
         False, "--write",
         help="Apply the durable DB write (default: dry-run report).",
     ),
+    relock: bool = typer.Option(
+        False, "--relock",
+        help="Also repair clips that already have DB coords but were never "
+             "locked (fragile — a metadata refresh can wipe them) and never "
+             "geocoded. Only touches rows whose DB coord matches the SRT "
+             "fix within 2km; anything else is left alone as likely "
+             "user-set.",
+    ),
     config_path: Path = typer.Option(None, "--config", help="immy config path."),
 ) -> None:
     """Write each drone clip's first valid fix (takeoff point) into Immich's
     `asset_exif.latitude/longitude` via the durable, lock-protected channel,
     so a metadata refresh can't clobber it, AND reverse-geocode it (country/
     state/city) from Immich's own geodata. Idempotent: assets already
-    carrying DB coords are skipped."""
+    carrying DB coords are skipped (unless --relock)."""
     config, conn, library = _srt_pg_setup(config_path)
-    tagged = would = no_asset = 0
+    tagged = would = no_asset = relocked = would_relock = mismatch = 0
     try:
         for folder in folders:
             console.print(f"\n[bold]srt geotag[/bold] {folder}")
             rows = read_folder(folder)
             outcomes = srtgeo_mod.geotag_folder(
                 conn, library, folder, rows,
-                write=write, emit=lambda m: console.print(m, highlight=False),
+                write=write, relock=relock,
+                emit=lambda m: console.print(m, highlight=False),
             )
             if write:
                 conn.commit()
             f_tagged = sum(1 for o in outcomes if o.status == "tagged")
             f_would = sum(1 for o in outcomes if o.status == "would-tag")
             f_no_asset = sum(1 for o in outcomes if o.status == "no-asset")
+            f_relocked = sum(1 for o in outcomes if o.status == "relocked")
+            f_would_relock = sum(
+                1 for o in outcomes if o.status == "would-relock")
+            f_mismatch = sum(1 for o in outcomes if o.status == "skip-mismatch")
             tagged += f_tagged; would += f_would; no_asset += f_no_asset
+            relocked += f_relocked; would_relock += f_would_relock
+            mismatch += f_mismatch
             console.print(
                 f"  [dim]{folder.name}: tagged={f_tagged} would-tag={f_would} "
-                f"no-asset={f_no_asset}[/dim]"
+                f"no-asset={f_no_asset} relocked={f_relocked} "
+                f"would-relock={f_would_relock} skip-mismatch={f_mismatch}"
+                f"[/dim]"
             )
     finally:
         conn.close()
     if write:
-        console.print(f"\n[green]tagged {tagged} clip(s)[/green]")
+        console.print(
+            f"\n[green]tagged {tagged} clip(s), relocked {relocked}[/green]"
+        )
     else:
         console.print(
-            f"\n[green]would tag {would} clip(s)[/green] "
-            f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
+            f"\n[green]would tag {would} clip(s), would relock "
+            f"{would_relock}[/green] [dim](no-asset={no_asset}, "
+            f"skip-mismatch={mismatch}; run with --write to apply)[/dim]"
         )
 
 
@@ -947,6 +968,78 @@ def srt_verify_channel(
 
 
 app.add_typer(srt_app, name="srt")
+
+
+tags_app = typer.Typer(
+    help="Native Immich Tag API push — the video-safe channel for "
+         "notes-derived tags XMP can't reach.",
+    no_args_is_help=True,
+)
+
+
+@tags_app.command("sync")
+def tags_sync(
+    folders: list[Path] = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Trip folder(s) whose notes `tags:` should be pushed.",
+    ),
+    write: bool = typer.Option(
+        False, "--write", help="Apply (default: dry-run report).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Push each trip's notes `tags:` (Gear/Camera/*, Events/*, Source/*, …)
+    to every one of its assets via Immich's native Tag API — the durable
+    channel for video assets, which never pick up the XMP sidecar
+    `trip-tags-from-notes` writes. Idempotent: re-running just re-asserts
+    the same tags."""
+    config, conn, library = _srt_pg_setup(config_path)
+    client = ImmichClient(
+        url=config.immich.url,
+        api_key=config.immich.api_key,
+        ssh_host=config.immich.ssh_host,
+    )
+    tagged = would = no_asset = tag_failed = 0
+    try:
+        for folder in folders:
+            console.print(f"\n[bold]tags sync[/bold] {folder}")
+            outcomes = tagsync_mod.tag_sync_folder(
+                conn, client, library, folder,
+                write=write, emit=lambda m: console.print(m, highlight=False),
+            )
+            if write:
+                conn.commit()
+            f_tagged = sum(1 for o in outcomes if o.status == "tagged")
+            f_would = sum(1 for o in outcomes if o.status == "would-tag")
+            f_no_asset = sum(1 for o in outcomes if o.status == "no-asset")
+            f_tag_failed = sum(1 for o in outcomes if o.status == "tag-failed")
+            tagged += f_tagged; would += f_would; no_asset += f_no_asset
+            tag_failed += f_tag_failed
+            if not outcomes:
+                console.print(
+                    "  [yellow]no `tags:` in this trip's notes — "
+                    "nothing to sync[/yellow]")
+            else:
+                console.print(
+                    f"  [dim]{folder.name}: tagged={f_tagged} "
+                    f"would-tag={f_would} no-asset={f_no_asset} "
+                    f"tag-failed={f_tag_failed}[/dim]"
+                )
+    finally:
+        conn.close()
+    if write:
+        console.print(
+            f"\n[green]tagged {tagged} asset(s)[/green] "
+            + (f"[red]tag-failed={tag_failed}[/red]" if tag_failed else "")
+        )
+    else:
+        console.print(
+            f"\n[green]would tag {would} asset(s)[/green] "
+            f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
+        )
+
+
+app.add_typer(tags_app, name="tags")
 
 
 bloat_app = typer.Typer(

@@ -308,20 +308,33 @@ class ImmichClient:
     # --- tags --------------------------------------------------------------
 
     def upsert_tags(self, names: list[str]) -> dict[str, str]:
-        """Create tags by name and return `{name: id}`.
+        """Create tags by name and return `{requested_name: id}`.
 
         `PUT /api/tags` body `{tags:[…]}` is the idempotent bulk upsert: an
         existing name comes back with its existing id (no duplicate — verified
-        against the live API, tag count unchanged). Pass FLAT names; Immich
-        treats `/` as a hierarchy separator, so `post-edited` / `with-anya`
-        stay single tags."""
+        against the live API, tag count unchanged). Names MAY be hierarchical
+        (`Gear/Camera/DJI FC8282`) — Immich splits on `/` and, for a
+        hierarchical tag, echoes back `name` as just the LEAF segment
+        (`"DJI FC8282"`) with the full path in `value`
+        (`"Gear/Camera/DJI FC8282"`) — confirmed live against `GET /api/tags`
+        2026-07-12. Keying the output by `name` alone silently drops every
+        hierarchical tag (leaf collisions aside, it just never matches what
+        the caller asked for), so callers' `upsert_tags(...)[requested_name]`
+        lookups always miss and the follow-up `tag_assets` call never fires —
+        found when a full-library tag-sync backfill reported success but
+        `tag_asset` row counts didn't move. `value` is present on every tag
+        Immich returns (flat or hierarchical) and equals the exact string
+        that was requested, so key by that."""
         if not names:
             return {}
         resp = self._request("PUT", "/api/tags", body={"tags": names})
         out: dict[str, str] = {}
         for t in resp or []:
-            if isinstance(t, dict) and t.get("name") and t.get("id"):
-                out[t["name"]] = t["id"]
+            if not isinstance(t, dict) or not t.get("id"):
+                continue
+            key = t.get("value") or t.get("name")
+            if key:
+                out[key] = t["id"]
         return out
 
     def tag_assets(self, tag_id: str, asset_ids: list[str]) -> list[dict]:
