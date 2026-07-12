@@ -15,6 +15,12 @@ the two channels never disagree), resolves each file to its Immich asset id
 the same way `srtgeo.resolve_asset_id` does, and calls `upsert_tags` +
 `tag_assets`. Safe to re-run: both the Immich tag API and the resolution are
 idempotent.
+
+Add-only, by design: if you remove a tag from a trip's notes and re-run,
+the stale tag is NOT detached from assets that already carry it — this
+mirrors the underlying Immich Tag API (`tag_assets` only attaches) and the
+existing XMP rule has the same property. Detaching would need to diff
+against what was pushed last time, which this module doesn't track.
 """
 
 from __future__ import annotations
@@ -124,6 +130,14 @@ def tag_sync_folder(
                     failed_pairs.add((aid, name))
                     emit(f"  [warn] tag_assets failed for {aid} / {name}: "
                          f"{r.get('error')}")
+                else:
+                    # Can't tell which asset this result belongs to — fail
+                    # the whole batch for this tag rather than silently
+                    # treating unattributable failures as success.
+                    failed_pairs.update((a, name) for a in asset_ids)
+                    emit(f"  [warn] tag_assets failure with no asset id for "
+                         f"{name}: {r.get('error')} — failing all "
+                         f"{len(asset_ids)} asset(s) requested for this tag")
 
     for row, asset_id, per_file in pending:
         if not write:

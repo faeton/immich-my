@@ -121,6 +121,28 @@ def _drone_row(tmp_path: Path) -> ExifRow:
 
 _LIB = LibraryInfo(id="lib", owner_id="owner", container_root="/originals")
 
+_NULL_ISLAND_SRT = """1
+00:00:00,000 --> 00:00:00,033
+<font size="28">FrameCnt: 1, DiffTime: 33ms
+2024-08-12 18:30:00.000
+[iso: 100] [shutter: 1/1000.0] [fnum: 2.8] [ev: 0] [focal_len: 24.00] [latitude: 0.0] [longitude: 0.0] [rel_alt: 0.000 abs_alt: 0.000] </font>
+
+2
+00:00:00,033 --> 00:00:00,066
+<font size="28">FrameCnt: 2, DiffTime: 33ms
+2024-08-12 18:30:01.000
+[iso: 100] [shutter: 1/1000.0] [fnum: 2.8] [ev: 0] [focal_len: 24.00] [latitude: 0.0] [longitude: 0.0] [rel_alt: 0.000 abs_alt: 0.000] </font>
+"""
+
+
+def _no_fix_row(tmp_path: Path) -> ExifRow:
+    """A drone clip whose .SRT never gets a satellite lock — every frame is
+    the (0,0) null-island sentinel `first_valid_fix` is built to skip."""
+    media = tmp_path / "DJI_NOFIX.MP4"
+    media.write_bytes(b"")
+    (tmp_path / "DJI_NOFIX.SRT").write_text(_NULL_ISLAND_SRT)
+    return ExifRow(path=media, raw={})
+
 
 def test_geotag_would_tag_dry_run(tmp_path: Path):
     conn = _Conn(asset_id="aid", gps=(None, None))
@@ -222,6 +244,35 @@ def test_geotag_relock_skips_already_locked(tmp_path: Path):
     out = srtgeo.geotag_folder(
         conn, _LIB, tmp_path, rows, write=True, relock=True)
     assert out[0].status == "skip-has-gps"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_geotag_relock_just_inside_tolerance_boundary(tmp_path: Path):
+    # 1900m from the SRT fix — inside the 2000m tolerance.
+    conn = _Conn(asset_id="aid", gps=(41.40218711051246, 2.173400), locked=[])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=True, relock=True)
+    assert out[0].status == "relocked"
+
+
+def test_geotag_relock_just_outside_tolerance_boundary(tmp_path: Path):
+    # 2100m from the SRT fix — outside the 2000m tolerance.
+    conn = _Conn(asset_id="aid", gps=(41.4039857537243, 2.173400), locked=[])
+    rows = [_drone_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=True, relock=True)
+    assert out[0].status == "skip-mismatch"
+
+
+def test_geotag_no_fix_with_relock_and_existing_gps(tmp_path: Path):
+    # A .SRT that never got a satellite lock: relock has nothing to compare
+    # the existing DB coord against, so it must not touch it either way.
+    conn = _Conn(asset_id="aid", gps=(10.0, 20.0), locked=[])
+    rows = [_no_fix_row(tmp_path)]
+    out = srtgeo.geotag_folder(
+        conn, _LIB, tmp_path, rows, write=True, relock=True)
+    assert out[0].status == "no-fix"
     assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
 
 

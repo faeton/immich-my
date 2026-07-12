@@ -67,7 +67,7 @@ track_mod = _LazyModule("track")
 transcripts_mod = _LazyModule("transcripts")
 from .config import load as load_config
 from .exif import has_valid_gps as has_gps, read_folder
-from .immich import ImmichClient
+from .immich import ImmichClient, ImmichError
 from .notes import (
     ensure_notes,
     join_make_model as _join_make_model,
@@ -856,7 +856,8 @@ def srt_geotag(
         conn.close()
     if write:
         console.print(
-            f"\n[green]tagged {tagged} clip(s), relocked {relocked}[/green]"
+            f"\n[green]tagged {tagged} clip(s), relocked {relocked}[/green] "
+            f"[dim](no-asset={no_asset}, skip-mismatch={mismatch})[/dim]"
         )
     else:
         console.print(
@@ -999,14 +1000,22 @@ def tags_sync(
         api_key=config.immich.api_key,
         ssh_host=config.immich.ssh_host,
     )
-    tagged = would = no_asset = tag_failed = 0
+    tagged = would = no_asset = tag_failed = folder_errors = 0
     try:
         for folder in folders:
             console.print(f"\n[bold]tags sync[/bold] {folder}")
-            outcomes = tagsync_mod.tag_sync_folder(
-                conn, client, library, folder,
-                write=write, emit=lambda m: console.print(m, highlight=False),
-            )
+            # A transport/API error on one trip must not abort the rest of a
+            # multi-trip run (this command is routinely run over the whole
+            # library) — isolate per-folder like `promote` does per-asset.
+            try:
+                outcomes = tagsync_mod.tag_sync_folder(
+                    conn, client, library, folder,
+                    write=write, emit=lambda m: console.print(m, highlight=False),
+                )
+            except ImmichError as e:
+                folder_errors += 1
+                console.print(f"  [red]error:[/red] {e}")
+                continue
             if write:
                 conn.commit()
             f_tagged = sum(1 for o in outcomes if o.status == "tagged")
@@ -1027,16 +1036,22 @@ def tags_sync(
                 )
     finally:
         conn.close()
+    if folder_errors:
+        console.print(f"[red]{folder_errors} trip(s) errored — see above[/red]")
     if write:
         console.print(
             f"\n[green]tagged {tagged} asset(s)[/green] "
             + (f"[red]tag-failed={tag_failed}[/red]" if tag_failed else "")
         )
+        if tag_failed or folder_errors:
+            raise typer.Exit(code=1)
     else:
         console.print(
             f"\n[green]would tag {would} asset(s)[/green] "
             f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
         )
+        if folder_errors:
+            raise typer.Exit(code=1)
 
 
 app.add_typer(tags_app, name="tags")

@@ -80,6 +80,16 @@ def test_no_tags_in_notes_is_a_noop(tmp_path: Path):
     assert out == []
 
 
+def test_no_notes_file_at_all_is_a_noop(tmp_path: Path):
+    # Distinct from the case above: no TRIP.md/IMMY.md/README.md exists at
+    # all (vs. one existing with empty front-matter).
+    trip = tmp_path / "2026-06-corsica-sardinia-yacht"
+    trip.mkdir()
+    out = tagsync.tag_sync_folder(
+        _Conn(), _FakeClient(), _LIB, trip, rows=[_DJI_ROW(trip)], write=False)
+    assert out == []
+
+
 def test_dry_run_reports_would_tag_without_api_calls(tmp_path: Path):
     trip = _trip(tmp_path, notes=_NOTES)
     client = _FakeClient()
@@ -219,3 +229,22 @@ def test_tag_assets_duplicate_is_not_a_failure(tmp_path: Path):
     out = tagsync.tag_sync_folder(
         _Conn(), client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
     assert out[0].status == "tagged"
+
+
+class _UnattributableFailureClient(_FakeClient):
+    """`tag_assets` reports a failure with no `id` at all — can't tell which
+    asset it belongs to. Every asset requested for that tag must fail
+    conservatively rather than default to success."""
+
+    def tag_assets(self, tag_id, asset_ids):
+        self.assets_tagged.append((tag_id, list(asset_ids)))
+        return [{"success": False, "error": "server-error"}]
+
+
+def test_tag_assets_failure_without_id_fails_whole_batch(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    client = _UnattributableFailureClient()
+    out = tagsync.tag_sync_folder(
+        _Conn(), client, _LIB, trip,
+        rows=[_DJI_ROW(trip), _INSTA360_ROW(trip)], write=True)
+    assert all(o.status == "tag-failed" for o in out)

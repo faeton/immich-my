@@ -286,7 +286,9 @@ def geotag_folder(
     these are otherwise invisible to `geocode_located_missing`, which
     requires the lock token as proof-of-ownership before touching a row. We
     only relock when the existing DB coord is within `_RELOCK_TOLERANCE_M`
-    of the SRT-computed fix, so a location you pinned by hand is left alone."""
+    of the SRT-computed fix, so a location you pinned by hand is left alone.
+    Note this locks the EXISTING DB coord as-is — it does not snap the value
+    to the SRT fix, even though the two may differ by up to the tolerance."""
     from . import process as process_mod
     outcomes: list[GeotagOutcome] = []
     for row in rows:
