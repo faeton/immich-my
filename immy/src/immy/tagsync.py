@@ -48,6 +48,64 @@ class TagSyncOutcome:
                       # | "tag-failed"
 
 
+# Immich's video metadata extraction never populates asset_exif.make/model
+# for DJI clips (the MP4 container carries no such tags — same blind spot
+# as GPS), so the Details panel's "Camera" row is blank. Verified live
+# 2026-07-12 (`srt verify-channel`-style probe): unlike GPS, a metadata
+# refresh does NOT clobber an *unlocked* make/model write either — Immich
+# only ever sets these fields from a fresh file read, never nulls them out
+# when the file has none. Locked anyway, as a safety net matching the GPS
+# precedent (and in case that behavior differs in a future Immich version).
+CAMERA_LOCK_TOKENS: tuple[str, ...] = ("make", "model")
+
+_READ_CAMERA_SQL = (
+    'SELECT make, model, "lockedProperties" '
+    'FROM asset_exif WHERE "assetId" = %s'
+)
+
+
+def read_camera(
+    conn: psycopg.Connection, asset_id: str,
+) -> tuple[str | None, str | None, list[str]]:
+    row = conn.execute(_READ_CAMERA_SQL, (asset_id,)).fetchone()
+    if row is None:
+        return None, None, []
+    make, model, locked = row
+    return make, model, list(locked or [])
+
+
+def write_camera(
+    conn: psycopg.Connection,
+    asset_id: str,
+    make: str | None,
+    model: str | None,
+    *,
+    lock_tokens: tuple[str, ...] = CAMERA_LOCK_TOKENS,
+) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            'UPDATE asset_exif SET make = %(make)s, model = %(model)s, '
+            '"lockedProperties" = (SELECT array(SELECT DISTINCT unnest('
+            "  coalesce(\"lockedProperties\", '{}') || %(lock_tokens)s::text[]"
+            '))) WHERE "assetId" = %(asset_id)s',
+            {
+                "make": make, "model": model,
+                "lock_tokens": list(lock_tokens), "asset_id": asset_id,
+            },
+        )
+        return cur.rowcount
+
+
+@dataclass
+class CameraSyncOutcome:
+    media: Path
+    asset_id: str | None
+    make: str | None = None
+    model: str | None = None
+    status: str = ""  # "written" | "would-write" | "skip-has-camera"
+                      # | "no-gear-tag" | "no-asset"
+
+
 def trip_tags(trip_folder: Path) -> list[str]:
     """The trip's `tags:` list from its notes front-matter, or `[]`."""
     notes = resolve_notes(trip_folder)
@@ -150,5 +208,66 @@ def tag_sync_folder(
             status = "tagged"
         outcomes.append(TagSyncOutcome(row.path, asset_id, tuple(per_file), status))
         emit(f"  [{status}] {row.path.name} → {', '.join(per_file)}")
+
+    return outcomes
+
+
+def camera_sync_folder(
+    conn: psycopg.Connection,
+    library: LibraryInfo,
+    trip_folder: Path,
+    rows: list[ExifRow] | None = None,
+    *,
+    write: bool,
+    emit=lambda _msg: None,
+) -> list[CameraSyncOutcome]:
+    """Backfill `asset_exif.make`/`model` for files whose container carries
+    neither — the DJI-MP4 case — from the SAME `Gear/Camera/<make> <model>`
+    tag `tag_sync_folder` would resolve for that file, split on the first
+    space. Idempotent: an asset that already has make OR model (Immich's
+    own extraction succeeded, e.g. any non-DJI camera) is left untouched —
+    this never overwrites a value Immich read from the file itself."""
+    tags = trip_tags(trip_folder)
+    if not tags:
+        return []
+    if rows is None:
+        rows = read_folder(trip_folder)
+
+    outcomes: list[CameraSyncOutcome] = []
+    for row in rows:
+        cam = file_camera(row)
+        per_file = tags_for_file(cam, tags)
+        gear_tags = [t for t in per_file if t.startswith("Gear/Camera/")]
+        if not gear_tags:
+            outcomes.append(CameraSyncOutcome(row.path, None, status="no-gear-tag"))
+            continue
+        gear_value = gear_tags[0].removeprefix("Gear/Camera/").strip()
+        parts = gear_value.split(maxsplit=1)
+        make = parts[0] if parts else None
+        model = parts[1] if len(parts) > 1 else None
+        if not make:
+            outcomes.append(CameraSyncOutcome(row.path, None, status="no-gear-tag"))
+            continue
+        cpath = process_mod.container_path_for(
+            row.path, trip_folder, library.container_root)
+        asset_id = resolve_asset_id(conn, library, cpath)
+        if asset_id is None:
+            outcomes.append(CameraSyncOutcome(row.path, None, status="no-asset"))
+            emit(f"  [no-asset] {row.path.name} — not in Immich library yet")
+            continue
+        db_make, db_model, _ = read_camera(conn, asset_id)
+        if db_make or db_model:
+            outcomes.append(CameraSyncOutcome(
+                row.path, asset_id, db_make, db_model, status="skip-has-camera"))
+            continue
+        if not write:
+            outcomes.append(CameraSyncOutcome(
+                row.path, asset_id, make, model, status="would-write"))
+            emit(f"  [would-write] {row.path.name} → {make} {model or ''}".rstrip())
+            continue
+        write_camera(conn, asset_id, make, model)
+        outcomes.append(CameraSyncOutcome(
+            row.path, asset_id, make, model, status="written"))
+        emit(f"  [written] {row.path.name} → {make} {model or ''}".rstrip())
 
     return outcomes

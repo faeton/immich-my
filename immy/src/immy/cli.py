@@ -1054,6 +1054,60 @@ def tags_sync(
             raise typer.Exit(code=1)
 
 
+@tags_app.command("camera")
+def tags_camera(
+    folders: list[Path] = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Trip folder(s) whose notes-derived camera model should backfill "
+             "asset_exif.make/model.",
+    ),
+    write: bool = typer.Option(
+        False, "--write", help="Apply (default: dry-run report).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Backfill the Immich Details panel's blank "Camera" row for files whose
+    container carries no Make/Model (the DJI-MP4 case — same blind spot as
+    GPS and tags) from the trip's notes `Gear/Camera/<make> <model>` tag.
+    Never overwrites a value Immich already extracted from the file itself."""
+    config, conn, library = _srt_pg_setup(config_path)
+    written = would = no_asset = no_gear = 0
+    try:
+        for folder in folders:
+            console.print(f"\n[bold]tags camera[/bold] {folder}")
+            outcomes = tagsync_mod.camera_sync_folder(
+                conn, library, folder,
+                write=write, emit=lambda m: console.print(m, highlight=False),
+            )
+            if write:
+                conn.commit()
+            f_written = sum(1 for o in outcomes if o.status == "written")
+            f_would = sum(1 for o in outcomes if o.status == "would-write")
+            f_no_asset = sum(1 for o in outcomes if o.status == "no-asset")
+            f_no_gear = sum(1 for o in outcomes if o.status == "no-gear-tag")
+            written += f_written; would += f_would
+            no_asset += f_no_asset; no_gear += f_no_gear
+            if not outcomes:
+                console.print(
+                    "  [yellow]no `tags:` in this trip's notes — "
+                    "nothing to backfill[/yellow]")
+            else:
+                console.print(
+                    f"  [dim]{folder.name}: written={f_written} "
+                    f"would-write={f_would} no-asset={f_no_asset} "
+                    f"no-gear-tag={f_no_gear}[/dim]"
+                )
+    finally:
+        conn.close()
+    if write:
+        console.print(f"\n[green]wrote camera for {written} asset(s)[/green]")
+    else:
+        console.print(
+            f"\n[green]would write camera for {would} asset(s)[/green] "
+            f"[dim](no-asset={no_asset}; run with --write to apply)[/dim]"
+        )
+
+
 app.add_typer(tags_app, name="tags")
 
 

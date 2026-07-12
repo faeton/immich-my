@@ -64,6 +64,33 @@ continuously, so entries are dated rather than versioned.
   7,489 distinct assets carrying a native tag, `tag-failed=0` across all 65
   trips.
 
+### Also
+
+- **`immy tags camera <trip> [--write]`**: backfills the Details panel's
+  blank "Camera" row for DJI clips (`asset_exif.make`/`model`, empty because
+  the MP4 container carries neither) from the trip's notes `Gear/Camera/
+  <make> <model>` tag — same source `tags sync` resolves, split on the first
+  space. Verified live with a `srt verify-channel`-style probe first: unlike
+  GPS, Immich's metadata refresh doesn't clobber an *unlocked* make/model
+  write either (it only ever sets these fields from a fresh file read,
+  never nulls them when the file has none) — locked anyway as a safety net.
+  Never overwrites an asset that already has make or model set, so it can't
+  clobber Immich's own extraction for any non-DJI camera.
+- **Legacy tag cleanup**: found 78 malformed flat tags across the library
+  with a literal `|` in their name (e.g. `Gear|Camera|DJI FC8282`) predating
+  this session — a past bug (unrelated to the one above) that passed
+  hierarchical-looking names through the wrong separator. Deleted the 59
+  that were fully redundant with the correct `/`-hierarchical tag (verified
+  every attached asset already carried the correct equivalent first); left
+  19 alone where the pipe tag's assets weren't fully covered (renamed trips
+  whose old event name has no current equivalent, or gear not reflected in
+  current notes) rather than guess.
+
+Reviewed twice more end-to-end (Codex resumed thread + a fresh Grok pass)
+against the merged commit — both independently confirmed no further
+correctness issues; findings were operational hardening (non-zero exit on
+partial failure, per-trip error isolation for multi-trip runs) and applied.
+
 ## 2026-06-23 — `immy match` + snapshot v2
 
 ### Added

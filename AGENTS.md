@@ -21,6 +21,7 @@ transcripts → inserts/writes Immich Postgres) · `promote` (upload a trip to a
 reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
 `tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — to Immich's native
 Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·
+`tags camera` (backfill the blank Camera field for DJI MP4s from the notes gear tag; see `docs/TELEMETRY.md`) ·
 `snapshot` / `find-duplicates` / `repair-thumbs`.
 
 Two run targets: the **Mac** (MLX, default) and the **N5 NAS** (HTTP backends — Ollama captions,

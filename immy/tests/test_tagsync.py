@@ -31,15 +31,47 @@ class _FakeClient:
         return [{"id": aid, "success": True} for aid in asset_ids]
 
 
-class _Conn:
-    """Resolves any `FROM asset` lookup to `id-<filename>`; None to fail it."""
+class _Cursor:
+    def __init__(self, conn):
+        self.conn = conn
+        self.rowcount = 0
 
-    def __init__(self, resolves: bool = True):
-        self.resolves = resolves
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
 
     def execute(self, sql, params=None):
+        self.conn.calls.append((sql, params))
+        if sql.lstrip().upper().startswith("UPDATE"):
+            self.rowcount = 1
+        return self
+
+
+class _Conn:
+    """Resolves any `FROM asset` lookup to `id-<filename>`; None to fail it.
+    `camera={asset_id: (make, model, locked)}` seeds `read_camera` results
+    for pre-existing asset_exif rows; defaults to (None, None, [])."""
+
+    def __init__(self, resolves: bool = True, camera: dict | None = None):
+        self.resolves = resolves
+        self.camera = camera or {}
+        self.calls: list = []
+
+    def cursor(self):
+        return _Cursor(self)
+
+    def commit(self):
+        pass
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
         row = None
-        if "FROM asset" in sql and self.resolves:
+        if "asset_exif" in sql:  # read_camera
+            asset_id = params[0] if isinstance(params, tuple) else params
+            row = self.camera.get(asset_id, (None, None, []))
+        elif "FROM asset" in sql and self.resolves:
             container_path = params[-1] if isinstance(params, tuple) else params
             row = (f"id-{Path(container_path).name}",)
 
@@ -248,3 +280,69 @@ def test_tag_assets_failure_without_id_fails_whole_batch(tmp_path: Path):
         _Conn(), client, _LIB, trip,
         rows=[_DJI_ROW(trip), _INSTA360_ROW(trip)], write=True)
     assert all(o.status == "tag-failed" for o in out)
+
+
+# --- camera_sync_folder: backfill asset_exif.make/model from the resolved
+# Gear/Camera tag, for files whose container carries neither (DJI MP4s) ----
+
+_DJI_FILENAME_ONLY_ROW = lambda trip: ExifRow(
+    path=trip / "DJI_0002.MP4", raw={})  # no EXIF Make/Model at all
+
+
+def test_camera_written_from_filename_fallback_gear_match(tmp_path: Path):
+    # file_camera() falls back to bare "DJI" from the filename; tags_for_file
+    # substring-matches that against the notes' full "DJI FC8282" gear tag —
+    # camera_sync_folder must use the FULL matched tag, not the bare "DJI".
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn()
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+    assert out[0].status == "written"
+    assert (out[0].make, out[0].model) == ("DJI", "FC8282")
+    update = [c for c in conn.calls if c[0].lstrip().upper().startswith("UPDATE")]
+    assert update and update[0][1]["make"] == "DJI" and update[0][1]["model"] == "FC8282"
+    assert "lockedProperties" in update[0][0]
+
+
+def test_camera_dry_run_no_write(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn()
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=False)
+    assert out[0].status == "would-write"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_camera_skips_asset_that_already_has_one(tmp_path: Path):
+    # Immich's own extraction already succeeded (any non-DJI camera) —
+    # never overwrite it.
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn(camera={"id-DJI_0002.MP4": ("Existing", "Camera", [])})
+    out = tagsync.camera_sync_folder(
+        conn, _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+    assert out[0].status == "skip-has-camera"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_camera_no_gear_tag_for_unrecognized_camera(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    row = ExifRow(path=trip / "random.mp4", raw={})  # no camera signal at all
+    out = tagsync.camera_sync_folder(
+        conn := _Conn(), _LIB, trip, rows=[row], write=True)
+    assert out[0].status == "no-gear-tag"
+    assert not any(c[0].lstrip().upper().startswith("UPDATE") for c in conn.calls)
+
+
+def test_camera_no_tags_in_notes_is_a_noop(tmp_path: Path):
+    trip = _trip(tmp_path, notes="---\n---\n")
+    out = tagsync.camera_sync_folder(
+        _Conn(), _LIB, trip, rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+    assert out == []
+
+
+def test_camera_no_asset_skips(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    out = tagsync.camera_sync_folder(
+        _Conn(resolves=False), _LIB, trip,
+        rows=[_DJI_FILENAME_ONLY_ROW(trip)], write=True)
+    assert out[0].status == "no-asset"

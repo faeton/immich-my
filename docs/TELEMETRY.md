@@ -15,6 +15,7 @@ durably.
 | `immy srt geocode <trip>|--prefix P [--write]` | Backfill country/state/city for already-located clips, purely from DB coords (no files needed). Only touches rows already carrying our lock token. |
 | `immy srt verify-channel <asset>` | One-off probe: prove which DB write survives an Immich metadata refresh for a video. Non-destructive (restores the asset). |
 | `immy tags sync <trip> [--write]` | Push the trip's notes `tags:` to every asset via Immich's **native Tag API** — the video-safe channel for tags XMP can't reach. See [Tags for videos](#tags-for-videos-immy-tags-sync) below. |
+| `immy tags camera <trip> [--write]` | Backfill the Details panel's blank "Camera" row (`asset_exif.make`/`model`) for files whose container carries neither — the DJI-MP4 case — from the trip's notes `Gear/Camera/<make> <model>` tag. See [Camera model for videos](#camera-model-for-videos-immy-tags-camera) below. |
 
 Sidecars are written through `WritablePaths` (see [SIDECAR.md](SIDECAR.md)) — on
 the NAS they mirror under `sidecars_root`, never beside the read-only originals.
@@ -118,6 +119,32 @@ per-camera matching logic the XMP rule uses (`rules/trip_tags.tags_for_file`,
 extracted so the two channels can't disagree), resolves each file to its
 Immich asset id the same way `srt geotag` does, and upserts + attaches every
 tag. Idempotent — safe to re-run after adding new footage to a trip.
+
+## Camera model for videos (`immy tags camera`)
+
+DJI's MP4 container carries no `Make`/`Model` tags at all — `immy`'s own
+`exiftool`-based read (`file_camera()` in `rules/trip_tags.py`) recovers the
+model via a filename-prefix fallback plus the trip's curated
+`Gear/Camera/DJI FC8282`-style notes tag, but Immich's own (lighter-weight)
+video metadata extraction never does, so the Details panel's "Camera" row
+sits blank for every DJI clip even after GPS and tags are fixed.
+
+Verified live 2026-07-12 with a `srt verify-channel`-style probe (write a
+sentinel `make`/`model`, trigger a real metadata refresh, observe): unlike
+GPS, an **unlocked** make/model write survives a refresh too — Immich only
+ever *sets* these fields from a fresh file read, it never nulls them out
+when the file has none. So strictly a lock isn't required for durability
+here, but `tags camera` locks anyway (`make`, `model` tokens), matching the
+GPS precedent as a safety net against a future Immich version behaving
+differently.
+
+`immy tags camera <trip> [--write]` reuses the *exact* per-file tag
+resolution `tags sync` uses (`tags_for_file`) — for each file it takes the
+resolved `Gear/Camera/<make> <model>` tag (if any) and splits it on the
+first space into `make`/`model`. Idempotent and non-destructive by
+construction: an asset that already has `make` OR `model` set (Immich's own
+extraction succeeded — any non-DJI camera) is left alone, so this can never
+clobber a value Immich read from the file itself.
 
 ## Caption context
 
