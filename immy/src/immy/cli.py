@@ -3029,6 +3029,34 @@ def dedup_review_server(
     review_mod.serve(manifest_path, thumb_dir, host, port)
 
 
+@dedup_app.command("rescore")
+def dedup_rescore(
+    manifest_path: Path = _MANIFEST_OPT,
+    thumb_dir: Path = typer.Option(
+        Path("/scratch/dedup-review-tool"), "--thumb-dir",
+        help="Review tool's thumbnail cache (reused as the pixel source).",
+    ),
+    force: bool = typer.Option(False, "--force", help="Recompute existing scores."),
+) -> None:
+    """Compute pixel-identity signals (grayscale NCC + capture-time delta)
+    for every remaining review cluster into the `review_signal` side table.
+    Decision-support only — writes no decisions, moves no files. The review
+    UI shows the scores and lets sweeps threshold on them: same-frame
+    re-exports score ~1.0 even where pHash broke; distinct shots of the
+    same scene drop well below."""
+    from .dedup import signals as signals_mod
+
+    _, conn = _open_manifest(manifest_path)
+    result = signals_mod.compute_signals(
+        conn, thumb_dir, progress=_dedup_progress, force=force
+    )
+    console.print(
+        f"[green]{result['scored']} scored[/green], "
+        f"{result['no_pixels']} without decodable pixels "
+        f"(of {result['total']} clusters)"
+    )
+
+
 @dedup_app.command("status")
 def dedup_status(manifest_path: Path = _MANIFEST_OPT) -> None:
     """Counts per source × status, cluster decisions, embedding cache."""

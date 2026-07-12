@@ -33,10 +33,13 @@ import subprocess
 import threading
 from pathlib import Path
 
-from . import manifest
+from . import manifest, phash, signals
 from .engine import (
+    HAMMING_STRONG,
     AssetLite,
+    _aspect_change,
     _confidence,
+    _metadata_agrees,
     commit_cluster_decision,
     load_cluster_members,
     winner_score,
@@ -170,6 +173,38 @@ def validate_merge(
     return None, members
 
 
+def review_reason(members: list[AssetLite]) -> str:
+    """Best-effort, purely informational: which of Stage D's checks routed
+    this cluster to review (mirrors _decide_one's guard order). Tells the
+    reviewer what to look FOR — a crop, a different shot, an edit — instead
+    of making them guess."""
+    if any(m.burst_uuid for m in members):
+        return "burst group"
+    if any(m.edited for m in members) and not all(m.edited for m in members):
+        return "edited + unedited mixed"
+    winner = max(members, key=winner_score)
+    reasons: list[str] = []
+    for m in members:
+        if m.id == winner.id:
+            continue
+        if _aspect_change(winner, m) > 0.05:
+            reason = "aspect/crop differs"
+        elif m.source == "originals":
+            reason = "would displace originals"
+        elif m.media_type == "image" and (
+            winner.phash is None or m.phash is None
+            or phash.hamming(winner.phash, m.phash) > HAMMING_STRONG
+        ):
+            reason = "pHash weak — check: same shot or near-duplicate?"
+        elif not _metadata_agrees(winner, m):
+            reason = "metadata disagrees"
+        else:
+            continue
+        if reason not in reasons:
+            reasons.append(reason)
+    return ", ".join(reasons) or "borderline auto criteria"
+
+
 def default_winner(members: list[AssetLite]) -> AssetLite:
     """Pre-selected keeper: same heuristic decide() uses — except when the
     cluster contains a library/originals member, which is pre-locked as the
@@ -178,6 +213,16 @@ def default_winner(members: list[AssetLite]) -> AssetLite:
     originals = [m for m in members if m.source == "originals"]
     pool = originals or members
     return max(pool, key=winner_score)
+
+
+def pixel_chip(pixel_ncc: float | None, time_delta: float | None) -> str:
+    """Signal chip for the `dedup rescore` scores: green = pixels correlate
+    like a same-frame re-export, blue = they diverge like distinct shots."""
+    if pixel_ncc is None:
+        return ""
+    kind = "same" if pixel_ncc >= 0.97 else ("diff" if pixel_ncc <= 0.85 else "")
+    delta = f" &middot; &Delta;t {time_delta:.0f}s" if time_delta is not None else ""
+    return f"<span class='pixel {kind}'>pixel {pixel_ncc:.3f}{delta}</span>"
 
 
 # ------------------------------------------------------------------- pages
@@ -204,6 +249,12 @@ h1{font-size:1.05rem;margin:0}
 .src.icloud{background:#2a4d2a}.src.google{background:#2a3a5a}.src.gdrive{background:#5a3a2a}.src.originals{background:#5a2a4d}
 .winnertag{color:#4caf50;font-weight:600;margin-left:6px}
 .locknote{color:#f0ad4e;font-size:.78rem;margin:8px 0}
+.reason{background:#3a2f1d;border:1px solid #6f5f2f;border-radius:4px;padding:1px 8px;
+        font-size:.75rem;color:#d0b060}
+.ham{color:#c9a0d0}
+.pixel{border-radius:4px;padding:1px 8px;font-size:.75rem;border:1px solid #444;color:#bbb}
+.pixel.same{background:#1d4620;border-color:#2f6f34;color:#9fdca4}
+.pixel.diff{background:#1d2f46;border-color:#2f4a6f;color:#9fc0dc}
 .path{color:#888;word-break:break-all;font-size:.72rem;margin-top:3px}
 .score{color:var(--dim)}
 .actions{position:sticky;bottom:0;background:#111d;backdrop-filter:blur(4px);padding:12px 0;margin-top:14px;
@@ -290,10 +341,19 @@ const merge   = () => post('/api/decide/' + state.clusterId,
 const keepAll = () => post('/api/decide/' + state.clusterId, {action: 'keep_all'});
 const skip    = () => post('/api/skip/'   + state.clusterId);
 
+let lightboxIndex = 0;
 function lightbox(assetId) {
   const box = document.getElementById('lightbox');
+  lightboxIndex = Math.max(0, state.members.indexOf(assetId));
   box.querySelector('img').src = '/thumb/' + assetId + '?size=large';
   box.style.display = 'flex';
+}
+// Flicker-compare: same frame -> the image "blinks" in place; a different
+// shot -> everything jumps. Far faster than side-by-side scanning.
+function lightboxCycle() {
+  lightboxIndex = (lightboxIndex + 1) % state.members.length;
+  document.querySelector('#lightbox img').src =
+    '/thumb/' + state.members[lightboxIndex] + '?size=large';
 }
 document.addEventListener('click', ev => {
   const card = ev.target.closest('.card');
@@ -308,8 +368,13 @@ document.getElementById('lightbox').addEventListener('click',
 document.addEventListener('keydown', ev => {
   if (ev.target.tagName === 'INPUT') return;
   const box = document.getElementById('lightbox');
-  if (box.style.display === 'flex' && (ev.key === 'Escape' || ev.key === 'Enter')) {
-    box.style.display = 'none'; ev.preventDefault(); return;
+  if (box.style.display === 'flex') {
+    if (ev.key === 'Escape' || ev.key === 'Enter') {
+      box.style.display = 'none'; ev.preventDefault(); return;
+    }
+    if (ev.key === 'x' || ev.key === 'X' || ev.key === ' ') {
+      lightboxCycle(); ev.preventDefault(); return;
+    }
   }
   if (ev.key >= '1' && ev.key <= '9') {
     const i = Number(ev.key) - 1;
@@ -334,6 +399,7 @@ def render_cluster(
     members: list[AssetLite],
     counts: dict,
     prefetch_ids: tuple[int, ...] = (),
+    signal: tuple[float | None, float | None] = (None, None),
 ) -> str:
     suggested = default_winner(members)
     locked = any(m.source == "originals" for m in members)
@@ -341,6 +407,16 @@ def render_cluster(
     cards = []
     for i, m in enumerate(members):
         key_hint = f"<span class='key'>{i + 1}</span>" if i < 9 else ""
+        ham_note = ""
+        if (
+            m.id != suggested.id
+            and m.phash is not None and suggested.phash is not None
+        ):
+            distance = phash.hamming(m.phash, suggested.phash)
+            ham_note = (
+                f" &middot; <span class='ham'>pHash &Delta;{distance} vs keeper"
+                f"{' (same pixels)' if distance <= HAMMING_STRONG else ''}</span>"
+            )
         winner_note = (
             "<span class='winnertag'>&#10003; recommended keeper</span>"
             if m.id == suggested.id else ""
@@ -361,7 +437,7 @@ def render_cluster(
             {m.width or '?'}x{m.height or '?'} &middot; {human_bytes(m.bytes)}
             &middot; {html.escape(m.format or '?')}
             &middot; {html.escape(m.taken_at or '?')} ({html.escape(m.taken_src or '?')})
-            &middot; <span class="score">score {winner_score(m):.0f}</span>
+            &middot; <span class="score">score {winner_score(m):.0f}</span>{ham_note}
             {winner_note}
             <div class="path">{html.escape(m.path)}</div>
           </div>
@@ -388,6 +464,9 @@ def render_cluster(
       <h1>cluster {cluster_id}</h1>
       <span class="progress">clip_cos_sim {sim} &middot; {len(members)} members
         &middot; {counts['remaining']:,} remaining</span>
+      <span class="reason" title="which Stage D check routed this cluster to review">
+        {html.escape(review_reason(members))}</span>
+      {pixel_chip(*signal)}
       <span class="modeswitch"><a href="/batch">batch mode &rarr;</a></span>
     </header>
     {lock_note}
@@ -402,7 +481,9 @@ def render_cluster(
       <span class="key">1</span>-<span class="key">9</span> select keeper &middot;
       <span class="key">&#9166;</span> merge &middot; <span class="key">K</span> keep all &middot;
       <span class="key">S</span>/<span class="key">&rarr;</span> skip &middot;
-      <span class="key">Z</span>/space or alt-click zoom &middot; click a card to select.
+      <span class="key">Z</span>/space or alt-click zoom &middot;
+      <span class="key">X</span> in zoom flickers between members (same frame = blink in place,
+      different shot = everything jumps) &middot; click a card to select.
       Decisions are recorded in the manifest only; <code>dedup apply</code> moves files later.
       {counts['no_clip']:,} video/no-CLIP review clusters not shown (v2).
     </footer>
@@ -458,23 +539,31 @@ async function submitBatch() {
     inflight = false;
   }
 }
-async function mergeThreshold() {
+async function sweep(action, metric, inputId) {
   if (inflight) return;
-  const min = parseFloat(document.getElementById('mincos').value);
-  if (!(min > 0.9)) { alert('threshold must be above 0.9'); return; }
-  const call = dry => fetch('/api/decide-threshold', {method: 'POST',
+  const value = parseFloat(document.getElementById(inputId).value);
+  const call = dry => fetch('/api/sweep', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({min_cos: min, dry_run: dry})}).then(r => r.json());
-  const pre = await call(true);
-  if (!pre.count) { alert('nothing at or above cos ' + min); return; }
-  if (!confirm('Merge ALL ' + pre.count + ' remaining clusters with cos \\u2265 ' + min +
-               ', keeping the recommended winner in each? This records real decisions ' +
-               '(same as pressing Enter on each one).')) return;
-  inflight = true;
-  const out = await call(false);
-  alert('merged ' + out.merged +
-        (out.failed && out.failed.length ? ', failed ' + out.failed.length : ''));
-  window.location.href = '/batch';
+    body: JSON.stringify({action, metric, value, dry_run: dry})}).then(async r => {
+      const j = await r.json();
+      if (!r.ok) throw new Error(j.error || r.statusText);
+      return j;
+    });
+  try {
+    const pre = await call(true);
+    if (!pre.count) { alert('nothing matches ' + metric + (action === 'keep_all' ? ' \\u2264 ' : ' \\u2265 ') + value); return; }
+    const verb = action === 'merge'
+      ? 'MERGE (keep recommended winner, rest become losers)'
+      : 'mark KEEP-ALL (not duplicates, nothing quarantined)';
+    if (!confirm(pre.count + ' clusters with ' + metric +
+                 (action === 'keep_all' ? ' \\u2264 ' : ' \\u2265 ') + value + ' \\u2192 ' + verb +
+                 '?\\nSame write as deciding each one by hand.')) return;
+    inflight = true;
+    const out = await call(false);
+    alert('decided ' + out.decided +
+          (out.failed && out.failed.length ? ', failed ' + out.failed.length : ''));
+    window.location.href = '/batch';
+  } catch (e) { alert('sweep failed: ' + e.message); inflight = false; }
 }
 document.addEventListener('keydown', ev => {
   if (ev.target.tagName === 'INPUT') return;
@@ -506,7 +595,9 @@ def render_batch(rows: list[dict], counts: dict) -> str:
           <div class="bmeta">cluster {row['cluster_id']}<br>
             cos {f"{sim:.6f}" if sim is not None else "—"}<br>
             {len(row['members'])} members<br>
-            keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}
+            keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}<br>
+            <span class="reason">{html.escape(review_reason(row['members']))}</span><br>
+            {pixel_chip(*row.get('signal', (None, None)))}
           </div>
         </div>""")
 
@@ -522,9 +613,12 @@ def render_batch(rows: list[dict], counts: dict) -> str:
     <div class="actions">
       <button class="merge" id="mergebtn" onclick="submitBatch()">Merge checked</button>
       <span class="thresh">
-        <label for="mincos">everything above is dupes?</label>
         <input id="mincos" type="number" step="0.0001" min="0.9" max="1" value="0.9990">
-        <button class="danger" onclick="mergeThreshold()">Merge ALL &ge; cos</button>
+        <button class="danger" onclick="sweep('merge','cos','mincos')">Merge ALL &ge; cos</button>
+        <input id="minpx" type="number" step="0.001" min="0.9" max="1" value="0.980">
+        <button class="danger" onclick="sweep('merge','pixel','minpx')">Merge ALL &ge; pixel</button>
+        <input id="maxpx" type="number" step="0.001" min="0" max="0.9" value="0.750">
+        <button class="danger" onclick="sweep('keep_all','pixel','maxpx')">Keep-all ALL &le; pixel</button>
       </span>
     </div>
     <footer>Merging keeps the outlined member and marks the rest as losers
@@ -596,7 +690,10 @@ def create_app(manifest_path: Path, thumb_root: Path):
         members = load_cluster_members(conn, cluster_id)
         if not members:
             abort(404)
-        return render_cluster(cluster_id, row[1], members, _counts(conn), prefetch)
+        return render_cluster(
+            cluster_id, row[1], members, _counts(conn), prefetch,
+            signal=signals.get_signal(conn, cluster_id),
+        )
 
     @app.post("/api/decide/<int:cluster_id>")
     def decide_cluster(cluster_id: int):
@@ -678,49 +775,84 @@ def create_app(manifest_path: Path, thumb_root: Path):
         finally:
             conn.close()
 
-    @app.post("/api/decide-threshold")
-    def decide_threshold():
-        """Sweep-merge every pending cluster at or above a cos threshold,
-        each with its recommended (originals-locked) winner. The human
-        authorizes the band wholesale after having eyeballed its head —
-        equivalent to pressing Enter on each cluster, not a new kind of
+    @app.post("/api/sweep")
+    def sweep():
+        """Sweep every pending cluster past a threshold with one decision,
+        each cluster getting its recommended (originals-locked) winner. The
+        human authorizes a band wholesale after eyeballing its head —
+        equivalent to pressing Enter (or K) on each one, not a new kind of
         write. Session-skipped clusters are excluded: a skip means 'unsure',
-        and a sweep must never override an explicit human hesitation."""
+        and a sweep must never override an explicit human hesitation.
+
+        Shapes:
+          merge    + cos   >= v  (v > 0.9)  — the CLIP-identical band
+          merge    + pixel >= v  (v > 0.9)  — same-frame re-exports (rescore)
+          keep_all + pixel <= v  (v < 0.9)  — distinct shots of one scene
+        keep_all on cos is refused: scene similarity can't prove distinctness.
+        """
         payload = request.get_json(force=True, silent=True) or {}
+        action = payload.get("action")
+        metric = payload.get("metric")
         try:
-            min_cos = float(payload["min_cos"])
+            value = float(payload["value"])
         except (KeyError, TypeError, ValueError):
-            return jsonify(error="min_cos required"), 400
-        if min_cos <= 0.9:
-            return jsonify(error="refusing a sweep below cos 0.9"), 400
+            return jsonify(error="value required"), 400
+        if action not in ("merge", "keep_all") or metric not in ("cos", "pixel"):
+            return jsonify(error="action must be merge|keep_all, metric cos|pixel"), 400
+        if action == "merge" and value <= 0.9:
+            return jsonify(error="refusing a merge sweep below 0.9"), 400
+        if action == "keep_all" and (metric != "pixel" or value >= 0.9):
+            return jsonify(
+                error="keep_all sweeps need metric=pixel with a bar below 0.9"
+            ), 400
+
+        if metric == "cos":
+            sql = ("SELECT id FROM cluster WHERE decision='review'"
+                   " AND clip_cos_sim >= ? ORDER BY clip_cos_sim DESC, id ASC")
+        elif action == "merge":
+            sql = ("SELECT c.id FROM cluster c JOIN review_signal s ON s.cluster_id=c.id"
+                   " WHERE c.decision='review' AND s.pixel_ncc >= ?"
+                   " ORDER BY s.pixel_ncc DESC, c.id ASC")
+        else:
+            sql = ("SELECT c.id FROM cluster c JOIN review_signal s ON s.cluster_id=c.id"
+                   " WHERE c.decision='review' AND s.pixel_ncc <= ?"
+                   " ORDER BY s.pixel_ncc ASC, c.id ASC")
+
         conn = db()
         try:
-            ids = [
-                cid for (cid,) in conn.execute(
-                    "SELECT id FROM cluster WHERE decision='review'"
-                    " AND clip_cos_sim >= ? ORDER BY clip_cos_sim DESC, id ASC",
-                    (min_cos,),
-                )
-                if cid not in skipped
-            ]
+            try:
+                ids = [cid for (cid,) in conn.execute(sql, (value,)) if cid not in skipped]
+            except sqlite3.OperationalError:
+                return jsonify(error="no pixel scores yet — run `immy dedup rescore` first"), 400
             if payload.get("dry_run"):
                 return jsonify(count=len(ids))
-            merged, failed = 0, []
+            done, failed = 0, []
             for cid in ids:
                 members = load_cluster_members(conn, cid)
                 if not members:
                     continue
                 winner = default_winner(members)
-                error, checked = validate_merge(conn, cid, winner.id)
-                if error:
-                    failed.append({"cluster_id": cid, "error": error[1]})
-                    continue
-                commit_cluster_decision(
-                    conn, cid, checked, "auto", winner.id,
-                    _confidence(checked, winner),
-                )
-                merged += 1
-            return jsonify(ok=True, merged=merged, failed=failed[:10])
+                if action == "merge":
+                    error, checked = validate_merge(conn, cid, winner.id)
+                    if error:
+                        failed.append({"cluster_id": cid, "error": error[1]})
+                        continue
+                    commit_cluster_decision(
+                        conn, cid, checked, "auto", winner.id,
+                        _confidence(checked, winner),
+                    )
+                else:
+                    still = conn.execute(
+                        "SELECT decision FROM cluster WHERE id=?", (cid,)
+                    ).fetchone()
+                    if not still or still[0] != "review":
+                        continue
+                    commit_cluster_decision(
+                        conn, cid, members, "kept_all", winner.id,
+                        _confidence(members, winner),
+                    )
+                done += 1
+            return jsonify(ok=True, decided=done, failed=failed[:10])
         finally:
             conn.close()
 
@@ -744,6 +876,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     "clip_cos_sim": sim,
                     "members": members,
                     "winner_id": default_winner(members).id,
+                    "signal": signals.get_signal(conn, cid),
                 })
             return render_batch(rows, _counts(conn))
         finally:

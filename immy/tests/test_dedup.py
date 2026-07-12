@@ -545,6 +545,55 @@ def test_load_cluster_members_includes_all_statuses(tmp_path):
     assert members[1].source == "originals"
 
 
+# ------------------------------------------------- pixel signals (rescore)
+
+
+def test_ncc_separates_same_frame_from_distinct(tmp_path):
+    from immy.dedup import signals
+
+    same_a, same_b = tmp_path / "a.jpg", tmp_path / "a2.jpg"
+    _write_test_jpeg(same_a, seed=5)
+    import pyvips
+    # a heavy recompress+downscale of the SAME frame — the case pHash can
+    # miss but NCC must catch
+    pyvips.Image.thumbnail(str(same_a), 300).jpegsave(str(same_b), Q=40)
+    other = tmp_path / "b.jpg"
+    _write_test_jpeg(other, seed=6)
+
+    g = signals._gray
+    assert signals.ncc(g(same_a), g(same_b)) > 0.97
+    assert signals.ncc(g(same_a), g(other)) < 0.9
+
+
+def test_compute_signals_writes_side_table(tmp_path):
+    from immy.dedup import signals
+
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    root = tmp_path / "staging"
+    root.mkdir()
+    a, b = root / "IMG_1.JPG", root / "IMG_2.JPG"
+    _write_test_jpeg(a, seed=9)
+    _write_test_jpeg(b, seed=9)  # identical content
+    conn.execute("INSERT INTO cluster (id, decision, clip_cos_sim) VALUES (1, 'review', 0.96)")
+    for asset_id, path in ((1, a), (2, b)):
+        conn.execute(
+            "INSERT INTO asset (id, source, path, status, media_type, format,"
+            " taken_at, taken_src) VALUES (?, 'icloud', ?, 'clustered', 'image',"
+            " 'jpg', ?, 'exif')",
+            (asset_id, str(path), f"2025-06-01T12:00:0{asset_id}"),
+        )
+        conn.execute("INSERT INTO membership (cluster_id, asset_id) VALUES (1, ?)", (asset_id,))
+    conn.commit()
+
+    result = signals.compute_signals(conn, tmp_path / "thumbs")
+    assert result == {"scored": 1, "no_pixels": 0, "total": 1}
+    ncc_value, delta = signals.get_signal(conn, 1)
+    assert ncc_value > 0.99         # identical frames
+    assert delta == 1.0             # 12:00:01 - 12:00:02
+    # idempotent: second run has nothing left to score
+    assert signals.compute_signals(conn, tmp_path / "thumbs")["total"] == 0
+
+
 # ----------------------------------------------------------- end-to-end lite
 
 

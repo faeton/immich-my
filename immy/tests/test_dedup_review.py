@@ -150,6 +150,36 @@ def test_originals_cluster_page_shows_lock(client):
     assert "winner is locked" in page
 
 
+def test_review_reason_labels():
+    from immy.dedup.engine import AssetLite
+
+    def asset(id, **kw):
+        base = dict(
+            id=id, source="icloud", path=f"/staging/IMG_{id}.HEIC",
+            bytes=1_000_000, media_type="image", format="heic",
+            width=4032, height=3024, taken_at="2025-06-01T12:00:00",
+            taken_src="exif", gps_lat=None, gps_lon=None,
+            phash=0xFF00FF00FF00FF00, exif_fields=30,
+            burst_uuid=None, live_cid=None, edited=False,
+        )
+        base.update(kw)
+        return AssetLite(**base)
+
+    weak = [asset(1), asset(2, source="google", phash=0x00FF00FF00FF00FF)]
+    assert "pHash weak" in review.review_reason(weak)
+    edited = [asset(1), asset(2, edited=True)]
+    assert "edited" in review.review_reason(edited)
+    displace = [asset(1, format="dng", exif_fields=90),
+                asset(2, source="originals", phash=0xFF00FF00FF00FF01)]
+    assert "originals" in review.review_reason(displace)
+
+
+def test_pages_show_reason_chip(client):
+    c, _ = client
+    assert 'class="reason"' in c.get("/").get_data(as_text=True)
+    assert 'class="reason"' in c.get("/batch").get_data(as_text=True)
+
+
 def test_unknown_action_and_cluster(client):
     c, _ = client
     assert c.post("/api/decide/1", json={"action": "explode"}).status_code == 400
@@ -196,34 +226,80 @@ def test_batch_merges_checked_and_skips_unchecked(client):
     assert "No image review clusters left" in c.get("/batch").get_data(as_text=True)
 
 
-def test_threshold_sweep_merges_only_at_or_above_cos(client):
+def test_cos_sweep_merges_only_at_or_above_threshold(client):
     c, db_path = client
     # dry run: only cluster 1 (0.99) clears 0.98; nothing is written
-    pre = c.post("/api/decide-threshold", json={"min_cos": 0.98, "dry_run": True})
+    pre = c.post("/api/sweep", json={"action": "merge", "metric": "cos",
+                                     "value": 0.98, "dry_run": True})
     assert pre.get_json() == {"count": 1}
     assert _decision(db_path, 1) == ("review", None)
     # real sweep merges cluster 1 with its recommended winner (icloud asset 1
     # outscores google asset 2); cluster 2 (0.95) is untouched
-    out = c.post("/api/decide-threshold", json={"min_cos": 0.98}).get_json()
-    assert out["merged"] == 1 and out["failed"] == []
+    out = c.post("/api/sweep", json={"action": "merge", "metric": "cos",
+                                     "value": 0.98}).get_json()
+    assert out["decided"] == 1 and out["failed"] == []
     assert _decision(db_path, 1) == ("auto", 1)
     assert _decision(db_path, 2) == ("review", None)
 
 
-def test_threshold_sweep_uses_originals_winner_and_skips_hesitations(client):
+def test_cos_sweep_uses_originals_winner_and_skips_hesitations(client):
     c, db_path = client
     # a skipped cluster is an explicit hesitation — the sweep must not take it
     c.post("/api/skip/1")
-    out = c.post("/api/decide-threshold", json={"min_cos": 0.95}).get_json()
-    assert out["merged"] == 1
+    out = c.post("/api/sweep", json={"action": "merge", "metric": "cos",
+                                     "value": 0.95}).get_json()
+    assert out["decided"] == 1
     assert _decision(db_path, 1) == ("review", None)   # skipped, untouched
     assert _decision(db_path, 2) == ("auto", 4)        # originals member wins
 
 
-def test_threshold_sweep_refuses_low_bar(client):
+def test_sweep_refuses_unsafe_shapes(client):
     c, _ = client
-    assert c.post("/api/decide-threshold", json={"min_cos": 0.5}).status_code == 400
-    assert c.post("/api/decide-threshold", json={}).status_code == 400
+    post = lambda body: c.post("/api/sweep", json=body).status_code
+    assert post({"action": "merge", "metric": "cos", "value": 0.5}) == 400
+    assert post({"action": "merge", "metric": "cos"}) == 400
+    assert post({"action": "keep_all", "metric": "cos", "value": 0.5}) == 400
+    assert post({"action": "keep_all", "metric": "pixel", "value": 0.95}) == 400
+    assert post({"action": "explode", "metric": "cos", "value": 0.99}) == 400
+    # pixel sweeps before rescore has ever run → clear error, no crash
+    assert c.post("/api/sweep", json={"action": "merge", "metric": "pixel",
+                                      "value": 0.98}).status_code == 400
+
+
+def _seed_signals(db_path, values):
+    import sqlite3
+
+    conn = sqlite3.connect(db_path)
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS review_signal ("
+        " cluster_id INTEGER PRIMARY KEY, pixel_ncc REAL, time_delta REAL)"
+    )
+    for cid, ncc, dt in values:
+        conn.execute("INSERT INTO review_signal VALUES (?, ?, ?)", (cid, ncc, dt))
+    conn.commit()
+    conn.close()
+
+
+def test_pixel_sweeps_split_same_frame_from_distinct_shots(client):
+    c, db_path = client
+    # cluster 1 = same-frame re-export (ncc .995), cluster 2 = distinct shots
+    _seed_signals(db_path, [(1, 0.995, 0.0), (2, 0.60, 4.0)])
+    out = c.post("/api/sweep", json={"action": "merge", "metric": "pixel",
+                                     "value": 0.98}).get_json()
+    assert out["decided"] == 1
+    assert _decision(db_path, 1) == ("auto", 1)
+    out = c.post("/api/sweep", json={"action": "keep_all", "metric": "pixel",
+                                     "value": 0.75}).get_json()
+    assert out["decided"] == 1
+    decision, winner = _decision(db_path, 2)
+    assert decision == "kept_all" and winner == 4
+
+
+def test_pixel_chip_renders_when_signal_exists(client):
+    c, db_path = client
+    _seed_signals(db_path, [(1, 0.995, 0.0)])
+    page = c.get("/").get_data(as_text=True)
+    assert "pixel 0.995" in page and "pixel same" in page
 
 
 def test_batch_enforces_originals_guard_per_cluster(client):
