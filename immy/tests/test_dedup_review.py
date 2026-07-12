@@ -171,3 +171,39 @@ def test_index_prefetches_upcoming_cluster_thumbs(client):
     page = c.get("/").get_data(as_text=True)
     # cluster 2's members (assets 3, 4) are the next in queue
     assert "const PREFETCH = [3, 4];" in page
+
+
+def test_batch_page_lists_pending_clusters_with_winners(client):
+    c, _ = client
+    page = c.get("/batch").get_data(as_text=True)
+    assert 'data-cid="1"' in page and 'data-cid="2"' in page
+    # cluster 2's winner is pre-locked to the originals member (asset 4)
+    assert 'data-cid="2" data-winner="4"' in page
+
+
+def test_batch_merges_checked_and_skips_unchecked(client):
+    c, db_path = client
+    res = c.post("/api/decide-batch", json={
+        "decisions": [{"cluster_id": 1, "winner_asset_id": 1}],
+        "skip": [2],
+    })
+    assert res.status_code == 200
+    out = res.get_json()
+    assert out["merged"] == 1 and out["failed"] == []
+    assert _decision(db_path, 1) == ("auto", 1)
+    assert _decision(db_path, 2) == ("review", None)  # skip writes nothing
+    # both are now out of the queue: 1 decided, 2 session-skipped
+    assert "No image review clusters left" in c.get("/batch").get_data(as_text=True)
+
+
+def test_batch_enforces_originals_guard_per_cluster(client):
+    c, db_path = client
+    res = c.post("/api/decide-batch", json={"decisions": [
+        {"cluster_id": 1, "winner_asset_id": 1},
+        {"cluster_id": 2, "winner_asset_id": 3},   # non-originals winner: refused
+    ]})
+    out = res.get_json()
+    assert out["merged"] == 1
+    assert len(out["failed"]) == 1 and out["failed"][0]["cluster_id"] == 2
+    assert _decision(db_path, 1) == ("auto", 1)
+    assert _decision(db_path, 2) == ("review", None)

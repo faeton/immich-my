@@ -66,6 +66,13 @@ served — v2 needs ffmpeg poster frames and a different sort key.
   clusters' thumbnails into the browser cache — decisions paint the next
   cluster instantly. The `winner_score()`-recommended keeper renders
   pre-selected, so the common gesture is a single Enter per cluster.
+- Batch mode (`/batch`): 60 clusters per page as compact pre-checked rows
+  (green outline = keeper), Enter merges all checked in one POST; a click
+  unchecks a row (session-skipped, back via single mode after restart).
+  Built for the near-certain head of the queue (~500 clusters at
+  cos ≥ 0.9999) where per-cluster confirmation adds nothing. Same
+  `validate_merge` + `commit_cluster_decision` path as single mode,
+  including the originals guard, per-cluster commits.
 - Thumbnails: lazy fallback, cached under `/scratch/dedup-review-tool/{640,1600}/<asset_id>.jpg`
   (`gen_triage.py`'s direct-pyvips-then-exiftool-preview strategy, tmp+rename
   writes). Never regenerated once present.

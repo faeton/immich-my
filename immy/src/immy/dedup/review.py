@@ -44,6 +44,7 @@ from .engine import (
 
 THUMB_SIZE = 640        # card tier — the static gallery's 240px was too small
 LIGHTBOX_SIZE = 1600    # click-to-enlarge tier
+BATCH_SIZE = 60         # clusters per /batch page — one glance-and-Enter unit
 
 # exiftool embedded-preview tags, in preference order (RAW/corrupt fallback).
 PREVIEW_TAGS = ["-PreviewImage", "-JpgFromRaw", "-ThumbnailImage"]
@@ -137,6 +138,38 @@ def _counts(conn: sqlite3.Connection) -> dict:
     return {"remaining": remaining, "no_clip": no_clip}
 
 
+def validate_merge(
+    conn: sqlite3.Connection, cluster_id: int, winner_id: int
+) -> tuple[tuple[int, str] | None, list[AssetLite]]:
+    """Shared validation for single and batch merges. Returns
+    ((http_status, error), []) on rejection, or (None, members) when the
+    merge is safe to commit."""
+    row = conn.execute(
+        "SELECT decision FROM cluster WHERE id=?", (cluster_id,)
+    ).fetchone()
+    if row is None:
+        return (404, f"no cluster {cluster_id}"), []
+    if row[0] != "review":
+        # Stale tab / double-submit — never silently overwrite a decision
+        # that is no longer 'review'.
+        return (409, f"cluster {cluster_id} is already '{row[0]}'"), []
+    members = load_cluster_members(conn, cluster_id)
+    by_id = {m.id: m for m in members}
+    if winner_id not in by_id:
+        return (400, f"asset {winner_id} is not a member of cluster {cluster_id}"), []
+    if (
+        any(m.source == "originals" for m in members)
+        and by_id[winner_id].source != "originals"
+    ):
+        return (
+            400,
+            "cluster contains a library/originals member; the winner must be "
+            "the originals copy (a different winner would make `dedup apply` "
+            "promote a second copy next to the canonical file)",
+        ), []
+    return None, members
+
+
 def default_winner(members: list[AssetLite]) -> AssetLite:
     """Pre-selected keeper: same heuristic decide() uses — except when the
     cluster contains a library/originals member, which is pre-locked as the
@@ -186,6 +219,15 @@ button:disabled{opacity:.45;cursor:not-allowed}
        padding:8px 14px;border-radius:8px;display:none;z-index:20}
 footer{margin-top:18px;color:#666;font-size:.75rem}
 .done{margin-top:20vh;text-align:center;color:var(--dim);font-size:1.1rem}
+.modeswitch{font-size:.85rem}
+.brow{display:flex;gap:8px;align-items:center;border:2px solid #2f6f34;border-radius:8px;
+      padding:6px;margin-bottom:8px;background:var(--panel);cursor:pointer}
+.brow.unchecked{border-color:#333;opacity:.45}
+.brow img{height:180px;max-width:260px;object-fit:contain;background:#000;border-radius:4px}
+.brow .keepmark{outline:3px solid #4caf50;outline-offset:-3px}
+.brow .bmeta{font-size:.72rem;color:#aaa;min-width:130px}
+.brow .check{font-size:1.3rem;width:1.4em;text-align:center;color:#4caf50}
+.brow.unchecked .check{color:#555}
 """
 
 
@@ -339,6 +381,7 @@ def render_cluster(
       <h1>cluster {cluster_id}</h1>
       <span class="progress">clip_cos_sim {sim} &middot; {len(members)} members
         &middot; {counts['remaining']:,} remaining</span>
+      <span class="modeswitch"><a href="/batch">batch mode &rarr;</a></span>
     </header>
     {lock_note}
     <div class="cards">{''.join(cards)}</div>
@@ -371,6 +414,90 @@ def render_done(counts: dict) -> str:
       <p><a href="/">reload</a></p>
     </div>"""
     return _page("dedup review — done", body)
+
+
+_BATCH_JS = """
+document.addEventListener('click', ev => {
+  const row = ev.target.closest('.brow');
+  if (row) row.classList.toggle('unchecked');
+  updateCount();
+});
+function updateCount() {
+  const n = document.querySelectorAll('.brow:not(.unchecked)').length;
+  document.getElementById('mergebtn').textContent =
+    'Merge ' + n + ' checked \\u23CE  (unchecked \\u2192 single-mode queue)';
+}
+let inflight = false;
+async function submitBatch() {
+  if (inflight) return;
+  inflight = true;
+  const decisions = [...document.querySelectorAll('.brow:not(.unchecked)')].map(r =>
+    ({cluster_id: Number(r.dataset.cid), winner_asset_id: Number(r.dataset.winner)}));
+  const skip = [...document.querySelectorAll('.brow.unchecked')].map(r => Number(r.dataset.cid));
+  try {
+    const res = await fetch('/api/decide-batch', {method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({decisions, skip})});
+    const out = await res.json();
+    if (!res.ok) throw new Error(out.error || res.statusText);
+    if (out.failed && out.failed.length) alert('some failed: ' + JSON.stringify(out.failed));
+    window.location.reload();
+  } catch (e) {
+    alert('batch failed: ' + e.message);
+    inflight = false;
+  }
+}
+document.addEventListener('keydown', ev => {
+  if (ev.key === 'Enter') { submitBatch(); ev.preventDefault(); }
+});
+updateCount();
+"""
+
+
+def render_batch(rows: list[dict], counts: dict) -> str:
+    """rows: [{cluster_id, clip_cos_sim, members, winner_id}] — compact
+    one-line-per-cluster confirm view for the near-certain tail of the
+    queue. Everything renders pre-checked; a click toggles a row off
+    (unchecked rows go to the session skip list — resurface them in single
+    mode after a server restart)."""
+    body_rows = []
+    for row in rows:
+        thumbs = "".join(
+            f'<img src="/thumb/{m.id}" loading="lazy" title="{html.escape(m.source)} '
+            f'{m.width or "?"}x{m.height or "?"} {human_bytes(m.bytes)}"'
+            f'{" class=keepmark" if m.id == row["winner_id"] else ""}>'
+            for m in row["members"]
+        )
+        sim = row["clip_cos_sim"]
+        body_rows.append(f"""
+        <div class="brow" data-cid="{row['cluster_id']}" data-winner="{row['winner_id']}">
+          <div class="check">&#10003;</div>
+          {thumbs}
+          <div class="bmeta">cluster {row['cluster_id']}<br>
+            cos {f"{sim:.4f}" if sim is not None else "—"}<br>
+            {len(row['members'])} members<br>
+            keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}
+          </div>
+        </div>""")
+
+    body = f"""
+    <header>
+      <h1>batch mode</h1>
+      <span class="progress">{counts['remaining']:,} remaining &middot;
+        showing {len(rows)} &middot; green outline = keeper &middot;
+        click a row to uncheck it</span>
+      <span class="modeswitch"><a href="/">&larr; single mode</a></span>
+    </header>
+    <div>{''.join(body_rows)}</div>
+    <div class="actions">
+      <button class="merge" id="mergebtn" onclick="submitBatch()">Merge checked</button>
+    </div>
+    <footer>Merging keeps the outlined member and marks the rest as losers
+      (same manifest write as single mode, originals-guard enforced server-side).
+      Unchecked rows are skipped for this session and stay in the queue.</footer>
+    <script>{_BATCH_JS}</script>
+    """
+    return _page("dedup review — batch", body)
 
 
 # --------------------------------------------------------------------- app
@@ -454,7 +581,6 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     error=f"cluster {cluster_id} is already '{row[0]}'"
                 ), 409
             members = load_cluster_members(conn, cluster_id)
-            by_id = {m.id: m for m in members}
 
             if action == "keep_all":
                 winner = default_winner(members)
@@ -468,28 +594,75 @@ def create_app(manifest_path: Path, thumb_root: Path):
                 winner_id = int(payload["winner_asset_id"])
             except (KeyError, TypeError, ValueError):
                 return jsonify(error="merge needs winner_asset_id"), 400
-            if winner_id not in by_id:
-                return jsonify(
-                    error=f"asset {winner_id} is not a member of cluster {cluster_id}"
-                ), 400
-            # Server-side originals guard — the UI locks this too, but the
-            # manifest write is what must never go wrong.
-            if (
-                any(m.source == "originals" for m in members)
-                and by_id[winner_id].source != "originals"
-            ):
-                return jsonify(
-                    error="cluster contains a library/originals member; the "
-                    "winner must be the originals copy (a different winner "
-                    "would make `dedup apply` promote a second copy next to "
-                    "the canonical file)"
-                ), 400
-            winner = by_id[winner_id]
+            # Server-side originals guard lives in validate_merge — the UI
+            # locks this too, but the manifest write is what must never go
+            # wrong.
+            error, merge_members = validate_merge(conn, cluster_id, winner_id)
+            if error:
+                return jsonify(error=error[1]), error[0]
+            winner = next(m for m in merge_members if m.id == winner_id)
             commit_cluster_decision(
-                conn, cluster_id, members, "auto", winner_id,
-                _confidence(members, winner),
+                conn, cluster_id, merge_members, "auto", winner_id,
+                _confidence(merge_members, winner),
             )
             return jsonify(ok=True, decision="auto", winner_asset_id=winner_id)
+        finally:
+            conn.close()
+
+    @app.post("/api/decide-batch")
+    def decide_batch():
+        payload = request.get_json(force=True, silent=True) or {}
+        decisions = payload.get("decisions") or []
+        conn = db()
+        merged, failed = 0, []
+        try:
+            for entry in decisions:
+                try:
+                    cluster_id = int(entry["cluster_id"])
+                    winner_id = int(entry["winner_asset_id"])
+                except (KeyError, TypeError, ValueError):
+                    failed.append({"entry": entry, "error": "malformed"})
+                    continue
+                error, members = validate_merge(conn, cluster_id, winner_id)
+                if error:
+                    failed.append({"cluster_id": cluster_id, "error": error[1]})
+                    continue
+                winner = next(m for m in members if m.id == winner_id)
+                # One commit per cluster (inside commit_cluster_decision) —
+                # a mid-batch crash loses nothing already reported merged.
+                commit_cluster_decision(
+                    conn, cluster_id, members, "auto", winner_id,
+                    _confidence(members, winner),
+                )
+                merged += 1
+            for cid in payload.get("skip") or []:
+                skipped.add(int(cid))
+            return jsonify(ok=True, merged=merged, failed=failed)
+        finally:
+            conn.close()
+
+    @app.get("/batch")
+    def batch_page():
+        conn = db()
+        try:
+            pending = [cid for cid in _queue_ids(conn) if cid not in skipped]
+            if not pending:
+                return render_done(_counts(conn))
+            rows = []
+            for cid in pending[:BATCH_SIZE]:
+                sim = conn.execute(
+                    "SELECT clip_cos_sim FROM cluster WHERE id=?", (cid,)
+                ).fetchone()[0]
+                members = load_cluster_members(conn, cid)
+                if not members:
+                    continue
+                rows.append({
+                    "cluster_id": cid,
+                    "clip_cos_sim": sim,
+                    "members": members,
+                    "winner_id": default_winner(members).id,
+                })
+            return render_batch(rows, _counts(conn))
         finally:
             conn.close()
 
