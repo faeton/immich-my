@@ -305,28 +305,49 @@ class AssetLite:
             return None
 
 
+ASSET_LITE_COLUMNS = (
+    "id, source, path, bytes, media_type, format, width, height,"
+    " taken_at, taken_src, gps_lat, gps_lon, phash, exif_fields,"
+    " burst_uuid, live_cid, edited"
+)
+
+
+def asset_lite_from_row(r: tuple) -> AssetLite:
+    """One row selected via ASSET_LITE_COLUMNS → AssetLite."""
+    return AssetLite(
+        id=r[0], source=r[1], path=r[2], bytes=r[3] or 0, media_type=r[4] or "image",
+        format=r[5] or "", width=r[6], height=r[7], taken_at=r[8], taken_src=r[9],
+        gps_lat=r[10], gps_lon=r[11],
+        phash=phash.from_hex(r[12]) if r[12] else None,
+        exif_fields=r[13] or 0, burst_uuid=r[14], live_cid=r[15], edited=bool(r[16]),
+    )
+
+
 def load_clusterable(conn: sqlite3.Connection) -> list[AssetLite]:
     """Fingerprinted + canonical assets — the clustering universe.
 
     `decided`/`promoted`/`quarantined` rows are excluded: their clusters
     are settled and re-running must not reopen them."""
     rows = conn.execute(
-        "SELECT id, source, path, bytes, media_type, format, width, height,"
-        "       taken_at, taken_src, gps_lat, gps_lon, phash, exif_fields,"
-        "       burst_uuid, live_cid, edited"
-        "  FROM asset WHERE status IN (?, ?, ?)",
+        f"SELECT {ASSET_LITE_COLUMNS} FROM asset WHERE status IN (?, ?, ?)",
         (manifest.FINGERPRINTED, manifest.CLUSTERED, manifest.CANONICAL),
     ).fetchall()
-    return [
-        AssetLite(
-            id=r[0], source=r[1], path=r[2], bytes=r[3] or 0, media_type=r[4] or "image",
-            format=r[5] or "", width=r[6], height=r[7], taken_at=r[8], taken_src=r[9],
-            gps_lat=r[10], gps_lon=r[11],
-            phash=phash.from_hex(r[12]) if r[12] else None,
-            exif_fields=r[13] or 0, burst_uuid=r[14], live_cid=r[15], edited=bool(r[16]),
-        )
-        for r in rows
-    ]
+    return [asset_lite_from_row(r) for r in rows]
+
+
+def load_cluster_members(conn: sqlite3.Connection, cluster_id: int) -> list[AssetLite]:
+    """All members of one cluster, regardless of asset status — the review
+    tool must show (and re-role) every member, including `canonical` ones
+    that `load_clusterable` would return but a status filter could hide."""
+    # No column of ASSET_LITE_COLUMNS collides with membership's
+    # (cluster_id, asset_id, role), so the select list needs no aliasing.
+    rows = conn.execute(
+        f"SELECT {ASSET_LITE_COLUMNS}"
+        "  FROM asset JOIN membership m ON m.asset_id = asset.id"
+        " WHERE m.cluster_id=? ORDER BY asset.id",
+        (cluster_id,),
+    ).fetchall()
+    return [asset_lite_from_row(r) for r in rows]
 
 
 def normalized_stem(path: str) -> str:
@@ -690,6 +711,45 @@ def winner_score(a: AssetLite) -> float:
     )
 
 
+def commit_cluster_decision(
+    conn: sqlite3.Connection,
+    cluster_id: int,
+    members: list[AssetLite],
+    decision: str,
+    winner_id: int,
+    confidence: float | None = None,
+) -> None:
+    """The one place a cluster decision is ever persisted — used by both
+    `decide()` (Stage D, automatic) and the manual review tool (human-made).
+    Keeping this in one function means both write paths stay identical by
+    construction, not by convention.
+
+    Only `decision == 'auto'` ever advances asset.status (clustered →
+    decided, which is what makes `dedup apply` pick the cluster up).
+    `review` and `kept_all` leave every member's status untouched — that is
+    deliberate, so `cluster()`'s re-entry logic for originals-sourced assets
+    keeps working. Commits immediately: one short write transaction per
+    cluster keeps the WAL write-lock window small for concurrent writers.
+    """
+    conn.execute(
+        "UPDATE cluster SET winner_asset_id=?, confidence=?, decision=? WHERE id=?",
+        (winner_id, confidence, decision, cluster_id),
+    )
+    for member in members:
+        role = "winner" if member.id == winner_id else (
+            "member" if decision == "kept_all" else "loser"
+        )
+        conn.execute(
+            "UPDATE membership SET role=? WHERE asset_id=?", (role, member.id)
+        )
+        if decision == "auto":
+            conn.execute(
+                "UPDATE asset SET status=? WHERE id=? AND status=?",
+                (manifest.DECIDED, member.id, manifest.CLUSTERED),
+            )
+    conn.commit()
+
+
 def _metadata_agrees(a: AssetLite, b: AssetLite) -> bool:
     if a.epoch is not None and b.epoch is not None and abs(a.epoch - b.epoch) <= TIME_BLOCK_SECONDS:
         return True
@@ -789,24 +849,10 @@ def decide(conn: sqlite3.Connection) -> dict:
 
         decision = _decide_one(members, clip_cos)
         winner = max(members, key=winner_score)
-        confidence = _confidence(members, winner)
-
-        conn.execute(
-            "UPDATE cluster SET winner_asset_id=?, confidence=?, decision=? WHERE id=?",
-            (winner.id, confidence, decision, cluster_id),
+        commit_cluster_decision(
+            conn, cluster_id, members, decision, winner.id,
+            _confidence(members, winner),
         )
-        for member in members:
-            role = "winner" if member.id == winner.id else (
-                "member" if decision == "kept_all" else "loser"
-            )
-            conn.execute(
-                "UPDATE membership SET role=? WHERE asset_id=?", (role, member.id)
-            )
-            if decision == "auto":
-                conn.execute(
-                    "UPDATE asset SET status=? WHERE id=? AND status=?",
-                    (manifest.DECIDED, member.id, manifest.CLUSTERED),
-                )
         counts[decision] += 1
     conn.commit()
     return counts

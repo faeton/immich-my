@@ -38,7 +38,8 @@ RUN pip install --no-cache-dir \
         "timezonefinder>=6.5" \
         "psycopg[binary]>=3.2" \
         "pyvips>=2.2" \
-        "numpy>=1.26"
+        "numpy>=1.26" \
+        "flask>=3.0"
 
 WORKDIR /app
 COPY pyproject.toml ./

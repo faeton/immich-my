@@ -12,6 +12,8 @@ dependencies = [
     "psycopg[binary]>=3.2",
     "pyvips>=2.2",
     "numpy>=1.26",
+    "flask>=3.0",              # `dedup review-server` — the manual review web tool
+
     "mlx-clip @ git+https://github.com/harperreed/mlx_clip.git@f56e3ecc72c74c68b6b50eb6f50c3f22fc23fe2c ; sys_platform == 'darwin' and platform_machine == 'arm64'",
     "onnxruntime>=1.18",
     "huggingface-hub>=0.23",   # snapshot_download for clip_backend 'onnx'; else only transitive via the Darwin-only mlx-* deps

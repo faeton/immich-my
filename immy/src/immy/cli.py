@@ -2996,6 +2996,39 @@ def dedup_apply(
         console.print(f"[red]error:[/red] {sample}")
 
 
+@dedup_app.command("review-server")
+def dedup_review_server(
+    manifest_path: Path = _MANIFEST_OPT,
+    port: int = typer.Option(8765, "--port"),
+    host: str = typer.Option(
+        "0.0.0.0", "--host",
+        help="Bind address INSIDE the container. Must be 0.0.0.0 for a "
+        "docker `--publish` to reach it — restrict exposure on the host "
+        "side instead (`--publish 127.0.0.1:8765:8765`).",
+    ),
+    thumb_dir: Path = typer.Option(
+        Path("/scratch/dedup-review-tool"), "--thumb-dir",
+        help="Thumbnail cache root (lazily filled, never regenerated).",
+    ),
+) -> None:
+    """Web UI for the human half of Stage D: walk `review` clusters
+    safest-first, record merge / keep-all decisions straight into the
+    manifest (same write path as `decide`). Never moves a file — `dedup
+    apply` picks up the resulting `auto` clusters later. Runs in the
+    foreground for the duration of a review session; Ctrl-C when done.
+
+        sudo docker compose -f deploy/n5/compose.yaml run --rm \\
+          --publish 127.0.0.1:8765:8765 \\
+          immy dedup review-server --manifest /state/manifest.sqlite
+
+    then `ssh -L 8765:localhost:8765 n5` and open http://localhost:8765.
+    """
+    from .dedup import review as review_mod
+
+    console.print(f"serving dedup review on http://{host}:{port} — Ctrl-C to stop")
+    review_mod.serve(manifest_path, thumb_dir, host, port)
+
+
 @dedup_app.command("status")
 def dedup_status(manifest_path: Path = _MANIFEST_OPT) -> None:
     """Counts per source × status, cluster decisions, embedding cache."""

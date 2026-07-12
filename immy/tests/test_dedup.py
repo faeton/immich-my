@@ -455,6 +455,96 @@ def test_decide_clip_does_not_override_guards():
     assert engine._decide_one([a, b], clip_cos=1.0) == "review"
 
 
+# ----------------------------------------- commit_cluster_decision (shared)
+#
+# The one persisted write path for cluster decisions, shared by decide()
+# (Stage D) and the manual review tool. The status-transition contract here
+# is what `dedup apply` builds on — regressions would silently corrupt the
+# promote/quarantine flow, so it's pinned directly.
+
+
+def _seed_cluster(tmp_path, statuses: dict[int, str]):
+    """A manifest with one cluster whose members carry the given statuses."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    conn.execute("INSERT INTO cluster (id, decision) VALUES (1, 'review')")
+    for asset_id, status in statuses.items():
+        conn.execute(
+            "INSERT INTO asset (id, source, path, status, media_type) "
+            "VALUES (?, ?, ?, ?, 'image')",
+            (asset_id,
+             "originals" if status == manifest.CANONICAL else "icloud",
+             f"/staging/IMG_{asset_id}.HEIC", status),
+        )
+        conn.execute(
+            "INSERT INTO membership (cluster_id, asset_id) VALUES (1, ?)",
+            (asset_id,),
+        )
+    conn.commit()
+    return conn
+
+
+def test_commit_cluster_decision_auto_advances_clustered_only(tmp_path):
+    conn = _seed_cluster(tmp_path, {
+        1: manifest.CLUSTERED, 2: manifest.CLUSTERED, 3: manifest.CANONICAL,
+    })
+    members = [_asset(1), _asset(2), _asset(3, source="originals")]
+    engine.commit_cluster_decision(conn, 1, members, "auto", winner_id=3,
+                                   confidence=0.9)
+
+    decision, winner, confidence = conn.execute(
+        "SELECT decision, winner_asset_id, confidence FROM cluster WHERE id=1"
+    ).fetchone()
+    assert (decision, winner, confidence) == ("auto", 3, 0.9)
+
+    roles = dict(conn.execute("SELECT asset_id, role FROM membership"))
+    assert roles == {1: "loser", 2: "loser", 3: "winner"}
+
+    statuses = dict(conn.execute("SELECT id, status FROM asset"))
+    # clustered members advance to decided (what `apply` selects on);
+    # the canonical member must NOT move — apply never touches canonicals.
+    assert statuses == {
+        1: manifest.DECIDED, 2: manifest.DECIDED, 3: manifest.CANONICAL,
+    }
+
+
+def test_commit_cluster_decision_kept_all_touches_no_status(tmp_path):
+    conn = _seed_cluster(tmp_path, {1: manifest.CLUSTERED, 2: manifest.CLUSTERED})
+    members = [_asset(1), _asset(2)]
+    engine.commit_cluster_decision(conn, 1, members, "kept_all", winner_id=1)
+
+    decision, winner = conn.execute(
+        "SELECT decision, winner_asset_id FROM cluster WHERE id=1"
+    ).fetchone()
+    assert (decision, winner) == ("kept_all", 1)
+
+    roles = dict(conn.execute("SELECT asset_id, role FROM membership"))
+    assert roles == {1: "winner", 2: "member"}
+
+    # kept_all members stay `clustered` forever — same as machine-made
+    # kept_all clusters; advancing them would break cluster() re-entry.
+    statuses = set(conn.execute("SELECT status FROM asset"))
+    assert statuses == {(manifest.CLUSTERED,)}
+
+
+def test_commit_cluster_decision_commits_immediately(tmp_path):
+    conn = _seed_cluster(tmp_path, {1: manifest.CLUSTERED, 2: manifest.CLUSTERED})
+    engine.commit_cluster_decision(conn, 1, [_asset(1), _asset(2)], "auto",
+                                   winner_id=1)
+    # A second connection must see the decision without conn committing again
+    # (the review tool's per-request connections rely on this).
+    other = sqlite3.connect(tmp_path / "m.sqlite")
+    assert other.execute("SELECT decision FROM cluster WHERE id=1").fetchone() == ("auto",)
+
+
+def test_load_cluster_members_includes_all_statuses(tmp_path):
+    conn = _seed_cluster(tmp_path, {
+        1: manifest.CLUSTERED, 2: manifest.CANONICAL,
+    })
+    members = engine.load_cluster_members(conn, 1)
+    assert [m.id for m in members] == [1, 2]
+    assert members[1].source == "originals"
+
+
 # ----------------------------------------------------------- end-to-end lite
 
 
