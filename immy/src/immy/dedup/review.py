@@ -31,6 +31,7 @@ import os
 import sqlite3
 import subprocess
 import threading
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import manifest, phash, signals
@@ -282,6 +283,47 @@ def _band_of(px: float | None) -> int | None:
     return None
 
 
+SCENE_WINDOW_SECONDS = 30
+
+
+def scene_neighbor(
+    conn: sqlite3.Connection, members: list[AssetLite]
+) -> tuple[str, int] | None:
+    """(decision, cluster_id) of an already-decided cluster shot within
+    ±30s of this one — bursts get pairwise-clustered into several small
+    clusters, so the reviewer keeps re-meeting scenes they already ruled
+    on. Surfacing the earlier ruling turns those re-encounters into
+    one-glance confirms. Uses idx_asset_taken (ISO text ranges)."""
+    for m in members:
+        if m.taken_src not in ("exif", "json", "companion") or not m.taken_at:
+            continue
+        try:
+            t = datetime.fromisoformat(m.taken_at)
+        except ValueError:
+            continue
+        window = timedelta(seconds=SCENE_WINDOW_SECONDS)
+        row = conn.execute(
+            "SELECT c.decision, c.id FROM asset a"
+            "  JOIN membership m2 ON m2.asset_id = a.id"
+            "  JOIN cluster c ON c.id = m2.cluster_id"
+            " WHERE c.decision IN ('auto','kept_all')"
+            "   AND a.taken_at BETWEEN ? AND ? LIMIT 1",
+            ((t - window).isoformat(), (t + window).isoformat()),
+        ).fetchone()
+        if row:
+            return (row[0], row[1])
+    return None
+
+
+def scene_chip(neighbor: tuple[str, int] | None) -> str:
+    if neighbor is None:
+        return ""
+    decision, cid = neighbor
+    label = "merged" if decision == "auto" else "kept all"
+    return (f"<span class='scene' title='a cluster shot within {SCENE_WINDOW_SECONDS}s "
+            f"is already decided'>same scene: you {label} (#{cid})</span>")
+
+
 def pixel_chip(pixel_ncc: float | None, time_delta: float | None) -> str:
     """Signal chip for the `dedup rescore` scores: green = pixels correlate
     like a same-frame re-export, blue = they diverge like distinct shots."""
@@ -329,6 +371,8 @@ table.cat td a{font-weight:600}
 table.cat small{color:#777;font-weight:400}
 .filternote{background:#1d2f46;border:1px solid #2f4a6f;border-radius:4px;
             padding:1px 8px;font-size:.78rem;color:#9fc0dc}
+.scene{background:#33203a;border:1px solid #5f3f6f;border-radius:4px;
+       padding:1px 8px;font-size:.75rem;color:#c9a0d0}
 .path{color:#888;word-break:break-all;font-size:.72rem;margin-top:3px}
 .score{color:var(--dim)}
 .actions{position:sticky;bottom:0;background:#111d;backdrop-filter:blur(4px);padding:12px 0;margin-top:14px;
@@ -474,6 +518,7 @@ def render_cluster(
     counts: dict,
     prefetch_ids: tuple[int, ...] = (),
     signal: tuple[float | None, float | None] = (None, None),
+    neighbor: tuple[str, int] | None = None,
 ) -> str:
     suggested = default_winner(members)
     locked = any(m.source == "originals" for m in members)
@@ -541,6 +586,7 @@ def render_cluster(
       <span class="reason" title="which Stage D check routed this cluster to review">
         {html.escape(review_reason(members))}</span>
       {pixel_chip(*signal)}
+      {scene_chip(neighbor)}
       <span class="modeswitch"><a href="/categories">categories</a> &middot;
         <a href="/batch">batch mode &rarr;</a></span>
     </header>
@@ -633,7 +679,10 @@ def render_categories(
     <footer>Rows: which Stage D guard routed the cluster to review.
       Columns: pixel-identity band from <code>dedup rescore</code>
       (&ge;0.90 leans same-frame duplicate, &le;0.75 leans distinct shots).
-      Click any count to review exactly that slice in batch mode.</footer>
+      Click any count to review exactly that slice in batch mode.
+      {counts.get('skipped', 0):,} clusters skipped
+      <button onclick="fetch('/api/clear-skips',{{method:'POST'}}).then(()=>location.reload())">
+        bring skipped back</button></footer>
     """
     return _page("dedup review — categories", body)
 
@@ -732,6 +781,7 @@ def render_batch(rows: list[dict], counts: dict, filter_note: str = "") -> str:
             keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}<br>
             <span class="reason">{html.escape(review_reason(row['members']))}</span><br>
             {pixel_chip(*row.get('signal', (None, None)))}
+            {scene_chip(row.get('scene'))}
           </div>
         </div>""")
 
@@ -778,13 +828,32 @@ def create_app(manifest_path: Path, thumb_root: Path):
     from flask import Flask, abort, jsonify, request, send_file
 
     app = Flask("immy-dedup-review")
-    # In-process only: clusters the user skipped this session. No manifest
-    # write — a skipped cluster stays decision='review' and reappears after
-    # a restart, which is exactly the "come back to it later" semantic.
-    skipped: set[int] = set()
 
     def db() -> sqlite3.Connection:
         return manifest.open_manifest(manifest_path)
+
+    # Skips persist in a side table — restarts (every redeploy) used to
+    # resurface everything the reviewer had set aside, which read as "the
+    # tool is showing me things I already did". A skip still writes no
+    # decision; clear-skips brings them all back deliberately.
+    skipped: set[int] = set()
+    boot = db()
+    try:
+        boot.execute(
+            "CREATE TABLE IF NOT EXISTS review_skip (cluster_id INTEGER PRIMARY KEY)"
+        )
+        boot.commit()
+        skipped.update(r[0] for r in boot.execute("SELECT cluster_id FROM review_skip"))
+    finally:
+        boot.close()
+
+    def persist_skips(conn: sqlite3.Connection, cluster_ids) -> None:
+        conn.executemany(
+            "INSERT OR IGNORE INTO review_skip (cluster_id) VALUES (?)",
+            [(int(c),) for c in cluster_ids],
+        )
+        conn.commit()
+        skipped.update(int(c) for c in cluster_ids)
 
     @app.get("/")
     def index():
@@ -829,6 +898,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
         return render_cluster(
             cluster_id, row[1], members, _counts(conn), prefetch,
             signal=signals.get_signal(conn, cluster_id),
+            neighbor=scene_neighbor(conn, members),
         )
 
     @app.post("/api/decide/<int:cluster_id>")
@@ -905,8 +975,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     _confidence(members, winner),
                 )
                 merged += 1
-            for cid in payload.get("skip") or []:
-                skipped.add(int(cid))
+            persist_skips(conn, payload.get("skip") or [])
             return jsonify(ok=True, merged=merged, failed=failed)
         finally:
             conn.close()
@@ -1000,7 +1069,9 @@ def create_app(manifest_path: Path, thumb_root: Path):
             for _cid, members, px in _load_all_pending(conn, skipped):
                 key = (reason_slug(members), _band_of(px))
                 grid[key] = grid.get(key, 0) + 1
-            return render_categories(grid, _counts(conn))
+            counts = _counts(conn)
+            counts["skipped"] = len(skipped)
+            return render_categories(grid, counts)
         finally:
             conn.close()
 
@@ -1028,10 +1099,16 @@ def create_app(manifest_path: Path, thumb_root: Path):
                 if reason and reason_slug(members) != reason:
                     continue
                 selected.append((cid, members, px))
-                if len(selected) >= BATCH_SIZE:
-                    break
             if not selected:
                 return render_done(_counts(conn))
+            # Time order (default): a burst's sibling clusters land on the
+            # same page instead of scattered across the cos sort — one
+            # scene, one glance. ?sort=cos restores safest-first.
+            if args.get("sort", "time") == "time":
+                selected.sort(key=lambda item: min(
+                    (m.taken_at for m in item[1] if m.taken_at), default="9999"
+                ))
+            selected = selected[:BATCH_SIZE]
             rows = []
             for cid, members, _px in selected:
                 sim = conn.execute(
@@ -1043,6 +1120,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     "members": members,
                     "winner_id": default_winner(members).id,
                     "signal": signals.get_signal(conn, cid),
+                    "scene": scene_neighbor(conn, members),
                 })
             return render_batch(rows, _counts(conn), ", ".join(notes))
         finally:
@@ -1050,8 +1128,24 @@ def create_app(manifest_path: Path, thumb_root: Path):
 
     @app.post("/api/skip/<int:cluster_id>")
     def skip_cluster(cluster_id: int):
-        skipped.add(cluster_id)
+        conn = db()
+        try:
+            persist_skips(conn, [cluster_id])
+        finally:
+            conn.close()
         return jsonify(ok=True, skipped=len(skipped))
+
+    @app.post("/api/clear-skips")
+    def clear_skips():
+        conn = db()
+        try:
+            conn.execute("DELETE FROM review_skip")
+            conn.commit()
+        finally:
+            conn.close()
+        n = len(skipped)
+        skipped.clear()
+        return jsonify(ok=True, cleared=n)
 
     @app.get("/thumb/<int:asset_id>")
     def thumb(asset_id: int):

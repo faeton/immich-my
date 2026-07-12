@@ -25,20 +25,21 @@ def _seed(tmp_path: Path):
     """
     conn = manifest.open_manifest(tmp_path / "m.sqlite")
     rows = [
-        # id, source, path, status, cluster, clip
-        (1, "icloud", "/staging/icloud/IMG_1.HEIC", manifest.CLUSTERED),
-        (2, "google", "/staging/google/IMG_1.JPG", manifest.CLUSTERED),
-        (3, "google", "/staging/google/IMG_2.JPG", manifest.CLUSTERED),
-        (4, "originals", "/originals/2024/06/IMG_2.HEIC", manifest.CANONICAL),
-        (5, "icloud", "/staging/icloud/IMG_3.HEIC", manifest.DECIDED),
-        (6, "google", "/staging/google/IMG_3.JPG", manifest.DECIDED),
+        # id, source, path, status, taken_at — clusters 1 and 3 share a
+        # scene window (±30s); cluster 2 is an hour later
+        (1, "icloud", "/staging/icloud/IMG_1.HEIC", manifest.CLUSTERED, "2025-06-01T12:00:00"),
+        (2, "google", "/staging/google/IMG_1.JPG", manifest.CLUSTERED, "2025-06-01T12:00:01"),
+        (3, "google", "/staging/google/IMG_2.JPG", manifest.CLUSTERED, "2025-06-01T13:00:00"),
+        (4, "originals", "/originals/2024/06/IMG_2.HEIC", manifest.CANONICAL, "2025-06-01T13:00:01"),
+        (5, "icloud", "/staging/icloud/IMG_3.HEIC", manifest.DECIDED, "2025-06-01T12:00:10"),
+        (6, "google", "/staging/google/IMG_3.JPG", manifest.DECIDED, "2025-06-01T12:00:11"),
     ]
-    for asset_id, source, path, status in rows:
+    for asset_id, source, path, status, taken_at in rows:
         conn.execute(
             "INSERT INTO asset (id, source, path, status, media_type, format,"
-            " width, height, bytes, exif_fields)"
-            " VALUES (?, ?, ?, ?, 'image', 'jpg', 4032, 3024, 1000000, 30)",
-            (asset_id, source, path, status),
+            " width, height, bytes, exif_fields, taken_at, taken_src)"
+            " VALUES (?, ?, ?, ?, 'image', 'jpg', 4032, 3024, 1000000, 30, ?, 'exif')",
+            (asset_id, source, path, status, taken_at),
         )
     clusters = [(1, "review", 0.99), (2, "review", 0.95), (3, "auto", 1.0)]
     for cid, decision, cos in clusters:
@@ -311,6 +312,35 @@ def test_categories_page_cross_tabulates_queue(client):
     assert "phash-weak" in page
     assert "/batch?reason=phash-weak&amp;min_px=0.9" in page
     assert "/batch?reason=phash-weak&amp;max_px=0.75" in page
+
+
+def test_scene_chip_shows_prior_ruling_for_nearby_capture(client):
+    c, _ = client
+    # cluster 1 (12:00:00) is within 30s of decided cluster 3's members
+    page = c.get("/").get_data(as_text=True)
+    assert "same scene: you merged (#3)" in page
+    # cluster 2 (13:00) has no decided neighbour
+    assert "same scene" not in c.get("/cluster/2").get_data(as_text=True)
+
+
+def test_skips_persist_across_server_restarts(client, tmp_path):
+    c, db_path = client
+    assert c.post("/api/skip/1").status_code == 200
+    # a fresh app instance (= server restart) must still honor the skip
+    fresh = review.create_app(db_path, tmp_path / "thumbs2")
+    with fresh.test_client() as c2:
+        assert "cluster 2" in c2.get("/").get_data(as_text=True)
+        # clear-skips brings it back
+        assert c2.post("/api/clear-skips").get_json()["cleared"] == 1
+        assert "cluster 1" in c2.get("/").get_data(as_text=True)
+
+
+def test_batch_default_sort_is_capture_time(client):
+    c, db_path = client
+    _seed_signals(db_path, [(1, 0.95, 0.0), (2, 0.60, 4.0)])
+    page = c.get("/batch").get_data(as_text=True)
+    # cluster 1 (12:00) before cluster 2 (13:00) regardless of cos order
+    assert page.index('data-cid="1"') < page.index('data-cid="2"')
 
 
 def test_batch_pixel_band_filter(client):
