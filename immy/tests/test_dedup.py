@@ -545,6 +545,57 @@ def test_load_cluster_members_includes_all_statuses(tmp_path):
     assert members[1].source == "originals"
 
 
+# ------------------------------------------------------ promote_rest (F)
+
+
+def test_promote_rest_moves_only_keepers(tmp_path):
+    """fingerprinted singletons + clustered members move to originals;
+    decided/canonical/error/originals-source assets are untouched."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    staging = tmp_path / "staging"
+    originals = tmp_path / "originals"
+    staging.mkdir(), originals.mkdir()
+
+    cases = [
+        # id, status, should_move
+        (1, manifest.FINGERPRINTED, True),    # singleton
+        (2, manifest.CLUSTERED, True),        # kept_all / review member
+        (3, manifest.DECIDED, False),         # apply's queue, not ours
+        (4, manifest.ERROR, False),
+    ]
+    for asset_id, status, _ in cases:
+        p = staging / f"IMG_{asset_id}.JPG"
+        p.write_bytes(b"x" * (100 * asset_id))
+        conn.execute(
+            "INSERT INTO asset (id, source, path, status, bytes, taken_at) "
+            "VALUES (?, 'icloud', ?, ?, ?, '2024-06-15T10:00:00')",
+            (asset_id, str(p), status, 100 * asset_id),
+        )
+    # an originals-source asset must never be selected regardless of status
+    conn.execute(
+        "INSERT INTO asset (id, source, path, status, bytes) "
+        "VALUES (9, 'originals', ?, ?, 50)",
+        (str(originals / "already.jpg"), manifest.CANONICAL),
+    )
+    conn.commit()
+
+    dry = engine.promote_rest(conn, originals_root=originals, dry_run=True)
+    assert dry["promoted"] == 2 and dry["errors"] == 0
+    assert (staging / "IMG_1.JPG").exists()   # dry-run moved nothing
+
+    result = engine.promote_rest(conn, originals_root=originals, dry_run=False)
+    assert result["promoted"] == 2 and result["errors"] == 0
+    dest = originals / "2024" / "06"
+    assert (dest / "IMG_1.JPG").exists() and (dest / "IMG_2.JPG").exists()
+    assert not (staging / "IMG_1.JPG").exists()
+    assert (staging / "IMG_3.JPG").exists()   # decided stays for apply
+    statuses = dict(conn.execute("SELECT id, status FROM asset"))
+    assert statuses[1] == statuses[2] == manifest.PROMOTED
+    assert statuses[3] == manifest.DECIDED and statuses[4] == manifest.ERROR
+    # idempotent: nothing left to do
+    assert engine.promote_rest(conn, originals_root=originals, dry_run=False)["promoted"] == 0
+
+
 # ------------------------------------------------- pixel signals (rescore)
 
 
