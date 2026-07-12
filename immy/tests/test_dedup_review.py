@@ -196,6 +196,36 @@ def test_batch_merges_checked_and_skips_unchecked(client):
     assert "No image review clusters left" in c.get("/batch").get_data(as_text=True)
 
 
+def test_threshold_sweep_merges_only_at_or_above_cos(client):
+    c, db_path = client
+    # dry run: only cluster 1 (0.99) clears 0.98; nothing is written
+    pre = c.post("/api/decide-threshold", json={"min_cos": 0.98, "dry_run": True})
+    assert pre.get_json() == {"count": 1}
+    assert _decision(db_path, 1) == ("review", None)
+    # real sweep merges cluster 1 with its recommended winner (icloud asset 1
+    # outscores google asset 2); cluster 2 (0.95) is untouched
+    out = c.post("/api/decide-threshold", json={"min_cos": 0.98}).get_json()
+    assert out["merged"] == 1 and out["failed"] == []
+    assert _decision(db_path, 1) == ("auto", 1)
+    assert _decision(db_path, 2) == ("review", None)
+
+
+def test_threshold_sweep_uses_originals_winner_and_skips_hesitations(client):
+    c, db_path = client
+    # a skipped cluster is an explicit hesitation — the sweep must not take it
+    c.post("/api/skip/1")
+    out = c.post("/api/decide-threshold", json={"min_cos": 0.95}).get_json()
+    assert out["merged"] == 1
+    assert _decision(db_path, 1) == ("review", None)   # skipped, untouched
+    assert _decision(db_path, 2) == ("auto", 4)        # originals member wins
+
+
+def test_threshold_sweep_refuses_low_bar(client):
+    c, _ = client
+    assert c.post("/api/decide-threshold", json={"min_cos": 0.5}).status_code == 400
+    assert c.post("/api/decide-threshold", json={}).status_code == 400
+
+
 def test_batch_enforces_originals_guard_per_cluster(client):
     c, db_path = client
     res = c.post("/api/decide-batch", json={"decisions": [

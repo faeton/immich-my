@@ -223,7 +223,12 @@ footer{margin-top:18px;color:#666;font-size:.75rem}
 .brow{display:flex;gap:8px;align-items:center;border:2px solid #2f6f34;border-radius:8px;
       padding:6px;margin-bottom:8px;background:var(--panel);cursor:pointer}
 .brow.unchecked{border-color:#333;opacity:.45}
-.brow img{height:180px;max-width:260px;object-fit:contain;background:#000;border-radius:4px}
+.brow img{height:320px;max-width:480px;object-fit:contain;background:#000;border-radius:4px}
+.thresh{display:flex;gap:8px;align-items:center;margin-left:auto}
+.thresh input{width:6.5em;font-size:.9rem;padding:8px;border-radius:8px;border:1px solid #444;
+              background:#1a1a1a;color:#eee}
+button.danger{background:#4a1d1d;border-color:#6f2f2f}
+button.danger:hover{background:#5a2424}
 .brow .keepmark{outline:3px solid #4caf50;outline-offset:-3px}
 .brow .bmeta{font-size:.72rem;color:#aaa;min-width:130px}
 .brow .check{font-size:1.3rem;width:1.4em;text-align:center;color:#4caf50}
@@ -417,6 +422,10 @@ def render_done(counts: dict) -> str:
 
 
 _BATCH_JS = """
+// A submitted page must come back at the top — the next batch starts there.
+history.scrollRestoration = 'manual';
+window.scrollTo(0, 0);
+
 document.addEventListener('click', ev => {
   const row = ev.target.closest('.brow');
   if (row) row.classList.toggle('unchecked');
@@ -441,13 +450,32 @@ async function submitBatch() {
     const out = await res.json();
     if (!res.ok) throw new Error(out.error || res.statusText);
     if (out.failed && out.failed.length) alert('some failed: ' + JSON.stringify(out.failed));
-    window.location.reload();
+    window.location.href = '/batch';
   } catch (e) {
     alert('batch failed: ' + e.message);
     inflight = false;
   }
 }
+async function mergeThreshold() {
+  if (inflight) return;
+  const min = parseFloat(document.getElementById('mincos').value);
+  if (!(min > 0.9)) { alert('threshold must be above 0.9'); return; }
+  const call = dry => fetch('/api/decide-threshold', {method: 'POST',
+    headers: {'Content-Type': 'application/json'},
+    body: JSON.stringify({min_cos: min, dry_run: dry})}).then(r => r.json());
+  const pre = await call(true);
+  if (!pre.count) { alert('nothing at or above cos ' + min); return; }
+  if (!confirm('Merge ALL ' + pre.count + ' remaining clusters with cos \\u2265 ' + min +
+               ', keeping the recommended winner in each? This records real decisions ' +
+               '(same as pressing Enter on each one).')) return;
+  inflight = true;
+  const out = await call(false);
+  alert('merged ' + out.merged +
+        (out.failed && out.failed.length ? ', failed ' + out.failed.length : ''));
+  window.location.href = '/batch';
+}
 document.addEventListener('keydown', ev => {
+  if (ev.target.tagName === 'INPUT') return;
   if (ev.key === 'Enter') { submitBatch(); ev.preventDefault(); }
 });
 updateCount();
@@ -491,10 +519,17 @@ def render_batch(rows: list[dict], counts: dict) -> str:
     <div>{''.join(body_rows)}</div>
     <div class="actions">
       <button class="merge" id="mergebtn" onclick="submitBatch()">Merge checked</button>
+      <span class="thresh">
+        <label for="mincos">everything above is dupes?</label>
+        <input id="mincos" type="number" step="0.0001" min="0.9" max="1" value="0.9990">
+        <button class="danger" onclick="mergeThreshold()">Merge ALL &ge; cos</button>
+      </span>
     </div>
     <footer>Merging keeps the outlined member and marks the rest as losers
       (same manifest write as single mode, originals-guard enforced server-side).
-      Unchecked rows are skipped for this session and stay in the queue.</footer>
+      Unchecked rows are skipped for this session and stay in the queue.
+      "Merge ALL &ge; cos" sweeps every remaining cluster at or above the
+      threshold with its recommended winner — count and confirm shown first.</footer>
     <script>{_BATCH_JS}</script>
     """
     return _page("dedup review — batch", body)
@@ -638,6 +673,52 @@ def create_app(manifest_path: Path, thumb_root: Path):
             for cid in payload.get("skip") or []:
                 skipped.add(int(cid))
             return jsonify(ok=True, merged=merged, failed=failed)
+        finally:
+            conn.close()
+
+    @app.post("/api/decide-threshold")
+    def decide_threshold():
+        """Sweep-merge every pending cluster at or above a cos threshold,
+        each with its recommended (originals-locked) winner. The human
+        authorizes the band wholesale after having eyeballed its head —
+        equivalent to pressing Enter on each cluster, not a new kind of
+        write. Session-skipped clusters are excluded: a skip means 'unsure',
+        and a sweep must never override an explicit human hesitation."""
+        payload = request.get_json(force=True, silent=True) or {}
+        try:
+            min_cos = float(payload["min_cos"])
+        except (KeyError, TypeError, ValueError):
+            return jsonify(error="min_cos required"), 400
+        if min_cos <= 0.9:
+            return jsonify(error="refusing a sweep below cos 0.9"), 400
+        conn = db()
+        try:
+            ids = [
+                cid for (cid,) in conn.execute(
+                    "SELECT id FROM cluster WHERE decision='review'"
+                    " AND clip_cos_sim >= ? ORDER BY clip_cos_sim DESC, id ASC",
+                    (min_cos,),
+                )
+                if cid not in skipped
+            ]
+            if payload.get("dry_run"):
+                return jsonify(count=len(ids))
+            merged, failed = 0, []
+            for cid in ids:
+                members = load_cluster_members(conn, cid)
+                if not members:
+                    continue
+                winner = default_winner(members)
+                error, checked = validate_merge(conn, cid, winner.id)
+                if error:
+                    failed.append({"cluster_id": cid, "error": error[1]})
+                    continue
+                commit_cluster_decision(
+                    conn, cid, checked, "auto", winner.id,
+                    _confidence(checked, winner),
+                )
+                merged += 1
+            return jsonify(ok=True, merged=merged, failed=failed[:10])
         finally:
             conn.close()
 
