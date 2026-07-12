@@ -2773,7 +2773,7 @@ def apple_people(
 
 dedup_app = typer.Typer(
     help="Cross-source dedup (iCloud + Google Takeout → library/originals). "
-    "Cascade: block → pHash → decide; CLIP confirm lands after calibration.",
+    "Cascade: block → pHash → CLIP-confirm → decide.",
     no_args_is_help=True,
 )
 
@@ -2880,12 +2880,55 @@ def dedup_cluster(manifest_path: Path = _MANIFEST_OPT) -> None:
         console.print(f"[yellow]{warning}[/yellow]")
 
 
+@dedup_app.command("confirm")
+def dedup_confirm(
+    manifest_path: Path = _MANIFEST_OPT,
+    config_path: Path = typer.Option(None, "--config", help="immy config.yml (reads the `ml:` block)."),
+) -> None:
+    """Stage C: CLIP-confirm clusters `cluster` left ambiguous.
+
+    Attaches `clip_cos_sim` (min cosine(winner, member) over image members)
+    to every pending/review cluster missing one — cached per-asset in
+    `embedding` so re-runs only pay for new clusters. Run this after
+    `cluster`, before `decide` (or again later — `decide` re-reads
+    `clip_cos_sim` on every pass, so it also picks up backfilled clusters).
+    Doesn't move or decide anything by itself.
+    """
+    from .dedup import engine as engine_mod
+
+    config = load_config(config_path)
+    model_name = (
+        config.ml.clip_model
+        if (config.ml is not None and config.ml.clip_model)
+        else clip_mod.DEFAULT_MODEL
+    )
+    backend = os.environ.get("IMMY_CLIP_BACKEND") or (
+        config.ml.clip_backend if config.ml is not None else "mlx"
+    )
+    endpoint = os.environ.get("IMMY_IMMICH_ML_URL") or (
+        config.ml.immich_ml_url if config.ml is not None else None
+    )
+
+    _, conn = _open_manifest(manifest_path)
+    result = engine_mod.confirm_clip(
+        conn, backend=backend, endpoint=endpoint, model_name=model_name,
+        progress=_dedup_progress,
+    )
+    color = "red" if result["failed"] else "green"
+    console.print(
+        f"[green]{result['ok']} confirmed[/green], "
+        f"[{color}]{result['failed']} failed[/{color}] "
+        f"(of {result['total']} clusters needing CLIP)"
+    )
+
+
 @dedup_app.command("decide")
 def dedup_decide(manifest_path: Path = _MANIFEST_OPT) -> None:
-    """Stage D on pending clusters. CLIP-less v1: auto-merge needs strong
-    pHash + an agreeing metadata signal; guards (burst/Live/edited/crop)
-    and anything softer route to review. No files are moved — promote is
-    a separate, later command."""
+    """Stage D on pending/review clusters. Auto-merge needs strong pHash
+    (or a CLIP Stage C confirm past the calibrated bar) + an agreeing
+    metadata signal; guards (burst/Live/edited/crop) and anything softer
+    route to review. No files are moved — promote is a separate, later
+    command."""
     from .dedup import engine as engine_mod
 
     _, conn = _open_manifest(manifest_path)
@@ -2894,6 +2937,63 @@ def dedup_decide(manifest_path: Path = _MANIFEST_OPT) -> None:
         f"[green]auto {counts['auto']}[/green] · review {counts['review']} · "
         f"kept_all {counts['kept_all']}"
     )
+
+
+@dedup_app.command("apply")
+def dedup_apply(
+    manifest_path: Path = _MANIFEST_OPT,
+    originals_root: Path = typer.Option(
+        ..., "--originals", exists=True, file_okay=False, resolve_path=True,
+        help="Immich external library root — winners land in <root>/<YYYY>/<MM>/.",
+    ),
+    quarantine_root: Path = typer.Option(
+        ..., "--quarantine", file_okay=False, resolve_path=True,
+        help="Losers land here, mirroring their staging path. Never purged by this command.",
+    ),
+    write: bool = typer.Option(False, "--write", help="Move files for real (default: dry-run report)."),
+    limit: int = typer.Option(None, "--limit", help="Cap assets processed this run (testing/batching)."),
+) -> None:
+    """Stage E on `decide`'s `auto` clusters: promote winners into the
+    Immich library, quarantine losers. Nothing before this command has
+    ever moved a file — `decide` only writes a decision. Idempotent
+    (asset.status advances on success, crash-safe mid-move) and resumable
+    via --limit batching. Refuses to run if another `--write` apply is
+    already in progress against this manifest."""
+    from .dedup import engine as engine_mod
+
+    quarantine_root.mkdir(parents=True, exist_ok=True)
+    lock_path = manifest_path.with_suffix(".apply.lock")
+    lock_fd = None
+    if write:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            console.print(
+                f"[red]another --write apply looks to be in progress[/red] "
+                f"(lock file exists: {lock_path}). If that's stale (a prior run crashed "
+                f"hard), delete the lock file and retry."
+            )
+            raise typer.Exit(1)
+
+    try:
+        _, conn = _open_manifest(manifest_path)
+        result = engine_mod.apply_decisions(
+            conn, originals_root=originals_root, quarantine_root=quarantine_root,
+            dry_run=not write, limit=limit,
+        )
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
+
+    prefix = "[yellow]dry-run[/yellow] " if not write else "[green]applied[/green] "
+    console.print(
+        f"{prefix}promote {result['promoted']} ({result['promoted_bytes'] / 1e9:.1f} GB) · "
+        f"quarantine {result['quarantined']} ({result['quarantined_bytes'] / 1e9:.1f} GB) · "
+        f"sidecars {result['sidecars_written']} · errors {result['errors']}"
+    )
+    for sample in result["error_samples"]:
+        console.print(f"[red]error:[/red] {sample}")
 
 
 @dedup_app.command("status")

@@ -11,6 +11,7 @@ Modules:
     manifest — manifest.sqlite ledger (status lifecycle, watermarks,
                embedding cache)
     phash    — 64-bit DCT perceptual hash (Stage B)
-    engine   — fingerprint / block / cluster / decide (Stages A, B, D;
-               Stage C CLIP-confirm lands after threshold calibration)
+    engine   — fingerprint / block / cluster / confirm / decide
+               (Stages A, B, C, D — see engine.CLIP_AUTO_THRESHOLD for the
+               Stage C calibration note)
 """

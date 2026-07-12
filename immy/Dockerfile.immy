@@ -16,11 +16,14 @@ FROM python:3.12-slim
 
 # Media toolchain: ffmpeg gives ffmpeg+ffprobe; libimage-exiftool-perl gives
 # /usr/bin/exiftool (pyexiftool shells out to it); libvips42 is the runtime
-# pyvips loads via ctypes.
+# pyvips loads via ctypes; rsync is promote's transfer tool — unused until
+# promote started running in-container against the local /originals mount
+# instead of only from the Mac over ssh.
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         libvips42 \
         libimage-exiftool-perl \
+        rsync \
         ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 

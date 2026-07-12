@@ -150,6 +150,52 @@ def test_manifest_fingerprint_whitelist(tmp_path):
     assert manifest.pending_fingerprint(conn) == []
 
 
+def test_manifest_migration_adds_clip_cos_sim_column(tmp_path):
+    """Simulate a v1 manifest (predates `cluster.clip_cos_sim`) and confirm
+    `open_manifest` migrates it in place — n5's live manifest is exactly
+    this case: schema grows, existing rows don't move."""
+    path = tmp_path / "m.sqlite"
+    conn = sqlite3.connect(path)
+    conn.executescript(
+        """
+        CREATE TABLE cluster (
+          id INTEGER PRIMARY KEY, winner_asset_id INTEGER, confidence REAL,
+          decision TEXT NOT NULL DEFAULT 'pending'
+        );
+        CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+        INSERT INTO meta (key, value) VALUES ('schema_version', '1');
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    reopened = manifest.open_manifest(path)
+    cols = {row[1] for row in reopened.execute("PRAGMA table_info(cluster)")}
+    assert "clip_cos_sim" in cols
+    assert manifest.get_meta(reopened, "schema_version") == "2"
+
+
+def test_manifest_embedding_roundtrip(tmp_path):
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    root = tmp_path / "s"
+    root.mkdir()
+    (root / "a.jpg").write_bytes(b"j")
+    manifest.register(conn, "icloud", root)
+    (asset_id,) = conn.execute("SELECT id FROM asset LIMIT 1").fetchone()
+
+    assert manifest.get_embedding(conn, asset_id, "ViT-B-32__openai") is None
+    manifest.set_embedding(conn, asset_id, "ViT-B-32__openai", [0.1, 0.2, 0.3])
+    conn.commit()
+
+    vec = manifest.get_embedding(conn, asset_id, "ViT-B-32__openai")
+    assert vec is not None and len(vec) == 3
+    assert abs(vec[0] - 0.1) < 1e-5
+
+    # A different model name is a cache miss — embeddings aren't comparable
+    # across models.
+    assert manifest.get_embedding(conn, asset_id, "other-model") is None
+
+
 # ------------------------------------------------------------------ blocking
 
 
@@ -207,6 +253,104 @@ def test_normalized_stem():
     assert engine.normalized_stem("/a/IMG_1234(1).JPG") == "img_1234"
     assert engine.normalized_stem("/a/IMG_1234-edited.jpg") == "img_1234"
     assert engine.normalized_stem("/a/PXL_20240101-EFFECTS.jpg") == "pxl_20240101"
+
+
+# --------------------------------------------------------- video pair evidence
+#
+# Regression coverage for the 2026-07-12 fix: generic camera filename
+# counters (IMG_0001.MOV...) recur over 15+ years of device use, and videos
+# get no pHash to reject a coincidental stem match later. A bare shared
+# block is only trustworthy evidence for a video pair when it's checkable:
+# byte-identical, or both sides carry an independently reliable capture
+# time that's actually close together.
+
+
+def _video(id: int, **kwargs) -> engine.AssetLite:
+    kwargs.setdefault("media_type", "video")
+    kwargs.setdefault("format", "mov")
+    kwargs.setdefault("phash_value", None)
+    return _asset(id, **kwargs)
+
+
+def test_pair_evidence_video_byte_identical_is_strong_regardless_of_dates():
+    a = _video(1, path="IMG_0580.MOV", bytes=123456,
+               taken_at="2011-01-01T00:00:00", taken_src="mtime")
+    b = _video(2, path="IMG_0580.MOV", bytes=123456,
+               taken_at="2026-06-20T00:00:00", taken_src="mtime")
+    assert engine._pair_evidence(a, b) == ("strong", None)
+
+
+def test_pair_evidence_video_reliable_close_dates_is_candidate():
+    a = _video(1, path="IMG_0680.MOV", bytes=100,
+               taken_at="2019-04-14T20:38:51", taken_src="exif")
+    b = _video(2, path="IMG_0683.MOV", bytes=200,
+               taken_at="2019-04-14T21:01:23", taken_src="exif")
+    assert engine._pair_evidence(a, b) == ("candidate", None)
+
+
+def test_pair_evidence_video_reliable_but_far_apart_is_rejected():
+    # The actual bug: two real EXIF-dated clips 14 months apart, coincidental
+    # filename-counter collision (confirmed live: DJI_0079 SF <-> Cyprus).
+    a = _video(1, path="DJI_0079.MOV", bytes=100,
+               taken_at="2024-03-18T03:18:59", taken_src="exif")
+    b = _video(2, path="DJI_0079.MP4", bytes=200,
+               taken_at="2025-05-18T15:55:10", taken_src="exif")
+    assert engine._pair_evidence(a, b) is None
+
+
+def test_pair_evidence_video_unreliable_timestamp_is_rejected():
+    # taken_src='mtime' reflects copy/unpack time, not shoot time -- a bare
+    # stem match plus an unreliable timestamp on either side is coincidence.
+    a = _video(1, path="IMG_0001.MOV", bytes=100, taken_src="exif",
+               taken_at="2020-01-01T00:00:00")
+    b = _video(2, path="IMG_0001.MOV", bytes=200, taken_src="mtime",
+               taken_at="2020-01-01T00:05:00")
+    assert engine._pair_evidence(a, b) is None
+
+    c = _video(3, path="IMG_0001.MOV", bytes=100, taken_src="mtime",
+               taken_at="2026-06-20T00:00:00")
+    d = _video(4, path="IMG_0001.MOV", bytes=200, taken_src="mtime",
+               taken_at="2026-06-20T00:03:00")
+    assert engine._pair_evidence(c, d) is None
+
+
+def test_pair_evidence_video_companion_source_counts_as_reliable():
+    # DJI SRT-derived time ranks above filename/mtime in dates.py and is
+    # real capture time, not a copy-time artifact -- must not be silently
+    # excluded from candidate pairing.
+    a = _video(1, path="DJI_0100.MP4", bytes=100,
+               taken_at="2025-06-10T09:00:00", taken_src="companion")
+    b = _video(2, path="DJI_0101.MP4", bytes=200,
+               taken_at="2025-06-10T09:04:00", taken_src="companion")
+    assert engine._pair_evidence(a, b) == ("candidate", None)
+
+
+def test_pair_evidence_raw_jpeg_companion_is_not_a_dupe():
+    # DJI_0655.DNG + DJI_0655.JPG: same shutter press, two output formats,
+    # both always kept -- RAW decodes to a preview visually near-identical
+    # to its JPEG twin, so phash alone would call this "strong" and it would
+    # get stuck in review forever (member.source == 'originals' guard).
+    raw = _asset(1, source="originals", path="/trip/DJI_0655.DNG", format="dng",
+                 phash_value=0xAAAA5555AAAA5555)
+    jpg = _asset(2, source="originals", path="/trip/DJI_0655.JPG", format="jpg",
+                 phash_value=0xAAAA5555AAAA5555)
+    assert engine._pair_evidence(raw, jpg) is None
+    assert engine._pair_evidence(jpg, raw) is None
+
+
+def test_pair_evidence_raw_jpeg_different_stem_still_compared_normally():
+    # Different capture numbers -- not a companion pair, phash still applies.
+    raw = _asset(1, source="originals", path="/trip/DJI_0655.DNG", format="dng",
+                 phash_value=0xAAAA5555AAAA5555)
+    jpg = _asset(2, source="originals", path="/trip/DJI_0656.JPG", format="jpg",
+                 phash_value=0xFFFF0000FFFF0000)
+    assert engine._pair_evidence(raw, jpg) is None  # phash distance too large, not a companion-guard result
+    # sanity: same stem in a DIFFERENT directory doesn't trip the guard either
+    raw2 = _asset(3, source="originals", path="/tripA/DJI_0655.DNG", format="dng",
+                  phash_value=0xAAAA5555AAAA5555)
+    jpg2 = _asset(4, source="originals", path="/tripB/DJI_0655.JPG", format="jpg",
+                  phash_value=0xAAAA5555AAAA5555)
+    assert engine._pair_evidence(raw2, jpg2) == ("strong", 0)
 
 
 # ------------------------------------------------------------------- scoring
@@ -285,6 +429,32 @@ def test_decide_displacing_canonical_review():
     assert engine._decide_one([canonical, newcomer]) == "review"
 
 
+# --------------------------------------------------- Stage C (CLIP confirm)
+
+
+def test_decide_review_stays_review_below_clip_threshold():
+    a = _asset(1, phash_value=0xFF00FF00FF00FF00)
+    b = _asset(2, source="google", path="b.jpg",
+               phash_value=0xFF00FF00FF00FFFF)  # hamming 8 — candidate tier
+    assert engine._decide_one([a, b], clip_cos=0.90) == "review"
+
+
+def test_decide_auto_when_clip_confirms_weak_phash():
+    a = _asset(1, phash_value=0xFF00FF00FF00FF00)
+    b = _asset(2, source="google", path="b.jpg",
+               phash_value=0xFF00FF00FF00FFFF)  # hamming 8 — candidate tier
+    assert engine._decide_one([a, b], clip_cos=engine.CLIP_AUTO_THRESHOLD) == "auto"
+
+
+def test_decide_clip_does_not_override_guards():
+    # A perfect CLIP match must not bypass the edited-mix guard — Stage C
+    # only substitutes for the missing strong-pHash signal, never the guards.
+    a = _asset(1)
+    b = _asset(2, path="IMG_0001-edited.jpg", edited=True,
+               phash_value=0xAAAA5555AAAA5554)
+    assert engine._decide_one([a, b], clip_cos=1.0) == "review"
+
+
 # ----------------------------------------------------------- end-to-end lite
 
 
@@ -326,6 +496,57 @@ def test_cluster_and_decide_roundtrip(tmp_path):
         "SELECT a.path FROM cluster c JOIN asset a ON a.id = c.winner_asset_id"
     ).fetchone()
     assert winner_path.endswith("IMG_0001.HEIC")  # HEIC format bonus wins
+
+    # Idempotency: re-running creates nothing new.
+    assert engine.cluster(conn)["clusters_created"] == 0
+
+
+def test_confirm_clip_unlocks_auto_past_threshold(tmp_path, monkeypatch):
+    """A pair too far apart on pHash for Stage B alone (hamming 8, review)
+    gets a cached CLIP cosine attached by `confirm_clip`; re-running
+    `decide` then upgrades it to `auto` once that cosine clears the bar."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    root = tmp_path / "staging"
+    root.mkdir()
+    a_path, b_path = root / "IMG_0001.HEIC", root / "IMG_0002.JPG"
+    _write_test_jpeg(a_path, seed=1)
+    _write_test_jpeg(b_path, seed=2)
+    manifest.register(conn, "icloud", root)
+
+    rows = manifest.pending_fingerprint(conn)
+    fingerprints = {
+        "IMG_0001.HEIC": {"phash": phash.to_hex(0xFF00FF00FF00FF00),
+                          "taken_at": "2025-06-01T12:00:00"},
+        "IMG_0002.JPG": {"phash": phash.to_hex(0xFF00FF00FF00FFFF),  # hamming 8
+                         "taken_at": "2025-06-01T12:00:01"},
+    }
+    for asset_id, path_text, _ in rows:
+        extra = fingerprints[Path(path_text).name]
+        manifest.write_fingerprint(conn, asset_id, {
+            "media_type": "image", "width": 4032, "height": 3024,
+            "taken_src": "exif", "exif_fields": 30, **extra,
+        })
+    conn.commit()
+
+    assert engine.cluster(conn)["clusters_created"] == 1
+    assert engine.decide(conn) == {"auto": 0, "review": 1, "kept_all": 0}
+
+    # Stub the backend: identical vectors → cosine 1.0, well past the bar.
+    monkeypatch.setattr(engine.clip_mod, "embed", lambda path, **kw: [1.0, 0.0, 0.0])
+    confirm_result = engine.confirm_clip(conn, backend="stub")
+    assert confirm_result == {"ok": 1, "failed": 0, "total": 1}
+
+    (cos_sim,) = conn.execute("SELECT clip_cos_sim FROM cluster").fetchone()
+    assert cos_sim == pytest.approx(1.0)
+
+    # Cache hit on a second call — no re-embed needed, still just one cluster.
+    monkeypatch.setattr(
+        engine.clip_mod, "embed",
+        lambda path, **kw: (_ for _ in ()).throw(AssertionError("should be cached")),
+    )
+    assert engine._clip_ready_clusters(conn) == []
+
+    assert engine.decide(conn) == {"auto": 1, "review": 0, "kept_all": 0}
 
     # Idempotency: re-running creates nothing new.
     assert engine.cluster(conn)["clusters_created"] == 0

@@ -32,7 +32,7 @@ from pathlib import Path
 
 from ..exif import MEDIA_EXTS
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 # status lifecycle values (kept as plain strings in the DB)
 REGISTERED = "registered"
@@ -77,7 +77,9 @@ CREATE TABLE IF NOT EXISTS cluster (
   id               INTEGER PRIMARY KEY,
   winner_asset_id  INTEGER,
   confidence       REAL,
-  decision         TEXT NOT NULL DEFAULT 'pending'  -- pending | auto | review | kept_all
+  decision         TEXT NOT NULL DEFAULT 'pending',  -- pending | auto | review | kept_all
+  clip_cos_sim     REAL  -- Stage C: min(cosine(winner, member)) over image members;
+                          -- NULL until `dedup confirm` visits this cluster.
 );
 
 CREATE TABLE IF NOT EXISTS membership (
@@ -108,11 +110,26 @@ class RegisterResult:
     skipped_young: int
 
 
+def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+    """Column additions for existing manifests — `CREATE TABLE IF NOT EXISTS`
+    only handles brand-new databases, so schema growth on a live manifest
+    (e.g. n5's, already carrying 270k+ rows) needs an explicit ALTER TABLE."""
+    if from_version < 2:
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(cluster)")}
+        if "clip_cos_sim" not in cols:
+            conn.execute("ALTER TABLE cluster ADD COLUMN clip_cos_sim REAL")
+    conn.commit()
+
+
 def open_manifest(path: Path) -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
+    # confirm_clip holds a write lock across each network-bound embed call;
+    # without this a concurrent writer (e.g. `decide` running at the same
+    # time) gets an immediate "database is locked" instead of just waiting.
+    conn.execute("PRAGMA busy_timeout=30000")
     conn.executescript(_CREATE_SCHEMA)
     existing = conn.execute(
         "SELECT value FROM meta WHERE key='schema_version'"
@@ -123,10 +140,15 @@ def open_manifest(path: Path) -> sqlite3.Connection:
             (str(SCHEMA_VERSION),),
         )
         conn.commit()
-    elif int(existing[0]) > SCHEMA_VERSION:
-        raise RuntimeError(
-            f"manifest schema v{existing[0]} is newer than this immy (v{SCHEMA_VERSION})"
-        )
+    else:
+        current = int(existing[0])
+        if current > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"manifest schema v{current} is newer than this immy (v{SCHEMA_VERSION})"
+            )
+        if current < SCHEMA_VERSION:
+            _migrate(conn, current)
+            set_meta(conn, "schema_version", str(SCHEMA_VERSION))
     return conn
 
 
@@ -244,6 +266,30 @@ def write_error(conn: sqlite3.Connection, asset_id: int, message: str) -> None:
     conn.execute(
         "UPDATE asset SET status=?, error=? WHERE id=?",
         (ERROR, message[:500], asset_id),
+    )
+
+
+def get_embedding(conn: sqlite3.Connection, asset_id: int, model: str) -> list[float] | None:
+    """Cached CLIP vector for one asset, or None if never embedded with
+    this exact model (a model switch re-embeds — the cache key is
+    (asset_id) only, so callers must not mix models against one manifest
+    without wiping the table first)."""
+    row = conn.execute(
+        "SELECT model, vec FROM embedding WHERE asset_id=?", (asset_id,)
+    ).fetchone()
+    if row is None or row[0] != model:
+        return None
+    import numpy as np
+    return np.frombuffer(row[1], dtype=np.float32).tolist()
+
+
+def set_embedding(conn: sqlite3.Connection, asset_id: int, model: str, vec: list[float]) -> None:
+    import numpy as np
+    blob = np.asarray(vec, dtype=np.float32).tobytes()
+    conn.execute(
+        "INSERT INTO embedding (asset_id, model, vec) VALUES (?, ?, ?) "
+        "ON CONFLICT(asset_id) DO UPDATE SET model=excluded.model, vec=excluded.vec",
+        (asset_id, model, blob),
     )
 
 

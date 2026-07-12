@@ -30,8 +30,16 @@ services:
     volumes:
       # immy config lives on flash, outside git (it holds the PG password).
       - /mnt/flash/immy/config.yml:/config/config.yml:ro
-      # Originals are read-only — an enrichment pass must never mutate sources.
-      - /mnt/tank/immich/originals:/originals:ro
+      # Writable: `process`/`audit` only ever READ from here (enrichment must
+      # never mutate sources) — `promote` is the sole writer, rsync-ing
+      # winners in. Can't be :ro since promote now also runs in this
+      # container (N5 is the primary immich source; trip staging no longer
+      # round-trips through a laptop — see /trips below).
+      - /mnt/tank/immich/originals:/originals
+      # New trip staging root — the N5-native equivalent of the Mac's
+      # ~/Media/Trips: land a raw camera dump here, then
+      # `docker compose run --rm immy audit/process/promote /trips/<name>`.
+      - /mnt/tank/media/trips:/trips
       # Mirror immich_server's media mounts EXACTLY so the derivative paths
       # immy writes line up with what Immich serves (container_root=/data).
       - /mnt/tank/immich/media:/data
@@ -41,11 +49,15 @@ services:
       # Phase 6.1 writable roots — keep immy off the :ro originals.
       - /mnt/flash/immy/state:/scratch/immy-state
       - /mnt/flash/immy/sidecars:/sidecars
-      # Consolidation pipeline (`immy dedup`): staging sources are read-only
-      # (dedup never mutates them — promote, later, moves winners OUT);
-      # /state holds manifest.sqlite. Container paths are what the manifest
-      # records as asset paths, so keep these mounts stable across runs.
-      - /mnt/tank/media/staging:/staging:ro
+      # Consolidation pipeline (`immy dedup`): register/fingerprint/cluster/
+      # confirm/decide only ever READ from here — `dedup apply` (Stage E) is
+      # the sole writer, moving winners OUT to /originals and losers OUT to
+      # /quarantine (can't be :ro since apply deletes the staging original
+      # after a verified copy). /state holds manifest.sqlite. Container
+      # paths are what the manifest records as asset paths, so keep these
+      # mounts stable across runs.
+      - /mnt/tank/media/staging:/staging
+      - /mnt/tank/media/quarantine:/quarantine
       - /mnt/tank/media/state:/state
     networks:
       - ix-immich_default

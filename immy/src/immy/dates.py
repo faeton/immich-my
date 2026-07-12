@@ -29,6 +29,17 @@ from .srt import find_sibling, parse as parse_srt
 Source = Literal["exif", "companion", "filename", "mtime"]
 _RANK: dict[Source, int] = {"exif": 3, "companion": 2, "filename": 1, "mtime": 0}
 
+# Some cameras/phones lose their clock battery and fall back to a firmware
+# default (e.g. a batch of clips all stamped exactly 2036-01-01T23:59:59) --
+# garbage, but still a well-formed date, so it parses fine and would
+# otherwise pass through as if it were real EXIF/SRT/filename evidence.
+# Bound plausibility instead of trusting any parseable date.
+_MIN_PLAUSIBLE_YEAR = 1990
+
+
+def _is_plausible(dt: datetime) -> bool:
+    return _MIN_PLAUSIBLE_YEAR <= dt.year <= datetime.now().year + 1
+
 
 @dataclass(frozen=True)
 class DateAuthority:
@@ -67,17 +78,17 @@ _EXIF_DATE_KEYS = (
 def resolve(row: ExifRow) -> DateAuthority | None:
     for key in _EXIF_DATE_KEYS:
         dt = _parse_exif_dt(row.raw.get(key))
-        if dt is not None:
+        if dt is not None and _is_plausible(dt):
             return DateAuthority(dt=dt, source="exif", raw=key)
 
     srt = find_sibling(row.path)
     if srt is not None:
         tele = parse_srt(srt)
-        if tele.datetime_original is not None:
+        if tele.datetime_original is not None and _is_plausible(tele.datetime_original):
             return DateAuthority(dt=tele.datetime_original, source="companion", raw=srt.name)
 
     fn = parse_filename_date(row.path)
-    if fn is not None:
+    if fn is not None and _is_plausible(fn.dt):
         return DateAuthority(dt=fn.dt, source="filename", raw=row.path.name)
 
     try:
