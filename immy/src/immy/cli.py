@@ -3126,6 +3126,53 @@ def dedup_review_server(
     review_mod.serve(manifest_path, thumb_dir, host, port)
 
 
+@dedup_app.command("promote-rest")
+def dedup_promote_rest(
+    manifest_path: Path = _MANIFEST_OPT,
+    originals_root: Path = typer.Option(
+        ..., "--originals", exists=True, file_okay=False, resolve_path=True,
+        help="Immich external library root — keepers land in <root>/<YYYY>/<MM>/.",
+    ),
+    write: bool = typer.Option(False, "--write", help="Move files for real (default: dry-run report)."),
+    limit: int = typer.Option(None, "--limit", help="Cap assets processed this run (smoke-testing/batching)."),
+) -> None:
+    """Stage F: after review is done, promote every remaining keeper out of
+    staging — never-clustered singletons plus kept_all/review members.
+    Quarantines nothing; `apply` remains the only command that does.
+    Refuses to run alongside another file-moving run on this manifest."""
+    from .dedup import engine as engine_mod
+
+    lock_path = manifest_path.with_suffix(".promote-rest.lock")
+    lock_fd = None
+    if write:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            console.print(
+                f"[red]another --write promote-rest looks to be in progress[/red] "
+                f"(lock file exists: {lock_path}). If that's stale, delete it and retry."
+            )
+            raise typer.Exit(1)
+    try:
+        _, conn = _open_manifest(manifest_path)
+        result = engine_mod.promote_rest(
+            conn, originals_root=originals_root, dry_run=not write, limit=limit,
+            progress=_dedup_progress,
+        )
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
+
+    prefix = "[yellow]dry-run[/yellow] " if not write else "[green]promoted[/green] "
+    console.print(
+        f"{prefix}{result['promoted']} keepers ({result['promoted_bytes'] / 1e9:.1f} GB) · "
+        f"sidecars {result['sidecars_written']} · errors {result['errors']}"
+    )
+    for sample in result["error_samples"]:
+        console.print(f"[red]error:[/red] {sample}")
+
+
 @dedup_app.command("rescore")
 def dedup_rescore(
     manifest_path: Path = _MANIFEST_OPT,

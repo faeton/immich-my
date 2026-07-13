@@ -251,6 +251,41 @@ def default_winner(members: list[AssetLite]) -> AssetLite:
     return max(pool, key=winner_score)
 
 
+def apply_to_twins(
+    conn: sqlite3.Connection, twins: list[int], action: str
+) -> list[int]:
+    """Cascade a decision onto mirror clusters (see pending_twins): each
+    twin gets the same verdict with ITS OWN recommended winner (so the
+    icloud mirror keeps its icloud copy, originals lock still honored).
+    Twins that fail validation (e.g. an originals conflict) are left in
+    the queue for manual review rather than forced."""
+    applied: list[int] = []
+    for cid in twins:
+        still = conn.execute(
+            "SELECT decision FROM cluster WHERE id=?", (cid,)
+        ).fetchone()
+        if not still or still[0] != "review":
+            continue
+        members = load_cluster_members(conn, cid)
+        if not members:
+            continue
+        winner = default_winner(members)
+        if action == "merge":
+            error, checked = validate_merge(conn, cid, winner.id)
+            if error:
+                continue
+            commit_cluster_decision(
+                conn, cid, checked, "auto", winner.id, _confidence(checked, winner)
+            )
+        else:
+            commit_cluster_decision(
+                conn, cid, members, "kept_all", winner.id,
+                _confidence(members, winner),
+            )
+        applied.append(cid)
+    return applied
+
+
 def reason_slug(members: list[AssetLite]) -> str:
     """Primary category key derived from review_reason (first guard hit)."""
     reason = review_reason(members)
@@ -315,13 +350,47 @@ def scene_neighbor(
     return None
 
 
+TWIN_WINDOW_SECONDS = 5
+
+
+def pending_twins(
+    conn: sqlite3.Connection, cluster_id: int, members: list[AssetLite]
+) -> list[int]:
+    """Other still-pending clusters holding pixel-twins of this cluster's
+    members (pHash ≤ strong, shot within ±5s) — the per-source mirror
+    clusters incremental clustering leaves behind. A decision on one is a
+    decision on all: same pixels, same verdict."""
+    twins: set[int] = set()
+    window = timedelta(seconds=TWIN_WINDOW_SECONDS)
+    for m in members:
+        if m.phash is None or not m.taken_at:
+            continue
+        try:
+            t = datetime.fromisoformat(m.taken_at)
+        except ValueError:
+            continue
+        for other_cid, other_hex in conn.execute(
+            "SELECT m2.cluster_id, a.phash FROM asset a"
+            "  JOIN membership m2 ON m2.asset_id = a.id"
+            "  JOIN cluster c ON c.id = m2.cluster_id"
+            " WHERE c.decision='review' AND c.clip_cos_sim IS NOT NULL"
+            "   AND m2.cluster_id != ? AND a.phash IS NOT NULL"
+            "   AND a.taken_at BETWEEN ? AND ?",
+            (cluster_id, (t - window).isoformat(), (t + window).isoformat()),
+        ):
+            if phash.hamming(m.phash, phash.from_hex(other_hex)) <= HAMMING_STRONG:
+                twins.add(other_cid)
+    return sorted(twins)
+
+
 def scene_chip(neighbor: tuple[str, int] | None) -> str:
     if neighbor is None:
         return ""
     decision, cid = neighbor
     label = "merged" if decision == "auto" else "kept all"
     return (f"<span class='scene' title='a cluster shot within {SCENE_WINDOW_SECONDS}s "
-            f"is already decided'>same scene: you {label} (#{cid})</span>")
+            f"is already decided'>same scene: you {label} "
+            f"<a href='/cluster/{cid}'>#{cid}</a></span>")
 
 
 def pixel_chip(pixel_ncc: float | None, time_delta: float | None) -> str:
@@ -373,6 +442,12 @@ table.cat small{color:#777;font-weight:400}
             padding:1px 8px;font-size:.78rem;color:#9fc0dc}
 .scene{background:#33203a;border:1px solid #5f3f6f;border-radius:4px;
        padding:1px 8px;font-size:.75rem;color:#c9a0d0}
+.scene a{color:#e0b8e8}
+.twinchip{color:#7ab7ff;font-size:.72rem}
+.brow[data-twin]{border-left:6px solid #2f4a6f}
+.mirror{background:#1d2f46;border:1px solid #2f4a6f;border-radius:4px;
+        padding:1px 8px;font-size:.75rem;color:#9fc0dc}
+.mirror a{color:#c0dcff}
 .path{color:#888;word-break:break-all;font-size:.72rem;margin-top:3px}
 .score{color:var(--dim)}
 .actions{position:sticky;bottom:0;background:#111d;backdrop-filter:blur(4px);padding:12px 0;margin-top:14px;
@@ -519,6 +594,7 @@ def render_cluster(
     prefetch_ids: tuple[int, ...] = (),
     signal: tuple[float | None, float | None] = (None, None),
     neighbor: tuple[str, int] | None = None,
+    twins: list[int] | None = None,
 ) -> str:
     suggested = default_winner(members)
     locked = any(m.source == "originals" for m in members)
@@ -587,6 +663,10 @@ def render_cluster(
         {html.escape(review_reason(members))}</span>
       {pixel_chip(*signal)}
       {scene_chip(neighbor)}
+      {("<span class='mirror'>&#128279; mirror clusters " +
+        " ".join(f"<a href='/cluster/{t}'>#{t}</a>" for t in twins) +
+        " hold the same photos &mdash; your decision applies to them too</span>")
+       if twins else ""}
       <span class="modeswitch"><a href="/categories">categories</a> &middot;
         <a href="/batch">batch mode &rarr;</a></span>
     </header>
@@ -623,6 +703,45 @@ def render_done(counts: dict) -> str:
       <p><a href="/">reload</a></p>
     </div>"""
     return _page("dedup review — done", body)
+
+
+def annotate_twin_groups(rows: list[dict]) -> None:
+    """Mark batch rows that are pixel-twins of each other (cross-cluster
+    pHash ≤ strong within ±5s). Incremental clustering splits one photo's
+    copies into per-source clusters (later runs can't join already-claimed
+    assets), so the reviewer meets literal mirror rows back to back — the
+    time sort makes them adjacent, this makes them act as ONE decision.
+    Sets row['twin'] = group id on rows with at least one partner."""
+    parent = list(range(len(rows)))
+
+    def find(i: int) -> int:
+        while parent[i] != i:
+            parent[i] = parent[parent[i]]
+            i = parent[i]
+        return i
+
+    items = [
+        (idx, m.phash, m.epoch)
+        for idx, row in enumerate(rows)
+        for m in row["members"]
+        if m.phash is not None
+    ]
+    for i in range(len(items)):
+        for j in range(i + 1, len(items)):
+            ri, pi, ti = items[i]
+            rj, pj, tj = items[j]
+            if ri == rj:
+                continue
+            if ti is not None and tj is not None and abs(ti - tj) > 5:
+                continue
+            if phash.hamming(pi, pj) <= HAMMING_STRONG:
+                parent[find(ri)] = find(rj)
+    sizes: dict[int, int] = {}
+    for idx in range(len(rows)):
+        sizes[find(idx)] = sizes.get(find(idx), 0) + 1
+    for idx, row in enumerate(rows):
+        root = find(idx)
+        row["twin"] = root if sizes[root] > 1 else None
 
 
 def render_categories(
@@ -694,7 +813,15 @@ window.scrollTo(0, 0);
 
 document.addEventListener('click', ev => {
   const row = ev.target.closest('.brow');
-  if (row) row.classList.toggle('unchecked');
+  if (row) {
+    // Twin rows are the SAME photos split across per-source clusters —
+    // they toggle as one so the decision stays consistent.
+    const twin = row.dataset.twin;
+    const targets = twin !== undefined
+      ? document.querySelectorAll('.brow[data-twin="' + twin + '"]') : [row];
+    const uncheck = !row.classList.contains('unchecked');
+    targets.forEach(r => r.classList.toggle('unchecked', uncheck));
+  }
   updateCount();
 });
 function updateCount() {
@@ -771,11 +898,17 @@ def render_batch(rows: list[dict], counts: dict, filter_note: str = "") -> str:
             for m in row["members"]
         )
         sim = row["clip_cos_sim"]
+        twin = row.get("twin")
+        twin_attr = f' data-twin="{twin}"' if twin is not None else ""
+        twin_chip = (
+            "<br><span class='twinchip'>&#128279; same photos as linked rows "
+            "&mdash; toggles together</span>" if twin is not None else ""
+        )
         body_rows.append(f"""
-        <div class="brow" data-cid="{row['cluster_id']}" data-winner="{row['winner_id']}">
+        <div class="brow" data-cid="{row['cluster_id']}" data-winner="{row['winner_id']}"{twin_attr}>
           <div class="check">&#10003;</div>
           {thumbs}
-          <div class="bmeta">cluster {row['cluster_id']}<br>
+          <div class="bmeta">cluster {row['cluster_id']}{twin_chip}<br>
             cos {f"{sim:.6f}" if sim is not None else "—"}<br>
             {len(row['members'])} members<br>
             keeper: {html.escape(next(m.source for m in row['members'] if m.id == row['winner_id']))}<br>
@@ -899,6 +1032,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
             cluster_id, row[1], members, _counts(conn), prefetch,
             signal=signals.get_signal(conn, cluster_id),
             neighbor=scene_neighbor(conn, members),
+            twins=pending_twins(conn, cluster_id, members),
         )
 
     @app.post("/api/decide/<int:cluster_id>")
@@ -924,11 +1058,13 @@ def create_app(manifest_path: Path, thumb_root: Path):
 
             if action == "keep_all":
                 winner = default_winner(members)
+                twins = pending_twins(conn, cluster_id, members)
                 commit_cluster_decision(
                     conn, cluster_id, members, "kept_all", winner.id,
                     _confidence(members, winner),
                 )
-                return jsonify(ok=True, decision="kept_all")
+                cascaded = apply_to_twins(conn, twins, "keep_all")
+                return jsonify(ok=True, decision="kept_all", twins=cascaded)
 
             try:
                 winner_id = int(payload["winner_asset_id"])
@@ -941,11 +1077,14 @@ def create_app(manifest_path: Path, thumb_root: Path):
             if error:
                 return jsonify(error=error[1]), error[0]
             winner = next(m for m in merge_members if m.id == winner_id)
+            twins = pending_twins(conn, cluster_id, merge_members)
             commit_cluster_decision(
                 conn, cluster_id, merge_members, "auto", winner_id,
                 _confidence(merge_members, winner),
             )
-            return jsonify(ok=True, decision="auto", winner_asset_id=winner_id)
+            cascaded = apply_to_twins(conn, twins, "merge")
+            return jsonify(ok=True, decision="auto", winner_asset_id=winner_id,
+                           twins=cascaded)
         finally:
             conn.close()
 
@@ -965,9 +1104,14 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     continue
                 error, members = validate_merge(conn, cluster_id, winner_id)
                 if error:
+                    if error[0] == 409:
+                        # already decided — usually a twin cascade from an
+                        # earlier row in this same batch, not a failure
+                        continue
                     failed.append({"cluster_id": cluster_id, "error": error[1]})
                     continue
                 winner = next(m for m in members if m.id == winner_id)
+                twins = pending_twins(conn, cluster_id, members)
                 # One commit per cluster (inside commit_cluster_decision) —
                 # a mid-batch crash loses nothing already reported merged.
                 commit_cluster_decision(
@@ -975,6 +1119,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     _confidence(members, winner),
                 )
                 merged += 1
+                merged += len(apply_to_twins(conn, twins, "merge"))
             persist_skips(conn, payload.get("skip") or [])
             return jsonify(ok=True, merged=merged, failed=failed)
         finally:
@@ -1122,6 +1267,7 @@ def create_app(manifest_path: Path, thumb_root: Path):
                     "signal": signals.get_signal(conn, cid),
                     "scene": scene_neighbor(conn, members),
                 })
+            annotate_twin_groups(rows)
             return render_batch(rows, _counts(conn), ", ".join(notes))
         finally:
             conn.close()

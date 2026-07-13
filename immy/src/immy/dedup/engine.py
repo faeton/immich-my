@@ -1046,6 +1046,79 @@ def _rescue_sidecar(dest: Path, taken_at: str | None, gps_lat: float | None, gps
     return True
 
 
+def promote_rest(
+    conn: sqlite3.Connection,
+    *,
+    originals_root: Path,
+    dry_run: bool = True,
+    limit: int | None = None,
+    progress=None,
+) -> dict:
+    """Stage F: after dedup review is finished, move every remaining KEEPER
+    out of staging into the library — the consolidation plan's "no-match
+    singletons are first-class winners" step.
+
+    Selects staging assets (source != originals) still at:
+      - `fingerprinted` — never clustered: unique files with no duplicate
+        anywhere, the vast majority of the corpus;
+      - `clustered` — members of kept_all clusters ("not duplicates, keep
+        everything") and of still-`review` clusters (v1 leaves video
+        clusters unreviewed; promoting members == keep-all semantics, and
+        Immich's Duplicate UI is the designated second pass).
+
+    Never touches `decided` (that's apply's queue), `promoted`/
+    `quarantined` (done), `canonical` (already in the library) or `error`.
+    Same safety machinery as apply: _promote_dest layout, _resolve_dest
+    crash recovery, copy-hash-verify-delete moves, per-asset commits, and
+    the Google JSON sidecar rescue for Takeout keepers."""
+    rows = conn.execute(
+        """SELECT id, source, path, bytes, taken_at, taken_src, gps_lat, gps_lon
+           FROM asset
+           WHERE status IN (?, ?) AND source != 'originals'
+           ORDER BY id""",
+        (manifest.FINGERPRINTED, manifest.CLUSTERED),
+    ).fetchall()
+    if limit is not None:
+        rows = rows[:limit]
+
+    counts = {"promoted": 0, "promoted_bytes": 0, "sidecars_written": 0, "errors": 0}
+    errors: list[str] = []
+    total = len(rows)
+
+    for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon) in enumerate(rows):
+        src = Path(path_str)
+        try:
+            base_dest = _promote_dest(originals_root, path_str, taken_at)
+            if not dry_run:
+                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes)
+                if not already_done:
+                    if not src.exists():
+                        raise FileNotFoundError(str(src))
+                    _safe_move(src, dest)
+                elif src.exists():
+                    src.unlink()
+                if source == "google" and taken_src == "json":
+                    if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
+                        counts["sidecars_written"] += 1
+                conn.execute(
+                    "UPDATE asset SET status=? WHERE id=?",
+                    (manifest.PROMOTED, asset_id),
+                )
+                conn.commit()
+            counts["promoted"] += 1
+            counts["promoted_bytes"] += nbytes or 0
+        except Exception as exc:  # noqa: BLE001 — one bad file must not kill the batch
+            counts["errors"] += 1
+            errors.append(f"{path_str}: {exc}")
+        if progress and (i + 1) % 500 == 0:
+            progress(i + 1, total)
+
+    if progress:
+        progress(total, total)
+    counts["error_samples"] = errors[:20]
+    return counts
+
+
 def apply_decisions(
     conn: sqlite3.Connection,
     *,
