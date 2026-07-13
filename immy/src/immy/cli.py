@@ -2684,15 +2684,31 @@ def apple_people(
         None, "--only",
         help="Restrict to named person(s) (repeatable, exact full-name match).",
     ),
+    apply_: bool = typer.Option(
+        False, "--apply",
+        help="Write to Immich: name the existing (unnamed) person cluster "
+        "each Apple person's faces overlap, and attach any orphaned "
+        "same-cluster faces. Never creates new Person rows and never "
+        "renames an already-named person — see the plan preview first.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes",
+        help="Skip the confirmation prompt before writing (for non-interactive use).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
-    """Preview Apple Photos face-tagging that would seed Immich Person rows.
+    """Preview (or, with `--apply`, write) Apple Photos face-tagging into Immich.
 
-    Dry-run only — prints the named persons, their face counts, and how
-    many of those faces map to assets present in the Immich snapshot via
-    `(original_filename, size)` match. No write path yet; the plan is to
-    add `--apply` once the match rate looks sensible.
+    Matches Apple's named face clusters to Immich assets, prints the match
+    rate, then builds a plan against Immich's *own* existing (already-
+    clustered-but-unnamed) `asset_face`/`person` rows: whichever unnamed
+    cluster an Apple person's faces consistently overlap is named, and any
+    unclustered faces on the same assets are attached to it. This retroactively
+    names every other face already in that cluster too, not just the ones
+    Apple tagged — see `apple_photos.build_person_plans` for the matching.
 
-    Requires a fresh snapshot (`immy snapshot`) for the match phase.
+    Requires a fresh snapshot (`immy snapshot`) for the match phase, and (for
+    `--apply`) a `pg:` block in the config to reach Immich's Postgres.
     """
     try:
         db_path = apple_photos_mod.resolve_db_path(photos_library)
@@ -2765,10 +2781,91 @@ def apple_people(
         f"\nTotal: [bold]{total_matched:,}[/bold] / {total_faces:,} faces "
         f"({100 * total_matched / total_faces:.0f}%) map to assets in Immich."
     )
-    console.print(
-        "[dim]No changes made. Write path (`--apply`) not yet implemented — "
-        "review the match rate above first.[/dim]"
-    )
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print(
+            "\n[dim]No changes made. Add a `pg:` block to the config and "
+            "pass --apply to write.[/dim]"
+        )
+        return
+
+    try:
+        pconn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    try:
+        asset_ids = sorted({m.immich_asset_id for ms in matches.values() for m in ms})
+        raw_faces = pg_mod.fetch_existing_faces(pconn, asset_ids)
+        existing_faces_by_asset = {
+            asset_id: [apple_photos_mod.ExistingFace(*row) for row in rows]
+            for asset_id, rows in raw_faces.items()
+        }
+        plans = apple_photos_mod.build_person_plans(persons, matches, existing_faces_by_asset)
+
+        plan_table = Table(show_header=True, header_style="bold")
+        plan_table.add_column("person")
+        plan_table.add_column("target cluster")
+        plan_table.add_column("votes", justify="right")
+        plan_table.add_column("+orphans", justify="right")
+        plan_table.add_column("conflicts", justify="right")
+        plan_table.add_column("no-detect", justify="right")
+        actionable = [p for p in plans if p.target_person_id is not None]
+        for p in plans:
+            target = p.target_person_id[:8] if p.target_person_id else "[dim]-[/dim]"
+            votes = f"{p.target_votes}/{p.total_votes}" if p.total_votes else "-"
+            plan_table.add_row(
+                p.full_name, target, votes,
+                str(len(p.orphan_face_ids)), str(len(p.conflicts)), str(p.no_detection),
+            )
+        console.print("\n[bold]--apply plan[/bold] (against Immich's existing face clusters):")
+        console.print(plan_table)
+
+        total_conflicts = sum(len(p.conflicts) for p in plans)
+        if total_conflicts:
+            console.print(
+                f"[yellow]{total_conflicts} face(s) overlap a cluster already named "
+                "something else — skipped, not overwritten.[/yellow]"
+            )
+        if not actionable:
+            console.print(
+                "\n[yellow]No cluster meets the confidence bar "
+                f"(≥{apple_photos_mod.MIN_VOTES} votes, "
+                f"≥{apple_photos_mod.MIN_CONFIDENCE:.0%} confidence) — "
+                "nothing to apply.[/yellow]"
+            )
+            return
+
+        if not apply_:
+            console.print(
+                "\n[dim]No changes made. Pass --apply to write the plan above.[/dim]"
+            )
+            return
+
+        if not yes:
+            confirmed = typer.confirm(
+                f"\nName {len(actionable)} Immich person cluster(s) and attach "
+                f"{sum(len(p.orphan_face_ids) for p in actionable)} orphaned face(s)?"
+            )
+            if not confirmed:
+                console.print("[yellow]aborted, no changes made.[/yellow]")
+                return
+
+        named = 0
+        attached = 0
+        for p in actionable:
+            if pg_mod.name_person(pconn, p.target_person_id, p.full_name):
+                named += 1
+            attached += pg_mod.attach_orphan_faces(pconn, p.orphan_face_ids, p.target_person_id)
+        pconn.commit()
+        console.print(
+            f"\n[green]applied:[/green] named {named} person cluster(s), "
+            f"attached {attached} orphaned face(s)."
+        )
+    finally:
+        pconn.close()
 
 
 dedup_app = typer.Typer(
