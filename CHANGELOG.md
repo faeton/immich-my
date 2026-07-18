@@ -4,6 +4,28 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-07-18 — `immy triage scan|report` (footage triage, phase 1)
+
+### Added
+
+- **Manifest schema v3**: `triage` (human verdicts keep/compress/cold/trash,
+  `applied_at` NULL until a future executor acts) and `video_signal`
+  (scan-derived, rebuildable). Migration is table-creation only — existing
+  v2 manifests upgrade on open.
+- **`immy triage scan`** — per-clip signals for every trip video (named
+  `YYYY-MM-*` dirs only; the dated cloud tree is out of scope): ffprobe
+  duration/codec/bitrate, 6 sampled frames, a pooled clip-level CLIP vector
+  (cached in `embedding`), Immich favorite/album flags read directly from
+  PG (`album_asset`), take-grouping (>120 s gap or centroid cosine <0.80
+  starts a new take), and conservative advisory suggestions. Resumable and
+  ^C-safe; derived layers recompute every run so rule tweaks need no
+  `--force`. Runs in the deploy/n5 container (ffmpeg + immich-ml + PG live
+  there); see `immy/TRIAGE.md`.
+- **`immy triage report`** — per-trip rollup (clips, GB, take-group GB,
+  compress-candidate GB, favorites), biggest first; `--json` for machines.
+  Never touches a file — grading and applying stay separate stages, like
+  dedup's decide/apply split.
+
 ## 2026-07-12 — `srt geotag --relock` + `immy tags sync`
 
 ### Found
