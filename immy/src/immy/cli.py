@@ -3127,5 +3127,118 @@ def dedup_status(manifest_path: Path = _MANIFEST_OPT) -> None:
 app.add_typer(dedup_app, name="dedup")
 
 
+triage_app = typer.Typer(
+    help="Footage triage: signal scan + per-trip report for grading trip "
+    "videos keep/compress/cold/trash. Never touches a file.",
+    no_args_is_help=True,
+)
+
+
+@triage_app.command("scan")
+def triage_scan(
+    manifest_path: Path = _MANIFEST_OPT,
+    config_path: Path = typer.Option(None, "--config", help="immy config.yml (ml: + pg: blocks)."),
+    root: str = typer.Option(
+        "/originals", "--root",
+        help="Manifest path prefix of the originals library (asset.path anchor).",
+    ),
+    fs_root: str = typer.Option(
+        None, "--fs-root",
+        help="Where those files are readable from THIS process (host runs: "
+        "/mnt/tank/immich/originals). Default: same as --root.",
+    ),
+    frames_dir: Path = typer.Option(
+        Path("/scratch/triage-frames"), "--frames-dir",
+        help="Sampled-frame cache root (6 JPEGs per clip, reused by the "
+        "future review UI; safe to delete — frames re-extract on demand).",
+    ),
+    limit: int = typer.Option(None, "--limit", help="Cap NEW clips scanned this run (batching/smoke)."),
+    force: bool = typer.Option(False, "--force", help="Re-scan clips that already have signals."),
+    skip_immich: bool = typer.Option(
+        False, "--skip-immich", help="Skip the favorite/album lookup (offline run)."
+    ),
+) -> None:
+    """Gather per-clip signals for every trip video into `video_signal`:
+    ffprobe, 6 sampled frames + a pooled CLIP vector (cached forever in
+    `embedding`), Immich favorite/album flags, take-grouping, and
+    conservative suggestions. Resumable: ^C and re-run any time; only
+    new clips pay the probe/frames/CLIP cost."""
+    from .triage import engine as triage_engine
+    from .triage.flags import build_immich_lookup
+
+    config = load_config(config_path)
+    model_name = (
+        config.ml.clip_model
+        if (config.ml is not None and config.ml.clip_model)
+        else clip_mod.DEFAULT_MODEL
+    )
+    backend = os.environ.get("IMMY_CLIP_BACKEND") or (
+        config.ml.clip_backend if config.ml is not None else "mlx"
+    )
+    endpoint = os.environ.get("IMMY_IMMICH_ML_URL") or (
+        config.ml.immich_ml_url if config.ml is not None else None
+    )
+    lookup = None if skip_immich else build_immich_lookup(config, root)
+    if lookup is None and not skip_immich:
+        console.print("[yellow]no pg/immich config — favorite/album flags will be NULL[/yellow]")
+
+    _, conn = _open_manifest(manifest_path)
+    result = triage_engine.scan(
+        conn, root=root, fs_root=fs_root, frames_root=frames_dir,
+        backend=backend, endpoint=endpoint, model_name=model_name,
+        immich_lookup=lookup, force=force, limit=limit,
+        progress=lambda done, total: console.print(
+            f"  scan {done}/{total}", highlight=False
+        ),
+        log=lambda msg: console.print(f"[yellow]{msg}[/yellow]"),
+    )
+    console.print(
+        f"[green]{result['scanned_now']} scanned[/green] "
+        f"(+{result['total_scanned'] - result['scanned_now']} cached, "
+        f"[red]{result['failed']} failed[/red]) of {result['eligible']} eligible · "
+        f"{result['take_groups']} take groups · "
+        f"{result['immich_flagged']} immich-flagged"
+    )
+
+
+@triage_app.command("report")
+def triage_report(
+    manifest_path: Path = _MANIFEST_OPT,
+    root: str = typer.Option("/originals", "--root", help="Manifest originals prefix."),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Per-trip rollup of scanned signals, biggest recoverable bytes first."""
+    import json
+
+    from .triage import engine as triage_engine
+
+    _, conn = _open_manifest(manifest_path)
+    data = triage_engine.report(conn, root=root)
+    if as_json:
+        console.print_json(json.dumps(data))
+        return
+    table = Table(show_header=True, header_style="bold")
+    for col in ("trip", "clips", "GB", "take GB", "compress GB", "favs"):
+        table.add_column(col, justify="right" if col != "trip" else "left")
+    for trip, t in data["trips"].items():
+        table.add_row(
+            trip, f"{t['clips']:,}", f"{t['bytes'] / 1e9:.1f}",
+            f"{t['take_bytes'] / 1e9:.1f}", f"{t['compress_bytes'] / 1e9:.1f}",
+            str(t["favorites"]),
+        )
+    tot = data["totals"]
+    table.add_row(
+        "[bold]total[/bold]", f"[bold]{tot['clips']:,}[/bold]",
+        f"[bold]{tot['bytes'] / 1e9:.1f}[/bold]",
+        f"[bold]{tot['take_bytes'] / 1e9:.1f}[/bold]",
+        f"[bold]{tot['compress_bytes'] / 1e9:.1f}[/bold]",
+        f"[bold]{tot['favorites']}[/bold]",
+    )
+    console.print(table)
+
+
+app.add_typer(triage_app, name="triage")
+
+
 if __name__ == "__main__":
     app()
