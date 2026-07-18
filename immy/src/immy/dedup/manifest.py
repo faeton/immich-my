@@ -32,7 +32,7 @@ from pathlib import Path
 
 from ..exif import MEDIA_EXTS
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 # status lifecycle values (kept as plain strings in the DB)
 REGISTERED = "registered"
@@ -100,6 +100,31 @@ CREATE TABLE IF NOT EXISTS meta (
   key    TEXT PRIMARY KEY,
   value  TEXT NOT NULL
 );
+
+-- Footage triage (see immy/TRIAGE.md). `video_signal` is scan-derived and
+-- always safe to rebuild; `triage` holds real verdicts (human or executor)
+-- and is the ONLY table the future apply step will read.
+CREATE TABLE IF NOT EXISTS triage (
+  asset_id    INTEGER PRIMARY KEY REFERENCES asset(id),
+  verdict     TEXT NOT NULL CHECK (verdict IN ('keep','compress','cold','trash')),
+  reason      TEXT,
+  decided_by  TEXT NOT NULL,      -- 'human' | rule name
+  decided_at  TEXT NOT NULL,      -- ISO8601
+  applied_at  TEXT                -- set by the (future) executor; NULL = pending
+);
+
+CREATE TABLE IF NOT EXISTS video_signal (
+  asset_id       INTEGER PRIMARY KEY REFERENCES asset(id),
+  duration_s     REAL,
+  codec          TEXT,
+  bitrate_kbps   REAL,
+  take_group     INTEGER,          -- clips shot in one burst share a group
+  favorite       INTEGER,          -- Immich isFavorite; NULL = not looked up
+  album_count    INTEGER,
+  frames_json    TEXT,             -- sampled-frame paths relative to frames root
+  suggested      TEXT,             -- advisory: keep | compress | review-take
+  suggest_reason TEXT
+);
 """
 
 
@@ -118,6 +143,9 @@ def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
         cols = {row[1] for row in conn.execute("PRAGMA table_info(cluster)")}
         if "clip_cos_sim" not in cols:
             conn.execute("ALTER TABLE cluster ADD COLUMN clip_cos_sim REAL")
+    # v3 (triage + video_signal) adds whole tables only — the executescript
+    # of _CREATE_SCHEMA in open_manifest already created them by the time
+    # _migrate runs, so there is nothing to ALTER here.
     conn.commit()
 
 
