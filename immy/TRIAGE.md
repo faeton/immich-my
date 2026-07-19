@@ -111,3 +111,25 @@ then open `http://n5.bee-ruffe.ts.net:8766` from anywhere on the tailnet
 
 Rules are recomputed on every `scan` (derived layer, no `--force` needed),
 so retuning them is a code edit + a cheap re-scan.
+
+## Executor — `immy triage apply`
+
+The file-touching half (v1: `compress` only). Per pending compress
+verdict: encode → verify duration → same-path swap with the original
+quarantined under `/quarantine/compress-originals/<trip>/` → stamp
+`applied_at` → one Immich library rescan at the end of the run.
+
+- **Same path, same container, always**: Immich keys external assets by
+  `originalPath`, so an in-place swap preserves asset identity (albums,
+  favorites). `.mp4` → SVT-AV1 10-bit (crf 30 preset 6); `.mov` → x265
+  HEVC 10-bit (crf 22, hvc1) because AV1-in-mov isn't a thing.
+- **Safety**: staged `.immy-new.<name>` + atomic rename (crash → `heal()`
+  finishes the swap on next run); duration mismatch fails the clip;
+  < 10% size gain keeps the original and stamps no-gain; every clip is
+  logged to `exec_log`; owner/mode/mtime copied from the original;
+  `--write` takes a lock. Biggest files first (`--smallest-first` for
+  smoke runs); ^C between clips loses nothing.
+- **Deliberate loss**: only the primary video + audio streams survive —
+  DJI's embedded data tracks are dropped (telemetry already lives in
+  immy's .srt/.gpx sidecars).
+- Thermal: `--threads N` caps the encoder pool; mind the CPU watchdog.

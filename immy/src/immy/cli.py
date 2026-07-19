@@ -3237,6 +3237,83 @@ def triage_report(
     console.print(table)
 
 
+@triage_app.command("apply")
+def triage_apply(
+    manifest_path: Path = _MANIFEST_OPT,
+    config_path: Path = typer.Option(None, "--config", help="immy config.yml (for the Immich rescan)."),
+    root: str = typer.Option("/originals", "--root"),
+    fs_root: str = typer.Option(None, "--fs-root"),
+    write: bool = typer.Option(False, "--write", help="Touch files for real (default: dry-run count)."),
+    limit: int = typer.Option(None, "--limit", help="Cap clips processed this run."),
+    threads: int = typer.Option(8, "--threads", help="Encoder thread cap (thermal budget)."),
+    smallest_first: bool = typer.Option(
+        False, "--smallest-first", help="Process smallest clips first (fast smoke runs)."
+    ),
+) -> None:
+    """Execute pending `compress` verdicts: re-encode (mp4→SVT-AV1,
+    mov→x265, container never changes), verify duration, swap in place
+    with the original quarantined, stamp `applied_at`, then one Immich
+    library rescan. Resumable — ^C between clips loses nothing; biggest
+    files go first so an interrupted run still banked the largest wins.
+
+        sudo docker compose -f deploy/n5/compose.yaml run --rm --cpus 8 \\
+          immy triage apply --manifest /state/manifest.sqlite \\
+          --config /config/config.yml --write
+    """
+    from .triage import executor as executor_mod
+
+    lock_path = manifest_path.with_suffix(".triage-apply.lock")
+    lock_fd = None
+    if write:
+        try:
+            lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            console.print(
+                f"[red]another --write apply looks to be in progress[/red] "
+                f"(lock file exists: {lock_path}). If that's stale, delete it and retry."
+            )
+            raise typer.Exit(1)
+    try:
+        _, conn = _open_manifest(manifest_path)
+        result = executor_mod.apply_compress(
+            conn, root=root, fs_root=fs_root, threads=threads, limit=limit,
+            smallest_first=smallest_first, dry_run=not write,
+            progress=lambda i, n, name: console.print(
+                f"  [{i}/{n}] {name}", highlight=False
+            ),
+            log=lambda msg: console.print(f"  {msg}", highlight=False),
+        )
+    finally:
+        if lock_fd is not None:
+            os.close(lock_fd)
+            lock_path.unlink(missing_ok=True)
+
+    if not write:
+        console.print(
+            f"[yellow]dry-run[/yellow] — {result.processed} clips "
+            f"({result.bytes_in / 1e9:.1f} GB) pending compress; re-run with --write"
+        )
+        return
+    saved = (result.bytes_in - result.bytes_out) / 1e9
+    console.print(
+        f"[green]{result.swapped} swapped[/green] "
+        f"({result.bytes_in / 1e9:.1f} → {result.bytes_out / 1e9:.1f} GB, "
+        f"saved {saved:.1f} GB) · {result.no_gain} no-gain kept · "
+        + (f"[red]{result.failed} failed[/red]" if result.failed else "0 failed")
+    )
+    config = load_config(config_path)
+    if result.swapped and config.immich is not None and config.immich.library_id:
+        client = ImmichClient(
+            url=config.immich.url, api_key=config.immich.api_key,
+            ssh_host=config.immich.ssh_host,
+        )
+        try:
+            client.scan_library(config.immich.library_id)
+            console.print("immich library rescan queued")
+        except Exception as e:
+            console.print(f"[yellow]immich rescan failed (queue it by hand): {e}[/yellow]")
+
+
 @triage_app.command("stack-insv")
 def triage_stack_insv(
     config_path: Path = typer.Option(None, "--config", help="immy config.yml (pg: + immich: blocks)."),

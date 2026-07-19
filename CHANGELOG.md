@@ -4,6 +4,23 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-07-19 — `immy triage apply` (executor, phase 3: compress)
+
+### Added
+
+- **`immy triage apply`** — executes pending `compress` verdicts:
+  mp4→SVT-AV1 10-bit / mov→x265 10-bit (container and path never change,
+  preserving Immich asset identity), duration-verified, original
+  quarantined, owner/mode/mtime carried over, `exec_log` journal,
+  crash-safe staged swap with `heal()`, no-gain guard, biggest-first and
+  resumable. One Immich rescan per run. Smoke-verified on n5 (av1 -92%,
+  hevc -62%).
+- Fat-tail auto-sweep on n5: 2,047 non-360 clips >40 Mbps marked
+  `compress` by `rule:fat-tail-40mbps` → queue now 2,407 clips / 836 GB.
+- 360 viewer additions: raw-fisheye de-warp fallback (+front/back lens
+  toggle) for recordings with no stitched preview on disk; X4/X5 naming
+  (`LRV_*.lrv`, `360VID_*.mp4`); triage→viewer playback deep links.
+
 ## 2026-07-19 — `immy triage review-server` (footage triage, phase 2)
 
 ### Added
