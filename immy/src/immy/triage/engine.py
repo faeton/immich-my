@@ -35,8 +35,17 @@ from ..video import VideoProbeError, probe
 # Formats treated as video when `asset.media_type` was never fingerprinted.
 VIDEO_FORMATS = {
     "mp4", "mov", "m4v", "avi", "mkv", "mts", "webm", "wmv",
-    "mpg", "mpeg", "3gp", "insv", "lrv", "lrf", "360",
+    "mpg", "mpeg", "3gp", "insv", "360",
 }
+
+# Camera low-res proxy sidecars — derivable from their master, excluded from
+# the vv mirror, and their fate follows the master's verdict, so they are
+# OUT of triage scope entirely (grading one is a wasted human decision).
+PROXY_SUFFIXES = {".lrv", ".lrf"}
+
+
+def is_proxy(path: str) -> bool:
+    return PurePosixPath(path).suffix.lower() in PROXY_SUFFIXES
 
 FRAMES_PER_CLIP = 6
 TAKE_GAP_S = 120.0        # capture-time gap that always starts a new take
@@ -115,7 +124,7 @@ def load_trip_videos(conn, root: str) -> list[Clip]:
     clips = []
     for id_, path, bytes_, mtime, taken_at in rows:
         trip = trip_of(path, root)
-        if trip is None:
+        if trip is None or is_proxy(path):
             continue
         clips.append(Clip(
             id=id_, path=path, trip=trip, bytes=bytes_ or 0,
@@ -291,6 +300,14 @@ def scan(
     suggestions) are recomputed over the full clip set every run."""
     fs_root = fs_root or root
     embed_fn = embed_fn or clip_mod.embed
+    # Self-heal a scope widening/narrowing: signals for now-out-of-scope
+    # proxies are scan-derived data, safe to drop (v1 scanned .lrv/.lrf).
+    conn.execute(
+        "DELETE FROM video_signal WHERE asset_id IN ("
+        "  SELECT id FROM asset WHERE LOWER(path) LIKE '%.lrv'"
+        "    OR LOWER(path) LIKE '%.lrf')"
+    )
+    conn.commit()
     clips = load_trip_videos(conn, root)
 
     done = {
@@ -405,7 +422,7 @@ def report(conn, *, root: str = "/originals") -> dict:
     trips: dict[str, dict] = {}
     for path, bytes_, tg, suggested, favorite in rows:
         trip = trip_of(path, root)
-        if trip is None:
+        if trip is None or is_proxy(path):
             continue
         t = trips.setdefault(trip, {
             "clips": 0, "bytes": 0, "take_bytes": 0,

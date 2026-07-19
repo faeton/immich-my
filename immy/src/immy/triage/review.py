@@ -27,7 +27,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..dedup import manifest
-from .engine import map_path, trip_of
+from .engine import is_proxy, map_path, trip_of
 
 VERDICTS = ("keep", "compress", "cold", "trash")
 
@@ -85,7 +85,7 @@ def load_clips(conn: sqlite3.Connection, root: str) -> list[dict]:
         verdict, applied_at,
     ) in rows:
         trip = trip_of(path, root)
-        if trip is None:
+        if trip is None or is_proxy(path):
             continue
         epoch = None
         if taken_at:

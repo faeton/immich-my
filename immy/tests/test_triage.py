@@ -149,6 +149,35 @@ def test_take_groups_missing_vec_falls_back_to_time():
     assert a.take_group == b.take_group
 
 
+def test_proxies_out_of_scope(tmp_path: Path):
+    """.lrv/.lrf are derivable camera proxies excluded from the vv mirror —
+    they must never reach the human review queue, and rows a v1 scan wrote
+    for them are purged on the next scan."""
+    assert engine.is_proxy("/originals/t/LRV_001.lrv")
+    assert engine.is_proxy("/originals/t/DJI_0001.LRF")
+    assert not engine.is_proxy("/originals/t/VID_001.insv")
+
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _seed_asset(conn, 1, "/originals/2024-04-namibia/VID_001.insv", format="insv")
+    _seed_asset(conn, 2, "/originals/2024-04-namibia/LRV_001.lrv", format="lrv")
+    conn.execute(
+        "INSERT INTO video_signal (asset_id, duration_s) VALUES (2, 60)"
+    )  # stale v1 row for the proxy
+    conn.commit()
+
+    assert [c.id for c in engine.load_trip_videos(conn, "/originals")] == [1]
+    engine.scan(
+        conn, root="/originals", frames_root=tmp_path / "f",
+        backend="immich-ml", endpoint="http://ml", model_name="m",
+        probe_fn=lambda p: _FakeInfo(10.0),
+        extract_fn=_fake_extract, embed_fn=lambda *a, **k: [1.0, 0.0],
+        immich_lookup=None,
+    )
+    assert conn.execute(
+        "SELECT COUNT(*) FROM video_signal WHERE asset_id=2"
+    ).fetchone()[0] == 0
+
+
 def test_take_groups_never_cross_trips():
     a = _clip(1, trip="2024-03-antarctica", epoch=0.0)
     b = _clip(2, trip="2025-06-svalbard-arctic", epoch=10.0)

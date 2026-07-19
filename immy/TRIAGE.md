@@ -11,6 +11,11 @@ separate, future executor with its own dry-run and quarantine.
 
 Two manifest tables (schema v3, `dedup/manifest.py`):
 
+Scope: named trip dirs (`YYYY-MM-*`) only — the dated `YYYY/` cloud tree is
+excluded, and so are `.lrv`/`.lrf` camera proxies (derivable from their
+master, excluded from the vv mirror; their fate follows the master's
+verdict, so grading one would be a wasted human decision).
+
 - `video_signal` — scan-derived, always safe to rebuild: ffprobe facts
   (duration/codec/bitrate), 6 sampled frames per clip (`frames_json`,
   relative to the frames root), Immich `favorite`/`album_count`, a

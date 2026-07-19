@@ -46,6 +46,8 @@ def app(tmp_path: Path):
           taken_at="2024-04-02T10:00:00", take_group=2)
     _seed(conn, 4, "/originals/2025-06-svalbard-arctic/DJI_0004.MP4",
           take_group=3)
+    # stale v1-scan proxy row — must never render anywhere in the UI
+    _seed(conn, 5, "/originals/2024-04-namibia/LRV_0005.lrv", take_group=1)
     conn.commit()
     conn.close()
 
@@ -83,6 +85,7 @@ def test_trip_page_groups_takes_and_marks_playability(client):
     assert "DJI_0001.MP4" in page and "VID_0003.insv" in page
     # the insv clip gets no play button; the mp4s do
     assert page.count("play</button>") == 2
+    assert "LRV_0005.lrv" not in page   # proxies are out of triage scope
     assert client.get("/trip/nope").status_code == 404
 
 
