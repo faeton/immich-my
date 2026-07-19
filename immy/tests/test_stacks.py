@@ -29,6 +29,19 @@ def test_plan_stacks_groups_ranks_and_skips():
     assert [aid for aid, _ in plan.children] == ["c", "a", "b"]
 
 
+def test_plan_stacks_new_gen_naming():
+    """X4/X5 era: LRV preview has ext .lrv, app exports are 360VID_*.mp4."""
+    rows = [
+        ("a", "/lib/t/VID_20260226_070904_00_006.insv", None),
+        ("b", "/lib/t/LRV_20260226_070904_01_006.lrv", None),
+        ("c", "/lib/t/360VID_20260226_070904_00_006.mp4", None),
+    ]
+    plans, _, _ = stacks.plan_stacks(rows)
+    assert len(plans) == 1
+    assert plans[0].primary[0] == "c"           # stitched export wins
+    assert [aid for aid, _ in plans[0].children] == ["b", "a"]
+
+
 def test_plan_stacks_lrv_primary_without_export():
     rows = [
         ("a", "/lib/t/VID_20240211_125134_00_053.insv", None),

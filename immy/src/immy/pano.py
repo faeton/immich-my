@@ -75,8 +75,8 @@ def load_recordings(conn: sqlite3.Connection, root: str) -> list[Recording]:
     recs: dict[str, Recording] = {}
     for asset_id, path in conn.execute(
         "SELECT id, path FROM asset WHERE source='originals'"
-        " AND (path LIKE '%.insv' OR path LIKE '%.mp4'"
-        "  OR path LIKE '%.INSV' OR path LIKE '%.MP4')"
+        " AND (path LIKE '%.insv' OR path LIKE '%.mp4' OR path LIKE '%.lrv'"
+        "  OR path LIKE '%.INSV' OR path LIKE '%.MP4' OR path LIKE '%.LRV')"
     ):
         trip = trip_of(path, root)
         if trip is None:
@@ -87,7 +87,9 @@ def load_recordings(conn: sqlite3.Connection, root: str) -> list[Recording]:
         key = f"{m['ts']}_{m['serial']}"
         rec = recs.setdefault(key, Recording(key=key, trip=trip, ts=m["ts"]))
         role, lens, ext = m["role"].lower(), m["lens"], m["ext"].lower()
-        if role == "lrv" and ext == "insv":
+        if role == "lrv" and ext in ("insv", "lrv"):
+            # stitched in-camera preview — X3 era: LRV_*_11_*.insv,
+            # X4/X5 era: LRV_*_01_*.lrv. Both equirect h264.
             rec.lrv_id = asset_id
         elif role == "vid" and ext == "mp4":
             rec.export_id = asset_id

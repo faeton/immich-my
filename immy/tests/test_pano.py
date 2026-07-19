@@ -29,6 +29,9 @@ def conn(tmp_path: Path):
     _seed(conn, 5, f"{trip}/VID_20240301_000000_00_060.insv")   # master only
     _seed(conn, 6, f"{trip}/GX010001.MP4")                      # flat gopro — no group
     _seed(conn, 7, "/originals/2024/02/VID_20240401_000000_00_001.insv")  # dated tree
+    # X4/X5-era naming: single-file master + stitched preview as .lrv
+    _seed(conn, 8, "/originals/2026-02-mau-whales/VID_20260226_070904_00_006.insv")
+    _seed(conn, 9, "/originals/2026-02-mau-whales/LRV_20260226_070904_01_006.lrv")
     conn.execute("INSERT INTO video_signal (asset_id, duration_s) VALUES (1, 95)")
     conn.commit()
     return conn
@@ -36,7 +39,9 @@ def conn(tmp_path: Path):
 
 def test_load_recordings_groups_and_picks_stream(conn):
     recs = pano.load_recordings(conn, "/originals")
-    assert len(recs) == 2                       # dated tree + flat mp4 excluded
+    assert len(recs) == 3                       # dated tree + flat mp4 excluded
+    x4 = next(r for r in recs if r.key == "20260226_070904_006")
+    assert (x4.masters, x4.lrv_id) == ([8], 9)  # .lrv preview streams too
     full = next(r for r in recs if r.key == "20240211_125134_053")
     assert sorted(full.masters) == [1, 2]
     assert full.master_bytes == 4 * 10**9

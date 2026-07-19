@@ -25,14 +25,18 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 
+# Naming has drifted across camera generations: X3-era writes VID_/LRV_
+# .insv (stitched preview = lens code 11, ext insv); X4/X5-era writes the
+# stitched preview as LRV_*_01_*.lrv (ext .lrv!) and the phone app exports
+# stitched mp4s with a "360" prefix (360VID_*.mp4). One regex covers all.
 _NAME = re.compile(
-    r"^(?P<role>VID|LRV)_(?P<ts>\d{8}_\d{6})_(?P<lens>\d{2})_(?P<serial>\d+)"
-    r"\.(?P<ext>insv|mp4)$",
+    r"^(?:360)?(?P<role>VID|LRV)_(?P<ts>\d{8}_\d{6})_(?P<lens>\d{2})_(?P<serial>\d+)"
+    r"\.(?P<ext>insv|mp4|lrv)$",
     re.I,
 )
 
 # SQL-side prefilter for the same shape (POSIX regex, case-insensitive).
-PG_NAME_PATTERN = r"/(VID|LRV)_\d{8}_\d{6}_\d{2}_\d+\.(insv|mp4)$"
+PG_NAME_PATTERN = r"/(360)?(VID|LRV)_\d{8}_\d{6}_\d{2}_\d+\.(insv|mp4|lrv)$"
 
 
 def _rank(role: str, lens: str, ext: str) -> int:
@@ -42,6 +46,8 @@ def _rank(role: str, lens: str, ext: str) -> int:
     if role == "vid" and ext == "mp4":
         return 0
     if role == "lrv":
+        return 1
+    if ext == "lrv":
         return 1
     return 2 if lens == "00" else 3
 
