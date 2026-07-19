@@ -3237,6 +3237,47 @@ def triage_report(
     console.print(table)
 
 
+@triage_app.command("review-server")
+def triage_review_server(
+    manifest_path: Path = _MANIFEST_OPT,
+    port: int = typer.Option(8766, "--port"),
+    host: str = typer.Option(
+        "0.0.0.0", "--host",
+        help="Bind address INSIDE the container. Must be 0.0.0.0 for a "
+        "docker `--publish` to reach it — restrict exposure on the host "
+        "side instead (`--publish <tailscale-ip>:8766:8766`).",
+    ),
+    frames_dir: Path = typer.Option(
+        Path("/scratch/triage-frames"), "--frames-dir",
+        help="The scan's sampled-frame cache (contact-sheet source).",
+    ),
+    root: str = typer.Option(
+        "/originals", "--root",
+        help="Manifest path prefix of the originals library.",
+    ),
+    fs_root: str = typer.Option(
+        None, "--fs-root",
+        help="Where originals are readable from THIS process (host runs: "
+        "/mnt/tank/immich/originals). Default: same as --root.",
+    ),
+) -> None:
+    """Web UI for grading trip footage: one trip per screen, clips in
+    capture order grouped into takes, K/C/A/T verdicts written to the
+    `triage` table. Never touches a media file — the (future) executor
+    is the only thing that acts on verdicts. Foreground; Ctrl-C when done.
+
+        sudo docker compose -f deploy/n5/compose.yaml run --rm \\
+          --name immy-triage-review --publish 100.115.236.50:8766:8766 \\
+          immy triage review-server --manifest /state/manifest.sqlite
+
+    then open http://n5.bee-ruffe.ts.net:8766 from anywhere on the tailnet.
+    """
+    from .triage import review as review_mod
+
+    console.print(f"serving triage review on http://{host}:{port} — Ctrl-C to stop")
+    review_mod.serve(manifest_path, frames_dir, root, fs_root, host, port)
+
+
 app.add_typer(triage_app, name="triage")
 
 

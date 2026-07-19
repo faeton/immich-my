@@ -1,10 +1,11 @@
 # Footage triage — `immy triage`
 
-Phase 1 tooling for shrinking the trip-video tier (~2.1T as of 2026-07):
-gather per-clip signals, rank trips by recoverable bytes, and prepare the
-ground for a human review pass. **Nothing in `immy triage` moves, rewrites,
-or re-encodes a file** — verdicts are data (`triage` table), and applying
-them is a separate, future executor with its own dry-run and quarantine.
+Tooling for shrinking the trip-video tier (~2.1T as of 2026-07): gather
+per-clip signals, rank trips by recoverable bytes (phase 1: `scan`,
+`report`), and grade every clip by hand in a web UI (phase 2:
+`review-server`). **Nothing in `immy triage` moves, rewrites, or re-encodes
+a file** — verdicts are data (`triage` table), and applying them is a
+separate, future executor with its own dry-run and quarantine.
 
 ## Model
 
@@ -47,13 +48,51 @@ and vectors come from the embedding cache. `--limit N` scans in batches.
 The favorite/album lookup is best-effort; `--skip-immich` for offline runs.
 
 `triage report` rolls up per trip: clip count, GB, GB sitting in ≥3-clip
-take groups, GB suggested `compress` (>120 s at >60 Mbps, not favorited),
+take groups, GB suggested `compress` (>120 s at >40 Mbps, not favorited),
 and favorites. `--json` for machines.
+
+## Review UI — `immy triage review-server`
+
+The human pass. One trip per screen (index sorted by undecided GB — review
+top-down for the biggest payoff), clips in capture order grouped into take
+blocks, each clip a contact sheet of the scan's 6 cached frames plus
+duration/size/bitrate/codec and the advisory suggestion. Keyboard-first:
+
+    K keep · C compress · A archive (cold) · T trash · U undo
+    shift+key = whole take · ↓/J/↑ move · Z zoom · P play · H hide decided
+
+The zoom lightbox cycles frames (X/←→) and plays mp4/mov in-browser via
+Range streaming (HEVC needs Safari or hw-decode Chrome); .insv/.360 can't
+play — grade those from the frames. Verdict keys work inside the zoom.
+
+Verdicts are upserts into `triage` (`decided_by='human'`, `decided_at`
+UTC); U deletes the row. A verdict the executor has already applied
+(`applied_at` set) renders with a dashed outline and is locked — the UI
+refuses to change it (409), because a changed verdict would silently
+disagree with what's on disk.
+
+On n5 (frames + manifest live in the standard container mounts):
+
+```sh
+sudo docker compose -f deploy/n5/compose.yaml run --rm \
+  --name immy-triage-review --publish 100.115.236.50:8766:8766 \
+  immy triage review-server --manifest /state/manifest.sqlite
+```
+
+then open `http://n5.bee-ruffe.ts.net:8766` from anywhere on the tailnet
+(port 8765 stays with the dedup review server).
 
 ## Suggestion rules (advisory, conservative)
 
-1. Immich favorite or album member → `keep` — a human already voted.
-2. >120 s and >60 Mbps and not favorited → `compress` candidate.
+1. Immich favorite → `keep` — a human already voted. Album membership is
+   deliberately **not** a signal: immy's auto-albums cover every trip clip,
+   and on the first n5 scan the album rule blanket-kept 1.86 TB.
+2. >120 s and >40 Mbps and not favorited → `compress` candidate (n5's
+   H.264 averages 51 Mbps, HEVC 88 Mbps — the old 60 Mbps bar excluded
+   most of the re-encodable long tail).
 3. Member of a ≥3-clip take group → `review-take` (pick the best, grade
    the rest by hand).
 4. Otherwise no suggestion.
+
+Rules are recomputed on every `scan` (derived layer, no `--force` needed),
+so retuning them is a code edit + a cheap re-scan.

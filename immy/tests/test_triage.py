@@ -162,7 +162,16 @@ def test_take_groups_never_cross_trips():
 def test_suggest_favorite_wins_over_compress():
     c = _clip(1)
     c.duration_s, c.bitrate_kbps, c.favorite = 600.0, 100_000.0, 1
-    assert engine.suggest(c, take_size=5) == ("keep", "immich favorite/album")
+    assert engine.suggest(c, take_size=5) == ("keep", "immich favorite")
+
+
+def test_suggest_ignores_albums():
+    """immy auto-albums cover every trip clip — album membership must not
+    suggest keep (it once blanket-kept 1.86 TB)."""
+    c = _clip(1)
+    c.duration_s, c.bitrate_kbps, c.album_count = 600.0, 100_000.0, 3
+    suggested, _ = engine.suggest(c, take_size=1)
+    assert suggested == "compress"
 
 
 def test_suggest_compress_candidate():

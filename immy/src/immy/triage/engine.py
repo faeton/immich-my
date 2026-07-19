@@ -42,7 +42,7 @@ FRAMES_PER_CLIP = 6
 TAKE_GAP_S = 120.0        # capture-time gap that always starts a new take
 TAKE_MIN_COS = 0.80       # centroid cosine below this starts a new take
 COMPRESS_MIN_DURATION_S = 120.0
-COMPRESS_MIN_KBPS = 60_000.0
+COMPRESS_MIN_KBPS = 40_000.0
 REVIEW_TAKE_MIN_CLIPS = 3
 
 _DATED_TOP = re.compile(r"^\d{4}$")
@@ -243,12 +243,14 @@ def assign_take_groups(
 def suggest(clip: Clip, take_size: int) -> tuple[str | None, str | None]:
     """Conservative auto-suggestion — advisory only, never a verdict.
 
-    Precedence: an Immich favorite/album always suggests keep (a human
-    already voted with their thumb); long high-bitrate non-favorites are
-    compress candidates; ≥3-clip takes are flagged for human take-review."""
-    fav = bool(clip.favorite)
-    if fav or (clip.album_count or 0) > 0:
-        return "keep", "immich favorite/album"
+    Precedence: an Immich favorite always suggests keep (a human already
+    voted with their thumb). Album membership is deliberately NOT a keep
+    signal — immy's auto-albums put every trip clip in an album, so the
+    first scan of n5 marked 1.86 TB "keep" off albums alone. Long
+    high-bitrate non-favorites are compress candidates; ≥3-clip takes are
+    flagged for human take-review."""
+    if bool(clip.favorite):
+        return "keep", "immich favorite"
     if (
         (clip.duration_s or 0) > COMPRESS_MIN_DURATION_S
         and (clip.bitrate_kbps or 0) > COMPRESS_MIN_KBPS

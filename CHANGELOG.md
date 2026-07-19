@@ -4,6 +4,30 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-07-19 — `immy triage review-server` (footage triage, phase 2)
+
+### Added
+
+- **`immy triage review-server`** — web UI for grading trip footage
+  (`triage/review.py`, port 8766): trip index sorted by undecided GB, then
+  one trip per screen with clips in capture order grouped into take blocks.
+  Each clip is a 6-frame contact sheet from the scan's frame cache with
+  duration/size/bitrate/codec, a lightbox (frame cycling + in-browser
+  playback of mp4/mov via Range requests; .insv greys out), and keyboard
+  verdicts: K keep · C compress · A archive (`cold`) · T trash · U undo,
+  shift+key for the whole take, H hides decided. Verdicts land in the
+  `triage` table (`decided_by='human'`); rows the executor has applied
+  (`applied_at` set) are locked against re-grading. Never touches a file.
+
+### Changed
+
+- **Suggestion rules retuned from the first real scan** (n5, 3,808 clips):
+  album membership no longer suggests keep — immy's auto-albums cover every
+  trip clip, so the rule blanket-kept 1.86 TB and starved the others.
+  Favorites (still a keep) are genuinely rare. Compress threshold dropped
+  60 → 40 Mbps: the library's H.264 averages 51 Mbps and HEVC 88 Mbps, so
+  60 excluded most of the plausibly re-encodable long tail.
+
 ## 2026-07-18 — `immy triage scan|report` (footage triage, phase 1)
 
 ### Added
