@@ -108,6 +108,39 @@ def load_clips(conn: sqlite3.Connection, root: str) -> list[dict]:
     return clips
 
 
+_INSV_LENS = re.compile(r"^(VID_\d{8}_\d{6})_(\d{2})_(\d+)\.insv$", re.I)
+
+
+def merge_lens_pairs(clips: list[dict]) -> list[dict]:
+    """Insta360 dual-lens recordings write one .insv per lens (`_00_` front
+    hemisphere, `_10_` back — see insta360.py): two files, ONE video. Grading
+    them separately would be incoherent (half a sphere is unusable alone), so
+    the UI folds a pair into a single row — combined size, first lens's
+    contact sheet, one verdict written to both asset ids. Keyed on the
+    (timestamp, serial) the camera shares across the pair, same as the LRV
+    index in insta360.py."""
+    by_key: dict[tuple, dict] = {}
+    out: list[dict] = []
+    for c in clips:
+        m = _INSV_LENS.match(c["name"])
+        if not m:
+            out.append(c)
+            continue
+        key = (str(Path(c["path"]).parent), m.group(1), m.group(3))
+        prime = by_key.get(key)
+        if prime is None:
+            c = dict(c, partner_ids=[], lenses=1)
+            by_key[key] = c
+            out.append(c)
+        else:
+            prime["bytes"] += c["bytes"]
+            prime["partner_ids"].append(c["id"])
+            prime["lenses"] += 1
+            prime["verdict"] = prime["verdict"] or c["verdict"]
+            prime["applied"] = prime["applied"] or c["applied"]
+    return out
+
+
 def trip_rollup(clips: list[dict]) -> list[dict]:
     """Per-trip progress, biggest undecided bytes first — the index is a
     worklist, so the trip where a review session recovers the most space
@@ -340,9 +373,12 @@ function updateHeader() {
 async function verdict(ids, v, reason) {
   ids = ids.filter(id => !byId[id].applied);
   if (!ids.length) { toast('verdict already applied by the executor \\u2014 locked'); return; }
+  // A row can stand for several files (Insta360 lens pairs) — the verdict
+  // covers all of them.
+  const assetIds = ids.flatMap(id => byId[id].ids || [id]);
   const res = await fetch('/api/verdict', {method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({asset_ids: ids, verdict: v, reason: reason || null})});
+    body: JSON.stringify({asset_ids: assetIds, verdict: v, reason: reason || null})});
   const out = await res.json().catch(() => ({}));
   if (!res.ok) { toast('failed: ' + (out.error || res.statusText)); return; }
   ids.forEach(id => { byId[id].decided = v === 'clear' ? null : v; paint(id); });
@@ -474,6 +510,7 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
         for c in group:
             js_clips.append({
                 "id": c["id"], "name": c["name"], "bytes": c["bytes"],
+                "ids": [c["id"], *c.get("partner_ids", [])],
                 "frames": c["n_frames"], "playable": c["playable"],
                 "decided": c["verdict"], "applied": c["applied"],
             })
@@ -495,6 +532,12 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
                 if c["suggested"] else ""
             )
             fav_chip = "<span class='chip fav'>&#9733; favorite</span>" if c["favorite"] else ""
+            lens_chip = (
+                f"<span class='chip' title='Insta360 writes one .insv per lens "
+                f"(_00_ front, _10_ back) — one recording, one verdict for both files'>"
+                f"&#127760; {c['lenses']} lens files</span>"
+                if c.get("lenses", 1) > 1 else ""
+            )
             play = (
                 "<button class='play'>&#9654; play</button>"
                 if c["playable"] else ""
@@ -511,7 +554,7 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
                 {fmt_duration(c['duration_s'])} &middot; {human_bytes(c['bytes'])}
                 &middot; {mbps} {html.escape(c['codec'] or '?')}
                 &middot; {html.escape((c['taken_at'] or '?')[:16])}<br>
-                {suggest_chip}{fav_chip}{play}
+                {suggest_chip}{fav_chip}{lens_chip}{play}
               </div>
               <div class="vchip{verdict_class}{applied}">{verdict_label}</div>
             </div>""")
@@ -612,7 +655,7 @@ def create_app(
     def index():
         conn = db()
         try:
-            return render_index(trip_rollup(load_clips(conn, root)))
+            return render_index(trip_rollup(merge_lens_pairs(load_clips(conn, root))))
         finally:
             conn.close()
 
@@ -620,7 +663,9 @@ def create_app(
     def trip_page(trip: str):
         conn = db()
         try:
-            clips = [c for c in load_clips(conn, root) if c["trip"] == trip]
+            clips = merge_lens_pairs(
+                [c for c in load_clips(conn, root) if c["trip"] == trip]
+            )
         finally:
             conn.close()
         if not clips:

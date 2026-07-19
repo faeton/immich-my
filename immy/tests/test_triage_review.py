@@ -48,6 +48,11 @@ def app(tmp_path: Path):
           take_group=3)
     # stale v1-scan proxy row — must never render anywhere in the UI
     _seed(conn, 5, "/originals/2024-04-namibia/LRV_0005.lrv", take_group=1)
+    # Insta360 dual-lens pair: two files, one recording, one row, one verdict
+    _seed(conn, 6, "/originals/2024-04-namibia/VID_20240401_120000_00_007.insv",
+          bytes=2 * 10**9, taken_at="2024-04-01T12:00:00", take_group=4)
+    _seed(conn, 7, "/originals/2024-04-namibia/VID_20240401_120000_10_007.insv",
+          bytes=2 * 10**9, taken_at="2024-04-01T12:00:00", take_group=4)
     conn.commit()
     conn.close()
 
@@ -97,6 +102,23 @@ def test_key_instructions_visible_without_scrolling(client):
     assert "grading keys" in trip
     index = client.get("/").get_data(as_text=True)
     assert "cheat-sheet" in index
+
+
+def test_lens_pair_folds_into_one_row_one_verdict(client, tmp_path):
+    page = client.get("/trip/2024-04-namibia").get_data(as_text=True)
+    assert 'data-id="6"' in page          # front lens renders as THE row
+    assert 'data-id="7"' not in page      # back lens folded into it
+    assert "VID_20240401_120000_10_007.insv" not in page
+    assert "2 lens files" in page and "3.7GB" in page  # 4e9 bytes combined
+
+    # a verdict on the visible (front-lens) row covers both files
+    res = client.post("/api/verdict", json={"asset_ids": [6, 7], "verdict": "keep"})
+    assert res.status_code == 200 and res.get_json()["count"] == 2
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    assert dict(conn.execute(
+        "SELECT asset_id, verdict FROM triage WHERE asset_id IN (6,7)"
+    )) == {6: "keep", 7: "keep"}
+    conn.close()
 
 
 # ------------------------------------------------------------------ verdict
