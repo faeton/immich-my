@@ -209,6 +209,13 @@ button.play{font-size:.72rem;padding:2px 8px}
        padding:8px 14px;border-radius:8px;display:none;z-index:20}
 footer{margin-top:18px;color:#666;font-size:.75rem;line-height:1.7}
 .filters{margin-left:auto;font-size:.8rem}
+.legend{font-size:.75rem;color:#999;line-height:1.9}
+.legend b{color:#ccc;font-weight:600}
+#help{position:fixed;inset:0;background:#000c;display:none;align-items:center;
+      justify-content:center;z-index:15}
+#help .card{background:var(--panel);border:1px solid #444;border-radius:12px;
+            padding:18px 26px;max-width:560px;font-size:.85rem;line-height:2.1;color:#ccc}
+#help h2{font-size:.95rem;margin:0 0 6px}
 """
 
 
@@ -269,9 +276,12 @@ def render_index(trips: list[dict]) -> str:
       {''.join(rows)}{totals_row}
     </table>
     <footer>Sorted by undecided GB — review top-down for the biggest payoff.
-      Verdicts are data in the manifest; nothing moves or re-encodes until the
-      executor runs them. Rough expectations: trash + cold free their full size
-      from the vv mirror, compress typically recovers about half.</footer>
+      Open a trip and grade with <span class="key">K</span> keep &middot;
+      <span class="key">C</span> compress &middot; <span class="key">A</span> archive &middot;
+      <span class="key">T</span> trash (press <span class="key">?</span> inside for the full
+      cheat-sheet). Verdicts are data in the manifest; nothing moves or re-encodes
+      until the executor runs them. Rough expectations: trash + cold free their
+      full size from the vv mirror, compress typically recovers about half.</footer>
     """
     return _page("footage triage", body)
 
@@ -384,6 +394,10 @@ function closeLightbox() {
 
 // ---------------------------------------------------------------- input
 document.addEventListener('click', ev => {
+  if (ev.target.closest('#help')) {
+    document.getElementById('help').style.display = 'none';
+    return;
+  }
   if (ev.target.closest('#lightbox')) {
     if (ev.target.tagName !== 'VIDEO') closeLightbox();
     return;
@@ -409,6 +423,13 @@ document.addEventListener('click', ev => {
 const KEYMAP = {k: 'keep', c: 'compress', a: 'cold', t: 'trash'};
 document.addEventListener('keydown', ev => {
   if (ev.target.tagName === 'INPUT' || ev.metaKey || ev.ctrlKey) return;
+  const help = document.getElementById('help');
+  if (ev.key === '?' || (help.style.display === 'flex' && ev.key === 'Escape')) {
+    help.style.display = help.style.display === 'flex' ? 'none' : 'flex';
+    ev.preventDefault();
+    return;
+  }
+  if (help.style.display === 'flex') return;   // modal: swallow other keys
   const box = document.getElementById('lightbox');
   const inLb = box.style.display === 'flex';
   const key = ev.key.toLowerCase();
@@ -519,6 +540,18 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
       <span class="progress" id="prog"></span>
       <span class="filters"><label><input type="checkbox" id="hidebox">
         hide decided <span class="key">H</span></label></span>
+      <span class="legend" style="width:100%">
+        <span class="key">K</span><b>keep</b> &middot;
+        <span class="key">C</span><b>compress</b> &middot;
+        <span class="key">A</span><b>archive</b> &middot;
+        <span class="key">T</span><b>trash</b> &middot;
+        <span class="key">U</span>undo &middot;
+        <span class="key">&#8679;</span>+key = whole take &middot;
+        <span class="key">&darr;</span><span class="key">&uarr;</span> move &middot;
+        <span class="key">Z</span> zoom &middot;
+        <span class="key">P</span> play &middot;
+        <span class="key">?</span> help
+      </span>
     </header>
     <div id="clips">{''.join(take_blocks)}</div>
     <footer>
@@ -532,6 +565,27 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
       the executor moves/encodes later; dashed outline = already applied, locked.
     </footer>
     <div id="lightbox"><img><video controls></video><div id="lbnote"></div></div>
+    <div id="help"><div class="card">
+      <h2>grading keys</h2>
+      <span class="key">K</span> keep &middot; <span class="key">C</span> compress (re-encode later) &middot;
+      <span class="key">A</span> archive to cold storage &middot; <span class="key">T</span> trash &middot;
+      <span class="key">U</span> undo a verdict<br>
+      <span class="key">&#8679;</span>+any of those applies it to the whole take block<br>
+      <h2>moving around</h2>
+      <span class="key">&darr;</span>/<span class="key">J</span> next clip &middot;
+      <span class="key">&uarr;</span> previous &middot; click a clip to focus it &middot;
+      <span class="key">H</span> hide decided clips<br>
+      <h2>looking closer</h2>
+      <span class="key">Z</span>/space or click a frame = zoom &middot;
+      in zoom <span class="key">X</span>/<span class="key">&larr;</span><span class="key">&rarr;</span>
+      cycle frames, verdict keys still work &middot;
+      <span class="key">P</span> plays mp4/mov in the browser (.insv can't play — use the frames)<br>
+      <h2>what a verdict does</h2>
+      Writes a row in the manifest, nothing more — no file is moved or
+      re-encoded until the executor runs, and you can re-grade or
+      <span class="key">U</span>ndo any time before that.<br>
+      <span class="key">?</span>/<span class="key">Esc</span> closes this.
+    </div></div>
     <div id="toast"></div>
     <script>const CLIPS = {json.dumps(js_clips)};\n{_TRIP_JS}</script>
     """

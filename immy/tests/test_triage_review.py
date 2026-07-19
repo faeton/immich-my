@@ -86,6 +86,16 @@ def test_trip_page_groups_takes_and_marks_playability(client):
     assert client.get("/trip/nope").status_code == 404
 
 
+def test_key_instructions_visible_without_scrolling(client):
+    """The key legend must live in the sticky header and the ? overlay —
+    a footer below 300+ clips is effectively invisible."""
+    trip = client.get("/trip/2024-04-namibia").get_data(as_text=True)
+    assert 'class="legend"' in trip and 'id="help"' in trip
+    assert "grading keys" in trip
+    index = client.get("/").get_data(as_text=True)
+    assert "cheat-sheet" in index
+
+
 # ------------------------------------------------------------------ verdict
 
 
