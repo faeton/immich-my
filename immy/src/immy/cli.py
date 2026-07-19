@@ -3237,6 +3237,51 @@ def triage_report(
     console.print(table)
 
 
+@triage_app.command("stack-insv")
+def triage_stack_insv(
+    config_path: Path = typer.Option(None, "--config", help="immy config.yml (pg: + immich: blocks)."),
+    write: bool = typer.Option(False, "--write", help="Create the stacks for real (default: dry-run report)."),
+) -> None:
+    """Backfill Immich stacks for Insta360 recordings: fold each recording's
+    VID_ _00_/_10_ lens masters, LRV_ _11_ stitched preview, and any stitched
+    .mp4 export into one stack (best-watchable member as primary). Groups
+    where any member is already stacked are skipped. Reads asset ids from
+    Postgres, writes only through the Immich API."""
+    from . import stacks as stacks_mod
+    from .pg import connect
+
+    config = load_config(config_path)
+    if config.pg is None or config.immich is None:
+        console.print("[red]needs pg: and immich: config blocks[/red]")
+        raise typer.Exit(1)
+    with connect(config.pg) as pg_conn:
+        rows = stacks_mod.fetch_candidates(pg_conn)
+    plans, already, singles = stacks_mod.plan_stacks(rows)
+    console.print(
+        f"{len(rows)} insta360 files → {len(plans)} stacks to create · "
+        f"{already} groups already stacked · {singles} singletons"
+    )
+    for plan in plans[:12]:
+        console.print(
+            f"  {plan.primary[1]} ← {', '.join(n for _, n in plan.children)}"
+        )
+    if len(plans) > 12:
+        console.print(f"  … and {len(plans) - 12} more")
+    if not write:
+        console.print("[yellow]dry-run[/yellow] — re-run with --write to create them")
+        return
+    client = ImmichClient(
+        url=config.immich.url,
+        api_key=config.immich.api_key,
+        ssh_host=config.immich.ssh_host,
+    )
+    done, failed = stacks_mod.apply_stacks(
+        client, plans, log=lambda msg: console.print(f"[red]{msg}[/red]")
+    )
+    console.print(f"[green]{done} stacks created[/green]" +
+                  (f" · [red]{failed} failed[/red]" if failed else ""))
+
+
 @triage_app.command("review-server")
 def triage_review_server(
     manifest_path: Path = _MANIFEST_OPT,

@@ -216,6 +216,14 @@ def test_suggest_compress_candidate():
     assert "300s" in reason and "80 Mbps" in reason
 
 
+def test_suggest_never_compresses_insv():
+    """A transcoded .insv can't open in Insta360 Studio — not a candidate."""
+    c = _clip(1, path="/originals/2024-02-peru-bolivia/VID_x_00_001.insv")
+    c.duration_s, c.bitrate_kbps = 300.0, 80_000.0
+    suggested, _ = engine.suggest(c, take_size=1)
+    assert suggested is None
+
+
 def test_suggest_review_take_and_none():
     c = _clip(1)
     c.duration_s, c.bitrate_kbps = 30.0, 40_000.0

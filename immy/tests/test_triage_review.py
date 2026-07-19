@@ -149,6 +149,21 @@ def test_verdict_write_update_and_clear(client, tmp_path):
     conn.close()
 
 
+def test_verdict_compress_refused_for_insv(client, tmp_path):
+    """faeton's rule: never store 360 footage in a form Insta360 Studio
+    can't open — compress on .insv is rejected server-side."""
+    res = client.post("/api/verdict", json={"asset_ids": [3], "verdict": "compress"})
+    assert res.status_code == 400 and ".insv" in res.get_json()["error"]
+    # keep/cold/trash still fine
+    assert client.post("/api/verdict",
+                       json={"asset_ids": [3], "verdict": "cold"}).status_code == 200
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    assert conn.execute(
+        "SELECT verdict FROM triage WHERE asset_id=3"
+    ).fetchone()[0] == "cold"
+    conn.close()
+
+
 def test_verdict_rejects_garbage(client):
     assert client.post("/api/verdict", json={"asset_ids": [1], "verdict": "shred"}).status_code == 400
     assert client.post("/api/verdict", json={"asset_ids": [], "verdict": "keep"}).status_code == 400

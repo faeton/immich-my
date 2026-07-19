@@ -373,6 +373,16 @@ function updateHeader() {
 async function verdict(ids, v, reason) {
   ids = ids.filter(id => !byId[id].applied);
   if (!ids.length) { toast('verdict already applied by the executor \\u2014 locked'); return; }
+  if (v === 'compress') {
+    // 360 masters must stay Studio-openable — compress never applies to .insv.
+    const insv = ids.filter(id => byId[id].name.toLowerCase().endsWith('.insv'));
+    if (insv.length) {
+      ids = ids.filter(id => !insv.includes(id));
+      toast('compress is not available for .insv (Studio could not open the result) ' +
+            '\\u2014 use keep, cold or trash' + (ids.length ? '; applied to the rest' : ''));
+      if (!ids.length) return;
+    }
+  }
   // A row can stand for several files (Insta360 lens pairs) — the verdict
   // covers all of them.
   const assetIds = ids.flatMap(id => byId[id].ids || [id]);
@@ -711,6 +721,22 @@ def create_app(
             unknown = [i for i in ids if i not in known]
             if unknown:
                 return jsonify(error=f"assets {unknown} were never scanned"), 400
+            if verdict == "compress":
+                # faeton's rule (2026-07-19): never store 360 footage in a
+                # form Insta360 Studio can't open — a transcoded .insv loses
+                # the gyro/stitch metadata, so compress is not a valid
+                # verdict for these. keep / cold / trash only.
+                insv = [
+                    r[0] for r in conn.execute(
+                        f"SELECT id FROM asset WHERE id IN ({marks})"
+                        " AND LOWER(path) LIKE '%.insv'", ids,
+                    )
+                ]
+                if insv:
+                    return jsonify(
+                        error="compress is not available for .insv (Studio "
+                        "couldn't open the result) — use keep, cold or trash"
+                    ), 400
             if verdict == "clear":
                 conn.execute(
                     f"DELETE FROM triage WHERE asset_id IN ({marks})", ids

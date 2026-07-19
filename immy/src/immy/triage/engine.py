@@ -269,6 +269,9 @@ def suggest(clip: Clip, take_size: int) -> tuple[str | None, str | None]:
     if (
         (clip.duration_s or 0) > COMPRESS_MIN_DURATION_S
         and (clip.bitrate_kbps or 0) > COMPRESS_MIN_KBPS
+        # .insv is never a compress candidate: a transcode strips the
+        # gyro/stitch metadata and Insta360 Studio can't open the result.
+        and not clip.path.lower().endswith(".insv")
     ):
         return "compress", (
             f"{clip.duration_s:.0f}s at {clip.bitrate_kbps / 1000:.0f} Mbps"

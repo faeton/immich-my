@@ -70,6 +70,16 @@ The zoom lightbox cycles frames (X/←→) and plays mp4/mov in-browser via
 Range streaming (HEVC needs Safari or hw-decode Chrome); .insv/.360 can't
 play — grade those from the frames. Verdict keys work inside the zoom.
 
+**`compress` is not available for `.insv` — at all.** The .insv container
+carries Insta360's proprietary boxes (gyro/IMU for FlowState, lens
+pairing); any transcode strips them and the file no longer opens in
+Insta360 Studio. faeton's rule (2026-07-19): never store 360 footage in a
+form Studio can't open. So .insv verdicts are keep / cold / trash only —
+the UI filters `C` out (with a toast), the server rejects it (400), and
+the scan never suggests compress for one. Reclaiming space from 360
+footage means `cold` (move the untouched masters to `tank/cold`) or
+`trash`, never a re-encode.
+
 Verdicts are upserts into `triage` (`decided_by='human'`, `decided_at`
 UTC); U deletes the row. A verdict the executor has already applied
 (`applied_at` set) renders with a dashed outline and is locked — the UI
