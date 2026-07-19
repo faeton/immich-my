@@ -45,7 +45,13 @@ PROXY_SUFFIXES = {".lrv", ".lrf"}
 
 
 def is_proxy(path: str) -> bool:
-    return PurePosixPath(path).suffix.lower() in PROXY_SUFFIXES
+    p = PurePosixPath(path)
+    if p.suffix.lower() in PROXY_SUFFIXES:
+        return True
+    # Insta360 marks its stitched low-res preview by PREFIX, not extension:
+    # LRV_<ts>_11_<serial>.insv next to the VID_ _00_/_10_ lens masters
+    # (see insta360.py — lens code 11 = both hemispheres combined).
+    return p.name.lower().startswith("lrv_") and p.suffix.lower() == ".insv"
 
 FRAMES_PER_CLIP = 6
 TAKE_GAP_S = 120.0        # capture-time gap that always starts a new take
@@ -305,7 +311,8 @@ def scan(
     conn.execute(
         "DELETE FROM video_signal WHERE asset_id IN ("
         "  SELECT id FROM asset WHERE LOWER(path) LIKE '%.lrv'"
-        "    OR LOWER(path) LIKE '%.lrf')"
+        "    OR LOWER(path) LIKE '%.lrf'"
+        r"    OR LOWER(path) LIKE '%/lrv\_%.insv' ESCAPE '\')"
     )
     conn.commit()
     clips = load_trip_videos(conn, root)

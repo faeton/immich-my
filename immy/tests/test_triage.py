@@ -155,14 +155,19 @@ def test_proxies_out_of_scope(tmp_path: Path):
     for them are purged on the next scan."""
     assert engine.is_proxy("/originals/t/LRV_001.lrv")
     assert engine.is_proxy("/originals/t/DJI_0001.LRF")
-    assert not engine.is_proxy("/originals/t/VID_001.insv")
+    # Insta360 stitched preview: proxy by PREFIX, extension is .insv
+    assert engine.is_proxy("/originals/t/LRV_20240211_125134_11_053.insv")
+    assert not engine.is_proxy("/originals/t/VID_20240211_125134_00_053.insv")
 
     conn = manifest.open_manifest(tmp_path / "m.sqlite")
     _seed_asset(conn, 1, "/originals/2024-04-namibia/VID_001.insv", format="insv")
     _seed_asset(conn, 2, "/originals/2024-04-namibia/LRV_001.lrv", format="lrv")
-    conn.execute(
-        "INSERT INTO video_signal (asset_id, duration_s) VALUES (2, 60)"
-    )  # stale v1 row for the proxy
+    _seed_asset(conn, 3, "/originals/2024-04-namibia/LRV_20240401_120000_11_007.insv",
+                format="insv")
+    conn.executemany(
+        "INSERT INTO video_signal (asset_id, duration_s) VALUES (?, 60)",
+        [(2,), (3,)],
+    )  # stale v1/v2 rows for the proxies
     conn.commit()
 
     assert [c.id for c in engine.load_trip_videos(conn, "/originals")] == [1]
@@ -174,7 +179,7 @@ def test_proxies_out_of_scope(tmp_path: Path):
         immich_lookup=None,
     )
     assert conn.execute(
-        "SELECT COUNT(*) FROM video_signal WHERE asset_id=2"
+        "SELECT COUNT(*) FROM video_signal WHERE asset_id IN (2, 3)"
     ).fetchone()[0] == 0
 
 
