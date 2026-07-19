@@ -108,7 +108,14 @@ def load_clips(conn: sqlite3.Connection, root: str) -> list[dict]:
     return clips
 
 
-_INSV_LENS = re.compile(r"^(VID_\d{8}_\d{6})_(\d{2})_(\d+)\.insv$", re.I)
+_INSV_LENS = re.compile(r"^VID_(\d{8}_\d{6})_(\d{2})_(\d+)\.insv$", re.I)
+
+
+def pano_key(name: str) -> str | None:
+    """Recording key (<ts>_<serial>) for an insv master — the deep-link id
+    the 360 viewer uses, so triage can hand playback over to it."""
+    m = _INSV_LENS.match(name)
+    return f"{m.group(1)}_{m.group(3)}" if m else None
 
 
 def merge_lens_pairs(clips: list[dict]) -> list[dict]:
@@ -420,7 +427,17 @@ function showFrames(id, frame = 0) {
 }
 function playVideo(id) {
   const c = byId[id];
-  if (!c.playable) { toast('.' + c.name.split('.').pop() + ' does not play in a browser \\u2014 use the frames'); return; }
+  if (!c.playable) {
+    if (c.pano) {
+      // raw fisheye is unwatchable flat — hand off to the 360 viewer,
+      // which streams this recording's stitched preview.
+      window.open('http://' + location.hostname + ':8767/trip/' +
+                  encodeURIComponent(TRIP) + '?open=' + c.pano, '_blank');
+    } else {
+      toast('.' + c.name.split('.').pop() + ' does not play in a browser \\u2014 use the frames');
+    }
+    return;
+  }
   lb.id = id;
   const box = document.getElementById('lightbox');
   box.querySelector('img').style.display = 'none';
@@ -522,6 +539,7 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
                 "id": c["id"], "name": c["name"], "bytes": c["bytes"],
                 "ids": [c["id"], *c.get("partner_ids", [])],
                 "frames": c["n_frames"], "playable": c["playable"],
+                "pano": pano_key(c["name"]),
                 "decided": c["verdict"], "applied": c["applied"],
             })
             frames = (
@@ -548,10 +566,13 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
                 f"&#127760; {c['lenses']} lens files</span>"
                 if c.get("lenses", 1) > 1 else ""
             )
-            play = (
-                "<button class='play'>&#9654; play</button>"
-                if c["playable"] else ""
-            )
+            if c["playable"]:
+                play = "<button class='play'>&#9654; play</button>"
+            elif pano_key(c["name"]):
+                play = ("<button class='play' title='opens this recording in "
+                        "the 360 viewer (:8767)'>&#127760; 360 view</button>")
+            else:
+                play = ""
             verdict_class = f" {c['verdict']}" if c["verdict"] else ""
             verdict_label = c["verdict"] or "&mdash;"
             applied = " applied" if c["applied"] else ""
@@ -640,7 +661,8 @@ def render_trip(trip: str, groups: list[list[dict]]) -> str:
       <span class="key">?</span>/<span class="key">Esc</span> closes this.
     </div></div>
     <div id="toast"></div>
-    <script>const CLIPS = {json.dumps(js_clips)};\n{_TRIP_JS}</script>
+    <script>const CLIPS = {json.dumps(js_clips)};
+    const TRIP = {json.dumps(trip)};\n{_TRIP_JS}</script>
     """
     return _page(f"triage — {trip}", body)
 

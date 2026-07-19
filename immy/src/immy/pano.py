@@ -318,6 +318,14 @@ document.addEventListener('click', ev => {
   const card = ev.target.closest('.card');
   if (card) { openRec(Number(card.dataset.i)); frame(); }
 });
+
+// Deep link from the triage UI: /trip/<trip>?open=<key> lands straight in
+// the player on that recording.
+const deepLink = new URLSearchParams(location.search).get('open');
+if (deepLink) {
+  const i = RECS.findIndex(r => r.key === deepLink);
+  if (i >= 0) { openRec(i); frame(); }
+}
 document.getElementById('closebtn').addEventListener('click', closePlayer);
 document.getElementById('playbtn').addEventListener('click',
   () => video.paused ? video.play() : video.pause());

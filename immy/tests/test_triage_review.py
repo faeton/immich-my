@@ -90,6 +90,8 @@ def test_trip_page_groups_takes_and_marks_playability(client):
     assert "DJI_0001.MP4" in page and "VID_0003.insv" in page
     # the insv clip gets no play button; the mp4s do
     assert page.count("play</button>") == 2
+    # insv rows get a 360-viewer handoff button instead of a play button
+    assert "360 view</button>" in page and '"pano": "20240401_120000_007"' in page
     assert "LRV_0005.lrv" not in page   # proxies are out of triage scope
     assert client.get("/trip/nope").status_code == 404
 
