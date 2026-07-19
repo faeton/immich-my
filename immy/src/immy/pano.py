@@ -50,11 +50,23 @@ class Recording:
     master_bytes: int = 0
     lrv_id: int | None = None
     export_id: int | None = None
+    front_id: int | None = None    # VID _00_ lens master
+    back_id: int | None = None     # VID _10_ lens master
     duration_s: float | None = None
 
     @property
     def stream_id(self) -> int | None:
         return self.lrv_id if self.lrv_id is not None else self.export_id
+
+    @property
+    def poster_id(self) -> int | None:
+        """Best source for a thumbnail — stitched if we have one, else the
+        raw front lens (a fisheye circle is still recognizable)."""
+        if self.stream_id is not None:
+            return self.stream_id
+        return self.front_id if self.front_id is not None else (
+            self.masters[0] if self.masters else None
+        )
 
     def when(self) -> str:
         try:
@@ -95,6 +107,10 @@ def load_recordings(conn: sqlite3.Connection, root: str) -> list[Recording]:
             rec.export_id = asset_id
         elif role == "vid" and ext == "insv":
             rec.masters.append(asset_id)
+            if lens == "00":
+                rec.front_id = asset_id
+            elif lens == "10":
+                rec.back_id = asset_id
             rec.master_bytes += conn.execute(
                 "SELECT bytes FROM asset WHERE id=?", (asset_id,)
             ).fetchone()[0] or 0
@@ -166,6 +182,7 @@ h1{font-size:1.05rem;margin:0}
 .card .meta{padding:8px 12px;font-size:.78rem;color:#bbb;display:flex;gap:10px}
 .badge{border:1px solid #3a5a3a;color:#9fdca4;border-radius:4px;padding:0 6px;font-size:.7rem}
 .badge.lrv{border-color:#3a4a6a;color:#9fc0dc}
+.badge.raw{border-color:#6a5a3a;color:#dcc09f}
 #player{position:fixed;inset:0;background:#000;display:none;z-index:10}
 #player canvas{position:absolute;inset:0;width:100%;height:100%;cursor:grab}
 #player canvas.dragging{cursor:grabbing}
@@ -219,7 +236,7 @@ def render_index(recs: list[Recording]) -> str:
 _PLAYER_JS = r"""
 const RECS = RECS_JSON;
 let cur = -1, gl = null, tex = null, prog = null;
-let yaw = 0, pitch = 0, fov = 1.35, projecting = true;
+let yaw = 0, pitch = 0, fov = 1.35, projecting = true, lensMode = 0;
 
 const video = document.querySelector('#player video');
 const canvas = document.querySelector('#player canvas');
@@ -229,7 +246,7 @@ function initGL() {
   const vs = `attribute vec2 p; varying vec2 ndc;
     void main(){ ndc = p; gl_Position = vec4(p, 0.0, 1.0); }`;
   const fs = `precision mediump float; varying vec2 ndc;
-    uniform float yaw, pitch, fov, aspect; uniform sampler2D tex;
+    uniform float yaw, pitch, fov, aspect, mode; uniform sampler2D tex;
     void main(){
       float f = 1.0 / tan(fov * 0.5);
       vec3 d = normalize(vec3(ndc.x * aspect, ndc.y, -f));
@@ -237,9 +254,23 @@ function initGL() {
       d = vec3(d.x, d.y*cp - d.z*sp, d.y*sp + d.z*cp);
       float cy = cos(yaw), sy = sin(yaw);
       d = vec3(d.x*cy + d.z*sy, d.y, -d.x*sy + d.z*cy);
-      float u = 0.5 + atan(d.x, -d.z) / 6.28318530718;
-      float v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) / 3.14159265359;
-      gl_FragColor = texture2D(tex, vec2(u, v));
+      if (mode < 0.5) {
+        // equirectangular (stitched preview / export)
+        float u = 0.5 + atan(d.x, -d.z) / 6.28318530718;
+        float v = 0.5 - asin(clamp(d.y, -1.0, 1.0)) / 3.14159265359;
+        gl_FragColor = texture2D(tex, vec2(u, v));
+      } else {
+        // raw single-lens fisheye master (2880x2880 equidistant, ~200deg):
+        // r on the sensor is proportional to the angle off the lens axis.
+        float theta = acos(clamp(-d.z, -1.0, 1.0));
+        float maxT = 1.745;                       // ~100deg half-FOV at edge
+        vec2 rad = vec2(d.x, d.y);
+        float rl = max(length(rad), 1e-5);
+        float r = 0.5 * theta / maxT;
+        vec2 uv = vec2(0.5 + r * rad.x / rl, 0.5 - r * rad.y / rl);
+        gl_FragColor = theta > maxT
+          ? vec4(0.02, 0.02, 0.04, 1.0) : texture2D(tex, uv);
+      }
     }`;
   function shader(type, src) {
     const s = gl.createShader(type);
@@ -279,6 +310,7 @@ function frame() {
     gl.uniform1f(gl.getUniformLocation(prog, 'pitch'), pitch);
     gl.uniform1f(gl.getUniformLocation(prog, 'fov'), fov);
     gl.uniform1f(gl.getUniformLocation(prog, 'aspect'), canvas.width / canvas.height);
+    gl.uniform1f(gl.getUniformLocation(prog, 'mode'), lensMode);
     gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   }
   const seek = document.getElementById('seek');
@@ -292,14 +324,22 @@ function openRec(i) {
   const r = RECS[i];
   if (!gl) initGL();
   document.getElementById('player').style.display = 'block';
+  const raw = r.stream === null;
   document.querySelector('#hud .title').textContent =
-    r.when + ' · ' + r.dur + ' · masters ' + r.size;
-  document.getElementById('srcbtn').style.display = r.export ? '' : 'none';
+    r.when + ' · ' + r.dur + ' · masters ' + r.size +
+    (raw ? ' · raw lens (no stitched preview on disk — half sphere per lens)' : '');
+  const srcbtn = document.getElementById('srcbtn');
+  if (raw && r.back) { srcbtn.style.display = ''; srcbtn.textContent = 'back lens'; }
+  else if (!raw && r.export && r.stream !== r.export) {
+    srcbtn.style.display = ''; srcbtn.textContent = 'full-res source';
+  } else srcbtn.style.display = 'none';
   yaw = 0; pitch = 0; fov = 1.35;
-  setSource(r.stream);
+  if (raw) setSource(r.front !== null ? r.front : r.back, 1);
+  else setSource(r.stream, 0);
   setProjection(true);
 }
-function setSource(assetId) {
+function setSource(assetId, mode) {
+  lensMode = mode;
   video.src = '/stream/' + assetId;
   video.play().catch(() => {});
 }
@@ -333,8 +373,15 @@ document.getElementById('projbtn').addEventListener('click',
   () => setProjection(!projecting));
 document.getElementById('srcbtn').addEventListener('click', () => {
   const r = RECS[cur];
+  if (r.stream === null) {
+    // raw recording: flip between the two fisheye hemispheres
+    const onFront = video.src.endsWith('/stream/' + r.front);
+    document.getElementById('srcbtn').textContent = onFront ? 'front lens' : 'back lens';
+    setSource(onFront ? r.back : r.front, 1);
+    return;
+  }
   const usingLrv = video.src.endsWith('/stream/' + r.stream) && r.stream === r.lrv;
-  setSource(usingLrv && r.export ? r.export : r.stream);
+  setSource(usingLrv && r.export ? r.export : r.stream, 0);
 });
 document.getElementById('fsbtn').addEventListener('click', () =>
   document.fullscreenElement ? document.exitFullscreen()
@@ -387,11 +434,16 @@ def render_trip(trip: str, recs: list[Recording]) -> str:
             "key": r.key, "when": r.when(), "dur": fmt_duration(r.duration_s),
             "size": human_bytes(r.master_bytes),
             "stream": r.stream_id, "lrv": r.lrv_id, "export": r.export_id,
+            "front": r.front_id, "back": r.back_id,
         })
-        badge = (
-            "<span class='badge'>full-res export</span>" if r.export_id
-            else "<span class='badge lrv'>camera preview</span>"
-        )
+        if r.export_id:
+            badge = "<span class='badge'>full-res export</span>"
+        elif r.lrv_id:
+            badge = "<span class='badge lrv'>camera preview</span>"
+        else:
+            badge = ("<span class='badge raw' title='no stitched preview on "
+                     "disk — plays de-warped raw lens, half sphere at a time'>"
+                     "raw lens</span>")
         cards.append(f"""
         <div class="card" data-i="{i}">
           <img src="/poster/{r.key}" loading="lazy"
@@ -462,12 +514,12 @@ def create_app(
         dst = poster_root / f"{key}.jpg"
         if not dst.exists():
             rec = next((r for r in recordings() if r.key == key), None)
-            if rec is None or rec.stream_id is None:
+            if rec is None or rec.poster_id is None:
                 abort(404)
             conn = db()
             try:
                 row = conn.execute(
-                    "SELECT path FROM asset WHERE id=?", (rec.stream_id,)
+                    "SELECT path FROM asset WHERE id=?", (rec.poster_id,)
                 ).fetchone()
             finally:
                 conn.close()

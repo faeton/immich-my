@@ -49,7 +49,9 @@ def test_load_recordings_groups_and_picks_stream(conn):
     assert full.stream_id == 3                  # LRV preferred (surely equirect)
     assert full.duration_s == 95
     bare = next(r for r in recs if r.key == "20240301_000000_060")
-    assert bare.stream_id is None               # nothing watchable to stream
+    assert bare.stream_id is None               # no stitched source on disk
+    assert bare.front_id == 5                   # → raw fisheye fallback
+    assert bare.poster_id == 5
 
 
 def test_pages_and_stream_route(conn, tmp_path):
@@ -66,7 +68,8 @@ def test_pages_and_stream_route(conn, tmp_path):
 
     assert "2024-02-peru-bolivia" in client.get("/").get_data(as_text=True)
     page = client.get("/trip/2024-02-peru-bolivia").get_data(as_text=True)
-    assert "full-res export" in page and "camera preview" in page
+    assert "full-res export" in page          # trio with export
+    assert "raw lens" in page                 # master-only recording
     assert client.get("/trip/none").status_code == 404
 
     res = client.get("/stream/3")
