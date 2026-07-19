@@ -3323,6 +3323,32 @@ def triage_review_server(
     review_mod.serve(manifest_path, frames_dir, root, fs_root, host, port)
 
 
+@app.command("pano-server")
+def pano_server(
+    manifest_path: Path = _MANIFEST_OPT,
+    port: int = typer.Option(8767, "--port"),
+    host: str = typer.Option("0.0.0.0", "--host"),
+    poster_dir: Path = typer.Option(
+        Path("/scratch/pano-posters"), "--poster-dir",
+        help="Lazily-filled poster cache (one JPEG per recording).",
+    ),
+    root: str = typer.Option("/originals", "--root"),
+    fs_root: str = typer.Option(None, "--fs-root"),
+) -> None:
+    """360 viewer Immich doesn't have: per-trip grid of Insta360 recordings
+    with a drag-around WebGL equirect player, streaming the stitched
+    in-camera previews (LRV) and full-res exports. Read-only.
+
+        sudo docker compose -f deploy/n5/compose.yaml run --rm \\
+          --name immy-360-viewer --publish 100.115.236.50:8767:8767 \\
+          immy pano-server --manifest /state/manifest.sqlite
+    """
+    from . import pano as pano_mod
+
+    console.print(f"serving 360 viewer on http://{host}:{port} — Ctrl-C to stop")
+    pano_mod.serve(manifest_path, poster_dir, root, fs_root, host, port)
+
+
 app.add_typer(triage_app, name="triage")
 
 
