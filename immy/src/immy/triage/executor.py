@@ -134,6 +134,168 @@ class CompressResult:
     bytes_out: int = 0
 
 
+def _now() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _finalize_swap(
+    conn: sqlite3.Connection,
+    *,
+    asset_id: int,
+    mpath: str,
+    src: Path,
+    new_file: Path,
+    quarantine_root: Path,
+    root: str,
+    action: str,
+) -> int:
+    """The shared safe-swap tail (see module docstring): stage the verified
+    new file beside the original, quarantine the original, atomic rename,
+    carry owner/mode/mtime, stamp + journal. Consumes `new_file`. Returns
+    the swapped-in size."""
+    st = src.stat()
+    out_bytes = new_file.stat().st_size
+    os.utime(new_file, (st.st_atime, st.st_mtime))
+    staged = src.with_name(NEW_PREFIX + src.name)
+    shutil.move(str(new_file), staged)
+    trip = trip_of(mpath, root) or "_untripped"
+    qdst = quarantine_root / trip / src.name
+    qdst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(src), qdst)
+    staged.rename(src)
+    try:
+        os.chown(src, st.st_uid, st.st_gid)
+        os.chmod(src, st.st_mode)
+    except OSError:
+        pass
+    conn.execute(
+        "UPDATE triage SET applied_at=? WHERE asset_id=?", (_now(), asset_id)
+    )
+    conn.execute(
+        "UPDATE asset SET bytes=?, mtime=? WHERE id=?",
+        (out_bytes, src.stat().st_mtime, asset_id),
+    )
+    conn.execute(
+        f"INSERT INTO exec_log VALUES (?, '{action}', 'swapped', ?, ?, ?, ?)",
+        (asset_id, st.st_size, out_bytes, str(qdst), _now()),
+    )
+    conn.commit()
+    return out_bytes
+
+
+def apply_ingest(
+    conn: sqlite3.Connection,
+    *,
+    returns_root: Path,
+    root: str = "/originals",
+    fs_root: str | None = None,
+    quarantine_root: Path = Path("/quarantine/compress-originals"),
+    dry_run: bool = True,
+    duration_fn: Callable[[Path], float | None] = ffprobe_duration,
+    progress: Callable[[int, int, str], None] = lambda i, n, name: None,
+    log: Callable[[str], None] = lambda s: None,
+) -> CompressResult:
+    """Ingest encodes produced by an external worker (the GPU laptop):
+    every file under `returns_root` whose trip-relative path matches a
+    pending compress verdict goes through the SAME verification and swap
+    as a local encode — duration against the original, size gain, then
+    `_finalize_swap`. The worker is untrusted by design: unmatched files
+    are left in place and logged, `.part`/dot files (in-progress writes)
+    are skipped, and a bad encode just fails verification and stays
+    pending for the local CPU path.
+
+    A successful swap CONSUMES the returned file; a no-gain result stamps
+    the verdict and deletes the return. Run repeatedly while the worker
+    is still producing — each pass picks up whatever has landed."""
+    fs_root = fs_root or root
+    _log_table(conn)
+    if not dry_run:
+        heal(Path(fs_root), log)
+
+    pending = {
+        p: (asset_id, in_bytes) for asset_id, p, in_bytes in conn.execute(
+            "SELECT t.asset_id, a.path, a.bytes FROM triage t"
+            " JOIN asset a ON a.id = t.asset_id"
+            " WHERE t.verdict='compress' AND t.applied_at IS NULL"
+        )
+    }
+    files = [
+        f for f in sorted(returns_root.rglob("*"))
+        if f.is_file() and not f.name.startswith(".")
+        and f.suffix.lower() not in (".part", ".bad", ".jsonl", ".json", ".md", ".txt", ".log")
+    ]
+    result = CompressResult()
+    for i, ret in enumerate(files):
+        rel = ret.relative_to(returns_root).as_posix()
+        mpath = f"{root.rstrip('/')}/{rel}"
+        progress(i + 1, len(files), rel)
+        entry = pending.get(mpath)
+        if entry is None:
+            conn.execute(
+                "INSERT INTO exec_log VALUES (NULL, 'ingest', 'unmatched', "
+                " NULL, ?, ?, ?)",
+                (ret.stat().st_size, rel, _now()),
+            )
+            conn.commit()
+            log(f"unmatched (left in place): {rel}")
+            continue
+        asset_id, in_bytes = entry
+        result.processed += 1
+        if dry_run:
+            result.bytes_in += in_bytes or 0
+            continue
+        src = map_path(mpath, root, fs_root)
+        try:
+            if not src.exists():
+                raise RuntimeError(f"original missing: {src}")
+            src_dur, out_dur = duration_fn(src), duration_fn(ret)
+            if src_dur and (out_dur is None or abs(out_dur - src_dur) > DURATION_TOLERANCE_S):
+                raise RuntimeError(f"duration mismatch {src_dur} → {out_dur}")
+            out_bytes = ret.stat().st_size
+            if out_bytes == 0:
+                raise RuntimeError("empty return")
+            if out_bytes >= (in_bytes or 0) * MIN_GAIN:
+                conn.execute(
+                    "UPDATE triage SET applied_at=?, reason=COALESCE(reason,'') "
+                    " || ' [no-gain: kept original]' WHERE asset_id=?",
+                    (_now(), asset_id),
+                )
+                conn.execute(
+                    "INSERT INTO exec_log VALUES (?, 'ingest', 'no-gain', ?, ?, NULL, ?)",
+                    (asset_id, in_bytes, out_bytes, _now()),
+                )
+                conn.commit()
+                ret.unlink()
+                result.no_gain += 1
+                continue
+            _finalize_swap(
+                conn, asset_id=asset_id, mpath=mpath, src=src, new_file=ret,
+                quarantine_root=quarantine_root, root=root, action="ingest",
+            )
+            result.swapped += 1
+            result.bytes_in += in_bytes or 0
+            result.bytes_out += out_bytes
+            log(f"{rel}: {(in_bytes or 0) / 1e9:.2f}G → {out_bytes / 1e9:.2f}G")
+            pending.pop(mpath, None)
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            result.failed += 1
+            conn.execute(
+                "INSERT INTO exec_log VALUES (?, 'ingest', 'failed', ?, NULL, ?, ?)",
+                (asset_id, in_bytes, str(e)[:300], _now()),
+            )
+            conn.commit()
+            log(f"FAIL {rel}: {e}")
+            try:
+                # park the bad return so the next pass doesn't re-fail it;
+                # the verdict stays pending for the local CPU path
+                ret.rename(ret.with_name(ret.name + ".bad"))
+            except OSError:
+                pass
+    return result
+
+
 def apply_compress(
     conn: sqlite3.Connection,
     *,
@@ -211,37 +373,10 @@ def apply_compress(
                 result.no_gain += 1
                 continue
 
-            st = src.stat()
-            os.utime(tmp, (st.st_atime, st.st_mtime))
-            # staged copy next to the original, then quarantine, then the
-            # atomic same-directory rename (see module docstring)
-            staged = src.with_name(NEW_PREFIX + src.name)
-            shutil.move(str(tmp), staged)
-            trip = trip_of(mpath, root) or "_untripped"
-            qdst = quarantine_root / trip / src.name
-            qdst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(src), qdst)
-            staged.rename(src)
-            try:
-                # match the original's owner/mode — the container runs as
-                # root and a root-owned original is Immich "perm disease"
-                os.chown(src, st.st_uid, st.st_gid)
-                os.chmod(src, st.st_mode)
-            except OSError:
-                pass
-
-            conn.execute(
-                "UPDATE triage SET applied_at=? WHERE asset_id=?", (now(), asset_id)
+            _finalize_swap(
+                conn, asset_id=asset_id, mpath=mpath, src=src, new_file=tmp,
+                quarantine_root=quarantine_root, root=root, action="compress",
             )
-            conn.execute(
-                "UPDATE asset SET bytes=?, mtime=? WHERE id=?",
-                (out_bytes, src.stat().st_mtime, asset_id),
-            )
-            conn.execute(
-                "INSERT INTO exec_log VALUES (?, 'compress', 'swapped', ?, ?, ?, ?)",
-                (asset_id, in_bytes, out_bytes, str(qdst), now()),
-            )
-            conn.commit()
             result.swapped += 1
             result.bytes_in += in_bytes or 0
             result.bytes_out += out_bytes

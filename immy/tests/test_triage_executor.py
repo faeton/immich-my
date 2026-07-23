@@ -136,6 +136,65 @@ def test_heal_finishes_interrupted_swap(tmp_path):
     assert not (fs / f"{executor.NEW_PREFIX}b.mp4").exists()
 
 
+def test_ingest_swaps_matched_returns(env, tmp_path):
+    conn, _ = env
+    returns = tmp_path / "returns"
+    (returns / "2024-04-namibia").mkdir(parents=True)
+    (returns / "2024-04-namibia" / "DJI_0001.MP4").write_bytes(b"c" * 400)
+    (returns / "2024-04-namibia" / "DJI_0002.MP4.part").write_bytes(b"half")  # in-flight
+    (returns / "2024-04-namibia" / "UNKNOWN.MP4").write_bytes(b"???")         # unmatched
+    (returns / "done.jsonl").write_text("{}")                                 # bookkeeping
+
+    res = executor.apply_ingest(
+        conn, returns_root=returns, root="/originals",
+        fs_root=str(tmp_path / "originals"), quarantine_root=tmp_path / "q",
+        dry_run=False, duration_fn=lambda p: 10.0,
+    )
+    assert (res.swapped, res.failed) == (1, 0)
+    swapped = tmp_path / "originals" / "2024-04-namibia" / "DJI_0001.MP4"
+    assert swapped.read_bytes() == b"c" * 400
+    assert (tmp_path / "q" / "2024-04-namibia" / "DJI_0001.MP4").exists()
+    assert not (returns / "2024-04-namibia" / "DJI_0001.MP4").exists()   # consumed
+    assert (returns / "2024-04-namibia" / "UNKNOWN.MP4").exists()        # left in place
+    assert (returns / "2024-04-namibia" / "DJI_0002.MP4.part").exists()  # skipped
+    assert conn.execute(
+        "SELECT applied_at IS NOT NULL FROM triage WHERE asset_id=1"
+    ).fetchone()[0] == 1
+    # clips 2+3 still pending for the local CPU path
+    assert conn.execute(
+        "SELECT COUNT(*) FROM triage WHERE applied_at IS NULL"
+    ).fetchone()[0] == 2
+
+
+def test_ingest_bad_return_parked_and_verdict_stays(env, tmp_path):
+    conn, _ = env
+    returns = tmp_path / "returns"
+    (returns / "2024-04-namibia").mkdir(parents=True)
+    bad = returns / "2024-04-namibia" / "DJI_0001.MP4"
+    bad.write_bytes(b"c" * 400)
+
+    res = executor.apply_ingest(
+        conn, returns_root=returns, root="/originals",
+        fs_root=str(tmp_path / "originals"), quarantine_root=tmp_path / "q",
+        dry_run=False,
+        duration_fn=lambda p: 10.0 if "originals" in str(p) else 3.0,  # truncated
+    )
+    assert (res.swapped, res.failed) == (0, 1)
+    original = tmp_path / "originals" / "2024-04-namibia" / "DJI_0001.MP4"
+    assert original.read_bytes() == b"x" * 1000                  # untouched
+    assert (returns / "2024-04-namibia" / "DJI_0001.MP4.bad").exists()
+    assert conn.execute(
+        "SELECT applied_at FROM triage WHERE asset_id=1"
+    ).fetchone()[0] is None                                      # still pending
+    # a second pass ignores the parked .bad file
+    res2 = executor.apply_ingest(
+        conn, returns_root=returns, root="/originals",
+        fs_root=str(tmp_path / "originals"), quarantine_root=tmp_path / "q",
+        dry_run=False, duration_fn=lambda p: 10.0,
+    )
+    assert res2.processed == 0 and res2.failed == 0
+
+
 def test_dry_run_touches_nothing(env, tmp_path):
     conn, _ = env
     res = executor.apply_compress(

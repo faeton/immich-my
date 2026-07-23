@@ -3249,6 +3249,12 @@ def triage_apply(
     smallest_first: bool = typer.Option(
         False, "--smallest-first", help="Process smallest clips first (fast smoke runs)."
     ),
+    ingest: Path = typer.Option(
+        None, "--ingest",
+        help="Instead of encoding locally, ingest finished encodes from this "
+        "returns directory (external GPU worker): same verification and "
+        "swap, no ffmpeg encode. Run repeatedly while the worker produces.",
+    ),
 ) -> None:
     """Execute pending `compress` verdicts: re-encode (mp4→SVT-AV1,
     mov→x265, container never changes), verify duration, swap in place
@@ -3275,14 +3281,20 @@ def triage_apply(
             raise typer.Exit(1)
     try:
         _, conn = _open_manifest(manifest_path)
-        result = executor_mod.apply_compress(
-            conn, root=root, fs_root=fs_root, threads=threads, limit=limit,
-            smallest_first=smallest_first, dry_run=not write,
+        kwargs = dict(
+            root=root, fs_root=fs_root, dry_run=not write,
             progress=lambda i, n, name: console.print(
                 f"  [{i}/{n}] {name}", highlight=False
             ),
             log=lambda msg: console.print(f"  {msg}", highlight=False),
         )
+        if ingest is not None:
+            result = executor_mod.apply_ingest(conn, returns_root=ingest, **kwargs)
+        else:
+            result = executor_mod.apply_compress(
+                conn, threads=threads, limit=limit,
+                smallest_first=smallest_first, **kwargs,
+            )
     finally:
         if lock_fd is not None:
             os.close(lock_fd)
