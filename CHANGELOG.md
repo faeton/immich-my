@@ -21,6 +21,8 @@ continuously, so entries are dated rather than versioned.
   library HEIC scored **0.989** against its original, while selfies of the
   same person from different years all cluster at **0.92–0.94**. Hence the
   verdict bands: ≥0.95 same frame, 0.85–0.95 same subject, else similar.
+  Faces: the same re-compressed copy scored **0.951** against its own
+  `face_search` row; every other shot of the same person peaked at 0.82.
 - **CLIP coverage is image-complete.** 137k of 223k live assets have a
   vector; the 85k gap is almost entirely videos in the external library
   (83,714) plus 1,483 images. So an image miss means "not in Immich", not

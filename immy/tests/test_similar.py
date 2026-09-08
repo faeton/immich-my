@@ -33,3 +33,10 @@ def test_search_passes_pgvector_literal_and_filters_min_sim():
     assert "ORDER BY s.embedding <=> %(v)s::vector" in sql
     assert [h.asset_id for h in hits] == ["id-a"]
     assert hits[0].label == "same frame"
+
+
+def test_search_faces_labels_and_person():
+    rows = [("id-x", "/x.heic", "IMAGE", None, "Ivan", 0.951), ("id-y", "/y.heic", "IMAGE", None, "Ivan", 0.82)]
+    hits = similar.search_faces(_Conn(rows), [0.0, 1.0], limit=2)
+    assert [h.label for h in hits] == ["same frame", "same person"]
+    assert hits[0].person == "Ivan"

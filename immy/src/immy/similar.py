@@ -94,6 +94,71 @@ def search(
     return [h for h in hits if h.similarity >= min_similarity]
 
 
+# --- face route ---------------------------------------------------------------
+# Same idea against `face_search` (ArcFace buffalo_l, 512-d, cosine). Ranks by
+# *identity*, so the histogram of `person` names tells you who the query is,
+# and only a very high score means the same frame. Calibrated 2026-09-08: the
+# re-compressed copy scored 0.951 against its own face row; other shots of the
+# same person peaked at 0.82.
+FACE_SAME_FRAME = 0.93
+FACE_SAME_PERSON = 0.60
+
+
+@dataclass(frozen=True)
+class FaceHit:
+    asset_id: str
+    original_path: str
+    asset_type: str
+    taken_at: datetime | None
+    person: str | None
+    similarity: float
+
+    @property
+    def label(self) -> str:
+        if self.similarity >= FACE_SAME_FRAME:
+            return "same frame"
+        if self.similarity >= FACE_SAME_PERSON:
+            return "same person"
+        return "similar"
+
+
+_FACE_SQL = """
+SELECT a.id, a."originalPath", a.type, a."localDateTime", p.name,
+       1 - (fs.embedding <=> %(v)s::vector) AS similarity
+FROM face_search fs
+JOIN asset_face af ON af.id = fs."faceId"
+JOIN asset a ON a.id = af."assetId"
+LEFT JOIN person p ON p.id = af."personId"
+WHERE a."deletedAt" IS NULL AND af."deletedAt" IS NULL
+  AND (%(videos)s OR a.type = 'IMAGE')
+ORDER BY fs.embedding <=> %(v)s::vector
+LIMIT %(limit)s
+"""
+
+
+def search_faces(
+    conn: psycopg.Connection,
+    embedding: list[float],
+    *,
+    limit: int = 30,
+    include_videos: bool = True,
+    min_similarity: float = 0.0,
+) -> list[FaceHit]:
+    """Nearest `face_search` rows to one ArcFace embedding, best first."""
+    rows = conn.execute(
+        _FACE_SQL,
+        {"v": to_pgvector_literal(embedding), "videos": include_videos, "limit": limit},
+    ).fetchall()
+    hits = [
+        FaceHit(
+            asset_id=str(r[0]), original_path=r[1], asset_type=r[2],
+            taken_at=r[3], person=r[4], similarity=float(r[5]),
+        )
+        for r in rows
+    ]
+    return [h for h in hits if h.similarity >= min_similarity]
+
+
 def coverage(conn: psycopg.Connection) -> tuple[int, int]:
     """(assets with a CLIP vector, live assets) — how much of the library the
     search can even see. immy-inserted assets never auto-queue SmartSearch."""
@@ -105,4 +170,8 @@ def coverage(conn: psycopg.Connection) -> tuple[int, int]:
     return int(embedded), int(live)
 
 
-__all__ = ["Hit", "SAME_FRAME", "SAME_SUBJECT", "label_for", "search", "coverage"]
+__all__ = [
+    "Hit", "SAME_FRAME", "SAME_SUBJECT", "label_for", "search",
+    "FaceHit", "FACE_SAME_FRAME", "FACE_SAME_PERSON", "search_faces",
+    "coverage",
+]
