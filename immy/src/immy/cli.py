@@ -59,6 +59,7 @@ offline_mod = _LazyModule("offline")
 process_mod = _LazyModule("process")
 promote_mod = _LazyModule("promote")
 pg_mod = _LazyModule("pg")
+similar_mod = _LazyModule("similar")
 snapshot_mod = _LazyModule("snapshot")
 srt_mod = _LazyModule("srt")
 srtgeo_mod = _LazyModule("srtgeo")
@@ -1918,6 +1919,90 @@ def sync_offline(
     )
     if summary["failed"]:
         raise typer.Exit(code=1)
+
+
+@app.command()
+def similar(
+    image: Path = typer.Argument(..., exists=True, dir_okay=False, help="Query photo (any JPEG/PNG/HEIC PIL can open)."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+    limit: int = typer.Option(30, "--limit", "-n", help="How many neighbours to show."),
+    min_sim: float = typer.Option(0.0, "--min-sim", help="Drop hits below this cosine similarity (0..1)."),
+    no_videos: bool = typer.Option(False, "--no-videos", help="Images only."),
+    backend: str = typer.Option("onnx", "--backend", help="onnx (Immich's own model, in-process) | immich-ml (NAS HTTP; needs ml.immich_ml_url). NOT mlx — different vector space."),
+    as_json: bool = typer.Option(False, "--json", help="Print hits as JSON lines instead of a table."),
+) -> None:
+    """Find library assets that look like IMAGE — image-to-image search on Immich's CLIP index.
+
+    Immich's UI only searches by text; this embeds the query photo with the
+    same ViT-B-32 model Immich indexed with and asks pgvector for the nearest
+    `smart_search` rows. Read-only. Similarity >= 0.95 is the same frame
+    (a re-compressed copy scores ~0.99), 0.85-0.95 the same subject/pose
+    (selfies of one person from different years all land 0.92-0.94), below
+    that just the same kind of shot.
+    Only assets Immich itself embedded are visible — immy-inserted ones never
+    auto-queue SmartSearch, and coverage is printed so a miss is explainable.
+    """
+    import json as _json
+    from . import clip as clip_mod
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red] — similar needs the tailnet up and `pg:` set.")
+        raise typer.Exit(code=2)
+    if backend == "mlx":
+        console.print("[red]--backend mlx is not in Immich's vector space[/red]; use onnx or immich-ml.")
+        raise typer.Exit(code=2)
+    model = (config.ml.clip_model if config.ml and config.ml.clip_model else clip_mod.DEFAULT_MODEL)
+    endpoint = config.ml.immich_ml_url if config.ml else None
+    try:
+        vec = clip_mod.embed(image, model_name=model, backend=backend, endpoint=endpoint)
+    except (clip_mod.ClipUnavailable, clip_mod.ClipBackendError) as e:
+        console.print(f"[red]embed failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    with conn:
+        embedded, live = similar_mod.coverage(conn)
+        hits = similar_mod.search(
+            conn, vec, limit=limit, include_videos=not no_videos, min_similarity=min_sim,
+        )
+    if as_json:
+        for h in hits:
+            print(_json.dumps({
+                "assetId": h.asset_id, "similarity": round(h.similarity, 4), "label": h.label,
+                "type": h.asset_type, "takenAt": h.taken_at.isoformat() if h.taken_at else None,
+                "path": h.original_path, "city": h.city, "country": h.country,
+            }))
+        return
+    console.print(
+        f"[dim]{model} via {backend} · searchable {embedded:,} of {live:,} live assets "
+        f"({embedded * 100 // max(live, 1)}%)[/dim]"
+    )
+    if not hits:
+        console.print("no hits above the threshold")
+        return
+    t = Table(title=f"nearest to {image.name}")
+    t.add_column("sim", justify="right")
+    t.add_column("verdict")
+    t.add_column("taken")
+    t.add_column("where")
+    t.add_column("file", no_wrap=True)
+    for h in hits:
+        style = "bold green" if h.label == "same frame" else ("yellow" if h.label == "same subject" else "")
+        where = ", ".join(x for x in (h.city, h.country) if x)
+        t.add_row(
+            f"[{style}]{h.similarity:.3f}[/{style}]" if style else f"{h.similarity:.3f}",
+            h.label,
+            h.taken_at.strftime("%Y-%m-%d %H:%M") if h.taken_at else "",
+            where,
+            "/".join(h.original_path.rsplit("/", 3)[-3:])
+            + (" [dim](video)[/dim]" if h.asset_type == "VIDEO" else ""),
+        )
+    console.print(t)
+    console.print(f"[dim]open in Immich: {config.immich.url.rstrip('/') if config.immich else '<immich>'}/photos/<assetId> (use --json for ids)[/dim]")
 
 
 @app.command("db-setup")

@@ -4,6 +4,28 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-09-08 — `immy similar`: image→image search
+
+### Added
+
+- **`immy similar <photo>`** — "which library shot is this?" Immich's UI only
+  searches by text, but its `smart_search` table + vchordrq cosine index are
+  queryable directly. The command embeds the query with Immich's own ONNX
+  ViT-B-32 (or the NAS ML server via `--backend immich-ml`; both share the
+  index's vector space — `mlx` is refused) and prints the nearest neighbours
+  with date, place and a verdict. Read-only. `--json` for asset ids.
+
+### Found
+
+- **Calibration on the live library.** A 343-px, q65 re-compression of a
+  library HEIC scored **0.989** against its original, while selfies of the
+  same person from different years all cluster at **0.92–0.94**. Hence the
+  verdict bands: ≥0.95 same frame, 0.85–0.95 same subject, else similar.
+- **CLIP coverage is image-complete.** 137k of 223k live assets have a
+  vector; the 85k gap is almost entirely videos in the external library
+  (83,714) plus 1,483 images. So an image miss means "not in Immich", not
+  "not embedded". The command prints coverage on every run.
+
 ## 2026-07-12 — `srt geotag --relock` + `immy tags sync`
 
 ### Found

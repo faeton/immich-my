@@ -32,6 +32,8 @@ The main operational interface is `immy`:
 - `tags sync` pushes a trip's notes tags (gear/camera, event, source) to Immich's native Tag API — the only channel that reaches video assets, which never read XMP
 - `tags camera` backfills the blank "Camera" field for DJI MP4s from the notes gear tag
 - `snapshot` dumps the Immich library index to a portable SQLite file
+- `similar <photo>` finds the library assets that look like a photo (image→image search
+  on Immich's own CLIP index; ≥0.95 = same frame, 0.85–0.95 = same subject)
 - `find-duplicates` scans any disk/folder and reports what's already in Immich
 
 Typical development commands:
