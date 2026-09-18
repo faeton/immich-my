@@ -150,7 +150,7 @@ class Sink(Protocol):
     def clip_recorded(self, asset_id: str) -> bool: ...
     def faces_recorded(self, asset_id: str) -> bool: ...
     def update_asset_dims(self, asset_id: str, width: int, height: int) -> None: ...
-    def update_asset_duration(self, asset_id: str, duration: str) -> None: ...
+    def update_asset_duration(self, asset_id: str, duration: int) -> None: ...
     def get_description(self, asset_id: str) -> str | None: ...
     def update_description_if_empty(
         self, asset_id: str, text: str, file_name: str | None = None) -> None: ...
@@ -308,7 +308,7 @@ class PgSink:
                 "id": asset_id, "width": width, "height": height,
             })
 
-    def update_asset_duration(self, asset_id: str, duration: str) -> None:
+    def update_asset_duration(self, asset_id: str, duration: int) -> None:
         with self.conn.cursor() as cur:
             cur.execute(_UPDATE_ASSET_DURATION, {
                 "id": asset_id, "duration": duration,
@@ -569,7 +569,7 @@ class OfflineSink:
         entry["asset"]["height"] = height
         self._flush(hex_key)
 
-    def update_asset_duration(self, asset_id: str, duration: str) -> None:
+    def update_asset_duration(self, asset_id: str, duration: int) -> None:
         hex_key, entry = self._entry_for(asset_id)
         entry["asset"]["duration"] = duration
         self._flush(hex_key)

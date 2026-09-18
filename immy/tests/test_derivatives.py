@@ -185,7 +185,7 @@ def test_compute_video_stages_poster_stills_and_transcode(
     assert kinds == {"thumbnail", "preview", "encoded_video"}
     assert result.width == 1920
     assert result.height == 1080
-    assert result.duration == "00:00:12.500"
+    assert result.duration == 12500
     encoded = next(d for d in result.files if d.kind == "encoded_video")
     assert encoded.staged_path.is_file()
     assert encoded.relative_path.startswith("encoded-video/u/ab/cd/")
@@ -307,7 +307,7 @@ def test_compute_video_mirror_from_sibling_skips_ffmpeg(
         assert d.staged_path.is_file()
         assert "bb" in d.relative_path
     # Probe still ran on the sibling master.
-    assert second.width == 2880 and second.duration == "00:00:04.000"
+    assert second.width == 2880 and second.duration == 4000
 
 
 # --- process_trip integration --------------------------------------------

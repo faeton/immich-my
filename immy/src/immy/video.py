@@ -154,15 +154,16 @@ def probe(path: Path) -> VideoInfo:
     )
 
 
-def format_duration(seconds: float) -> str:
-    """Render ffprobe seconds as Immich's `HH:MM:SS.sss` string — the
-    format `asset.duration` expects. We zero-pad all three fields so
-    ORDER BY on the text column sorts correctly."""
+def duration_ms(seconds: float) -> int:
+    """Render ffprobe seconds as Immich's `asset.duration` integer.
+
+    Immich 3.x stores duration as milliseconds in an `integer` column
+    (it was an `HH:MM:SS.sss` string in 2.x). Rounding matches what
+    Immich's own scanner writes: a 44.8448 s clip lands as 44845.
+    """
     if seconds < 0:
         seconds = 0.0
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+    return round(seconds * 1000)
 
 
 def needs_transcode(info: VideoInfo) -> bool:
@@ -265,7 +266,7 @@ def transcode(src: Path, dst: Path, *, preproc_vf: str | None = None) -> None:
 
 __all__ = [
     "VideoInfo", "VideoProbeError", "VideoTranscodeError",
-    "probe", "format_duration", "needs_transcode",
+    "probe", "duration_ms", "needs_transcode",
     "extract_poster", "transcode",
     "POSTER_SEEK_CAP_SEC", "TRANSCODE_TARGET_HEIGHT",
 ]

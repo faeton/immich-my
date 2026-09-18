@@ -84,10 +84,13 @@ def test_probe_raises_when_no_video_stream(monkeypatch):
         video_mod.probe(Path("audio.m4a"))
 
 
-def test_format_duration_pads_to_millis():
-    assert video_mod.format_duration(0) == "00:00:00.000"
-    assert video_mod.format_duration(3661.5) == "01:01:01.500"
-    assert video_mod.format_duration(14.269989).startswith("00:00:14.2")
+def test_duration_ms_rounds_to_milliseconds():
+    assert video_mod.duration_ms(0) == 0
+    assert video_mod.duration_ms(3661.5) == 3661500
+    assert video_mod.duration_ms(14.269989) == 14270
+    # Matches what Immich's own scanner wrote for this clip.
+    assert video_mod.duration_ms(44.8448) == 44845
+    assert video_mod.duration_ms(-5) == 0
 
 
 def test_needs_transcode_matches_required_policy():

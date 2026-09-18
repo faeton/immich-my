@@ -45,6 +45,7 @@ from . import pg as pg_mod
 from . import raw as raw_mod
 from . import sidecar as sidecar_mod
 from . import transcripts as transcripts_mod
+from . import video as video_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
 from .heartbeat import Heartbeat
@@ -179,7 +180,7 @@ class AssetRow:
     file_created_at: datetime
     file_modified_at: datetime
     local_date_time: datetime
-    duration: str | None
+    duration: int | None
     # Populated after derivative gen (Y.2). Written via UPDATE, not the
     # initial INSERT, because we don't decode the image until derivatives
     # run. Immich's viewer reads these for intrinsic fullscreen dims.
@@ -231,13 +232,11 @@ def build_rows(
     file_created_at = _to_utc(best_dt) if best_dt is not None else mtime_utc
     local_date_time = file_created_at
 
-    duration: str | None = None
+    duration: int | None = None
     if asset_type == "VIDEO":
         d = _float(exif_row.get("QuickTime:Duration", "Composite:Duration"))
         if d is not None and d > 0:
-            h, rem = divmod(d, 3600)
-            m, s = divmod(rem, 60)
-            duration = f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+            duration = video_mod.duration_ms(d)
 
     asset = AssetRow(
         id=asset_id,
@@ -423,7 +422,7 @@ def update_exif_description(
 
 
 def update_asset_duration(
-    conn: psycopg.Connection, asset_id: str, duration: str,
+    conn: psycopg.Connection, asset_id: str, duration: int,
 ) -> None:
     """Overwrite `asset.duration` with the ffprobe value.
 
