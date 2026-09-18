@@ -107,11 +107,9 @@ def test_build_rows_dji_fixture_populates_exif(tmp_path: Path):
 
     assert asset.owner_id == "owner-1"
     assert asset.library_id == "lib-1"
-    assert asset.device_id == "Library Import"
     assert asset.asset_type == "IMAGE"
     assert asset.original_path == f"/mnt/external/originals/{target.name}/DJI_0001.JPG"
     assert asset.original_file_name == "DJI_0001.JPG"
-    assert asset.device_asset_id == "DJI_0001.JPG"
     assert len(asset.checksum) == 20
     assert asset.checksum == hashlib.sha1(
         f"path:{asset.original_path}".encode()
@@ -130,15 +128,15 @@ def test_build_rows_dji_fixture_populates_exif(tmp_path: Path):
     assert exif.exif_image_height == 1
 
 
-def test_build_rows_deviceassetid_strips_spaces(tmp_path: Path):
+def test_build_rows_preserves_spaces_in_filename(tmp_path: Path):
     trip = tmp_path / "t"
     trip.mkdir()
     f = trip / "GP Temp Download.jpg"
     f.write_bytes(b"x")
     rows = read_folder(trip)
     asset, _ = process_mod.build_rows(f, trip, rows[0], LIB)
-    assert asset.device_asset_id == "GPTempDownload.jpg"
     assert asset.original_file_name == "GP Temp Download.jpg"
+    assert asset.original_path.endswith("/GP Temp Download.jpg")
 
 
 def test_build_rows_uuid_is_unique(tmp_path: Path):

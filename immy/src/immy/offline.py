@@ -176,12 +176,12 @@ class Sink(Protocol):
 
 _INSERT_ASSET = """
 INSERT INTO asset (
-  id, "deviceAssetId", "ownerId", "deviceId", type,
+  id, "ownerId", type,
   "originalPath", "originalFileName", checksum, "checksumAlgorithm",
   "fileCreatedAt", "fileModifiedAt", "localDateTime",
   duration, "libraryId", "isExternal"
 ) VALUES (
-  %(id)s, %(device_asset_id)s, %(owner_id)s, %(device_id)s, %(asset_type)s,
+  %(id)s, %(owner_id)s, %(asset_type)s,
   %(original_path)s, %(original_file_name)s, %(checksum)s, 'sha1-path',
   %(file_created_at)s, %(file_modified_at)s, %(local_date_time)s,
   %(duration)s, %(library_id)s, true

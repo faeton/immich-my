@@ -170,10 +170,8 @@ def _str(raw: Any) -> str | None:
 @dataclass
 class AssetRow:
     id: str
-    device_asset_id: str
     owner_id: str
     library_id: str
-    device_id: str
     asset_type: str  # 'IMAGE' | 'VIDEO'
     original_path: str
     original_file_name: str
@@ -243,10 +241,8 @@ def build_rows(
 
     asset = AssetRow(
         id=asset_id,
-        device_asset_id=basename.replace(" ", ""),
         owner_id=library.owner_id,
         library_id=library.id,
-        device_id="Library Import",
         asset_type=asset_type,
         original_path=cpath,
         original_file_name=basename,
@@ -319,12 +315,12 @@ def build_rows(
 
 _INSERT_ASSET = """
 INSERT INTO asset (
-  id, "deviceAssetId", "ownerId", "deviceId", type,
+  id, "ownerId", type,
   "originalPath", "originalFileName", checksum, "checksumAlgorithm",
   "fileCreatedAt", "fileModifiedAt", "localDateTime",
   duration, "libraryId", "isExternal"
 ) VALUES (
-  %(id)s, %(device_asset_id)s, %(owner_id)s, %(device_id)s, %(asset_type)s,
+  %(id)s, %(owner_id)s, %(asset_type)s,
   %(original_path)s, %(original_file_name)s, %(checksum)s, 'sha1-path',
   %(file_created_at)s, %(file_modified_at)s, %(local_date_time)s,
   %(duration)s, %(library_id)s, true
