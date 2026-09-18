@@ -3124,6 +3124,10 @@ def dedup_cluster(manifest_path: Path = _MANIFEST_OPT) -> None:
         f"universe {result['universe']} → {result['pairs_blocked']} blocked pairs → "
         f"{result['pairs_confirmed']} confirmed → "
         f"[green]{result['clusters_created']} new cluster(s)[/green]"
+        + (
+            f", {result['clusters_extended']} extended (re-confirm needed)"
+            if result["clusters_extended"] else ""
+        )
     )
     for warning in result["warnings"]:
         console.print(f"[yellow]{warning}[/yellow]")

@@ -172,7 +172,7 @@ def test_manifest_migration_adds_clip_cos_sim_column(tmp_path):
     reopened = manifest.open_manifest(path)
     cols = {row[1] for row in reopened.execute("PRAGMA table_info(cluster)")}
     assert "clip_cos_sim" in cols
-    assert manifest.get_meta(reopened, "schema_version") == "2"
+    assert manifest.get_meta(reopened, "schema_version") == str(manifest.SCHEMA_VERSION)
 
 
 def test_manifest_embedding_roundtrip(tmp_path):
@@ -272,10 +272,16 @@ def _video(id: int, **kwargs) -> engine.AssetLite:
     return _asset(id, **kwargs)
 
 
-def test_pair_evidence_video_byte_identical_is_strong_regardless_of_dates():
-    a = _video(1, path="IMG_0580.MOV", bytes=123456,
+def test_pair_evidence_video_content_identical_is_strong_regardless_of_dates(tmp_path):
+    # Equal LENGTH is not equal content (see test_dedup_safety.py) — the
+    # shortcut confirms the bytes, and then dates stop mattering.
+    same = b"\x00\x01\x02\x03" * 1024
+    (tmp_path / "a").mkdir(), (tmp_path / "b").mkdir()
+    for side in ("a", "b"):
+        (tmp_path / side / "IMG_0580.MOV").write_bytes(same)
+    a = _video(1, path=str(tmp_path / "a" / "IMG_0580.MOV"), bytes=len(same),
                taken_at="2011-01-01T00:00:00", taken_src="mtime")
-    b = _video(2, path="IMG_0580.MOV", bytes=123456,
+    b = _video(2, path=str(tmp_path / "b" / "IMG_0580.MOV"), bytes=len(same),
                taken_at="2026-06-20T00:00:00", taken_src="mtime")
     assert engine._pair_evidence(a, b) == ("strong", None)
 

@@ -271,6 +271,69 @@ def fingerprint_pending(
     return ok, failed
 
 
+# ---------------------------------------------------------- content identity
+
+# Two distinct files of identical byte length are not rare in a phone library
+# — thousands of ~3 s Live Photo .mov halves share one resolution, codec and
+# bitrate — so "same size" is never enough to call two paths the same
+# content. It decides whether a staging file gets deleted (`_resolve_dest`)
+# and whether two clips auto-merge (`_pair_evidence`, `_decide_one`), so both
+# now compare actual bytes.
+#
+# Full compare up to CONTENT_FULL_COMPARE_MAX (covers every image and every
+# short clip); above it three sampled windows — head, middle, tail — which
+# separates two unrelated recordings with certainty for any real container
+# (header, moov atom and trailing frames all differ) while capping the work
+# at ~12 MB per side instead of reading 4 GB twice. That cap matters:
+# `_pair_evidence` calls this during clustering, once per equal-size video
+# pair, and a NAS pass should not turn into hundreds of GB of reads.
+# Detecting silent *corruption* is not this function's job — `_safe_move`
+# still verifies every copy it makes with a full sha256.
+CONTENT_CHUNK = 4 * 1024 * 1024
+CONTENT_FULL_COMPARE_MAX = 16 * 1024 * 1024
+CONTENT_SAMPLE_WINDOW = 4 * 1024 * 1024
+
+
+def content_equal(left: Path, right: Path) -> bool:
+    """True when both paths hold the same bytes.
+
+    Raises OSError if either file can't be read — an unverifiable answer is
+    never silently an affirmative one; callers decide what to do with it."""
+    left_size, right_size = left.stat().st_size, right.stat().st_size
+    if left_size != right_size:
+        return False
+    if left_size <= CONTENT_FULL_COMPARE_MAX:
+        with open(left, "rb") as fl, open(right, "rb") as fr:
+            while True:
+                chunk_l = fl.read(CONTENT_CHUNK)
+                if chunk_l != fr.read(CONTENT_CHUNK):
+                    return False
+                if not chunk_l:
+                    return True
+    windows = (
+        0,
+        max(0, left_size // 2 - CONTENT_SAMPLE_WINDOW // 2),
+        max(0, left_size - CONTENT_SAMPLE_WINDOW),
+    )
+    with open(left, "rb") as fl, open(right, "rb") as fr:
+        for offset in windows:
+            fl.seek(offset)
+            fr.seek(offset)
+            if fl.read(CONTENT_SAMPLE_WINDOW) != fr.read(CONTENT_SAMPLE_WINDOW):
+                return False
+    return True
+
+
+def _content_equal_or_unknown(left: str | Path, right: str | Path) -> bool | None:
+    """`content_equal`, but None when the files can't be read (missing,
+    permission, offline mount). Used where an unreadable file must fall back
+    to weaker evidence rather than abort the whole pass."""
+    try:
+        return content_equal(Path(left), Path(right))
+    except OSError:
+        return None
+
+
 # ------------------------------------------------------------------- blocking
 
 
@@ -454,7 +517,7 @@ def _pair_evidence(a: AssetLite, b: AssetLite) -> tuple[str, int | None] | None:
     if a.media_type == "video" and b.media_type == "video":
         # v1: no frame decode for videos, so a shared block (often just a
         # generic recycled filename stem) is only trustworthy when we can
-        # actually check it: byte-identical (definite dupe, works
+        # actually check it: content-identical (definite dupe, works
         # regardless of metadata quality) or two INDEPENDENTLY reliable
         # capture times (exif/json — never the mtime fallback, which
         # reflects copy/unpack time, not shoot time) that are close
@@ -462,7 +525,13 @@ def _pair_evidence(a: AssetLite, b: AssetLite) -> tuple[str, int | None] | None:
         # recur for 15+ years of phone use; on unreliable-timestamp
         # videos a bare block match is coincidence, not evidence, and was
         # chaining thousands of unrelated clips into single clusters.
-        if a.bytes and a.bytes == b.bytes:
+        # The equal-size shortcut CONFIRMS the bytes before claiming
+        # "strong", and falls through to the date gate below when it can't
+        # (unreadable file, offline mount). Diagnosed 2026-09-18: returning
+        # early on size alone put that gate behind the very shortcut it was
+        # added to protect — two unrelated IMG_1234.MOV of equal length
+        # auto-merged, and Live Photo .mov halves make equal lengths common.
+        if a.bytes and a.bytes == b.bytes and _content_equal_or_unknown(a.path, b.path):
             return ("strong", None)
         reliable = (
             a.epoch is not None and a.taken_src in ("exif", "json", "companion")
@@ -500,7 +569,7 @@ def cluster(conn: sqlite3.Connection) -> dict:
     for asset_id in uf.parent:
         groups.setdefault(uf.find(asset_id), []).append(asset_id)
 
-    created = 0
+    created = extended = 0
     for members in groups.values():
         if len(members) < 2:
             continue
@@ -514,6 +583,8 @@ def cluster(conn: sqlite3.Connection) -> dict:
                 members,
             )
         }
+        reused = bool(existing)
+        changed = False
         if existing:
             cluster_id = existing.pop()  # merge into the first; others re-pointed
             for stale in existing:
@@ -522,26 +593,52 @@ def cluster(conn: sqlite3.Connection) -> dict:
                     (cluster_id, stale),
                 )
                 conn.execute("DELETE FROM cluster WHERE id=?", (stale,))
+                changed = True
         else:
             cursor = conn.execute("INSERT INTO cluster (decision) VALUES ('pending')")
             cluster_id = cursor.lastrowid
             created += 1
         for asset_id in members:
-            conn.execute(
+            cursor = conn.execute(
                 "INSERT INTO membership (cluster_id, asset_id) VALUES (?, ?) "
                 "ON CONFLICT(asset_id) DO NOTHING",
                 (cluster_id, asset_id),
             )
+            if cursor.rowcount:
+                changed = True
             conn.execute(
                 "UPDATE asset SET status=? WHERE id=? AND status=?",
                 (manifest.CLUSTERED, asset_id, manifest.FINGERPRINTED),
             )
+        if reused and changed:
+            # A cluster that GREW has a clip_cos_sim computed over different
+            # membership, and `_clip_ready_clusters` only ever visits
+            # clusters where it is NULL — so without this it is never
+            # recomputed. Diagnosed 2026-09-18: `originals` rows deliberately
+            # re-enter clustering, so a fresh arrival attaching to a settled
+            # cluster inherited a 0.999 earned by two other images and was
+            # auto-merged away on evidence that was never about it. Clearing
+            # it puts the cluster back in Stage C's queue and, until Stage C
+            # runs again, `_decide_one` sees clip_cos=None and routes to
+            # review — the safe direction.
+            #
+            # Scoped to undecided clusters: an `auto` cluster has already
+            # been acted on and `decide()` deliberately never revisits it,
+            # so blanking its record there would lose information without
+            # changing any outcome.
+            conn.execute(
+                "UPDATE cluster SET clip_cos_sim=NULL "
+                "WHERE id=? AND decision IN ('pending', 'review')",
+                (cluster_id,),
+            )
+            extended += 1
     conn.commit()
     return {
         "universe": len(universe),
         "pairs_blocked": len(pairs),
         "pairs_confirmed": len(evidence),
         "clusters_created": created,
+        "clusters_extended": extended,
         "warnings": warnings,
     }
 
@@ -873,6 +970,27 @@ def _decide_one(members: list[AssetLite], clip_cos: float | None = None) -> str:
     if any(m.edited for m in members) and not all(m.edited for m in members):
         return "review"
 
+    # Guard: a RAW+JPEG companion pair anywhere in the cluster.
+    # `_pair_evidence` suppresses only the DIRECT raw↔jpeg edge; union-find
+    # still joins the two components through any third image that matches
+    # both. Diagnosed 2026-09-18: same-directory IMG_1234.DNG + .JPG at
+    # 6000x4000 plus a 3000x2000 re-export of the same capture — differing
+    # dimensions clear the burst guard, identical aspect ratios clear the
+    # crop guard, the re-export can win on source weight, and BOTH Photos
+    # components including the irreplaceable RAW become losers. Component
+    # incompatibility has to survive transitive clustering, so it is
+    # re-checked here over every member pair, not just the direct edge.
+    for left, right in combinations(members, 2):
+        if _is_raw_jpeg_companion(left, right):
+            return "review"
+
+    # Guard: conflicting Apple ContentIdentifier. Two members that each name
+    # a capture and name DIFFERENT ones are not one asset twice, whatever
+    # the visual or filename evidence says — a hard bar on heuristic
+    # merging, not a signal to weigh.
+    if len({m.live_cid for m in members if m.live_cid}) > 1:
+        return "review"
+
     winner = max(members, key=winner_score)
     for member in members:
         if member.id == winner.id:
@@ -901,7 +1019,15 @@ def _decide_one(members: list[AssetLite], clip_cos: float | None = None) -> str:
                 if clip_cos is None or clip_cos < CLIP_AUTO_THRESHOLD:
                     return "review"
         else:
+            # Videos carry no pHash, so size is the whole of the visual
+            # evidence — and equal length is not equal content. Losing here
+            # means quarantining a file, and `_metadata_agrees` below falls
+            # back to a bare filename-stem match, which generic camera
+            # counters satisfy by coincidence. Confirm the bytes; an
+            # unreadable file (None) is not a confirmation.
             if member.bytes != winner.bytes:
+                return "review"
+            if not _content_equal_or_unknown(winner.path, member.path):
                 return "review"
         if not _metadata_agrees(winner, member):
             return "review"
@@ -955,13 +1081,46 @@ def _sha256(path: Path) -> str:
     return h.hexdigest()
 
 
-def _resolve_dest(dest: Path, asset_id: int, expected_bytes: int | None) -> tuple[Path, bool]:
+def _dest_holds_this_asset(
+    candidate: Path, expected_bytes: int | None, src: Path | None
+) -> bool:
+    """Is `candidate` this asset's own file, already moved by a prior run?
+
+    Size alone cannot answer that (see `content_equal`), and being wrong here
+    is not cosmetic: both callers respond to `already_done` by unlinking the
+    staging file WITHOUT copying it anywhere, so a false yes deletes an asset
+    that never reached the library. Content has to agree.
+
+    The one case still resting on size alone is `src` already gone — a prior
+    run that finished the copy AND the unlink but died before its status
+    commit. Nothing is left to compare against, and nothing gets deleted on
+    that path either, so the recorded size is allowed to settle it; the worst
+    outcome is a bookkeeping row pointing at the wrong twin, never a lost
+    file."""
+    if expected_bytes is None:
+        return False
+    try:
+        if candidate.stat().st_size != expected_bytes:
+            return False
+    except OSError:
+        return False
+    if src is None or not src.exists():
+        return True
+    return content_equal(src, candidate)
+
+
+def _resolve_dest(
+    dest: Path,
+    asset_id: int,
+    expected_bytes: int | None,
+    src: Path | None = None,
+) -> tuple[Path, bool]:
     """Decide the real destination for one asset, handling every crash-
     recovery case up front so `_safe_move` never has to guess:
 
     - `dest` free                              -> use it, nothing to skip.
     - `dest` occupied by THIS asset already
-      (size matches what the manifest recorded) -> a prior run got as far
+      (recorded size AND identical content)    -> a prior run got as far
       as the copy (or further) before dying; tell the caller to skip the
       copy and just finish bookkeeping.
     - `dest` occupied by a DIFFERENT asset      -> genuine collision (two
@@ -971,16 +1130,22 @@ def _resolve_dest(dest: Path, asset_id: int, expected_bytes: int | None) -> tupl
       interrupted at that qualified name, the same "already there" check
       applies again.
 
+    `src` is the staging file this asset would be moved FROM — it is what
+    makes the second case checkable instead of guessed. Diagnosed 2026-09-18:
+    with size as the only discriminator, an unrelated library file of equal
+    length sitting at the same YYYY/MM/basename made a staging asset "already
+    done", and it was deleted without its content ever reaching originals/.
+
     Returns (final_dest, already_done).
     """
     if not dest.exists():
         return dest, False
-    if expected_bytes is not None and dest.stat().st_size == expected_bytes:
+    if _dest_holds_this_asset(dest, expected_bytes, src):
         return dest, True
     qualified = dest.with_name(f"{dest.stem}__{asset_id}{dest.suffix}")
     if not qualified.exists():
         return qualified, False
-    if expected_bytes is not None and qualified.stat().st_size == expected_bytes:
+    if _dest_holds_this_asset(qualified, expected_bytes, src):
         return qualified, True
     # Both the plain and asset-id-qualified names are taken by something
     # else entirely — vanishingly unlikely, but refuse to guess further.
@@ -1090,7 +1255,7 @@ def promote_rest(
         try:
             base_dest = _promote_dest(originals_root, path_str, taken_at)
             if not dry_run:
-                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes)
+                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes, src)
                 if not already_done:
                     if not src.exists():
                         raise FileNotFoundError(str(src))
@@ -1138,7 +1303,9 @@ def apply_decisions(
 
     Idempotent and crash-safe: only `decided` assets belonging to `auto`
     clusters are selected, `_resolve_dest` recognizes a destination a prior
-    run already finished writing (by size match) so a kill at ANY point —
+    run already finished writing (recorded size AND matching content — never
+    size alone, which deletes a staging file onto an unrelated same-length
+    twin) so a kill at ANY point —
     mid-copy, between rename and unlink, or between unlink and commit — is
     safe to resume, and status commits after every single asset (not
     batched) so the manifest is never more than one file out of sync with
@@ -1174,7 +1341,7 @@ def apply_decisions(
                 else _quarantine_dest(quarantine_root, path_str)
             )
             if not dry_run:
-                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes)
+                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes, src)
                 if not already_done:
                     if not src.exists():
                         # Neither the source nor a matching dest exists —

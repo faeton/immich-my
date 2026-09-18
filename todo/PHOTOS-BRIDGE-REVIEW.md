@@ -1,6 +1,6 @@
 # Photos Bridge — review findings & action plan
 
-**Status:** review complete, nothing implemented
+**Status:** P0.1–P0.4 fixed (Phase 0.5 done, 2026-09-18). Everything else open.
 **Date:** 2026-09-18
 **Subject:** the "Photos Bridge" design brief (Apple Photos → `osxphotos` → rsync batches
 → `immy dedup` → Immich external library), which supersedes the `icloudpd` forward-sync path.
@@ -20,6 +20,11 @@ not exist, and a transport protocol that does not deliver the guarantee it claim
 ## P0 — Live bugs. Fix independent of whether the bridge is ever built.
 
 These are reachable today, with no new source. They are not in the brief.
+
+**All four are fixed as of 2026-09-18** — `dedup/engine.py`, covered by
+`immy/tests/test_dedup_safety.py` (20 tests, no pyvips needed). Each fix is
+marked below; the diagnosis text is left as written, since it is the record
+of what the code did. No schema change and no new source, per Phase 0.5.
 
 ### P0.1 `_resolve_dest` can delete an asset that never reached the library
 
@@ -42,6 +47,12 @@ returning `already_done`, for both the plain and the asset-id-qualified destinat
 Severity: silent data loss in a pipeline that has already run. This is the single most
 urgent item in this document.
 
+**Done 2026-09-18.** `_resolve_dest` now takes the staging `src` and defers to
+`_dest_holds_this_asset`, which requires `content_equal(src, candidate)` on both the
+plain and the qualified name. The one remaining size-only branch is `src` already
+consumed — nothing is left to compare and nothing is deleted there, so its worst case
+is a bookkeeping row on the wrong twin, never a lost file.
+
 ### P0.2 Same-stem, same-size videos auto-merge on filename alone
 
 `dedup/engine.py:465` (early return), `engine.py:762` (`_metadata_agrees` fallback),
@@ -60,6 +71,11 @@ Live Photo `.mov` halves make exact size collisions substantially likelier — t
 **Fix:** require real hash equality for the exact-video shortcut; treat conflicting `live_cid`
 as a hard bar to heuristic merging.
 
+**Done 2026-09-18.** The equal-size shortcut in `_pair_evidence` confirms content before
+claiming `strong` and otherwise falls through to the plausibility gate; `_decide_one`'s
+video branch confirms content after the size check; an unreadable file counts as *not*
+confirmed. Conflicting `live_cid` returns `review` for any cluster, image or video.
+
 ### P0.3 An extended cluster keeps a stale CLIP score
 
 `dedup/engine.py:517` (in-place merge), `engine.py:563` (`clip_cos_sim IS NULL` filter),
@@ -76,6 +92,12 @@ lets a fresh arrival attach to a settled cluster.
 
 **Fix:** invalidate `clip_cos_sim` whenever membership changes; recompute over the full
 membership before permitting `auto`.
+
+**Done 2026-09-18.** `cluster()` tracks whether a reused cluster actually gained rows and
+clears `clip_cos_sim` when it did, scoped to `pending`/`review` clusters (an `auto`
+cluster has been acted on and `decide()` never revisits it). Stage C re-queues the
+cluster; until it runs, `_decide_one` sees `clip_cos=None` and routes to review.
+`dedup cluster` prints the extended count.
 
 ### P0.4 RAW/JPEG companion exclusion does not survive transitivity
 
@@ -96,6 +118,11 @@ constant arrival pattern rather than an occasional one.
 **Fix:** component incompatibility must survive transitive clustering and be re-checked in
 `_decide_one`.
 
+**Done 2026-09-18.** `_decide_one` re-checks `_is_raw_jpeg_companion` over every member
+pair before winner selection and returns `review`. Deliberately not persisted: the
+predicate is a pure function of path and format, so recomputing it at decide time cannot
+drift from what pairing saw.
+
 ---
 
 ## P1 — Identity (brief §6). Worth doing even if the bridge dies.
@@ -106,6 +133,11 @@ multi-source library. Corrections to the brief as written:
 
 - **Schema version is 2, not 3.** `manifest.py:31` — `SCHEMA_VERSION = 2`. The migration is
   **v2 → v3**, not v3 → v4.
+  *Superseded 2026-09-18:* merging the triage branch took `SCHEMA_VERSION` to **3**
+  (`triage` + `video_signal`), so the identity migration is **v3 → v4**. The point stands —
+  read the constant, do not assume. The v3 step also sets the precedent the next one should
+  not copy: it is table-creation only and leans on `_CREATE_SCHEMA` having already run, so
+  `_migrate` has no restart-safety story to inherit.
 - **The DDL contradicts the pseudocode.** §6 promises "else → new REVISION; record, do not
   silently overwrite", but `UNIQUE (source, source_uid, component)` permits exactly one row
   per tuple and there is nowhere else to put a revision. Two successive edited renders of one
@@ -248,7 +280,7 @@ already checksums every file it transfers. Cut the double hash, not the director
 | Phase | Deliverable | Gate |
 |---|---|---|
 | **0** | Unlock the Apple Account. **Reinstall `osxphotos` on a supported Python and pin it.** Confirm Photos on m3max is synced | prerequisite for everything |
-| **0.5** | **P0.1–P0.4 fixed, with tests.** No new source, no schema change | existing pipeline green; the silent-drop path in `_resolve_dest` closed |
+| ~~**0.5**~~ | ~~**P0.1–P0.4 fixed, with tests.** No new source, no schema change~~ | **Done 2026-09-18** — `test_dedup_safety.py`, 20 tests; suite shows no new failures |
 | **1** | Fixture corpus (brief §12) exported and characterised | regression suite exists; §7 already decided, so this confirms rather than decides |
 | **2** | Schema **v2→v3** + identity logic + `stub` guard + sha256 backfill over the overlap window | migration is restart-safe; alias branch can actually fire |
 | **3** | `immy dedup register photos` reading `osxphotos` JSON sidecars; source-adapter wiring gaps closed | fixture batch ingests correctly in a **shadow manifest** |
@@ -257,6 +289,12 @@ already checksums every file it transfers. Cut the double hash, not the director
 | **6** | Monitoring (trimmed); two weeks of clean runs | then and only then, brief §9 decommissioning of the icloudpd stub tree |
 
 Phase 0.5 is new and did not appear in the brief. Phase 2 remains worth doing on its own merits.
+
+**Where this stands (2026-09-18):** Phase 0.5 is complete. Phase 0 is the next gate and is
+not a code task — unlock the Apple Account, reinstall `osxphotos` on a supported Python and
+pin it, confirm Photos on m3max is synced. Nothing after it can be verified until then, and
+the open questions below (especially #1, catalog vs. backup) still decide the shape of
+Phases 4–6.
 
 ---
 

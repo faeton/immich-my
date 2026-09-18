@@ -4,6 +4,58 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-09-18 — dedup safety: four ways identity was being guessed
+
+Phase 0.5 of the Photos Bridge review (`todo/PHOTOS-BRIDGE-REVIEW.md`) — live
+bugs in the existing cascade, fixed ahead of any bridge work and independent
+of it. All four shared one root: byte length, a filename stem or a stale
+score was standing in for content identity, on paths that delete or
+quarantine files.
+
+### Fixed
+
+- **`_resolve_dest` could delete an asset that never reached the library**
+  (P0.1, the urgent one). An existing destination of the expected size was
+  read as this asset's own completed move, and both callers answer that by
+  unlinking the staging file *without copying it anywhere*. A library file
+  of equal length at the same `YYYY/MM/basename` was enough: the asset was
+  marked `promoted` and was simply gone. Destination identity now requires
+  verified content equality; only a source that is already consumed (copy
+  and unlink done, status commit missing) still resolves on size, and
+  nothing is deleted on that path.
+- **Same-stem, same-size videos auto-merged on filename alone** (P0.2).
+  `_pair_evidence` returned `("strong", None)` on equal byte length *before*
+  the `VIDEO_STEM_PLAUSIBILITY_SECONDS` gate — so the gate added 2026-07-12
+  sat behind the very shortcut it was meant to protect, and `_decide_one`'s
+  video branch tested only `bytes`, with `_metadata_agrees` falling through
+  to a bare stem match. Both now confirm the bytes; an unreadable file is
+  not a confirmation. Conflicting `live_cid` (Apple ContentIdentifier) is a
+  hard bar on auto-merging anywhere.
+- **An extended cluster kept a stale CLIP score** (P0.3). `cluster()` merges
+  new members into an existing `cluster_id`, but `_clip_ready_clusters` only
+  visits clusters where `clip_cos_sim IS NULL` — so a fresh arrival
+  attaching to a settled cluster (which `originals` rows deliberately enable)
+  inherited a cosine earned by two other images and could be auto-merged away
+  on it. Membership growth now clears the score, which re-queues Stage C and
+  routes the cluster to review until it is recomputed. `dedup cluster`
+  reports the count.
+- **RAW/JPEG companion exclusion did not survive transitivity** (P0.4). The
+  exclusion suppressed only the direct RAW↔JPEG edge; union-find still joined
+  both components through any third image matching each, and both — including
+  the irreplaceable RAW — became losers. The check now runs over every member
+  pair in `_decide_one`, where transitive clustering cannot route around it.
+
+### Changed
+
+- `content_equal()` is the one place content identity is decided: a full
+  byte compare up to 16 MB, three sampled windows above it, capped at ~12 MB
+  per side so clustering a video library does not turn into hundreds of GB
+  of reads. Silent-corruption detection stays with `_safe_move`'s sha256.
+- `tests/test_dedup_safety.py` — 20 tests pinning all four, including
+  end-to-end `promote_rest` / `apply_decisions` runs against a same-size
+  stranger sitting at the destination. Needs no pyvips, so it runs on the
+  NAS too.
+
 ## 2026-09-08 — `immy similar`: image→image search
 
 ### Added
