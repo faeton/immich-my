@@ -189,3 +189,73 @@ def replace_asset_faces(
                 "embedding": face["embedding"],
             })
     return len(faces)
+
+
+# --- apple-people: naming Immich's existing (unnamed) face clusters ------
+
+_SELECT_EXISTING_FACES = """
+SELECT af.id, af."assetId", af."personId", p.name,
+       af."boundingBoxX1"::float / af."imageWidth",
+       af."boundingBoxY1"::float / af."imageHeight",
+       af."boundingBoxX2"::float / af."imageWidth",
+       af."boundingBoxY2"::float / af."imageHeight"
+FROM asset_face af
+LEFT JOIN person p ON p.id = af."personId"
+WHERE af."assetId" = ANY(%(asset_ids)s)
+  AND af."imageWidth" > 0 AND af."imageHeight" > 0
+"""
+
+
+def fetch_existing_faces(
+    conn: psycopg.Connection, asset_ids: list[str],
+) -> dict[str, list[tuple[str, str | None, str | None, float, float, float, float]]]:
+    """Batch-fetch `asset_face` rows for the given assets, bbox normalized
+    to 0..1. Returns `assetId -> [(face_id, person_id, person_name, x1, y1,
+    x2, y2), ...]`. Caller (`apple_photos.build_person_plans`) does the
+    overlap logic — this is IO only.
+    """
+    out: dict[str, list[tuple]] = {}
+    if not asset_ids:
+        return out
+    rows = conn.execute(_SELECT_EXISTING_FACES, {"asset_ids": asset_ids}).fetchall()
+    for face_id, asset_id, person_id, name, x1, y1, x2, y2 in rows:
+        out.setdefault(str(asset_id), []).append(
+            (str(face_id), str(person_id) if person_id else None, name, x1, y1, x2, y2)
+        )
+    return out
+
+
+_NAME_PERSON = """
+UPDATE person SET name = %(name)s
+WHERE id = %(person_id)s AND name = ''
+"""
+
+
+def name_person(conn: psycopg.Connection, person_id: str, name: str) -> bool:
+    """Set a currently-unnamed person's name. Guarded by `name = ''` in the
+    WHERE clause so this never clobbers an existing name (e.g. a race with
+    the user naming it in the Immich UI between preview and apply).
+    Returns whether a row was actually updated.
+    """
+    with conn.cursor() as cur:
+        cur.execute(_NAME_PERSON, {"person_id": person_id, "name": name})
+        return cur.rowcount > 0
+
+
+_ATTACH_ORPHAN_FACES = """
+UPDATE asset_face SET "personId" = %(person_id)s
+WHERE id = ANY(%(face_ids)s) AND "personId" IS NULL
+"""
+
+
+def attach_orphan_faces(
+    conn: psycopg.Connection, face_ids: list[str], person_id: str,
+) -> int:
+    """Attach unclustered `asset_face` rows to a person. Guarded by
+    `personId IS NULL` so an already-clustered face is never reassigned.
+    """
+    if not face_ids:
+        return 0
+    with conn.cursor() as cur:
+        cur.execute(_ATTACH_ORPHAN_FACES, {"face_ids": face_ids, "person_id": person_id})
+        return cur.rowcount

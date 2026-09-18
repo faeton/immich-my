@@ -59,6 +59,7 @@ offline_mod = _LazyModule("offline")
 process_mod = _LazyModule("process")
 promote_mod = _LazyModule("promote")
 pg_mod = _LazyModule("pg")
+similar_mod = _LazyModule("similar")
 snapshot_mod = _LazyModule("snapshot")
 srt_mod = _LazyModule("srt")
 srtgeo_mod = _LazyModule("srtgeo")
@@ -1920,6 +1921,157 @@ def sync_offline(
         raise typer.Exit(code=1)
 
 
+@app.command()
+def similar(
+    image: Path = typer.Argument(..., exists=True, dir_okay=False, help="Query photo (any JPEG/PNG/HEIC PIL can open)."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+    limit: int = typer.Option(30, "--limit", "-n", help="How many neighbours to show."),
+    min_sim: float = typer.Option(0.0, "--min-sim", help="Drop hits below this cosine similarity (0..1)."),
+    no_videos: bool = typer.Option(False, "--no-videos", help="Images only."),
+    backend: str = typer.Option("onnx", "--backend", help="onnx (Immich's own model, in-process) | immich-ml (NAS HTTP; needs ml.immich_ml_url). NOT mlx — different vector space."),
+    as_json: bool = typer.Option(False, "--json", help="Print hits as JSON lines instead of a table."),
+    by_face: bool = typer.Option(False, "--faces", help="Rank by face identity instead of whole frame: detect faces in IMAGE (Vision), ArcFace-embed, query face_search. One block per face."),
+) -> None:
+    """Find library assets that look like IMAGE — image-to-image search on Immich's CLIP index.
+
+    Immich's UI only searches by text; this embeds the query photo with the
+    same ViT-B-32 model Immich indexed with and asks pgvector for the nearest
+    `smart_search` rows. Read-only. Similarity >= 0.95 is the same frame
+    (a re-compressed copy scores ~0.99), 0.85-0.95 the same subject/pose
+    (selfies of one person from different years all land 0.92-0.94), below
+    that just the same kind of shot.
+    Only assets Immich itself embedded are visible — immy-inserted ones never
+    auto-queue SmartSearch, and coverage is printed so a miss is explainable.
+
+    `--faces` switches to the face_search index (ArcFace, Mac-only: Vision
+    detector + insightface). That ranks by WHO is in the shot — the person
+    column tells you the identity — and only >= 0.93 means the same frame
+    (a re-compressed copy scores ~0.95; other shots of the same person peak
+    near 0.82).
+    """
+    import json as _json
+    from . import clip as clip_mod
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red] — similar needs the tailnet up and `pg:` set.")
+        raise typer.Exit(code=2)
+    if backend == "mlx":
+        console.print("[red]--backend mlx is not in Immich's vector space[/red]; use onnx or immich-ml.")
+        raise typer.Exit(code=2)
+    if by_face:
+        _similar_by_face(config, image, limit=limit, min_sim=min_sim,
+                         include_videos=not no_videos, as_json=as_json)
+        return
+    model = (config.ml.clip_model if config.ml and config.ml.clip_model else clip_mod.DEFAULT_MODEL)
+    endpoint = config.ml.immich_ml_url if config.ml else None
+    try:
+        vec = clip_mod.embed(image, model_name=model, backend=backend, endpoint=endpoint)
+    except (clip_mod.ClipUnavailable, clip_mod.ClipBackendError) as e:
+        console.print(f"[red]embed failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    with conn:
+        embedded, live = similar_mod.coverage(conn)
+        hits = similar_mod.search(
+            conn, vec, limit=limit, include_videos=not no_videos, min_similarity=min_sim,
+        )
+    if as_json:
+        for h in hits:
+            print(_json.dumps({
+                "assetId": h.asset_id, "similarity": round(h.similarity, 4), "label": h.label,
+                "type": h.asset_type, "takenAt": h.taken_at.isoformat() if h.taken_at else None,
+                "path": h.original_path, "city": h.city, "country": h.country,
+            }))
+        return
+    console.print(
+        f"[dim]{model} via {backend} · searchable {embedded:,} of {live:,} live assets "
+        f"({embedded * 100 // max(live, 1)}%)[/dim]"
+    )
+    if not hits:
+        console.print("no hits above the threshold")
+        return
+    t = Table(title=f"nearest to {image.name}")
+    t.add_column("sim", justify="right")
+    t.add_column("verdict")
+    t.add_column("taken")
+    t.add_column("where")
+    t.add_column("file", no_wrap=True)
+    for h in hits:
+        style = "bold green" if h.label == "same frame" else ("yellow" if h.label == "same subject" else "")
+        where = ", ".join(x for x in (h.city, h.country) if x)
+        t.add_row(
+            f"[{style}]{h.similarity:.3f}[/{style}]" if style else f"{h.similarity:.3f}",
+            h.label,
+            h.taken_at.strftime("%Y-%m-%d %H:%M") if h.taken_at else "",
+            where,
+            "/".join(h.original_path.rsplit("/", 3)[-3:])
+            + (" [dim](video)[/dim]" if h.asset_type == "VIDEO" else ""),
+        )
+    console.print(t)
+    console.print(f"[dim]open in Immich: {config.immich.url.rstrip('/') if config.immich else '<immich>'}/photos/<assetId> (use --json for ids)[/dim]")
+
+
+def _similar_by_face(config, image: Path, *, limit: int, min_sim: float,
+                     include_videos: bool, as_json: bool) -> None:
+    import json as _json
+    from collections import Counter
+    from . import faces as faces_mod
+
+    data = image.read_bytes()
+    try:
+        detected, w, h = faces_mod.detect(data)
+        embedded = faces_mod.embed_faces(data, detected)
+    except faces_mod.FacesUnavailable as e:
+        console.print(f"[red]face pipeline unavailable:[/red] {e}")
+        raise typer.Exit(code=2)
+    if not embedded:
+        console.print("no face detected in the query image")
+        raise typer.Exit(code=1)
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    with conn:
+        for i, ef in enumerate(embedded, 1):
+            hits = similar_mod.search_faces(
+                conn, ef.embedding.tolist(), limit=limit,
+                include_videos=include_videos, min_similarity=min_sim,
+            )
+            f = ef.face
+            if as_json:
+                for hh in hits:
+                    print(_json.dumps({
+                        "queryFace": i, "assetId": hh.asset_id, "similarity": round(hh.similarity, 4),
+                        "label": hh.label, "person": hh.person, "type": hh.asset_type,
+                        "takenAt": hh.taken_at.isoformat() if hh.taken_at else None, "path": hh.original_path,
+                    }))
+                continue
+            who = Counter(hh.person or "(unnamed)" for hh in hits).most_common(3)
+            console.print(
+                f"[dim]face {i}/{len(embedded)} bbox ({f.x1},{f.y1})-({f.x2},{f.y2}) in {w}x{h} · "
+                f"top-{len(hits)} identity: {', '.join(f'{n} x{c}' for n, c in who)}[/dim]"
+            )
+            t = Table(title=f"faces nearest to {image.name} (face {i})")
+            t.add_column("sim", justify="right"); t.add_column("verdict"); t.add_column("person")
+            t.add_column("taken"); t.add_column("file", no_wrap=True)
+            for hh in hits:
+                style = "bold green" if hh.label == "same frame" else ""
+                t.add_row(
+                    f"[{style}]{hh.similarity:.3f}[/{style}]" if style else f"{hh.similarity:.3f}",
+                    hh.label, hh.person or "",
+                    hh.taken_at.strftime("%Y-%m-%d %H:%M") if hh.taken_at else "",
+                    "/".join(hh.original_path.rsplit("/", 3)[-3:])
+                    + (" [dim](video)[/dim]" if hh.asset_type == "VIDEO" else ""),
+                )
+            console.print(t)
+
+
 @app.command("db-setup")
 def db_setup(
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
@@ -2684,15 +2836,31 @@ def apple_people(
         None, "--only",
         help="Restrict to named person(s) (repeatable, exact full-name match).",
     ),
+    apply_: bool = typer.Option(
+        False, "--apply",
+        help="Write to Immich: name the existing (unnamed) person cluster "
+        "each Apple person's faces overlap, and attach any orphaned "
+        "same-cluster faces. Never creates new Person rows and never "
+        "renames an already-named person — see the plan preview first.",
+    ),
+    yes: bool = typer.Option(
+        False, "--yes",
+        help="Skip the confirmation prompt before writing (for non-interactive use).",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
-    """Preview Apple Photos face-tagging that would seed Immich Person rows.
+    """Preview (or, with `--apply`, write) Apple Photos face-tagging into Immich.
 
-    Dry-run only — prints the named persons, their face counts, and how
-    many of those faces map to assets present in the Immich snapshot via
-    `(original_filename, size)` match. No write path yet; the plan is to
-    add `--apply` once the match rate looks sensible.
+    Matches Apple's named face clusters to Immich assets, prints the match
+    rate, then builds a plan against Immich's *own* existing (already-
+    clustered-but-unnamed) `asset_face`/`person` rows: whichever unnamed
+    cluster an Apple person's faces consistently overlap is named, and any
+    unclustered faces on the same assets are attached to it. This retroactively
+    names every other face already in that cluster too, not just the ones
+    Apple tagged — see `apple_photos.build_person_plans` for the matching.
 
-    Requires a fresh snapshot (`immy snapshot`) for the match phase.
+    Requires a fresh snapshot (`immy snapshot`) for the match phase, and (for
+    `--apply`) a `pg:` block in the config to reach Immich's Postgres.
     """
     try:
         db_path = apple_photos_mod.resolve_db_path(photos_library)
@@ -2765,10 +2933,91 @@ def apple_people(
         f"\nTotal: [bold]{total_matched:,}[/bold] / {total_faces:,} faces "
         f"({100 * total_matched / total_faces:.0f}%) map to assets in Immich."
     )
-    console.print(
-        "[dim]No changes made. Write path (`--apply`) not yet implemented — "
-        "review the match rate above first.[/dim]"
-    )
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print(
+            "\n[dim]No changes made. Add a `pg:` block to the config and "
+            "pass --apply to write.[/dim]"
+        )
+        return
+
+    try:
+        pconn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    try:
+        asset_ids = sorted({m.immich_asset_id for ms in matches.values() for m in ms})
+        raw_faces = pg_mod.fetch_existing_faces(pconn, asset_ids)
+        existing_faces_by_asset = {
+            asset_id: [apple_photos_mod.ExistingFace(*row) for row in rows]
+            for asset_id, rows in raw_faces.items()
+        }
+        plans = apple_photos_mod.build_person_plans(persons, matches, existing_faces_by_asset)
+
+        plan_table = Table(show_header=True, header_style="bold")
+        plan_table.add_column("person")
+        plan_table.add_column("target cluster")
+        plan_table.add_column("votes", justify="right")
+        plan_table.add_column("+orphans", justify="right")
+        plan_table.add_column("conflicts", justify="right")
+        plan_table.add_column("no-detect", justify="right")
+        actionable = [p for p in plans if p.target_person_id is not None]
+        for p in plans:
+            target = p.target_person_id[:8] if p.target_person_id else "[dim]-[/dim]"
+            votes = f"{p.target_votes}/{p.total_votes}" if p.total_votes else "-"
+            plan_table.add_row(
+                p.full_name, target, votes,
+                str(len(p.orphan_face_ids)), str(len(p.conflicts)), str(p.no_detection),
+            )
+        console.print("\n[bold]--apply plan[/bold] (against Immich's existing face clusters):")
+        console.print(plan_table)
+
+        total_conflicts = sum(len(p.conflicts) for p in plans)
+        if total_conflicts:
+            console.print(
+                f"[yellow]{total_conflicts} face(s) overlap a cluster already named "
+                "something else — skipped, not overwritten.[/yellow]"
+            )
+        if not actionable:
+            console.print(
+                "\n[yellow]No cluster meets the confidence bar "
+                f"(≥{apple_photos_mod.MIN_VOTES} votes, "
+                f"≥{apple_photos_mod.MIN_CONFIDENCE:.0%} confidence) — "
+                "nothing to apply.[/yellow]"
+            )
+            return
+
+        if not apply_:
+            console.print(
+                "\n[dim]No changes made. Pass --apply to write the plan above.[/dim]"
+            )
+            return
+
+        if not yes:
+            confirmed = typer.confirm(
+                f"\nName {len(actionable)} Immich person cluster(s) and attach "
+                f"{sum(len(p.orphan_face_ids) for p in actionable)} orphaned face(s)?"
+            )
+            if not confirmed:
+                console.print("[yellow]aborted, no changes made.[/yellow]")
+                return
+
+        named = 0
+        attached = 0
+        for p in actionable:
+            if pg_mod.name_person(pconn, p.target_person_id, p.full_name):
+                named += 1
+            attached += pg_mod.attach_orphan_faces(pconn, p.orphan_face_ids, p.target_person_id)
+        pconn.commit()
+        console.print(
+            f"\n[green]applied:[/green] named {named} person cluster(s), "
+            f"attached {attached} orphaned face(s)."
+        )
+    finally:
+        pconn.close()
 
 
 dedup_app = typer.Typer(
