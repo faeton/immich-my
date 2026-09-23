@@ -128,7 +128,9 @@ def test_fmt_make_model_falls_back_to_xmp_camera_tag():
 def test_audit_empty_folder_exits_zero(tmp_path):
     result = runner.invoke(app, ["audit", str(tmp_path)])
     assert result.exit_code == 0
-    assert "0 media file" in result.stdout
+    # Rich wraps at the terminal width, and a long tmp path (Linux) pushes
+    # the count onto the next line — compare with whitespace collapsed.
+    assert "0 media file" in " ".join(result.stdout.split())
 
 
 def test_iter_media_skips_audit_derivatives(tmp_path: Path):

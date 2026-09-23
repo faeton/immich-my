@@ -424,7 +424,7 @@ h1{font-size:1.05rem;margin:0}
 .key{display:inline-block;min-width:1.2em;text-align:center;background:#2c2c2c;border:1px solid #444;
      border-radius:4px;padding:0 4px;margin-right:6px;font-family:ui-monospace,monospace;font-size:.75rem}
 .src{font-weight:600;padding:1px 6px;border-radius:3px;margin-right:6px}
-.src.icloud{background:#2a4d2a}.src.google{background:#2a3a5a}.src.gdrive{background:#5a3a2a}.src.originals{background:#5a2a4d}
+.src.icloud{background:#2a4d2a}.src.google{background:#2a3a5a}.src.gdrive{background:#5a3a2a}.src.originals{background:#5a2a4d}.src.photos{background:#2a4d4d}
 .winnertag{color:#4caf50;font-weight:600;margin-left:6px}
 .locknote{color:#f0ad4e;font-size:.78rem;margin:8px 0}
 .reason{background:#3a2f1d;border:1px solid #6f5f2f;border-radius:4px;padding:1px 8px;

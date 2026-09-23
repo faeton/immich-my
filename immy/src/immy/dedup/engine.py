@@ -93,7 +93,11 @@ VIDEO_EXTS = {"mp4", "mov", "m4v", "avi", "mkv", "mts", "m2ts", "insv", "lrv", "
 RAW_EXTS = {"dng", "cr2", "cr3", "arw", "nef", "raf", "rw2", "orf"}
 JPEG_EXTS = {"jpg", "jpeg", "heic", "heif"}
 
-SOURCE_WEIGHT = {"originals": 120, "icloud": 100, "google": 30}
+# `photos` (osxphotos export from Apple Photos) outranks an icloudpd copy of
+# the same shot: it is the same original plus the library's own metadata.
+# An unknown source falls back to 50 in `winner_score`, which would have
+# lost winner selection to every icloudpd twin.
+SOURCE_WEIGHT = {"originals": 120, "photos": 110, "icloud": 100, "google": 30}
 FORMAT_BONUS = {
     "heic": 20, "heif": 20, "dng": 20, "cr2": 20, "cr3": 20,
     "arw": 20, "nef": 20, "raf": 20, "rw2": 20, "orf": 20,
@@ -101,7 +105,9 @@ FORMAT_BONUS = {
 
 # Google Takeout marks edited exports with a filename suffix; Apple marks
 # adjustments in XMP. Either flag flips `edited` (a never-auto-merge guard).
-_EDITED_NAME_RE = re.compile(r"-(edited|effects)$", re.IGNORECASE)
+# Takeout uses a hyphen (`-edited`); osxphotos' default `--edited-suffix` is
+# `_edited`, so both separators count.
+_EDITED_NAME_RE = re.compile(r"[-_](edited|effects)$", re.IGNORECASE)
 # Takeout numbers filename collisions as "IMG_1234(1).JPG"; the copy marker
 # is noise for stem blocking.
 _COPY_MARKER_RE = re.compile(r"\(\d+\)$")
@@ -1192,7 +1198,11 @@ def _rescue_sidecar(dest: Path, taken_at: str | None, gps_lat: float | None, gps
     rescued the real date/GPS from the `*.json` companion into the manifest
     (taken_src='json') — write it back out as an XMP sidecar next to the
     promoted file so Immich actually sees it, instead of an undated/
-    un-geotagged asset."""
+    un-geotagged asset.
+
+    Gated on `taken_src == 'json'` alone, not on source: any adapter whose
+    companion JSON corrects the date (Photos exports included) needs the
+    same write-back, or the correction lives only in the manifest."""
     patch: dict[str, object] = {}
     if taken_at:
         try:
@@ -1262,7 +1272,7 @@ def promote_rest(
                     _safe_move(src, dest)
                 elif src.exists():
                     src.unlink()
-                if source == "google" and taken_src == "json":
+                if taken_src == "json":
                     if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
                         counts["sidecars_written"] += 1
                 conn.execute(
@@ -1353,7 +1363,7 @@ def apply_decisions(
                     # Copy finished in a prior run but the source unlink
                     # (or the status commit) never happened — finish it.
                     src.unlink()
-                if is_winner and source == "google" and taken_src == "json":
+                if is_winner and taken_src == "json":
                     if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
                         counts["sidecars_written"] += 1
                 conn.execute(
