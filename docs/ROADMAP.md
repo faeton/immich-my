@@ -46,13 +46,13 @@ container-side.
 
 ### Trip Status Command
 
-Add `immy status <trip>`:
-- audit HIGH/MEDIUM pending count
-- process marker state
-- journal phase counts
-- offline entries pending/synced by target
-- staged derivative files present/missing
-- last heartbeat/progress file
+Shipped 2026-09-23 as `immy status <trip>` (`immy/src/immy/status.py`):
+pending audit HIGH/MEDIUM (`--no-audit` skips the exiftool pass), process
+marker, journal counts per worker (flags a worker split across model
+versions), offline entries synced/pending, staged derivatives present/missing,
+last heartbeat with pid liveness. `--json` for scripts. Per-target offline
+state (`synced.local` / `synced.vv`) will show up once Local Immich Triage
+adds it.
 
 ### Docs Restructure
 

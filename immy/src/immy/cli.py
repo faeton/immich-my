@@ -3021,6 +3021,78 @@ def apple_people(
 
 
 @app.command()
+def status(
+    trip: Path = typer.Argument(..., exists=True, file_okay=False, resolve_path=True),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+    with_audit: bool = typer.Option(
+        True, "--audit/--no-audit",
+        help="Count pending audit findings (runs exiftool over the trip).",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """Where a trip is at: pending audit, process marker, journal phases,
+    offline cache, staged derivatives, last heartbeat. Read-only."""
+    import json as json_mod
+    from datetime import datetime as _dt
+
+    from . import status as status_mod
+
+    info = status_mod.trip_status(trip, load_config(config_path), with_audit=with_audit)
+    if as_json:
+        print(json_mod.dumps(info, indent=2, default=str))
+        return
+
+    console.print(f"[bold]{trip.name}[/bold]  [dim]{info['audit_dir']}[/dim]", highlight=False)
+    audit = info["audit"]
+    if audit is not None:
+        color = "red" if audit["high"] else ("yellow" if audit["medium"] else "green")
+        console.print(
+            f"  audit       [{color}]{audit['high']} HIGH, {audit['medium']} MEDIUM pending[/{color}]"
+            f"  ({audit['applied']} applied, {audit['files']} files)", highlight=False,
+        )
+    proc = info["process"]
+    if proc is None:
+        console.print("  process     [dim]not processed[/dim]")
+    else:
+        when = _dt.fromtimestamp(proc["processed_at"]).strftime("%Y-%m-%d %H:%M") if proc["processed_at"] else "?"
+        console.print(
+            f"  process     {when} — {proc['assets']} assets "
+            f"({proc['inserted']} inserted, {proc['already_present']} already present)",
+            highlight=False,
+        )
+    if info["journal"]:
+        parts = []
+        for worker, rec in info["journal"].items():
+            extra = f" [yellow]({len(rec['versions'])} versions)[/yellow]" if len(rec["versions"]) > 1 else ""
+            parts.append(f"{worker} {rec['done']}{extra}")
+        console.print("  journal     " + ", ".join(parts), highlight=False)
+    else:
+        console.print("  journal     [dim]empty[/dim]")
+    off = info["offline"]
+    if off["entries"]:
+        color = "yellow" if off["pending"] else "green"
+        console.print(
+            f"  offline     [{color}]{off['pending']} pending[/{color}] / {off['entries']} "
+            f"({off['synced']} synced)", highlight=False,
+        )
+    der = info["derivatives"]
+    if der["present"] or der["missing"]:
+        color = "red" if der["missing"] else "green"
+        console.print(
+            f"  derivs      [{color}]{der['present']} staged, {der['missing']} missing[/{color}]",
+            highlight=False,
+        )
+    hb = info["heartbeat"]
+    if hb is not None:
+        alive = {True: "[green]running[/green]", False: "[dim]exited[/dim]", None: "[dim]pid ?[/dim]"}[hb["alive"]]
+        where = f"{hb['index']}/{hb['total']} " if hb.get("total") else ""
+        console.print(
+            f"  heartbeat   {hb['phase']}:{hb['step']} {where}{hb.get('file') or ''} "
+            f"— {hb['age_s']}s ago, {alive}", highlight=False,
+        )
+
+
+@app.command()
 def doctor(
     config_path: Path = typer.Option(None, "--config", help="immy config path."),
 ) -> None:
