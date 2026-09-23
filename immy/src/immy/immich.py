@@ -305,6 +305,20 @@ class ImmichClient:
         )
         return resp if isinstance(resp, list) else []
 
+    def remove_assets_from_album(
+        self, album_id: str, asset_ids: list[str]
+    ) -> list[dict]:
+        """`DELETE /api/albums/{id}/assets` — mirror of the PUT: an asset
+        that is not a member comes back `success=false`, never an error, so
+        removing an already-removed asset is a no-op. Only the album link
+        goes; the asset itself is untouched."""
+        if not asset_ids:
+            return []
+        resp = self._request(
+            "DELETE", f"/api/albums/{album_id}/assets", body={"ids": asset_ids}
+        )
+        return resp if isinstance(resp, list) else []
+
     # --- tags --------------------------------------------------------------
 
     def upsert_tags(self, names: list[str]) -> dict[str, str]:

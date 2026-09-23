@@ -29,10 +29,13 @@ user-edited names/descriptions alone.
 from __future__ import annotations
 
 import hashlib
+import json
 import math
+import os
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from pathlib import Path
 
 
 IMMY_CLUSTER_MARKER = "immy-cluster:"
@@ -259,7 +262,58 @@ def extract_cluster_key(description: str | None) -> str | None:
     return None
 
 
+# --- pruning ---------------------------------------------------------------
+#
+# `immy cluster --apply` only ever PUTs assets into albums, so an asset whose
+# event membership changes (a late photo shifts a boundary, `--max-km`
+# changes) ends up in both albums. Pruning removes it from the old one — but
+# only assets immy itself put there. An album's current contents cannot tell
+# a stale immy member from a photo the user added by hand, so the ledger
+# (key → asset ids immy last assigned) is the only thing prune ever acts on.
+# First run with no ledger prunes nothing.
+
+LEDGER_FILENAME = "cluster-ledger.json"
+
+
+def load_ledger(path: Path) -> dict[str, list[str]]:
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    albums = data.get("albums") if isinstance(data, dict) else None
+    if not isinstance(albums, dict):
+        return {}
+    return {str(k): [str(a) for a in v] for k, v in albums.items() if isinstance(v, list)}
+
+
+def save_ledger(path: Path, ledger: dict[str, list[str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(
+        {"schema": 1, "albums": {k: sorted(v) for k, v in sorted(ledger.items())}},
+        indent=1,
+    ))
+    os.replace(tmp, path)
+
+
+def prune_plan(
+    ledger: dict[str, list[str]], clusters: list["Cluster"],
+) -> dict[str, list[str]]:
+    """key → asset ids to remove from that key's album: ids immy assigned
+    last time that are no longer in the event. A key whose event vanished
+    entirely (its centroid/start moved, so the key changed) loses every
+    member immy gave it; the album itself is left alone."""
+    current = {c.stable_key(): {a.asset_id for a in c.assets} for c in clusters}
+    plan: dict[str, list[str]] = {}
+    for key, previous in ledger.items():
+        stale = sorted(set(previous) - current.get(key, set()))
+        if stale:
+            plan[key] = stale
+    return plan
+
+
 __all__ = [
+    "LEDGER_FILENAME", "load_ledger", "save_ledger", "prune_plan",
     "IMMY_CLUSTER_MARKER",
     "DEFAULT_MAX_GAP_HOURS", "DEFAULT_MAX_KM", "DEFAULT_MIN_ASSETS",
     "AssetPoint", "Cluster",

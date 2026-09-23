@@ -2163,6 +2163,12 @@ def cluster(
         clustering_mod.DEFAULT_MAX_KM, "--max-km",
         help=f"Distance from centroid that splits an event (default: {clustering_mod.DEFAULT_MAX_KM} km).",
     ),
+    prune: bool = typer.Option(
+        False, "--prune/--no-prune",
+        help="Also remove assets immy put in an album on an earlier run that "
+             "are no longer in that event. Never touches assets immy did not "
+             "add (tracked in cluster-ledger.json under state_root or ~/.immy).",
+    ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
 ) -> None:
     """Group assets by (time, lat, lon) into events and auto-create albums.
@@ -2177,9 +2183,10 @@ def cluster(
     Idempotent via a `immy-cluster:<stable_key>` marker line embedded in
     each album's description. The key is derived from rounded centroid +
     start date so late-arriving photos don't spawn duplicate albums.
-    MVP: we only *add* assets to existing immy-cluster albums — if an
-    asset's cluster membership changes across runs, it ends up in both.
-    Manually prune when that happens.
+    Without `--prune` assets are only ever added — if an asset's event
+    membership changes across runs, it ends up in both albums. `--prune`
+    removes the stale copies, limited to assets immy itself added (a
+    ledger records them), so hand-added photos always stay.
     """
     config = load_config(config_path)
     if config.pg is None:
@@ -2243,6 +2250,17 @@ def cluster(
             f"[dim]{len(c.assets)} asset(s), key={c.stable_key()}[/dim]"
         )
 
+    ledger_path = (
+        (config.state_root or Path.home() / ".immy") / clustering_mod.LEDGER_FILENAME
+    )
+    ledger = clustering_mod.load_ledger(ledger_path)
+    plan = clustering_mod.prune_plan(ledger, clusters) if prune else {}
+    if plan:
+        console.print(
+            f"  [yellow]prune[/yellow] {sum(len(v) for v in plan.values())} stale "
+            f"asset-link(s) across {len(plan)} album(s)"
+        )
+
     if dry_run:
         console.print(
             "\n[yellow]dry-run[/yellow] — pass `--apply` to create/update "
@@ -2287,6 +2305,8 @@ def cluster(
             if album_id:
                 created += 1
                 added_assets_total += len(asset_ids)
+                ledger[key] = sorted(set(ledger.get(key, [])) | set(asset_ids))
+                clustering_mod.save_ledger(ledger_path, ledger)
                 console.print(
                     f"  [green]created[/green] {name} "
                     f"[dim]({len(asset_ids)} asset(s))[/dim]"
@@ -2303,14 +2323,40 @@ def cluster(
             added = sum(1 for r in result if isinstance(r, dict) and r.get("success"))
             updated += 1
             added_assets_total += added
+            # Union, not replace: without --prune the stale claims must be
+            # remembered so a later --prune can still find them.
+            ledger[key] = sorted(set(ledger.get(key, [])) | set(asset_ids))
+            clustering_mod.save_ledger(ledger_path, ledger)
             console.print(
                 f"  [green]updated[/green] {name} "
                 f"[dim]({added} new, {len(asset_ids) - added} already present)[/dim]"
             )
 
+    removed_total = 0
+    current_keys = {c.stable_key() for c in clusters}
+    for key, stale in plan.items():
+        album = key_to_album.get(key)
+        if album is not None:
+            result = client.remove_assets_from_album(album["id"], stale)
+            removed = sum(1 for r in result if isinstance(r, dict) and r.get("success"))
+            removed_total += removed
+            console.print(
+                f"  [yellow]pruned[/yellow] {album.get('albumName') or key} "
+                f"[dim]({removed} removed, {len(stale) - removed} already gone)[/dim]"
+            )
+        # The album was deleted by hand, or the links are now removed: either
+        # way immy no longer claims these assets for this key.
+        keep = set(ledger.get(key, [])) - set(stale)
+        if keep or key in current_keys:
+            ledger[key] = sorted(keep)
+        else:
+            ledger.pop(key, None)
+        clustering_mod.save_ledger(ledger_path, ledger)
+
     console.print(
         f"\n[green]✓[/green] {created} album(s) created, "
         f"{updated} updated, {added_assets_total} asset-link(s) added"
+        + (f", {removed_total} pruned" if prune else "")
     )
 
 

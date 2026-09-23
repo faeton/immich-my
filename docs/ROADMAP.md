@@ -64,12 +64,13 @@ adds it.
 
 ### Cluster Pruning
 
-`immy cluster` currently only adds assets to cluster albums. Add stale-member
-removal for albums marked with `immy-cluster:<key>`.
-
-Likely storage:
-- per-asset prior cluster key in journal, or
-- a small immy-owned table if this becomes cross-trip/global state.
+Shipped 2026-09-23 as `immy cluster --apply --prune`. A ledger
+(`cluster-ledger.json` under `state_root`, else `~/.immy/`) records which
+asset ids immy assigned to each `immy-cluster:<key>` album; prune removes only
+those that left the event, so photos added by hand are never touched. Without
+`--prune` claims accumulate (union) so a later prune still finds them. A key
+whose event vanished loses all its immy-assigned members; the album is kept.
+First run after upgrade has no ledger and prunes nothing.
 
 ## Later
 

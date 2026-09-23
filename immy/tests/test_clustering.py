@@ -192,3 +192,43 @@ def test_extract_cluster_key_ignores_marker_inside_prose() -> None:
     # to be the start of a stripped line.
     desc = "The word immy-cluster:whatever appears here in passing."
     assert extract_cluster_key(desc) is None
+
+
+# --- pruning ---------------------------------------------------------------
+
+from immy.clustering import load_ledger, prune_plan, save_ledger  # noqa: E402
+
+
+def _event(ids: list[str], *, start: datetime, lat: float = 45.0, lon: float = 15.0):
+    points = [_p(i, start + timedelta(minutes=n), lat, lon) for n, i in enumerate(ids)]
+    (cluster,) = cluster_assets(points, min_assets=1)
+    return cluster
+
+
+T0 = datetime(2025, 6, 1, 10, 0, tzinfo=timezone.utc)
+
+
+def test_prune_plan_removes_only_ids_immy_assigned():
+    event = _event(["a", "b"], start=T0)
+    # "c" moved to another event; "manual" was never in the ledger (a photo
+    # the user added by hand) so it can never appear in the plan.
+    ledger = {event.stable_key(): ["a", "b", "c"]}
+    assert prune_plan(ledger, [event]) == {event.stable_key(): ["c"]}
+
+
+def test_prune_plan_vanished_event_loses_all_its_claims():
+    ledger = {"gone00000000": ["x", "y"]}
+    assert prune_plan(ledger, [_event(["a"], start=T0)]) == {"gone00000000": ["x", "y"]}
+
+
+def test_prune_plan_first_run_prunes_nothing():
+    assert prune_plan({}, [_event(["a"], start=T0)]) == {}
+
+
+def test_ledger_roundtrip_and_garbage_tolerance(tmp_path):
+    path = tmp_path / "state" / "cluster-ledger.json"
+    assert load_ledger(path) == {}
+    save_ledger(path, {"k": ["b", "a"]})
+    assert load_ledger(path) == {"k": ["a", "b"]}
+    path.write_text("{not json")
+    assert load_ledger(path) == {}
