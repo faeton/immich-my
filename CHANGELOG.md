@@ -4,6 +4,67 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-09-23 — manifest identity (schema v4), `photos` adapter, doctor/status/prune
+
+Phase 2 of the Photos Bridge plan (`todo/PHASE2-IDENTITY-DESIGN.md`, rev 3 after
+two Codex design reviews) plus the n5-side of Phase 3 and three ROADMAP items.
+None of it needs the Mac.
+
+### Added
+
+- **Schema v4.** `asset` gains `source_uid`, `component`, `sha256`, `dest_path`,
+  `alias_path`; new `library_file` table — a content index of what the library
+  actually holds. Migration is one transaction (columns + version bump), inspects
+  `PRAGMA table_info` so a half-migrated or version-less manifest completes, and
+  creates indexes only after it. Checked on a copy of n5's live manifest (285k
+  rows): < 1 s, integrity ok.
+- **Content identity at fingerprint time.** Every new arrival is hashed. A
+  non-`originals` file whose exact bytes a library file holds becomes `alias`
+  (no pHash, never clustered); `dedup apply` quarantines it after re-hashing
+  **both** files in full, or sends it back to `registered` if the proof fails.
+  `originals` rows are never aliased — bootstrap builds the index instead.
+- **Stub guard**: 0 bytes, exiftool `Error`, or a media-named file whose content
+  sniffs as `text/*` → `error: stub: …`. `immy dedup retry-errors [--match stub]`
+  resets them once the real file arrives.
+- **`immy dedup index-library --originals … [--dir 2026/05 …]`** — hash library
+  subtrees into `library_file`; resumable, prunes vanished files. 2026/07
+  (426 files, 9 GB) took 28 s on n5.
+- **`photos` source adapter** (`dedup/photos.py`): Photos UUID from the osxphotos
+  JSON export report, component (`original`/`live_video`/`raw`/`edited`) from the
+  exported name, Photos-corrected date/location from the JSON sidecar
+  (`taken_src='json'`, so promote writes it back as XMP). A promoted twin with a
+  different hash is held as `error: revision of #N`.
+- **`immy doctor`** — read-only preflight (binaries, libvips, roots, ML backend
+  coherence, Immich API + import paths, Postgres, direct-write columns, CLIP dim).
+- **`immy status <trip>`** — audit pending, process marker, journal per worker,
+  offline synced/pending, staged derivatives, heartbeat.
+- **`immy cluster --prune`** — removes stale members immy itself added, tracked
+  in a ledger; hand-added photos are never touched.
+
+### Changed
+
+- **Moves record before they consume.** `_safe_copy` (copy → fsync → rename →
+  fsync dir → full sha256) replaces `_safe_move`; `dest_path` + `sha256` are
+  committed before the source is unlinked. Recovery uses the record: a source
+  that changed since is refused, never consumed; a recorded file that no longer
+  matches with the source gone is refused rather than size-guessed.
+- `_resolve_dest` requires **full sha256** equality before claiming a
+  destination as this asset's own — `content_equal`'s sampled windows can pass
+  two >16 MB files differing elsewhere (a test pins that counterexample).
+- `dedup apply`, `dedup promote-rest` and `triage apply` share one lock,
+  `<manifest>.movers.lock`.
+- Triage's in-place swap clears `asset.sha256` and the file's `library_file`
+  row (it preserves mtime, so a stat check alone could miss it).
+- `photos` source weight 110; `_edited` suffix counts as edited; JSON date
+  rescue no longer Google-only; review UI styles `.src.photos`.
+
+### Found
+
+- **osxphotos' JSON sidecar has no UUID** (0.77.1 source): the review's plan to
+  take identity from it would not have worked. The JSON *export report* has it.
+- **Tests run on n5 now**: `uv sync --no-install-package insightface` +
+  `pyvips-binary` + user-local exiftool (AGENTS.md). 802 passed.
+
 ## 2026-09-18 — dedup safety: four ways identity was being guessed
 
 Phase 0.5 of the Photos Bridge review (`todo/PHOTOS-BRIDGE-REVIEW.md`) — live

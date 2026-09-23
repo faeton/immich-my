@@ -3165,6 +3165,9 @@ def doctor(
         raise typer.Exit(code=1)
 
 
+MOVERS_LOCK_SUFFIX = ".movers.lock"
+
+
 dedup_app = typer.Typer(
     help="Cross-source dedup (iCloud + Google Takeout → library/originals). "
     "Cascade: block → pHash → CLIP-confirm → decide.",
@@ -3251,11 +3254,83 @@ def dedup_fingerprint(
     from .dedup import engine as engine_mod
 
     _, conn = _open_manifest(manifest_path)
+    stats: dict = {}
     ok, failed = engine_mod.fingerprint_pending(
-        conn, source=source, batch_size=batch_size, progress=_dedup_progress
+        conn, source=source, batch_size=batch_size, progress=_dedup_progress,
+        stats=stats,
     )
     color = "red" if failed else "green"
-    console.print(f"[green]{ok} fingerprinted[/green], [{color}]{failed} failed[/{color}]")
+    console.print(
+        f"[green]{ok} fingerprinted[/green], [{color}]{failed} failed[/{color}]"
+        + (f", {stats['alias']} already in the library (alias)" if stats.get("alias") else "")
+    )
+
+
+@dedup_app.command("index-library")
+def dedup_index_library(
+    originals_root: Path = typer.Option(
+        ..., "--originals", exists=True, file_okay=False, resolve_path=True,
+        help="library/originals — what Immich serves.",
+    ),
+    manifest_path: Path = _MANIFEST_OPT,
+    subdir: list[str] = typer.Option(
+        None, "--dir",
+        help="Only these subtrees of --originals (repeatable), e.g. --dir 2026/05. "
+        "Default: the whole library.",
+    ),
+    limit: int = typer.Option(None, "--limit", help="Hash at most this many files this run."),
+) -> None:
+    """Hash library files into the manifest's content index (`library_file`).
+
+    This is what lets `fingerprint` recognise an arrival whose exact bytes
+    the library already holds. Read-only on the files; resumable (unchanged
+    files are not re-read); prunes index rows whose file is gone. For the
+    Photos-bridge overlap window, index the recent YYYY/MM dirs only."""
+    from .dedup import identity
+
+    roots: list[Path] = []
+    for d in subdir or ["."]:
+        root = Path(os.path.normpath(originals_root / d))
+        rel = root.relative_to(originals_root) if root.is_relative_to(originals_root) else None
+        if rel is None or any(p.startswith(".") for p in rel.parts):
+            console.print(f"[red]--dir must be a non-hidden subtree of --originals:[/red] {d}")
+            raise typer.Exit(1)
+        # Every component from --originals down must be a real directory: a
+        # symlink anywhere (`link/subdir`) could lead outside the library.
+        probe = originals_root
+        for part in rel.parts:
+            probe = probe / part
+            if probe.is_symlink():
+                console.print(f"[red]--dir crosses a symlink:[/red] {probe}")
+                raise typer.Exit(1)
+        if not root.is_dir():
+            console.print(f"[red]not a directory:[/red] {root}")
+            raise typer.Exit(1)
+        roots.append(root)
+    _, conn = _open_manifest(manifest_path)
+    result = identity.index_library(
+        conn, roots, limit=limit,
+        progress=lambda n: console.print(f"  hashed {n}", highlight=False),
+    )
+    console.print(
+        f"[green]{result.hashed} hashed[/green], {result.unchanged} unchanged, "
+        f"{result.pruned} pruned, {result.skipped} skipped (unstable/unreadable/symlink)"
+    )
+
+
+@dedup_app.command("retry-errors")
+def dedup_retry_errors(
+    manifest_path: Path = _MANIFEST_OPT,
+    match: str = typer.Option(
+        None, "--match", help="Only errors whose message contains this, e.g. 'stub'.",
+    ),
+) -> None:
+    """Send `error` rows back to `registered` (size/mtime refreshed from
+    disk) so the next `fingerprint` retries them — e.g. a stub that has since
+    been replaced by the real file. Rows whose file is gone stay `error`."""
+    manifest_mod, conn = _open_manifest(manifest_path)
+    reset = manifest_mod.retry_errors(conn, match=match)
+    console.print(f"[green]{reset} reset to registered[/green]")
 
 
 @dedup_app.command("cluster")
@@ -3360,14 +3435,18 @@ def dedup_apply(
     from .dedup import engine as engine_mod
 
     quarantine_root.mkdir(parents=True, exist_ok=True)
-    lock_path = manifest_path.with_suffix(".apply.lock")
+    # One lock for every command that moves files the manifest tracks
+    # (dedup apply, dedup promote-rest, triage apply): they read and write
+    # the same rows and paths, so they must not interleave.
+    lock_path = manifest_path.with_suffix(MOVERS_LOCK_SUFFIX)
     lock_fd = None
     if write:
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             console.print(
-                f"[red]another --write apply looks to be in progress[/red] "
+                f"[red]another file-moving run (dedup apply / promote-rest / triage apply) "
+                f"looks to be in progress[/red] "
                 f"(lock file exists: {lock_path}). If that's stale (a prior run crashed "
                 f"hard), delete the lock file and retry."
             )
@@ -3389,6 +3468,12 @@ def dedup_apply(
         f"{prefix}promote {result['promoted']} ({result['promoted_bytes'] / 1e9:.1f} GB) · "
         f"quarantine {result['quarantined']} ({result['quarantined_bytes'] / 1e9:.1f} GB) · "
         f"sidecars {result['sidecars_written']} · errors {result['errors']}"
+        + (
+            f" · aliases quarantined {result['aliases_quarantined']}"
+            f" ({result['aliases_bytes'] / 1e9:.1f} GB)"
+            f", requeued {result['aliases_requeued']}"
+            if result.get("aliases_quarantined") or result.get("aliases_requeued") else ""
+        )
     )
     for sample in result["error_samples"]:
         console.print(f"[red]error:[/red] {sample}")
@@ -3443,14 +3528,18 @@ def dedup_promote_rest(
     Refuses to run alongside another file-moving run on this manifest."""
     from .dedup import engine as engine_mod
 
-    lock_path = manifest_path.with_suffix(".promote-rest.lock")
+    # One lock for every command that moves files the manifest tracks
+    # (dedup apply, dedup promote-rest, triage apply): they read and write
+    # the same rows and paths, so they must not interleave.
+    lock_path = manifest_path.with_suffix(MOVERS_LOCK_SUFFIX)
     lock_fd = None
     if write:
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             console.print(
-                f"[red]another --write promote-rest looks to be in progress[/red] "
+                f"[red]another file-moving run (dedup apply / promote-rest / triage apply) "
+                f"looks to be in progress[/red] "
                 f"(lock file exists: {lock_path}). If that's stale, delete it and retry."
             )
             raise typer.Exit(1)
@@ -3666,14 +3755,18 @@ def triage_apply(
     """
     from .triage import executor as executor_mod
 
-    lock_path = manifest_path.with_suffix(".triage-apply.lock")
+    # One lock for every command that moves files the manifest tracks
+    # (dedup apply, dedup promote-rest, triage apply): they read and write
+    # the same rows and paths, so they must not interleave.
+    lock_path = manifest_path.with_suffix(MOVERS_LOCK_SUFFIX)
     lock_fd = None
     if write:
         try:
             lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             console.print(
-                f"[red]another --write apply looks to be in progress[/red] "
+                f"[red]another file-moving run (dedup apply / promote-rest / triage apply) "
+                f"looks to be in progress[/red] "
                 f"(lock file exists: {lock_path}). If that's stale, delete it and retry."
             )
             raise typer.Exit(1)

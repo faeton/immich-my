@@ -61,7 +61,7 @@ def test_manifest_v3_created_fresh(tmp_path: Path):
         )
     }
     assert {"triage", "video_signal"} <= tables
-    assert manifest.get_meta(conn, "schema_version") == "3"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
 
 
 def test_manifest_v2_migrates_to_v3(tmp_path: Path):
@@ -79,7 +79,7 @@ def test_manifest_v2_migrates_to_v3(tmp_path: Path):
     raw.close()
 
     conn = manifest.open_manifest(db)
-    assert manifest.get_meta(conn, "schema_version") == "3"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
     conn.execute(
         "INSERT INTO asset (id, source, path, status) "
         "VALUES (1, 'originals', '/originals/t/a.mp4', 'canonical')"

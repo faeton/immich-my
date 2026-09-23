@@ -171,10 +171,14 @@ def _finalize_swap(
     conn.execute(
         "UPDATE triage SET applied_at=? WHERE asset_id=?", (_now(), asset_id)
     )
+    # The swap deliberately carries the original's mtime onto the new file,
+    # so a (bytes, mtime) freshness check alone could miss it: drop the
+    # content hash and the library index entry for this path explicitly.
     conn.execute(
-        "UPDATE asset SET bytes=?, mtime=? WHERE id=?",
+        "UPDATE asset SET bytes=?, mtime=?, sha256=NULL WHERE id=?",
         (out_bytes, src.stat().st_mtime, asset_id),
     )
+    conn.execute("DELETE FROM library_file WHERE path=?", (mpath,))
     conn.execute(
         f"INSERT INTO exec_log VALUES (?, '{action}', 'swapped', ?, ?, ?, ?)",
         (asset_id, st.st_size, out_bytes, str(qdst), _now()),

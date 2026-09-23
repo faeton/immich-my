@@ -25,6 +25,7 @@ fingerprint/cluster pass writes.
 from __future__ import annotations
 
 import json
+import os
 import sqlite3
 import time
 from dataclasses import dataclass
@@ -32,7 +33,7 @@ from pathlib import Path
 
 from ..exif import MEDIA_EXTS
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 
 # status lifecycle values (kept as plain strings in the DB)
 REGISTERED = "registered"
@@ -43,6 +44,20 @@ PROMOTED = "promoted"
 QUARANTINED = "quarantined"
 CANONICAL = "canonical"
 ERROR = "error"
+# v4: the library already holds this file's exact bytes (see library_file);
+# `dedup apply` moves it to quarantine and it ends as `quarantined`.
+ALIAS = "alias"
+
+# v4 identity columns, in the order they are added to an existing manifest.
+# Brand-new manifests get them from the CREATE TABLE text below; old ones get
+# them from `_migrate`. Keep the two lists in step.
+V4_ASSET_COLUMNS = (
+    ("source_uid", "TEXT"),
+    ("component", "TEXT"),
+    ("sha256", "TEXT"),
+    ("dest_path", "TEXT"),
+    ("alias_path", "TEXT"),
+)
 
 _CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS asset (
@@ -66,12 +81,34 @@ CREATE TABLE IF NOT EXISTS asset (
   burst_uuid   TEXT,
   live_cid     TEXT,               -- Apple ContentIdentifier (Live Photo pair glue)
   edited       INTEGER NOT NULL DEFAULT 0,
-  error        TEXT
+  error        TEXT,
+  -- v4 identity (todo/PHASE2-IDENTITY-DESIGN.md). Indexes on these live in
+  -- _CREATE_INDEXES: this script runs BEFORE the version check, and an old
+  -- manifest has none of these columns until _migrate adds them.
+  source_uid   TEXT,               -- the source's own id (Photos UUID); NULL if none
+  component    TEXT,               -- original | live_video | raw | edited; set iff source_uid
+  sha256       TEXT,               -- full-content hash while immy held the file
+  dest_path    TEXT,               -- where apply/promote-rest put it; written before unlink
+  alias_path   TEXT                -- status alias: the library_file whose bytes these are
 );
 CREATE INDEX IF NOT EXISTS idx_asset_status   ON asset (status);
 CREATE INDEX IF NOT EXISTS idx_asset_source   ON asset (source, status);
 CREATE INDEX IF NOT EXISTS idx_asset_taken    ON asset (taken_at);
 CREATE INDEX IF NOT EXISTS idx_asset_live_cid ON asset (live_cid);
+
+-- v4: what the library holds, by content. Independent of asset rows on
+-- purpose — a promoted row's history says where a file went once, this says
+-- what is there. (bytes, mtime_ns, inode) is a cache key for skipping
+-- re-hashes, NOT proof: anything that disposes of a file on the strength of
+-- a match re-hashes both sides first (see dedup/identity.py).
+CREATE TABLE IF NOT EXISTS library_file (
+  path       TEXT PRIMARY KEY,
+  bytes      INTEGER NOT NULL,
+  mtime_ns   INTEGER NOT NULL,
+  inode      INTEGER NOT NULL,
+  sha256     TEXT NOT NULL,
+  hashed_at  TEXT NOT NULL
+);
 
 CREATE TABLE IF NOT EXISTS cluster (
   id               INTEGER PRIMARY KEY,
@@ -135,18 +172,34 @@ class RegisterResult:
     skipped_young: int
 
 
-def _migrate(conn: sqlite3.Connection, from_version: int) -> None:
+_CREATE_INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_asset_identity
+  ON asset (source, source_uid, component) WHERE source_uid IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_asset_sha256 ON asset (sha256) WHERE sha256 IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_library_file_sha256 ON library_file (sha256);
+"""
+
+
+def _add_missing_columns(conn: sqlite3.Connection, table: str, columns) -> None:
+    have = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in columns:
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
     """Column additions for existing manifests — `CREATE TABLE IF NOT EXISTS`
     only handles brand-new databases, so schema growth on a live manifest
-    (e.g. n5's, already carrying 270k+ rows) needs an explicit ALTER TABLE."""
-    if from_version < 2:
-        cols = {row[1] for row in conn.execute("PRAGMA table_info(cluster)")}
-        if "clip_cos_sim" not in cols:
-            conn.execute("ALTER TABLE cluster ADD COLUMN clip_cos_sim REAL")
-    # v3 (triage + video_signal) adds whole tables only — the executescript
-    # of _CREATE_SCHEMA in open_manifest already created them by the time
-    # _migrate runs, so there is nothing to ALTER here.
-    conn.commit()
+    (n5's carries 290k+ rows) needs an explicit ALTER TABLE.
+
+    Every step inspects `PRAGMA table_info` first, so running it against a
+    manifest that already has some or all columns is a no-op for those. Does
+    NOT commit: `open_manifest` runs it and the version bump inside one
+    transaction, so an interrupt leaves either the old version with none of
+    the new columns or the new version with all of them."""
+    _add_missing_columns(conn, "cluster", [("clip_cos_sim", "REAL")])  # v2
+    # v3 (triage + video_signal) is whole tables only — _CREATE_SCHEMA made them.
+    _add_missing_columns(conn, "asset", V4_ASSET_COLUMNS)              # v4
 
 
 def open_manifest(path: Path) -> sqlite3.Connection:
@@ -158,25 +211,31 @@ def open_manifest(path: Path) -> sqlite3.Connection:
     # without this a concurrent writer (e.g. `decide` running at the same
     # time) gets an immediate "database is locked" instead of just waiting.
     conn.execute("PRAGMA busy_timeout=30000")
-    conn.executescript(_CREATE_SCHEMA)
+    conn.executescript(_CREATE_SCHEMA)  # commits; runs strictly before the migration
     existing = conn.execute(
         "SELECT value FROM meta WHERE key='schema_version'"
     ).fetchone()
-    if existing is None:
-        conn.execute(
-            "INSERT INTO meta (key, value) VALUES ('schema_version', ?)",
-            (str(SCHEMA_VERSION),),
+    current = int(existing[0]) if existing else None
+    if current is not None and current > SCHEMA_VERSION:
+        raise RuntimeError(
+            f"manifest schema v{current} is newer than this immy (v{SCHEMA_VERSION})"
         )
-        conn.commit()
-    else:
-        current = int(existing[0])
-        if current > SCHEMA_VERSION:
-            raise RuntimeError(
-                f"manifest schema v{current} is newer than this immy (v{SCHEMA_VERSION})"
+    if current is None or current < SCHEMA_VERSION:
+        # A missing version row is inspected, not trusted to mean "fresh":
+        # _migrate is a no-op against a schema that already has every column.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            _migrate(conn)
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('schema_version', ?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (str(SCHEMA_VERSION),),
             )
-        if current < SCHEMA_VERSION:
-            _migrate(conn, current)
-            set_meta(conn, "schema_version", str(SCHEMA_VERSION))
+            conn.execute("COMMIT")
+        except BaseException:
+            conn.execute("ROLLBACK")
+            raise
+    conn.executescript(_CREATE_INDEXES)
     return conn
 
 
@@ -269,31 +328,94 @@ def pending_fingerprint(
     return conn.execute(sql, params).fetchall()
 
 
-def write_fingerprint(conn: sqlite3.Connection, asset_id: int, fields: dict) -> None:
-    """Advance one asset to `fingerprinted` with its extracted metadata.
+def write_fingerprint(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    fields: dict,
+    *,
+    status: str = FINGERPRINTED,
+) -> bool:
+    """Advance one `registered` asset to `status` (normally `fingerprinted`;
+    `alias` when the library already holds its bytes) with its extracted
+    metadata.
 
     `fields` keys must be column names; whitelisted here so a typo fails
-    loudly instead of writing nothing.
+    loudly instead of writing nothing. A `source_uid` without a `component`
+    is refused: identity is the pair, and a NULL component would let two
+    rows claim one UID. Conditional on the row still being `registered` —
+    returns False (and writes nothing) if another writer got there first.
     """
     allowed = {
         "media_type", "width", "height", "taken_at", "taken_src",
         "gps_lat", "gps_lon", "phash", "exif_fields",
         "burst_uuid", "live_cid", "edited",
+        "sha256", "source_uid", "component", "alias_path",
     }
     bad = set(fields) - allowed
     if bad:
         raise ValueError(f"unknown fingerprint fields: {bad}")
+    if fields.get("source_uid") and not fields.get("component"):
+        raise ValueError("source_uid requires a component")
     sets = ", ".join(f"{k}=?" for k in fields)
-    conn.execute(
-        f"UPDATE asset SET {sets}, status=?, error=NULL WHERE id=?",
-        [*fields.values(), FINGERPRINTED, asset_id],
+    cursor = conn.execute(
+        f"UPDATE asset SET {sets}, status=?, error=NULL WHERE id=? AND status=?",
+        [*fields.values(), status, asset_id, REGISTERED],
     )
+    return cursor.rowcount == 1
 
 
-def write_error(conn: sqlite3.Connection, asset_id: int, message: str) -> None:
+def write_error(
+    conn: sqlite3.Connection, asset_id: int, message: str, *, only_if: str | None = None,
+) -> bool:
+    """Mark one asset `error`. `only_if` makes it conditional on the current
+    status (fingerprint passes REGISTERED, so a worker holding a stale
+    pending list cannot overwrite a row another worker already advanced).
+    Returns whether the row was written."""
+    sql, params = "UPDATE asset SET status=?, error=? WHERE id=?", [ERROR, message[:500], asset_id]
+    if only_if is not None:
+        sql += " AND status=?"
+        params.append(only_if)
+    return conn.execute(sql, params).rowcount == 1
+
+
+def retry_errors(conn: sqlite3.Connection, *, match: str | None = None) -> int:
+    """Send `error` rows back to `registered` so the next fingerprint pass
+    retries them — the way out for a stub that has since been replaced by
+    the real file. `bytes`/`mtime` are refreshed from disk (a replaced file
+    at the same path is otherwise invisible: `register` keys on path).
+    Rows whose file is gone stay `error`. Returns the count reset."""
+    sql = "SELECT id, path FROM asset WHERE status=?"
+    params: list = [ERROR]
+    if match:
+        sql += " AND error LIKE ?"
+        params.append(f"%{match}%")
+    reset = 0
+    for asset_id, path in conn.execute(sql, params).fetchall():
+        try:
+            st = Path(path).stat()
+        except OSError:
+            continue
+        conn.execute(
+            "UPDATE asset SET status=?, error=NULL, bytes=?, mtime=? WHERE id=? AND status=?",
+            (REGISTERED, st.st_size, st.st_mtime, asset_id, ERROR),
+        )
+        reset += 1
+    conn.commit()
+    return reset
+
+
+def upsert_library_file(
+    conn: sqlite3.Connection, path: Path, sha256: str, st: os.stat_result,
+) -> None:
+    """Record that the library holds `path` with these bytes, keyed by the
+    stat taken around the hash (`identity.hash_stable`). Does not commit."""
     conn.execute(
-        "UPDATE asset SET status=?, error=? WHERE id=?",
-        (ERROR, message[:500], asset_id),
+        "INSERT INTO library_file (path, bytes, mtime_ns, inode, sha256, hashed_at) "
+        "VALUES (?, ?, ?, ?, ?, ?) ON CONFLICT(path) DO UPDATE SET "
+        "bytes=excluded.bytes, mtime_ns=excluded.mtime_ns, inode=excluded.inode, "
+        "sha256=excluded.sha256, hashed_at=excluded.hashed_at",
+        (str(path), st.st_size, st.st_mtime_ns, st.st_ino, sha256,
+         time.strftime("%Y-%m-%dT%H:%M:%S")),
     )
 
 

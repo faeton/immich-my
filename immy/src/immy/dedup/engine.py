@@ -39,6 +39,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat as stat_mod
 from dataclasses import dataclass
 from datetime import datetime
 from itertools import combinations
@@ -201,7 +202,7 @@ def fingerprint_fields(row: ExifRow, source: str) -> dict:
         or row.get("XMP:AdjustmentTimestamp", "MakerNotes:AdjustmentVersion")
     )
 
-    return {
+    fields = {
         "media_type": media_type,
         "width": _first_int(
             row, "File:ImageWidth", "EXIF:ExifImageWidth", "EXIF:ImageWidth",
@@ -220,6 +221,14 @@ def fingerprint_fields(row: ExifRow, source: str) -> dict:
         "live_cid": row.get("MakerNotes:ContentIdentifier", "QuickTime:ContentIdentifier"),
         "edited": int(edited),
     }
+    if source == "photos":
+        # Photos UUID + component from the batch's osxphotos report, and the
+        # library's own (possibly user-corrected) date/location from the
+        # JSON sidecar — see dedup/photos.py.
+        from . import photos
+
+        fields = photos.companion_fields(path, fields)
+    return fields
 
 
 def fingerprint_pending(
@@ -228,12 +237,22 @@ def fingerprint_pending(
     source: str | None = None,
     batch_size: int = 200,
     progress=None,
+    stats: dict | None = None,
 ) -> tuple[int, int]:
-    """Fingerprint every `registered` asset: exiftool batch + pHash.
+    """Fingerprint every `registered` asset: exiftool batch + identity + pHash.
 
-    Returns (ok, failed). Commits per batch so a crash resumes at the
+    Identity first (`identity.resolve`, schema v4): a stub goes to `error`;
+    a file whose exact bytes the library already holds becomes `alias` (no
+    pHash — it will never be clustered); everything else is fingerprinted
+    with its sha256. Assets are resolved one at a time on this connection,
+    so an earlier row of the same batch is visible to a later one.
+
+    Returns (ok, failed); `ok` includes aliases. Pass `stats` to receive
+    {"alias": n, "raced": n}. Commits per batch so a crash resumes at the
     batch boundary, not from zero."""
     import exiftool
+
+    from . import identity
 
     pending = manifest.pending_fingerprint(conn, source=source)
     ok = failed = 0
@@ -259,17 +278,56 @@ def fingerprint_pending(
             path = Path(path_text)
             raw = by_path.get(path_text)
             if raw is None:
-                manifest.write_error(conn, asset_id, "exiftool read failed")
+                try:
+                    empty = path.stat().st_size == 0
+                except OSError:
+                    empty = False
+                manifest.write_error(
+                    conn, asset_id, "stub: 0 bytes" if empty else "exiftool read failed",
+                    only_if=manifest.REGISTERED,
+                )
                 failed += 1
                 continue
             try:
                 fields = fingerprint_fields(ExifRow(path=path, raw=raw), asset_source)
-                if fields["media_type"] == "image":
-                    fields["phash"] = phash.to_hex(phash.phash_file(path))
-                manifest.write_fingerprint(conn, asset_id, fields)
+                # Phase 3 adapters (the `photos` source) supply these from
+                # their companion data; no current source does.
+                source_uid = fields.pop("source_uid", None)
+                component = fields.pop("component", None)
+                verdict = identity.resolve(
+                    conn, asset_id=asset_id, source=asset_source, path=path, raw=raw,
+                    source_uid=source_uid, component=component,
+                )
+                if verdict.kind == "error":
+                    manifest.write_error(conn, asset_id, verdict.message or "identity", only_if=manifest.REGISTERED)
+                    failed += 1
+                    continue
+                fields["sha256"] = verdict.sha256
+                if source_uid:
+                    fields["source_uid"], fields["component"] = source_uid, component
+                if verdict.kind == "alias":
+                    fields["alias_path"] = verdict.alias_path
+                    wrote = manifest.write_fingerprint(
+                        conn, asset_id, fields, status=manifest.ALIAS,
+                    )
+                    if stats is not None and wrote:
+                        stats["alias"] = stats.get("alias", 0) + 1
+                else:
+                    if fields["media_type"] == "image":
+                        fields["phash"] = phash.to_hex(phash.phash_file(path))
+                    wrote = manifest.write_fingerprint(conn, asset_id, fields)
+                    # `originals` rows ARE the library: bootstrap builds the
+                    # index the alias check above looks things up in.
+                    if (wrote and asset_source == "originals" and identity.library_eligible(path)
+                            and identity.no_symlinked_ancestor(path)):
+                        manifest.upsert_library_file(conn, path, verdict.sha256, verdict.stat)
+                if not wrote and stats is not None:
+                    stats["raced"] = stats.get("raced", 0) + 1
                 ok += 1
             except Exception as exc:  # corrupt file, undecodable HEIC, …
-                manifest.write_error(conn, asset_id, f"{type(exc).__name__}: {exc}")
+                manifest.write_error(
+                    conn, asset_id, f"{type(exc).__name__}: {exc}", only_if=manifest.REGISTERED,
+                )
                 failed += 1
         conn.commit()
         if progress:
@@ -1112,7 +1170,30 @@ def _dest_holds_this_asset(
         return False
     if src is None or not src.exists():
         return True
-    return content_equal(src, candidate)
+    # Full hash, not `content_equal`: its sampled windows are clustering
+    # evidence, and two >16 MB files that differ only outside them would
+    # pass. A yes here unlinks `src`, so it has to be proof.
+    return _sha256(src) == _sha256(candidate)
+
+
+def _distinct_regular(candidate: Path, src: Path | None) -> bool:
+    """`candidate` is a regular file in its own right: not a symlink (a link
+    to the source would "hold" its bytes until the source is unlinked) and
+    not the source itself under another name (hardlink, bind mount)."""
+    try:
+        st = os.lstat(candidate)
+    except OSError:
+        return False
+    if not stat_mod.S_ISREG(st.st_mode):
+        return False
+    if src is not None:
+        try:
+            s = os.stat(src)
+        except OSError:
+            return True
+        if (s.st_dev, s.st_ino) == (st.st_dev, st.st_ino):
+            return False
+    return True
 
 
 def _resolve_dest(
@@ -1120,6 +1201,7 @@ def _resolve_dest(
     asset_id: int,
     expected_bytes: int | None,
     src: Path | None = None,
+    recorded: tuple[str | None, str | None] = (None, None),
 ) -> tuple[Path, bool]:
     """Decide the real destination for one asset, handling every crash-
     recovery case up front so `_safe_move` never has to guess:
@@ -1142,55 +1224,214 @@ def _resolve_dest(
     length sitting at the same YYYY/MM/basename made a staging asset "already
     done", and it was deleted without its content ever reaching originals/.
 
+    `recorded` is the row's (dest_path, sha256), written by `_move_asset`
+    after the copy verified and BEFORE the source was unlinked. When present
+    it settles recovery exactly: the recorded file with the recorded hash is
+    this asset's copy, whatever else sits at the plain name. If it no longer
+    matches and the source is gone, nothing can be proven — refuse rather
+    than fall back to a size guess.
+
     Returns (final_dest, already_done).
     """
-    if not dest.exists():
+    rec_path, rec_sha = recorded
+    if rec_path and rec_sha:
+        candidate = Path(rec_path)
+        src_present = src is not None and src.exists()
+        if src_present and _sha256(src) != rec_sha:
+            # The staging file changed after its copy was recorded. The copy
+            # holds the OLD bytes; claiming done would unlink the new ones.
+            raise RuntimeError(
+                f"asset {asset_id}: source changed since its move to {rec_path} "
+                "was recorded — refusing to consume it"
+            )
+        try:
+            if _distinct_regular(candidate, src) and _sha256(candidate) == rec_sha:
+                return candidate, True
+        except OSError:
+            pass
+        if not src_present:
+            raise RuntimeError(
+                f"asset {asset_id}: recorded dest {rec_path} no longer holds its "
+                "content and the source is gone — not guessing"
+            )
+    if not os.path.lexists(dest):
         return dest, False
-    if _dest_holds_this_asset(dest, expected_bytes, src):
+    if _distinct_regular(dest, src) and _dest_holds_this_asset(dest, expected_bytes, src):
         return dest, True
     qualified = dest.with_name(f"{dest.stem}__{asset_id}{dest.suffix}")
-    if not qualified.exists():
+    if not os.path.lexists(qualified):
         return qualified, False
-    if _dest_holds_this_asset(qualified, expected_bytes, src):
+    if _distinct_regular(qualified, src) and _dest_holds_this_asset(qualified, expected_bytes, src):
         return qualified, True
     # Both the plain and asset-id-qualified names are taken by something
     # else entirely — vanishingly unlikely, but refuse to guess further.
     raise FileExistsError(f"dest collision unresolved for asset {asset_id}: {dest}")
 
 
-def _safe_move(src: Path, dst: Path) -> None:
-    """Copy-hash-verify-delete, never a bare rename or blind overwrite.
+def _safe_copy(src: Path, dst: Path) -> str:
+    """Copy-fsync-rename-verify; returns the sha256. Never a bare rename or
+    blind overwrite, and never unlinks `src` — `_move_asset` does that only
+    after the manifest has recorded where the bytes went.
+
     Staging and originals/quarantine live on different ZFS datasets
-    (cross-device rename fails), so this is copy+verify+delete — and the
-    verify is a full sha256, not just a size check, because a same-size
+    (cross-device rename fails), so this is a copy — and the verify is a
+    full sha256 re-read of `dst`, not a size check, because a same-size
     silent-corruption copy over NFS/a bind mount is exactly the failure
     mode that must never lead to deleting the only good copy.
 
     `dst` must not already exist — callers resolve collisions via
-    `_resolve_dest` first; this function only ever writes fresh files, so
-    it never has to decide whether an existing `dst` is safe to clobber.
+    `_resolve_dest` first.
     """
-    if dst.exists():
+    if os.path.lexists(dst):
         raise FileExistsError(f"refusing to overwrite existing dest: {dst}")
-    dst.parent.mkdir(parents=True, exist_ok=True)
+    _mkdirs_durable(dst.parent)
     tmp = dst.with_name(f".{dst.name}.{os.getpid()}.partial")
     hasher = hashlib.sha256()
+    before = os.lstat(src)
     with open(src, "rb") as fsrc, open(tmp, "wb") as ftmp:
         for chunk in iter(lambda: fsrc.read(4 * 1024 * 1024), b""):
             ftmp.write(chunk)
             hasher.update(chunk)
+        ftmp.flush()
+        os.fsync(ftmp.fileno())
     src_hash, src_size = hasher.hexdigest(), src.stat().st_size
     if tmp.stat().st_size != src_size:
         tmp.unlink(missing_ok=True)
         raise RuntimeError(f"copy size mismatch: {src} -> {dst}")
     shutil.copystat(src, tmp)
     tmp.rename(dst)
+    _fsync_dir(dst.parent)
     if _sha256(dst) != src_hash:
         # dst is corrupt — remove it so a re-run doesn't mistake it for a
         # completed move and skip re-copying a good source that's still here.
         dst.unlink(missing_ok=True)
         raise RuntimeError(f"post-move hash mismatch: {src} -> {dst}")
-    src.unlink()
+    if _file_key(os.lstat(src)) != _file_key(before):
+        raise RuntimeError(f"source changed while being copied: {src}")
+    return src_hash
+
+
+def _file_key(st: os.stat_result) -> tuple[int, int, int, int]:
+    return (st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns)
+
+
+def _fsync_dir(path: Path) -> None:
+    """Make a rename/unlink/mkdir in `path` durable. Errors propagate: the
+    source is only consumed once the destination's entry is known to
+    survive a power loss, and "could not tell" is not that."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _make_durable(dest: Path, root: Path) -> None:
+    """fsync `dest` itself and EVERY directory above it, to `/` — not just up
+    to `root`: the root may itself be new (the CLI creates quarantine_root
+    and its parents on demand), and its own entry lives in its parent. A
+    few extra directory fsyncs per move buy an answer that does not depend
+    on who created what. Re-done on every attempt, so a failed sync in a
+    prior run is never taken on trust. `root` is kept for callers' intent."""
+    fd = os.open(dest, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    for d in Path(os.path.abspath(dest)).parents:
+        _fsync_dir(d)
+
+
+def _mkdirs_durable(path: Path) -> None:
+    """`mkdir -p`, fsyncing the parent of every directory it creates."""
+    missing = []
+    probe = path
+    while not probe.exists():
+        missing.append(probe)
+        probe = probe.parent
+    for d in reversed(missing):
+        d.mkdir(exist_ok=True)
+        _fsync_dir(d.parent)
+
+
+def _is_under(path: Path, root: Path | None) -> bool:
+    if root is None:
+        return False
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _move_asset(
+    conn: sqlite3.Connection,
+    asset_id: int,
+    src: Path,
+    base_dest: Path,
+    nbytes: int | None,
+    recorded: tuple[str | None, str | None],
+    *,
+    library_root: Path | None,
+    dest_root: Path,
+) -> Path:
+    """Move one asset's file to `base_dest` (or its collision name) so that
+    every crash point is recoverable without guessing:
+
+        copy+verify  →  record dest_path+sha256, COMMIT  →  unlink src
+
+    The caller sets the terminal status afterwards. A kill before the
+    record leaves the source in place (the copy is re-verified or redone);
+    after it, `_resolve_dest` finds the recorded file by exact hash. A
+    destination under `library_root` also enters `library_file` — the
+    library index is what later arrivals are recognised against."""
+    src_key = _file_key(os.lstat(src)) if os.path.lexists(src) else None
+    dest, already_done = _resolve_dest(base_dest, asset_id, nbytes, src, recorded)
+    if already_done:
+        rec_path, rec_sha = recorded
+        sha = rec_sha if rec_path == str(dest) and rec_sha else _sha256(dest)
+    else:
+        if src_key is None:
+            # Neither the source nor a matching dest exists — genuinely
+            # missing, not a resumable state. Surface loudly rather than
+            # silently marking it done.
+            raise FileNotFoundError(str(src))
+        sha = _safe_copy(src, dest)
+    # Re-establish durability on EVERY path, including `already_done`: a
+    # prior run may have renamed the file into place and then failed its
+    # directory fsync. Nothing is recorded, and nothing consumed, until the
+    # file and each directory entry up to `dest_root` are synced.
+    _make_durable(dest, dest_root)
+    conn.execute(
+        "UPDATE asset SET dest_path=?, sha256=? WHERE id=?", (str(dest), sha, asset_id)
+    )
+    if _is_under(dest, library_root):
+        from . import identity
+
+        if identity.library_eligible(dest):
+            manifest.upsert_library_file(conn, dest, sha, os.lstat(dest))
+    conn.commit()
+    if os.path.lexists(src):
+        # Consume only the file that was verified: same inode, size and
+        # mtime_ns as when this move began. A replacement or ordinary rewrite
+        # since then is new bytes the destination does not hold.
+        #
+        # ASSUMPTION: staging files are settled — nothing writes to them
+        # while a mover runs (sources land files by rename, the settle gate
+        # and the movers lock keep immy's own writers apart). This is
+        # mutation DETECTION, not proof of current content: an in-place,
+        # same-size rewrite that restores mtime_ns would pass. A second full
+        # hash would not close that either without writer coordination (the
+        # hash→unlink window remains), so we take the cheap check and state
+        # the assumption.
+        if _file_key(os.lstat(src)) != src_key:
+            raise RuntimeError(
+                f"asset {asset_id}: source changed during the move — "
+                f"copy kept at {dest}, source left in place"
+            )
+        src.unlink()
+        _fsync_dir(src.parent)
+    return dest
 
 
 def _rescue_sidecar(dest: Path, taken_at: str | None, gps_lat: float | None, gps_lon: float | None) -> bool:
@@ -1247,7 +1488,8 @@ def promote_rest(
     crash recovery, copy-hash-verify-delete moves, per-asset commits, and
     the Google JSON sidecar rescue for Takeout keepers."""
     rows = conn.execute(
-        """SELECT id, source, path, bytes, taken_at, taken_src, gps_lat, gps_lon
+        """SELECT id, source, path, bytes, taken_at, taken_src, gps_lat, gps_lon,
+                  dest_path, sha256
            FROM asset
            WHERE status IN (?, ?) AND source != 'originals'
            ORDER BY id""",
@@ -1260,18 +1502,16 @@ def promote_rest(
     errors: list[str] = []
     total = len(rows)
 
-    for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon) in enumerate(rows):
+    for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon,
+            rec_dest, rec_sha) in enumerate(rows):
         src = Path(path_str)
         try:
             base_dest = _promote_dest(originals_root, path_str, taken_at)
             if not dry_run:
-                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes, src)
-                if not already_done:
-                    if not src.exists():
-                        raise FileNotFoundError(str(src))
-                    _safe_move(src, dest)
-                elif src.exists():
-                    src.unlink()
+                dest = _move_asset(
+                    conn, asset_id, src, base_dest, nbytes, (rec_dest, rec_sha),
+                    library_root=originals_root, dest_root=originals_root,
+                )
                 if taken_src == "json":
                     if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
                         counts["sidecars_written"] += 1
@@ -1323,7 +1563,7 @@ def apply_decisions(
     """
     rows = conn.execute(
         """SELECT a.id, a.source, a.path, a.bytes, a.taken_at, a.taken_src,
-                  a.gps_lat, a.gps_lon, c.winner_asset_id
+                  a.gps_lat, a.gps_lon, c.winner_asset_id, a.dest_path, a.sha256
            FROM asset a
            JOIN membership m ON m.asset_id = a.id
            JOIN cluster c ON c.id = m.cluster_id
@@ -1342,7 +1582,8 @@ def apply_decisions(
     errors: list[str] = []
     total = len(rows)
 
-    for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon, winner_id) in enumerate(rows):
+    for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon,
+            winner_id, rec_dest, rec_sha) in enumerate(rows):
         src = Path(path_str)
         is_winner = asset_id == winner_id
         try:
@@ -1351,18 +1592,11 @@ def apply_decisions(
                 else _quarantine_dest(quarantine_root, path_str)
             )
             if not dry_run:
-                dest, already_done = _resolve_dest(base_dest, asset_id, nbytes, src)
-                if not already_done:
-                    if not src.exists():
-                        # Neither the source nor a matching dest exists —
-                        # genuinely missing, not a resumable state. Surface
-                        # loudly rather than silently marking it done.
-                        raise FileNotFoundError(str(src))
-                    _safe_move(src, dest)
-                elif src.exists():
-                    # Copy finished in a prior run but the source unlink
-                    # (or the status commit) never happened — finish it.
-                    src.unlink()
+                dest = _move_asset(
+                    conn, asset_id, src, base_dest, nbytes, (rec_dest, rec_sha),
+                    library_root=originals_root,
+                    dest_root=originals_root if is_winner else quarantine_root,
+                )
                 if is_winner and taken_src == "json":
                     if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
                         counts["sidecars_written"] += 1
@@ -1384,5 +1618,88 @@ def apply_decisions(
         if progress:
             progress(i + 1, total)
 
+    _dispose_aliases(
+        conn, quarantine_root=quarantine_root, dry_run=dry_run,
+        limit=None if limit is None else max(0, limit - len(rows)),
+        counts=counts, errors=errors,
+    )
     counts["error_samples"] = errors[:20]
     return counts
+
+
+def _dispose_aliases(
+    conn: sqlite3.Connection,
+    *,
+    quarantine_root: Path,
+    dry_run: bool,
+    limit: int | None,
+    counts: dict,
+    errors: list[str],
+) -> None:
+    """Quarantine every `alias` row: an arrival whose exact bytes the library
+    already holds (schema v4, see dedup/identity.py). Never through cluster
+    membership — aliases have none.
+
+    The fingerprint-time match is only a lead. Here, immediately before the
+    move, both files are re-hashed in full; if the library copy changed, went
+    away, or IS the staging file, the row goes back to `registered` (alias
+    evidence cleared) and the next fingerprint pass decides it afresh.
+    Ends as `quarantined` with `alias_path` kept, so the reason survives."""
+    from . import identity
+
+    rows = conn.execute(
+        "SELECT id, path, bytes, sha256, alias_path, dest_path FROM asset"
+        " WHERE status=? ORDER BY id",
+        (manifest.ALIAS,),
+    ).fetchall()
+    if limit is not None:
+        rows = rows[:limit]
+    counts.setdefault("aliases_quarantined", 0)
+    counts.setdefault("aliases_requeued", 0)
+    counts.setdefault("aliases_bytes", 0)
+    for asset_id, path_str, nbytes, sha, alias_path, rec_dest in rows:
+        src = Path(path_str)
+        try:
+            if dry_run:
+                counts["aliases_quarantined"] += 1
+                counts["aliases_bytes"] += nbytes or 0
+                continue
+            # Source already consumed by a prior run (copy recorded, unlink
+            # done, status not yet written): the recorded quarantine copy is
+            # all there is, and `_move_asset` finishes from the record. While
+            # the source is still here, the library must hold its bytes NOW —
+            # a recorded copy is not a reason to skip that.
+            consumed = bool(rec_dest) and not os.path.lexists(src)
+            proven = consumed or (
+                bool(sha and alias_path) and identity.still_holds(Path(alias_path), sha, src)
+            )
+            if not proven:
+                if alias_path:
+                    # Correct the index, or the next fingerprint pass would
+                    # match the same stale row and loop alias → requeue.
+                    identity.refresh_library_row(conn, Path(alias_path))
+                # A prepared quarantine copy (rec_dest) stays where it is as a
+                # stray duplicate; the row forgets it so the asset can be
+                # decided afresh.
+                conn.execute(
+                    "UPDATE asset SET status=?, alias_path=NULL, dest_path=NULL"
+                    " WHERE id=? AND status=?",
+                    (manifest.REGISTERED, asset_id, manifest.ALIAS),
+                )
+                conn.commit()
+                counts["aliases_requeued"] += 1
+                continue
+            _move_asset(
+                conn, asset_id, src, _quarantine_dest(quarantine_root, path_str),
+                nbytes, (rec_dest, sha if rec_dest else None), library_root=None,
+                dest_root=quarantine_root,
+            )
+            conn.execute(
+                "UPDATE asset SET status=? WHERE id=?", (manifest.QUARANTINED, asset_id),
+            )
+            conn.commit()
+            counts["aliases_quarantined"] += 1
+            counts["aliases_bytes"] += nbytes or 0
+        except Exception as exc:  # noqa: BLE001 — one bad file must not kill the batch
+            counts["errors"] += 1
+            errors.append(f"{path_str}: {exc}")

@@ -1,6 +1,7 @@
 # Photos Bridge — review findings & action plan
 
-**Status:** P0.1–P0.4 fixed (Phase 0.5 done, 2026-09-18). Everything else open.
+**Status:** P0.1–P0.4 fixed (Phase 0.5, 2026-09-18). Phase 2 done and Phase 3 n5-side done
+(2026-09-23, see `todo/PHASE2-IDENTITY-DESIGN.md`). Phase 0 (Mac) is the gate for the rest.
 **Date:** 2026-09-18
 **Subject:** the "Photos Bridge" design brief (Apple Photos → `osxphotos` → rsync batches
 → `immy dedup` → Immich external library), which supersedes the `icloudpd` forward-sync path.
@@ -190,7 +191,11 @@ Verified against the installed package.
   `--sidecar xmp --sidecar json` is nearly free and closes brief §14.3: the XMP template
   carries `dc:subject` (keywords), `Iptc4xmpExt:PersonInImage`, `photoshop:DateCreated` and
   `exif:GPS*`, which Immich reads directly for images. The XMP has **no UUID field**, hence
-  JSON as well. Caveat: videos never read XMP (that is why `tags sync` exists), so Live `.mov`
+  JSON as well. *Corrected 2026-09-23 (checked against osxphotos 0.77.1 source):* the JSON
+  sidecar has no UUID either — it is exiftool-format metadata (`SourceFile`, `EXIF:*`,
+  `XMP:*`, …). The UUID is in the **JSON export report** (`--report batch.json`, key `uuid`;
+  the CSV report drops it) or can be written per file with `--sidecar-template`. See
+  `todo/PHASE2-IDENTITY-DESIGN.md`. Caveat: videos never read XMP (that is why `tags sync` exists), so Live `.mov`
   and video keywords still need the Tag API path.
   Naming: immy writes `basename.xmp` (`sidecar.py:25`); `osxphotos` defaults to
   `basename.ext.xmp`. `--sidecar-drop-ext` aligns them but then a RAW+JPEG pair collides on
@@ -282,15 +287,18 @@ already checksums every file it transfers. Cut the double hash, not the director
 | **0** | Unlock the Apple Account. **Reinstall `osxphotos` on a supported Python and pin it.** Confirm Photos on m3max is synced | prerequisite for everything |
 | ~~**0.5**~~ | ~~**P0.1–P0.4 fixed, with tests.** No new source, no schema change~~ | **Done 2026-09-18** — `test_dedup_safety.py`, 20 tests; suite shows no new failures |
 | **1** | Fixture corpus (brief §12) exported and characterised | regression suite exists; §7 already decided, so this confirms rather than decides |
-| **2** | Schema **v2→v3** + identity logic + `stub` guard + sha256 backfill over the overlap window | migration is restart-safe; alias branch can actually fire |
-| **3** | `immy dedup register photos` reading `osxphotos` JSON sidecars; source-adapter wiring gaps closed | fixture batch ingests correctly in a **shadow manifest** |
+| ~~**2**~~ | ~~Schema v3→v4 + identity logic + `stub` guard + sha256 backfill~~ | **Done 2026-09-23** — backfill replaced by `dedup index-library` (a content index; guessed per-row history is not identity). Run it over 2026/05→now before the first real batch |
+| **3** | `photos` adapter reading the osxphotos **export report** (the JSON sidecar has no UUID); wiring gaps closed | **n5 side done 2026-09-23** against fixtures shaped from osxphotos 0.77.1 source. Still to do: a real exported batch through a **shadow manifest** once Phase 0 is done |
 | **4** | Mac bridge script + scheduler + batch transport, including the unacknowledged-delivery queue and per-asset completeness accounting | a real batch lands in `ready/` and verifies; a deliberately failed transfer is retried successfully |
 | **5** | Wire to the live manifest; backfill the 2026-07-13 → present gap only | no duplicate promotions; spot-check in Immich |
 | **6** | Monitoring (trimmed); two weeks of clean runs | then and only then, brief §9 decommissioning of the icloudpd stub tree |
 
 Phase 0.5 is new and did not appear in the brief. Phase 2 remains worth doing on its own merits.
 
-**Where this stands (2026-09-18):** Phase 0.5 is complete. Phase 0 is the next gate and is
+**Where this stands (2026-09-23):** Phases 0.5 and 2 are done, and Phase 3 is done on the n5 side.
+Phase 0 is still the gate (below), then the real-batch check for Phase 3, then Phase 4.
+
+**As of 2026-09-18:** Phase 0.5 is complete. Phase 0 is the next gate and is
 not a code task — unlock the Apple Account, reinstall `osxphotos` on a supported Python and
 pin it, confirm Photos on m3max is synced. Nothing after it can be verified until then, and
 the open questions below (especially #1, catalog vs. backup) still decide the shape of
