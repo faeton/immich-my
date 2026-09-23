@@ -43,3 +43,6 @@ mlx-community/
 .codanna/
 .codannaignore
 .fastembed_cache
+
+# Scratch output dir for ad-hoc transcode/ASR runs
+dst/
