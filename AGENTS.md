@@ -23,7 +23,8 @@ reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
 Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·
 `tags camera` (backfill the blank Camera field for DJI MP4s from the notes gear tag; see `docs/TELEMETRY.md`) ·
 `similar` (image→image search on Immich's CLIP index: find the library shot a re-shared
-photo came from) · `snapshot` / `find-duplicates` / `repair-thumbs`.
+photo came from) · `doctor` (read-only preflight: binaries, paths, Immich API, Postgres
+schema, CLIP dim) · `snapshot` / `find-duplicates` / `repair-thumbs`.
 
 Two run targets: the **Mac** (MLX, default) and the **N5 NAS** (HTTP backends — Ollama captions,
 Qwen-ASR, Immich's own CLIP). The same code runs both; backend is config-selected.

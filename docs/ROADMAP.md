@@ -35,15 +35,12 @@ Work:
 
 ### Operational Preflight
 
-Add `immy doctor`:
-- config path and parsed sections
-- required binaries: `exiftool`, `ffmpeg`, `ffprobe`, `vips`
-- Immich API reachability
-- Postgres reachability
-- configured library exists and has import paths
-- media host/container roots look plausible
-- `smart_search.embedding` dimension matches configured CLIP model
-- direct-write schema columns exist
+Shipped 2026-09-23 as `immy doctor` (`immy/src/immy/doctor.py`): config
+sections, binaries + libvips, configured roots, ML backend coherence, Immich
+API + library import paths, Postgres reachability, direct-write columns,
+`smart_search` dimension vs `ml.clip_model`. Read-only; exits 1 on any
+failure. Run it inside the container on n5 — the config's paths and hosts are
+container-side.
 
 ## Next
 

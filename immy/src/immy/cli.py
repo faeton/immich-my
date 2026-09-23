@@ -3020,6 +3020,33 @@ def apple_people(
         pconn.close()
 
 
+@app.command()
+def doctor(
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Preflight: config, binaries, paths, Immich API, Postgres schema, CLIP
+    dimension. Read-only. Exits 1 if any configured check fails."""
+    from . import doctor as doctor_mod
+
+    config = load_config(config_path)
+    checks = doctor_mod.run_all(config)
+    style = {
+        doctor_mod.OK: "green", doctor_mod.WARN: "yellow",
+        doctor_mod.FAIL: "red", doctor_mod.SKIP: "dim",
+    }
+    width = max(len(c.name) for c in checks)
+    for c in checks:
+        console.print(
+            f"[{style[c.status]}]{c.status:>4}[/{style[c.status]}]  "
+            f"{c.name:<{width}}  {c.detail}",
+            highlight=False,
+        )
+    failed = sum(c.status == doctor_mod.FAIL for c in checks)
+    if failed:
+        console.print(f"[red]{failed} check(s) failed[/red]")
+        raise typer.Exit(code=1)
+
+
 dedup_app = typer.Typer(
     help="Cross-source dedup (iCloud + Google Takeout → library/originals). "
     "Cascade: block → pHash → CLIP-confirm → decide.",
