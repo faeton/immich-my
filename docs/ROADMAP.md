@@ -74,6 +74,12 @@ First run after upgrade has no ledger and prunes nothing.
 
 ## Later
 
+### Tesla Dashcam Ingest
+
+Plan: [TESLA-PLAN.md](TESLA-PLAN.md) (design only, not built). One mosaic
+video per event with baked-in GPS/date, SEI telemetry → GPX, grouped-confirm
+retention for EncryptedClips / RecentClips / raw Sentry.
+
 ### Apple Photos People Apply
 
 Spec: [raw/PLAN.md](../raw/PLAN.md) — external-library matching.
