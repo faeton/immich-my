@@ -14,6 +14,13 @@ median datetime itself — good enough for single-file outliers, which
 is the common case. Group drift (whole camera off by N hours) will
 want a richer propose/accept UX in a later iteration.
 
+Multi-day trips: timestamps are split into sessions wherever the gap
+between consecutive files exceeds the threshold. A session of
+≥ MIN_SAMPLES files is a real shooting day, not drift — snapping it to
+the median would collapse the whole day onto one instant (2026-08-la-manga:
+12 Sep-4 drone clips proposed as 2026-08-31 10:50:13). Only files in
+smaller sessions are candidates.
+
 Runs late so it sees dates written by earlier rules (dji-date-from-srt
 etc.) via the two-pass apply.
 """
@@ -48,6 +55,21 @@ def _multi_camera_folder(rows: list[ExifRow]) -> bool:
     return sum(1 for n in counts.values() if n >= MIN_GROUP) >= 2
 
 
+def _small_session_paths(authorities: list) -> set[Path]:
+    """Paths of files in sessions (runs split on >threshold gaps) with
+    fewer than MIN_SAMPLES members — the only plausible single-file drift."""
+    ordered = sorted(authorities, key=lambda ra: ra[1].dt.timestamp())
+    sessions: list[list[Path]] = []
+    prev_ts: float | None = None
+    for row, authority in ordered:
+        ts = authority.dt.timestamp()
+        if prev_ts is None or ts - prev_ts > DRIFT_THRESHOLD_SECONDS:
+            sessions.append([])
+        sessions[-1].append(row.path)
+        prev_ts = ts
+    return {p for s in sessions if len(s) < MIN_SAMPLES for p in s}
+
+
 def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
     if _multi_camera_folder(rows):
         return []
@@ -62,9 +84,12 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
     median_str = med_dt.strftime("%Y:%m:%d %H:%M:%S")
 
     out: list[Finding] = []
+    small = _small_session_paths(authorities)
     for row, authority in authorities:
         delta = authority.dt.timestamp() - med_ts
         if abs(delta) < DRIFT_THRESHOLD_SECONDS:
+            continue
+        if row.path not in small:
             continue
         days = delta / 86400.0
         this_str = authority.dt.strftime("%Y-%m-%d %H:%M:%S")
