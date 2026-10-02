@@ -34,11 +34,14 @@ touches remote originals. Enrichment is idempotent and queue-based.
 │  Redis                                                        │
 │  Nominatim (reverse geocoding)                               │
 │                                                              │
-│  Storage layout:                                             │
-│    /mnt/tank/media/…              (ZFS: originals, library)  │
-│    /mnt/flash/immy/{state,sidecars}  (immy state, NVMe pool) │
-│    Immich thumbs/encoded-video/   (derivatives, ix-immich)   │
-│    Postgres                       (ix-immich app dataset)    │
+│  Storage layout (see immy/deploy/n5/compose.yaml mounts):    │
+│    /mnt/tank/immich/originals  → /originals (external lib)   │
+│    /mnt/tank/immich/media      → /data (upload, library,     │
+│                                  encoded-video; HDD `tank`)  │
+│    /mnt/flash/immich/thumbs    → /data/thumbs (NVMe `flash`) │
+│    /mnt/flash/immich/postgres     (Postgres data, NVMe)      │
+│    /mnt/flash/immy/{state,sidecars}  (immy state, NVMe)      │
+│    /mnt/tank/media/{trips,staging,quarantine} (immy inputs)  │
 │                                                              │
 │  Fallback ML: Immich's stock CPU ML container (always on)    │
 │  Immich ML URL → balanced: Mac primary, n5 fallback        │
@@ -50,8 +53,9 @@ touches remote originals. Enrichment is idempotent and queue-based.
 
 | Tier | Where | What lives there | Readable when Mac asleep? |
 |---|---|---|---|
-| 0 — hot | n5 NVMe pool (`flash`) | thumbs, proxies, transcripts, captions, embeddings, Postgres | ✅ |
-| 1 — originals | n5 HDD pool (`tank`), NAS over SMB, external drives, rclone | untouched originals | ✅ if mounted |
+| 0 — hot | n5 NVMe pool (`flash`) | thumbs, Postgres (catalog, captions, embeddings), immy state + sidecars | ✅ |
+| 1 — bulk | n5 HDD pool (`tank`) | encoded-video proxies (`/data/encoded-video`), Immich uploads/library | ✅ |
+| 1 — originals | n5 HDD pool (`tank`, `/mnt/tank/immich/originals`), NAS over SMB, external drives, rclone | untouched originals | ✅ if mounted |
 | 2 — cold / offline | Unplugged drives, S3 archive | catalog stubs only (ghost assets) | ✅ browse only |
 
 Rule: after first ingest, **originals are never re-read for browsing**. Only
