@@ -37,7 +37,7 @@ def test_resolve_capture_prefers_srt(tmp_path: Path) -> None:
     mov.write_bytes(b"")
     _write_srt(tmp_path / "DJI_0001.SRT")
     row = ExifRow(path=mov, raw={"QuickTime:CreateDate": "2020:01:01 00:00:00"})
-    dt, source, kind = bf.resolve_capture(mov, row)
+    dt, source, kind, _ = bf.resolve_capture(mov, row)
     assert dt == datetime(2024, 2, 15, 10, 30, 0)  # SRT beat the embedded tag
     assert "SRT" in source
     assert kind == "utc"  # DJI SRT timestamps are UTC
@@ -47,7 +47,7 @@ def test_resolve_capture_filename_fallback(tmp_path: Path) -> None:
     mov = tmp_path / "DJI_20240309_141147_001.MOV"
     mov.write_bytes(b"")
     row = ExifRow(path=mov, raw={})  # no SRT, no embedded date
-    dt, source, kind = bf.resolve_capture(mov, row)
+    dt, source, kind, _ = bf.resolve_capture(mov, row)
     assert dt == datetime(2024, 3, 9, 14, 11, 47)
     assert "filename" in source
     assert kind == "local"  # filename stamp is local wall-clock
@@ -58,32 +58,27 @@ def test_resolve_capture_dji_compact_filename(tmp_path: Path) -> None:
     # past the filename parser entirely.
     mov = tmp_path / "DJI_20240412150201_0008_D.MP4"
     mov.write_bytes(b"")
-    dt, source, kind = bf.resolve_capture(mov, ExifRow(path=mov, raw={}))
+    dt, source, kind, _ = bf.resolve_capture(mov, ExifRow(path=mov, raw={}))
     assert dt == datetime(2024, 4, 12, 15, 2, 1)
     assert kind == "local"
     assert "filename" in source
 
 
-def test_resolve_capture_quicktime_fallback(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_capture_quicktime_is_utc_from_the_shared_read(tmp_path: Path) -> None:
+    # `read_folder` (-fast) now reads the moov CreateDate itself: no
+    # separate exiftool re-read. DJI CreateDate is UTC, as at ingest.
     mov = tmp_path / "DJI_0001.MOV"  # old-scheme name: no date, no SRT
     mov.write_bytes(b"")
-    monkeypatch.setattr(
-        bf.subprocess, "run",
-        lambda *a, **k: type("P", (), {"stdout": "2024:02:17 16:16:10\n"})(),
-    )
-    dt, source, kind = bf.resolve_capture(mov, ExifRow(path=mov, raw={}))
-    assert dt == datetime(2024, 2, 17, 16, 16, 10)
-    assert kind == "utc"  # QuickTime CreateDate is UTC
+    row = ExifRow(path=mov, raw={"QuickTime:CreateDate": "2024:02:17 16:16:10"})
+    dt, source, kind, _ = bf.resolve_capture(mov, row)
+    assert dt == datetime(2024, 2, 17, 16, 16, 10, tzinfo=timezone.utc)
+    assert kind == "utc"
     assert "QuickTime" in source
 
 
-def test_resolve_capture_none(tmp_path: Path, monkeypatch) -> None:
+def test_resolve_capture_none(tmp_path: Path) -> None:
     mov = tmp_path / "clip.MOV"
     mov.write_bytes(b"")
-    monkeypatch.setattr(
-        bf.subprocess, "run",
-        lambda *a, **k: type("P", (), {"stdout": ""})(),
-    )
     assert bf.resolve_capture(mov, ExifRow(path=mov, raw={})) is None
 
 
@@ -146,7 +141,7 @@ def test_resolve_timezone_no_signal(tmp_path: Path, monkeypatch) -> None:
 
 
 def _patch_read_folder(monkeypatch, rows):
-    monkeypatch.setattr(bf, "read_folder", lambda folder: rows)
+    monkeypatch.setattr(bf, "read_folder", lambda folder, **kw: rows)
 
 
 def test_plan_folder_builds_update_candidate(tmp_path: Path, monkeypatch) -> None:
@@ -347,6 +342,66 @@ def test_resolve_capture_insta360_quicktime_is_local(tmp_path: Path) -> None:
     insv = tmp_path / "VID_20240211_125116_00_052.insv"
     insv.write_bytes(b"")
     row = ExifRow(path=insv, raw={"QuickTime:CreateDate": "2024:02:11 12:51:08"})
-    dt, _, kind = bf.resolve_capture(insv, row)
+    dt, _, kind, _ = bf.resolve_capture(insv, row)
     assert dt == datetime(2024, 2, 11, 12, 51, 8)
     assert kind == "local"
+
+
+# --- final review H: shared capture resolution, NAS sidecars ---------------
+
+
+def test_plan_folder_file_offset_beats_trip_zone(tmp_path: Path, monkeypatch) -> None:
+    """A file that records its own offset is not re-zoned by the trip guess
+    (Lisbon) — the instant comes from the file, as at ingest."""
+    jpg = tmp_path / "IMG_0001.JPG"
+    jpg.write_bytes(b"x")
+    _patch_read_folder(monkeypatch, [ExifRow(path=jpg, raw={
+        "EXIF:DateTimeOriginal": "2024:05:01 18:00:00",
+        "EXIF:OffsetTimeOriginal": "+09:00",
+    })])
+    monkeypatch.setattr(bf, "resolve_timezone", lambda r, f, o: ("Europe/Lisbon", "trip"))
+    monkeypatch.setattr(bf, "_clip_timezone", lambda p: None)
+    conn, _ = _mock_conn(("a", "a", datetime(2024, 1, 1, tzinfo=timezone.utc)))
+
+    plan = bf.plan_folder(conn, LIB, tmp_path, retime=True)
+    c = plan.candidates[0]
+    assert c.date_time_original == datetime(2024, 5, 1, 9, 0, tzinfo=timezone.utc)
+    assert c.local_date_time == datetime(2024, 5, 1, 18, 0)
+    assert c.tz_name == "UTC+9"
+
+
+def test_plan_folder_sidecar_correction_beats_srt_and_embedded(tmp_path: Path, monkeypatch) -> None:
+    """--retime must not undo a correction that lives in the .xmp sidecar."""
+    mov = tmp_path / "DJI_0001.MOV"
+    mov.write_bytes(b"x")
+    _write_srt(tmp_path / "DJI_0001.SRT")  # 2024-02-15 10:30:00
+    _patch_read_folder(monkeypatch, [ExifRow(
+        path=mov, raw={"QuickTime:CreateDate": "2024:02:15 10:30:00"},
+        sidecar={"XMP:DateTimeOriginal": "2024:02:15 13:30:00+00:00"})])
+    conn, _ = _mock_conn(("a", "a", datetime(2024, 1, 1, tzinfo=timezone.utc)))
+
+    plan = bf.plan_folder(conn, LIB, tmp_path, tz_override="UTC", retime=True)
+    c = plan.candidates[0]
+    assert c.date_time_original == datetime(2024, 2, 15, 13, 30, tzinfo=timezone.utc)
+    assert "sidecar" in c.source
+
+
+def test_plan_folder_reads_sidecars_through_writable_paths(tmp_path: Path, monkeypatch) -> None:
+    """NAS: sidecars live under sidecars_root; plan_folder must read them
+    there (read_folder(..., paths=...)), not beside the read-only originals."""
+    from immy.paths import resolve_writable_paths
+
+    seen = {}
+
+    def _read(folder, *, paths=None):
+        seen["paths"] = paths
+        return []
+    monkeypatch.setattr(bf, "read_folder", _read)
+    paths = resolve_writable_paths(tmp_path, sidecars_root=tmp_path / "side")
+    conn, _ = _mock_conn(None)
+    bf.plan_folder(conn, LIB, tmp_path, tz_override="UTC", paths=paths)
+    assert seen["paths"] is paths
+
+
+def test_retime_keeps_existing_time_zone_when_none_is_known() -> None:
+    assert 'COALESCE(%(tz)s, "timeZone")' in bf._RETIME_EXIF

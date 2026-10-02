@@ -11,8 +11,10 @@ spot on the timeline.
 
 This module does the explicit `UPDATE` that ingest can't:
 
-1. read the capture wall-clock from each file's `.SRT` (or an embedded /
-   filename fallback),
+1. read the capture time — a `.xmp` sidecar correction first, then the
+   file's `.SRT`, then the embedded tags exactly as ingest reads them
+   (`capture.capture_time`: offsets honoured, QuickTime CreateDate UTC
+   except local-clock makes), then a filename stamp,
 2. match the local file to its Immich asset by `originalPath` (robust to
    the `DJI_0001.MOV`-collides-across-cards problem that filename matching
    has),
@@ -25,60 +27,45 @@ Default is plan/report only; the CLI applies under `--apply`.
 
 from __future__ import annotations
 
-import subprocess
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 from zoneinfo import ZoneInfo
 
+from .capture import SIDECAR_SOURCE, _compute_instant, _capture_sourced
 from .exif import ExifRow, read_folder
 from .filenames import parse_date as parse_filename_date
 from .pg import LibraryInfo
-from .process import (
-    _best_datetime, _compute_instant, _parse_exif_datetime, container_path_for,
-)
+from .process import container_path_for
 from .srt import find_sibling, parse as parse_srt
 from .rules.trip_timezone_guess import _tz_finder, guess_timezone
 
-
-_QUICKTIME_EXTS = {".mp4", ".mov", ".m4v"}
-
-
-def _quicktime_create_date(media_path: Path) -> datetime | None:
-    """Full (non `-fast2`) read of the container CreateDate.
-
-    immy's `read_folder` uses exiftool `-fast2`, which skips the MP4 `moov`
-    atom — so DJI's `QuickTime:CreateDate` is invisible to ingest and these
-    clips land dateless even though the date is right there. Per the
-    QuickTime spec (and verified against DJI footage: CreateDate matches the
-    file's modification time expressed in UTC) the value is UTC, so the
-    caller tags it kind="utc". One exiftool spawn per file — only reached as
-    a last resort, so the cost stays bounded to genuinely SRT-less clips.
-    """
-    if media_path.suffix.lower() not in _QUICKTIME_EXTS:
-        return None
-    try:
-        out = subprocess.run(
-            ["exiftool", "-n", "-s3", "-CreateDate", str(media_path)],
-            capture_output=True, text=True, check=False,
-        ).stdout.strip()
-    except Exception:
-        return None
-    return _parse_exif_datetime(out) if out else None
+if TYPE_CHECKING:
+    from .paths import WritablePaths
 
 
 # --- date resolution ------------------------------------------------------
 
 
-def resolve_capture(media_path: Path, row: ExifRow) -> tuple[datetime, str, str] | None:
-    """Find the capture instant for a dateless file. Backfill-specific
-    authority order (SRT first — these files are dateless *because* their
-    embedded tags are empty, and SRT is the camera's own record):
+def resolve_capture(
+    media_path: Path, row: ExifRow,
+) -> tuple[datetime, str, str, str | None] | None:
+    """Find the capture instant for a dateless file. Authority order:
 
-        SRT telemetry → embedded QuickTime/EXIF → filename pattern.
+        .xmp SIDECAR DateTimeOriginal (a deliberate correction — never undone)
+        → SRT telemetry (these files are often dateless *because* their
+          embedded tags are empty, and SRT is the camera's own record)
+        → embedded tags, read exactly as ingest reads them
+          (`capture._capture_sourced`) → filename pattern.
 
-    Returns `(dt, source_label, kind)` or None, where `kind` says how to
-    interpret `dt`:
+    (There is no separate QuickTime re-read any more: `read_folder` runs
+    exiftool `-fast`, which reads the `moov` CreateDate ingest uses.)
+
+    Returns `(dt, source_label, kind, file_zone)` or None. `file_zone` is
+    the zone the file itself records (offset tag / QuickTime TimeZone), or
+    None; when present it beats any trip/clip zone guess. `kind` says how
+    to interpret `dt`:
       - "utc"   — `dt` is an absolute instant (DJI SRT wall-clock is UTC; a
                   tz-aware embedded tag is absolute). localDateTime is then
                   derived by converting into the trip zone.
@@ -90,26 +77,24 @@ def resolve_capture(media_path: Path, row: ExifRow) -> tuple[datetime, str, str]
     real footage: a Hawaii clip stamped `03:32` with bright-daylight exposure
     is 17:32 local (UTC-10), a golden-hour flight, not 3 AM.
     """
+    captured = _capture_sourced(row)
+    if captured is not None and captured[2] == SIDECAR_SOURCE:
+        dt, tz_name, source = captured
+        return dt, source, "utc" if dt.tzinfo is not None else "local", tz_name
+
     srt = find_sibling(media_path)
     if srt is not None:
         tele = parse_srt(srt)
         if tele.datetime_original is not None:
-            return tele.datetime_original, f"SRT {srt.name}", "utc"
+            return tele.datetime_original, f"SRT {srt.name}", "utc", None
 
-    embedded = _best_datetime(row)
-    if embedded is not None:
-        kind = "utc" if embedded.tzinfo is not None else "local"
-        return embedded, "embedded EXIF/QuickTime", kind
+    if captured is not None:
+        dt, tz_name, source = captured
+        return dt, f"embedded {source}", "utc" if dt.tzinfo is not None else "local", tz_name
 
     fn = parse_filename_date(media_path)
     if fn is not None:
-        return fn.dt, f"filename {media_path.name}", "local"
-
-    # Last resort: DJI's QuickTime CreateDate, which immy's -fast2 ingest read
-    # skips. UTC.
-    qt = _quicktime_create_date(media_path)
-    if qt is not None:
-        return qt, "QuickTime CreateDate", "utc"
+        return fn.dt, f"filename {media_path.name}", "local", None
 
     return None
 
@@ -225,6 +210,7 @@ def plan_folder(
     *,
     tz_override: str | None = None,
     retime: bool = False,
+    paths: "WritablePaths | None" = None,
 ) -> FolderPlan:
     """Match every dateless local media file in `folder` to its Immich asset
     and compute the date/zone we'd write. No DB writes.
@@ -232,8 +218,11 @@ def plan_folder(
     `retime=True` also re-dates assets that already have a date — used to
     correct a wrong earlier write (e.g. a mixed-location folder that got one
     trip-wide zone). Without it, dated assets are left untouched.
+
+    `paths` (`WritablePaths`) locates the `.xmp` sidecars — under
+    `sidecars_root` on the NAS; unset → beside the media (Mac).
     """
-    rows = read_folder(folder)
+    rows = read_folder(folder, paths=paths)
     tz_name, tz_reason = resolve_timezone(rows, folder, tz_override)
     plan = FolderPlan(folder=folder, tz_name=tz_name, tz_reason=tz_reason)
 
@@ -243,7 +232,7 @@ def plan_folder(
         if resolved is None:
             plan.no_date_source.append(media)
             continue
-        dt, source, kind = resolved
+        dt, source, kind, file_tz = resolved
         original_path = container_path_for(media, folder, library.container_root)
 
         with conn.cursor() as cur:
@@ -257,9 +246,10 @@ def plan_folder(
             plan.already_dated += 1
             continue
 
-        # Per-clip zone (its own SRT GPS) beats the trip-wide guess — unless
-        # the user forced one with --timezone.
-        clip_tz = tz_override or _clip_timezone(media) or tz_name
+        # The file's own recorded zone (offset tag) beats every guess, as at
+        # ingest. Otherwise: --timezone, then the clip's own SRT-GPS zone,
+        # then the trip-wide guess.
+        clip_tz = file_tz or tz_override or _clip_timezone(media) or tz_name
         if existing_dto is not None:
             mode = "retime"
         elif exif_assetid is not None:
@@ -305,7 +295,7 @@ ON CONFLICT ("assetId") DO NOTHING
 _RETIME_EXIF = """
 UPDATE asset_exif
 SET "dateTimeOriginal" = %(dto)s,
-    "timeZone" = %(tz)s
+    "timeZone" = COALESCE(%(tz)s, "timeZone")
 WHERE "assetId" = %(aid)s
 """
 

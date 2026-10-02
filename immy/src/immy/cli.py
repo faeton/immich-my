@@ -2755,8 +2755,17 @@ def backfill_dates(
     grand_written = grand_cands = 0
     try:
         for folder in folders:
+            # Sidecars (rule fixes / user corrections) live under
+            # sidecars_root on the NAS — read them where they are, or
+            # --retime would overwrite a correction with the embedded value.
             plan = backfill_dates_mod.plan_folder(
                 conn, library, folder, tz_override=timezone, retime=retime,
+                paths=process_mod.resolve_writable_paths(
+                    folder,
+                    originals_root=config.originals_root,
+                    state_root=config.state_root,
+                    sidecars_root=config.sidecars_root,
+                ),
             )
             tz_disp = plan.tz_name or "(none — wall-as-UTC)"
             console.print(
