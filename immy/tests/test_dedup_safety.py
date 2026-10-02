@@ -128,13 +128,15 @@ def test_resolve_dest_checks_content_at_the_qualified_name_too(tmp_path):
         engine._resolve_dest(dest, 77, 2048, src)
 
 
-def test_resolve_dest_falls_back_to_size_when_src_is_gone(tmp_path):
-    """Copy AND unlink finished, status commit didn't. Nothing is left to
-    compare and nothing is deleted on this path, so the recorded size is
-    allowed to settle it — otherwise the pipeline could never resume."""
+def test_resolve_dest_never_settles_on_size_when_src_is_gone(tmp_path):
+    """Source gone, nothing recorded: size is not identity. (It used to
+    settle it, which let a same-size stranger's hash be recorded as a
+    winner's and its losers released — final review 2026-10.) The plain
+    name is not claimed; the move then fails loudly on the missing source."""
     dest = _video_file(tmp_path / "originals" / "IMG_1234.JPG", size=2048, fill=b"gone")
     missing_src = tmp_path / "staging" / "IMG_1234.JPG"
-    assert engine._resolve_dest(dest, 77, 2048, missing_src) == (dest, True)
+    final, done = engine._resolve_dest(dest, 77, 2048, missing_src)
+    assert done is False and final != dest
 
 
 def _manifest_with_staging_asset(tmp_path, *, status, size, fill) -> tuple:

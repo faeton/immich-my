@@ -388,3 +388,84 @@ def test_purge_accepts_a_legacy_winner_it_can_prove_and_records_it(tmp_path):
 
     assert eligible == [2]
     assert conn.execute("SELECT dest_path FROM asset WHERE id=1").fetchone()[0] == str(lib)
+
+
+# ------------------------------------- final review: size-only identity (E)
+
+
+def test_legacy_winner_with_source_gone_never_adopts_a_same_size_stranger(tmp_path):
+    """A v3 winner still `decided`, its source gone, nothing recorded (no
+    dest_path, no sha256). An UNRELATED library file of the same length sits
+    at its promote path. Size alone must not make it "this asset's copy":
+    that recorded the stranger's hash as the winner's and then let the
+    losers go to quarantine (and later purge)."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    stranger = _file(tmp_path / "originals" / "2024" / "06" / "W.HEIC", b"someone else")
+    loser = _file(tmp_path / "staging" / "L.JPG", b"loser")
+    _insert(conn, 1, tmp_path / "staging" / "W.HEIC", manifest.DECIDED,
+            nbytes=len(b"someone else"))
+    _insert(conn, 2, loser, manifest.DECIDED, nbytes=5)
+    _cluster(conn, 1, (1, 2))
+    conn.commit()
+
+    result = _apply(conn, tmp_path)
+
+    assert result["promoted"] == 0 and result["quarantined"] == 0
+    assert result["losers_held"] == 1
+    assert _status(conn, 1) == manifest.DECIDED
+    assert conn.execute("SELECT dest_path, sha256 FROM asset WHERE id=1").fetchone() == (None, None)
+    assert loser.exists() and _status(conn, 2) == manifest.DECIDED
+    assert stranger.read_bytes() == b"someone else"
+    eligible, _ = engine.purge_candidates(conn, originals_root=tmp_path / "originals")
+    assert eligible == []
+
+
+def test_promote_rest_with_source_gone_never_adopts_a_same_size_stranger(tmp_path):
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _file(tmp_path / "originals" / "2024" / "06" / "K.HEIC", b"someone else")
+    _insert(conn, 1, tmp_path / "staging" / "K.HEIC", manifest.FINGERPRINTED,
+            nbytes=len(b"someone else"))
+    conn.commit()
+
+    result = engine.promote_rest(conn, originals_root=tmp_path / "originals", dry_run=False)
+
+    assert result["promoted"] == 0 and result["errors"] == 1
+    assert _status(conn, 1) == manifest.FINGERPRINTED
+    assert conn.execute("SELECT dest_path, sha256 FROM asset WHERE id=1").fetchone() == (None, None)
+
+
+# ------------------------------- final review: needs-review clusters (D)
+
+
+def test_apply_holds_losers_of_an_unowned_cluster_a_guard_now_flags(tmp_path):
+    """A pre-provenance `auto` cluster (decided_by NULL) whose members turn
+    out to share a burst id: refresh_metadata lists it as needs-review and
+    never changes it — so apply must not quarantine its losers either."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    winner = _file(tmp_path / "staging" / "a" / "IMG_1.HEIC", b"winner")
+    loser = _file(tmp_path / "staging" / "b" / "IMG_2.HEIC", b"burst frame 2")
+    _insert(conn, 1, winner, manifest.DECIDED, nbytes=6)
+    _insert(conn, 2, loser, manifest.DECIDED, nbytes=13)
+    conn.execute("UPDATE asset SET burst_uuid='B-1' WHERE id IN (1, 2)")
+    _cluster(conn, 1, (1, 2))
+    conn.commit()
+
+    for dry_run in (True, False):
+        result = _apply(conn, tmp_path, dry_run=dry_run)
+        assert result["quarantined"] == 0
+        assert result["losers_held"] == 1
+        assert any("review" in s for s in result["held_samples"]), result["held_samples"]
+    assert loser.exists() and _status(conn, 2) == manifest.DECIDED
+
+
+def test_apply_still_quarantines_an_unflagged_unowned_cluster(tmp_path):
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    winner = _file(tmp_path / "staging" / "a" / "IMG_1.HEIC", b"winner")
+    loser = _file(tmp_path / "staging" / "b" / "IMG_1.JPG", b"loser")
+    _insert(conn, 1, winner, manifest.DECIDED, nbytes=6)
+    _insert(conn, 2, loser, manifest.DECIDED, nbytes=5)
+    _cluster(conn, 1, (1, 2))
+    conn.commit()
+
+    result = _apply(conn, tmp_path)
+    assert (result["promoted"], result["quarantined"], result["losers_held"]) == (1, 1, 0)

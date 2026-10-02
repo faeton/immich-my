@@ -1327,12 +1327,14 @@ def _dest_holds_this_asset(
     staging file WITHOUT copying it anywhere, so a false yes deletes an asset
     that never reached the library. Content has to agree.
 
-    The one case still resting on size alone is `src` already gone — a prior
-    run that finished the copy AND the unlink but died before its status
-    commit. Nothing is left to compare against, and nothing gets deleted on
-    that path either, so the recorded size is allowed to settle it; the worst
-    outcome is a bookkeeping row pointing at the wrong twin, never a lost
-    file."""
+    `src` already gone (a pre-v4 run that copied AND unlinked but died
+    before any commit) is a no: nothing is left to compare against, and size
+    is not identity. A yes there used to record the stranger's sha256 as this
+    asset's, which then proved a cluster winner "in the library" and released
+    its losers to quarantine and purge. Rows written since v4 record
+    dest_path+sha256 before the unlink and recover exactly through
+    `_resolve_dest`'s `recorded` branch; a legacy row in this state is left
+    for a person to resolve."""
     if expected_bytes is None:
         return False
     try:
@@ -1341,7 +1343,7 @@ def _dest_holds_this_asset(
     except OSError:
         return False
     if src is None or not src.exists():
-        return True
+        return False
     # Full hash, not `content_equal`: its sampled windows are clustering
     # evidence, and two >16 MB files that differ only outside them would
     # pass. A yes here unlinks `src`, so it has to be proof.
@@ -1564,10 +1566,13 @@ def _move_asset(
         sha = rec_sha if rec_path == str(dest) and rec_sha else _sha256(dest)
     else:
         if src_key is None:
-            # Neither the source nor a matching dest exists — genuinely
-            # missing, not a resumable state. Surface loudly rather than
-            # silently marking it done.
-            raise FileNotFoundError(str(src))
+            # No source, and no recorded (dest_path, sha256) that proves a
+            # destination file is this asset's: genuinely missing or not
+            # provable — never settled by size. Surface loudly and hold.
+            raise FileNotFoundError(
+                f"{src}: source is gone and no recorded sha256 proves which "
+                "destination file (if any) holds it — held for manual resolution"
+            )
         sha = _safe_copy(src, dest)
     # Re-establish durability on EVERY path, including `already_done`: a
     # prior run may have renamed the file into place and then failed its
@@ -1857,12 +1862,26 @@ def apply_decisions(
     held: list[str] = []
     # cluster id -> None (winner in the library) or the reason it is not.
     winner_gate: dict[int, str | None] = {}
+    # `auto` clusters not decided by the machine on which an id guard now
+    # fires (burst / two Live ids / edited+unedited) — the needs-review list
+    # `refresh_metadata` reports. Their decision is left alone, but their
+    # losers are held: disposing of them is exactly the burst/Live merge the
+    # guards exist to prevent.
+    needs_review = set(_unowned_clusters_needing_review(conn))
     total = len(rows)
 
     for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon,
             winner_id, rec_dest, rec_sha, cluster_id) in enumerate(rows):
         src = Path(path_str)
         is_winner = asset_id == winner_id
+        if not is_winner and cluster_id in needs_review:
+            counts["losers_held"] += 1
+            held.append(
+                f"{path_str}: cluster {cluster_id} needs review (an id guard — "
+                "burst, Live pair or edited — now fires on its members)")
+            if progress:
+                progress(i + 1, total)
+            continue
         if not is_winner:
             if cluster_id not in winner_gate:
                 winner_gate[cluster_id] = _winner_not_in_library(
