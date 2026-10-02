@@ -33,7 +33,7 @@ from pathlib import Path
 
 from ..exif import MEDIA_EXTS
 
-SCHEMA_VERSION = 4
+SCHEMA_VERSION = 5
 
 # status lifecycle values (kept as plain strings in the DB)
 REGISTERED = "registered"
@@ -115,8 +115,10 @@ CREATE TABLE IF NOT EXISTS cluster (
   winner_asset_id  INTEGER,
   confidence       REAL,
   decision         TEXT NOT NULL DEFAULT 'pending',  -- pending | auto | review | kept_all
-  clip_cos_sim     REAL  -- Stage C: min(cosine(winner, member)) over image members;
+  clip_cos_sim     REAL, -- Stage C: min(cosine(winner, member)) over image members;
                           -- NULL until `dedup confirm` visits this cluster.
+  decided_by       TEXT  -- v5: 'machine' (decide) | 'human' (review tool);
+                          -- NULL = decided before v5, provenance unknown.
 );
 
 CREATE TABLE IF NOT EXISTS membership (
@@ -200,6 +202,9 @@ def _migrate(conn: sqlite3.Connection) -> None:
     _add_missing_columns(conn, "cluster", [("clip_cos_sim", "REAL")])  # v2
     # v3 (triage + video_signal) is whole tables only — _CREATE_SCHEMA made them.
     _add_missing_columns(conn, "asset", V4_ASSET_COLUMNS)              # v4
+    # v5: who made a cluster's decision. Existing rows stay NULL (unknown) —
+    # the review tool also writes `auto`, so an old decision may be a person's.
+    _add_missing_columns(conn, "cluster", [("decided_by", "TEXT")])    # v5
 
 
 def open_manifest(path: Path) -> sqlite3.Connection:

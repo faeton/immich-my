@@ -41,10 +41,18 @@ from .engine import (
     _aspect_change,
     _confidence,
     _metadata_agrees,
-    commit_cluster_decision,
     load_cluster_members,
     winner_score,
 )
+from .engine import commit_cluster_decision as _commit_cluster_decision
+
+
+def commit_cluster_decision(*args, **kwargs) -> None:
+    """Every decision this tool writes is a person's — single-cluster,
+    batch, sweep and twin cascades alike (a sweep is a threshold a person
+    chose and confirmed). Recorded as such so `dedup fingerprint
+    --refresh-meta` never reopens it on its own."""
+    _commit_cluster_decision(*args, decided_by="human", **kwargs)
 
 THUMB_SIZE = 640        # card tier — the static gallery's 240px was too small
 LIGHTBOX_SIZE = 1600    # click-to-enlarge tier

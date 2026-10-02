@@ -49,7 +49,7 @@ def _indexes(conn) -> set[str]:
 def test_v3_manifest_migrates_to_v4_keeping_rows(tmp_path):
     conn = manifest.open_manifest(_v3(tmp_path / "m.sqlite"))
 
-    assert manifest.get_meta(conn, "schema_version") == "4"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
     assert {name for name, _ in manifest.V4_ASSET_COLUMNS} <= _asset_columns(conn)
     assert {"idx_asset_identity", "idx_asset_sha256", "idx_library_file_sha256"} <= _indexes(conn)
     assert conn.execute("SELECT path, status FROM asset").fetchall() == [
@@ -58,9 +58,24 @@ def test_v3_manifest_migrates_to_v4_keeping_rows(tmp_path):
     assert conn.execute("SELECT COUNT(*) FROM library_file").fetchone()[0] == 0
 
 
+def test_existing_clusters_migrate_with_unknown_provenance(tmp_path):
+    """v5: `cluster.decided_by`. Decisions made before it existed may have
+    been a person's, so they migrate to NULL (unknown), never 'machine'."""
+    path = _v3(tmp_path / "m.sqlite")
+    raw = sqlite3.connect(path)
+    raw.execute("INSERT INTO cluster (id, decision, winner_asset_id) VALUES (1, 'auto', 1)")
+    raw.commit()
+    raw.close()
+
+    conn = manifest.open_manifest(path)
+
+    assert manifest.get_meta(conn, "schema_version") == "5"
+    assert conn.execute("SELECT decided_by FROM cluster").fetchall() == [(None,)]
+
+
 def test_fresh_manifest_is_v4(tmp_path):
     conn = manifest.open_manifest(tmp_path / "m.sqlite")
-    assert manifest.get_meta(conn, "schema_version") == "4"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
     assert {name for name, _ in manifest.V4_ASSET_COLUMNS} <= _asset_columns(conn)
 
 
@@ -88,7 +103,7 @@ def test_interrupted_migration_rolls_back_and_retry_succeeds(tmp_path, monkeypat
 
     monkeypatch.setattr(manifest, "_add_missing_columns", real)
     conn = manifest.open_manifest(path)
-    assert manifest.get_meta(conn, "schema_version") == "4"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
     assert {name for name, _ in manifest.V4_ASSET_COLUMNS} <= _asset_columns(conn)
 
 
@@ -104,7 +119,7 @@ def test_partially_migrated_schema_without_version_bump_completes(tmp_path):
     raw.close()
 
     conn = manifest.open_manifest(path)
-    assert manifest.get_meta(conn, "schema_version") == "4"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
     assert {name for name, _ in manifest.V4_ASSET_COLUMNS} <= _asset_columns(conn)
 
 
@@ -116,7 +131,7 @@ def test_missing_version_row_is_inspected_not_trusted(tmp_path):
     raw.close()
 
     conn = manifest.open_manifest(path)
-    assert manifest.get_meta(conn, "schema_version") == "4"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
     assert "sha256" in _asset_columns(conn)
 
 
@@ -124,7 +139,7 @@ def test_v4_reopen_is_idempotent(tmp_path):
     path = tmp_path / "m.sqlite"
     manifest.open_manifest(path).close()
     conn = manifest.open_manifest(path)
-    assert manifest.get_meta(conn, "schema_version") == "4"
+    assert manifest.get_meta(conn, "schema_version") == str(manifest.SCHEMA_VERSION)
 
 
 # =================================================================== identity

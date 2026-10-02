@@ -448,3 +448,21 @@ def test_batch_enforces_originals_guard_per_cluster(client):
     assert len(out["failed"]) == 1 and out["failed"][0]["cluster_id"] == 2
     assert _decision(db_path, 1) == ("auto", 1)
     assert _decision(db_path, 2) == ("review", None)
+
+
+def test_review_tool_decisions_are_recorded_as_human(client):
+    """`dedup fingerprint --refresh-meta` may reopen only machine decisions;
+    everything the review tool writes must say it came from a person."""
+    import sqlite3
+
+    c, db_path = client
+    c.post("/api/decide/1", json={"action": "merge", "winner_asset_id": 1})
+    c.post("/api/decide/2", json={"action": "keep_all"})
+    conn = sqlite3.connect(db_path)
+    try:
+        rows = conn.execute(
+            "SELECT id, decided_by FROM cluster WHERE id IN (1, 2) ORDER BY id"
+        ).fetchall()
+    finally:
+        conn.close()
+    assert rows == [(1, "human"), (2, "human")]

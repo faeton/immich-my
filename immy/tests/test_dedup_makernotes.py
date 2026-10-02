@@ -78,9 +78,9 @@ def _insert(conn, asset_id, path, *, status, source="icloud", dest_path=None,
     )
 
 
-def _cluster(conn, cluster_id, decision, winner, members):
-    conn.execute("INSERT INTO cluster (id, decision, winner_asset_id) VALUES (?, ?, ?)",
-                 (cluster_id, decision, winner))
+def _cluster(conn, cluster_id, decision, winner, members, decided_by="machine"):
+    conn.execute("INSERT INTO cluster (id, decision, winner_asset_id, decided_by)"
+                 " VALUES (?, ?, ?, ?)", (cluster_id, decision, winner, decided_by))
     for m in members:
         conn.execute("INSERT INTO membership (cluster_id, asset_id, role) VALUES (?, ?, ?)",
                      (cluster_id, m, "winner" if m == winner else "loser"))
@@ -273,3 +273,129 @@ def test_cli_refresh_meta_waits_for_a_mover(tmp_path):
     res = CliRunner().invoke(app, ["dedup", "fingerprint", "--manifest", str(m), "--refresh-meta"])
 
     assert res.exit_code == 1 and "in progress" in " ".join(res.output.split())
+
+
+# ------------------------------------------- whose decision, and restarts
+
+
+def _auto_pair(tmp_path, conn, decided_by, cluster_id=1, first_id=1):
+    a, b = _files(tmp_path, f"IMG_{first_id}.JPG", f"IMG_{first_id + 1}.JPG")
+    _insert(conn, first_id, a, status=manifest.DECIDED)
+    _insert(conn, first_id + 1, b, status=manifest.DECIDED)
+    _cluster(conn, cluster_id, "auto", first_id, (first_id, first_id + 1),
+             decided_by=decided_by)
+    conn.commit()
+
+
+def _decision(conn, cluster_id=1):
+    return conn.execute("SELECT decision FROM cluster WHERE id=?", (cluster_id,)).fetchone()[0]
+
+
+def test_refresh_never_reopens_a_human_merge(tmp_path, monkeypatch):
+    """The review tool also writes `auto`. A person merged these; a gained
+    burst id is reported for them to look at, not acted on."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _auto_pair(tmp_path, conn, "human")
+    _fake_burst(monkeypatch)
+
+    result = engine.refresh_metadata(conn)
+
+    assert result["clusters_reopened"] == 0
+    assert result["needs_review"] == [1]
+    assert _decision(conn) == "auto"
+    assert {r[0] for r in conn.execute("SELECT status FROM asset")} == {manifest.DECIDED}
+
+
+def test_refresh_treats_unknown_provenance_like_a_human_merge(tmp_path, monkeypatch):
+    """Every cluster decided before provenance was recorded is NULL: it may
+    have been a person, so it is listed, never changed."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _auto_pair(tmp_path, conn, None)
+    _fake_burst(monkeypatch)
+
+    result = engine.refresh_metadata(conn)
+
+    assert (result["clusters_reopened"], result["needs_review"]) == (0, [1])
+    assert _decision(conn) == "auto"
+    assert {r[0] for r in conn.execute("SELECT status FROM asset")} == {manifest.DECIDED}
+
+
+def test_refresh_lists_a_human_cluster_only_when_an_id_guard_would_fire(tmp_path, monkeypatch):
+    """One shared live id is the same capture twice — no guard fires, so a
+    human merge is not flagged."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _auto_pair(tmp_path, conn, "human")
+    monkeypatch.setattr(engine, "_exiftool_batch", lambda paths: {
+        p: {"SourceFile": p, "MakerNotes:ContentIdentifier": "SAME"} for p in paths
+    })
+
+    result = engine.refresh_metadata(conn)
+
+    assert (result["updated"], result["needs_review"]) == (2, [])
+
+
+def test_interrupted_refresh_has_already_reopened_what_it_committed(tmp_path, monkeypatch):
+    """Killed after the first batch: the gained id is committed, so a rerun
+    finds nothing new to gain. Whatever made the merge stale must already be
+    on disk with it, or the burst-blind merge stays executable forever."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _auto_pair(tmp_path, conn, "machine")
+    calls = []
+
+    def burst_then_die(paths):
+        calls.append(paths)
+        if len(calls) > 1:
+            raise KeyboardInterrupt
+        return {p: {"SourceFile": p, "MakerNotes:BurstUUID": "B"} for p in paths}
+
+    monkeypatch.setattr(engine, "_exiftool_batch", burst_then_die)
+    with pytest.raises(KeyboardInterrupt):
+        engine.refresh_metadata(conn, batch_size=1)
+
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    assert _decision(conn) == "pending"
+    assert {r[0] for r in conn.execute("SELECT status FROM asset")} == {manifest.CLUSTERED}
+
+
+def test_needs_review_survives_an_interrupted_run(tmp_path, monkeypatch):
+    """The human-cluster list is read from the manifest, not remembered: a
+    rerun after a crash still reports it."""
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _auto_pair(tmp_path, conn, "human")
+    _fake_burst(monkeypatch)
+    engine.refresh_metadata(conn)
+
+    again = engine.refresh_metadata(conn)
+
+    assert (again["updated"], again["needs_review"]) == (0, [1])
+
+
+def test_decide_records_a_machine_decision(tmp_path):
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    a, b = _files(tmp_path, "IMG_1.JPG", "IMG_2.JPG")
+    _insert(conn, 1, a, status=manifest.CLUSTERED)
+    _insert(conn, 2, b, status=manifest.CLUSTERED)
+    _cluster(conn, 1, "pending", None, (1, 2), decided_by=None)
+    conn.commit()
+
+    engine.decide(conn)
+
+    assert conn.execute("SELECT decided_by FROM cluster").fetchone()[0] == "machine"
+
+
+def test_cli_refresh_meta_lists_unowned_merges(tmp_path, monkeypatch):
+    from typer.testing import CliRunner
+
+    from immy.cli import app
+
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    _auto_pair(tmp_path, conn, "human", cluster_id=7)
+    conn.close()
+    _fake_burst(monkeypatch)
+
+    res = CliRunner().invoke(app, [
+        "dedup", "fingerprint", "--manifest", str(tmp_path / "m.sqlite"), "--refresh-meta",
+    ])
+
+    assert res.exit_code == 0, res.output
+    assert "clusters 7" in " ".join(res.output.split())

@@ -379,16 +379,26 @@ def refresh_metadata(
     The file is read where it lives now: `dest_path` once promoted or
     quarantined, else `path`. A file at neither is counted `missing`.
 
-    A gained id can change a decision, so the clusters holding such rows
-    are re-opened — but nothing already applied is undone:
-      - `auto`, nothing moved yet  -> back to `pending`, its `decided`
-        members to `clustered`; `decide` takes it from there.
-      - `auto`, partly or fully applied -> moves stand; any member still
-        `decided` drops to `clustered` (promote-rest keeps it) instead of
-        being quarantined on the id-blind decision. Counted, not reopened.
-      - `pending`/`review` are re-decided by every `decide` run anyway, and
-        `kept_all` only ever comes from the burst guard, which a gained id
-        cannot loosen."""
+    A gained id can change a decision. Only clusters `decide` itself made
+    `auto` (`decided_by='machine'`) are acted on, and nothing already applied
+    is undone:
+      - nothing moved yet  -> back to `pending`, its `decided` members to
+        `clustered`; `decide` takes it from there.
+      - partly or fully applied -> moves stand; any member still `decided`
+        drops to `clustered` (promote-rest keeps it) instead of being
+        quarantined on the id-blind decision. Counted, not reopened.
+    This happens in the same transaction as the batch's metadata writes: a
+    run killed between the two would leave ids on disk that the next run
+    cannot "gain" again, and the stale merge executable for good.
+
+    A person's merge (`'human'`) or one from before provenance was recorded
+    (NULL) is never changed. Every such `auto` cluster on which an id guard
+    of `_decide_one` would now fire (a burst id, two different live ids,
+    edited mixed with unedited) is returned in `needs_review` — computed
+    from the manifest, not from this run's gains, so an interrupted run
+    loses nothing. `pending`/`review` clusters are re-decided by every
+    `decide` anyway, and `kept_all` only comes from the burst guard, which a
+    gained id cannot loosen."""
     marks = ",".join("?" * len(_REFRESHABLE))
     rows = conn.execute(
         "SELECT id, path, status, dest_path, burst_uuid, live_cid, edited FROM asset"
@@ -396,11 +406,10 @@ def refresh_metadata(
         " ORDER BY id",
         _REFRESHABLE,
     ).fetchall()
-    counts = {
+    counts: dict = {
         "checked": len(rows), "updated": 0, "missing": 0, "unreadable": 0,
         "clusters_reopened": 0, "applied_clusters_affected": 0,
     }
-    gained: list[int] = []
 
     for start in range(0, len(rows), batch_size):
         located = []
@@ -413,6 +422,7 @@ def refresh_metadata(
             else:
                 counts["missing"] += 1
         by_path = _exiftool_batch([where for _, where in located]) if located else {}
+        gained: list[int] = []
         for (asset_id, path_text, _, _, burst, live, edited), where in located:
             raw = by_path.get(where)
             if raw is None:
@@ -433,19 +443,28 @@ def refresh_metadata(
                 conn.execute(f"UPDATE asset SET {sets} WHERE id=?", [*changes.values(), asset_id])
                 counts["updated"] += 1
                 gained.append(asset_id)
+        _reconsider_machine_clusters(conn, gained, counts)
         conn.commit()
         if progress:
             progress(min(start + batch_size, len(rows)), len(rows))
 
-    affected = set()
-    for start in range(0, len(gained), 500):
-        chunk = gained[start:start + 500]
-        affected.update(conn.execute(
-            "SELECT DISTINCT c.id FROM cluster c JOIN membership m ON m.cluster_id = c.id"
-            f" WHERE c.decision = 'auto' AND m.asset_id IN ({','.join('?' * len(chunk))})",
-            chunk,
-        ).fetchall())
-    for (cluster_id,) in sorted(affected):
+    counts["needs_review"] = _unowned_clusters_needing_review(conn)
+    return counts
+
+
+def _reconsider_machine_clusters(
+    conn: sqlite3.Connection, gained: list[int], counts: dict,
+) -> None:
+    """`refresh_metadata`'s cluster step for one batch; does not commit."""
+    if not gained:
+        return
+    affected = conn.execute(
+        "SELECT DISTINCT c.id FROM cluster c JOIN membership m ON m.cluster_id = c.id"
+        " WHERE c.decision = 'auto' AND c.decided_by = 'machine'"
+        f" AND m.asset_id IN ({','.join('?' * len(gained))}) ORDER BY c.id",
+        gained,
+    ).fetchall()
+    for (cluster_id,) in affected:
         statuses = {s for (s,) in conn.execute(
             "SELECT a.status FROM membership m JOIN asset a ON a.id = m.asset_id"
             " WHERE m.cluster_id=?", (cluster_id,),
@@ -460,8 +479,25 @@ def refresh_metadata(
         else:
             conn.execute("UPDATE cluster SET decision='pending' WHERE id=?", (cluster_id,))
             counts["clusters_reopened"] += 1
-    conn.commit()
-    return counts
+
+
+def _unowned_clusters_needing_review(conn: sqlite3.Connection) -> list[int]:
+    """`auto` clusters not decided by the machine (a person's, or unknown)
+    on which an id guard of `_decide_one` fires given what the manifest now
+    knows: any burst id, two different live ids, or edited mixed with
+    unedited. They are reported, never changed."""
+    flagged = conn.execute(
+        """SELECT c.id FROM cluster c
+           JOIN membership m ON m.cluster_id = c.id
+           JOIN asset a ON a.id = m.asset_id
+           WHERE c.decision = 'auto' AND (c.decided_by IS NULL OR c.decided_by != 'machine')
+           GROUP BY c.id
+           HAVING COUNT(a.burst_uuid) > 0
+               OR COUNT(DISTINCT a.live_cid) > 1
+               OR (MAX(a.edited) = 1 AND MIN(a.edited) = 0)
+           ORDER BY c.id"""
+    ).fetchall()
+    return [cluster_id for (cluster_id,) in flagged]
 
 
 # ---------------------------------------------------------- content identity
@@ -1008,11 +1044,17 @@ def commit_cluster_decision(
     decision: str,
     winner_id: int,
     confidence: float | None = None,
+    *,
+    decided_by: str,
 ) -> None:
     """The one place a cluster decision is ever persisted — used by both
     `decide()` (Stage D, automatic) and the manual review tool (human-made).
     Keeping this in one function means both write paths stay identical by
     construction, not by convention.
+
+    `decided_by` is 'machine' or 'human' and is recorded on the cluster:
+    both write `auto`, and only a machine decision may later be reopened
+    without asking (`refresh_metadata`).
 
     Only `decision == 'auto'` ever advances asset.status (clustered →
     decided, which is what makes `dedup apply` pick the cluster up).
@@ -1022,8 +1064,9 @@ def commit_cluster_decision(
     cluster keeps the WAL write-lock window small for concurrent writers.
     """
     conn.execute(
-        "UPDATE cluster SET winner_asset_id=?, confidence=?, decision=? WHERE id=?",
-        (winner_id, confidence, decision, cluster_id),
+        "UPDATE cluster SET winner_asset_id=?, confidence=?, decision=?, decided_by=?"
+        " WHERE id=?",
+        (winner_id, confidence, decision, decided_by, cluster_id),
     )
     for member in members:
         role = "winner" if member.id == winner_id else (
@@ -1141,7 +1184,7 @@ def decide(conn: sqlite3.Connection) -> dict:
         winner = max(members, key=winner_score)
         commit_cluster_decision(
             conn, cluster_id, members, decision, winner.id,
-            _confidence(members, winner),
+            _confidence(members, winner), decided_by="machine",
         )
         counts[decision] += 1
     conn.commit()
@@ -1679,46 +1722,79 @@ def promote_rest(
     return counts
 
 
-def _winner_not_in_library(
-    conn: sqlite3.Connection, winner_id: int | None, *, verify: bool,
-) -> str | None:
-    """None when a cluster's winner is safely in the library; otherwise why
-    not. The gate in front of every disposal of a loser.
+def _holds_recorded_bytes(candidate: Path, sha: str) -> bool:
+    """`candidate` is a regular, non-symlink file whose full sha256 is `sha`
+    right now. Unreadable is a no."""
+    try:
+        return _distinct_regular(candidate, None) and _sha256(candidate) == sha
+    except OSError:
+        return False
 
-    In the library means `promoted` to a dest that is a real regular file,
-    or `canonical` (an `originals` row) whose path still is one. With
-    `verify` (apply, about to quarantine) a promoted winner must also have
-    its dest_path AND sha256 on record and the file must hash to it now; a
-    canonical winner is hashed when its sha256 is on record. Without it
-    (purge planning over the whole quarantine) presence is checked, and a
-    promoted row from before schema v4, which recorded no dest_path, stands
-    on its status — `promoted` was only ever written after a verified copy."""
+
+def _winner_not_in_library(
+    conn: sqlite3.Connection, winner_id: int | None, *, originals_root: Path,
+    record: bool = True,
+) -> str | None:
+    """None when a cluster's winner is proven to be in the library right
+    now; otherwise why not. The one check in front of every disposal of a
+    loser — `apply_decisions` before quarantining, `purge_candidates` before
+    a purge.
+
+    Proven means: the library file the manifest points at is a regular file
+    whose full sha256 equals the hash the manifest recorded for this asset.
+      - `promoted` with dest_path: that file, against asset.sha256.
+      - `promoted` without dest_path (moved before schema v4 recorded it):
+        the paths a promote could have used — `_promote_dest` and its
+        `__<id>` collision name — and only with a recorded sha256. A match
+        is written back as dest_path (unless `record=False`, a dry run), so
+        the search happens once.
+      - `canonical` (or an `originals` row): its own path, against
+        asset.sha256, or failing that the `library_file` row for that path
+        (what `dedup index-library` hashed).
+    No recorded hash, no file, a different file, or two candidates that
+    both match is "not proven": the loser waits. Never a size or name."""
     row = conn.execute(
-        "SELECT status, source, path, dest_path, sha256 FROM asset WHERE id=?",
+        "SELECT status, source, path, dest_path, sha256, taken_at FROM asset WHERE id=?",
         (winner_id,),
     ).fetchone() if winner_id is not None else None
     if row is None:
         return f"winner {winner_id} is not in the manifest"
-    status, source, path_str, dest_path, sha = row
+    status, source, path_str, dest_path, sha, taken_at = row
     if status == manifest.PROMOTED:
-        if verify and not (dest_path and sha):
-            return f"winner {winner_id} is promoted without a recorded dest_path+sha256"
-        if not dest_path:
+        if not sha:
+            return f"winner {winner_id} is promoted with no recorded sha256 to verify"
+        if dest_path:
+            if _holds_recorded_bytes(Path(dest_path), sha):
+                return None
+            return (f"winner {winner_id} file is missing or no longer matches its "
+                    f"sha256: {dest_path}")
+        plain = _promote_dest(originals_root, path_str, taken_at)
+        candidates = [plain, plain.with_name(f"{plain.stem}__{winner_id}{plain.suffix}")]
+        found = [c for c in candidates if _holds_recorded_bytes(c, sha)]
+        if len(found) != 1:
+            return (f"winner {winner_id} has no recorded dest_path and "
+                    f"{'no' if not found else 'more than one'} library file at "
+                    f"{plain} (or its collision name) holds its sha256")
+        if record:
+            conn.execute(
+                "UPDATE asset SET dest_path=? WHERE id=? AND dest_path IS NULL",
+                (str(found[0]), winner_id),
+            )
+            conn.commit()
+        return None
+    if status == manifest.CANONICAL or (source == "originals" and status != manifest.ERROR):
+        if not sha:
+            indexed = conn.execute(
+                "SELECT sha256 FROM library_file WHERE path=?", (path_str,)
+            ).fetchone()
+            sha = indexed[0] if indexed else None
+        if not sha:
+            return (f"winner {winner_id} is canonical with no recorded sha256 "
+                    "(run `dedup index-library`)")
+        if _holds_recorded_bytes(Path(path_str), sha):
             return None
-        target = Path(dest_path)
-    elif status == manifest.CANONICAL or (source == "originals" and status != manifest.ERROR):
-        target = Path(path_str)
-    else:
-        return f"winner {winner_id} is {status}, not in the library"
-    if not _distinct_regular(target, None):
-        return f"winner {winner_id} file is missing or not a regular file: {target}"
-    if verify and sha:
-        try:
-            if _sha256(target) != sha:
-                return f"winner {winner_id} file no longer matches its sha256: {target}"
-        except OSError as exc:
-            return f"winner {winner_id} file unreadable: {exc}"
-    return None
+        return f"winner {winner_id} file is missing or no longer matches its sha256: {path_str}"
+    return f"winner {winner_id} is {status}, not in the library"
 
 
 def apply_decisions(
@@ -1740,10 +1816,10 @@ def apply_decisions(
 
     Cluster by cluster, winner first. A loser is quarantined only once its
     winner is in the library: promoted by this run, or found by
-    `_winner_not_in_library(verify=True)` — promoted with a recorded
-    dest_path whose bytes hash to the recorded sha256, or the canonical file
-    itself. Otherwise the loser stays `decided`, untouched, and is counted in
-    `losers_held` with the reason in `held_samples`; a later run retries it.
+    `_winner_not_in_library` — the library file the manifest points at
+    hashes to the sha256 it recorded for the winner. Otherwise the loser
+    stays `decided`, untouched, and is counted in `losers_held` with the
+    reason in `held_samples`; a later run retries it.
     Diagnosed 2026-10: walking rows by asset id quarantined a lower-id loser
     before its winner's move was even attempted, and a failed winner then
     left the cluster's only surviving copy in quarantine.
@@ -1789,7 +1865,9 @@ def apply_decisions(
         is_winner = asset_id == winner_id
         if not is_winner:
             if cluster_id not in winner_gate:
-                winner_gate[cluster_id] = _winner_not_in_library(conn, winner_id, verify=True)
+                winner_gate[cluster_id] = _winner_not_in_library(
+                    conn, winner_id, originals_root=originals_root, record=not dry_run,
+                )
             reason = winner_gate[cluster_id]
             if reason is not None:
                 counts["losers_held"] += 1
@@ -1845,18 +1923,26 @@ def apply_decisions(
     return counts
 
 
-def purge_candidates(conn: sqlite3.Connection) -> tuple[list[int], list[tuple[int, str]]]:
+def purge_candidates(
+    conn: sqlite3.Connection, *, originals_root: Path,
+) -> tuple[list[int], list[tuple[int, str]]]:
     """Split `quarantined` rows into (purgeable ids, [(id, reason refused)]).
 
-    Any purge of the quarantine must go through this. A cluster loser is
-    purgeable only while its winner is in the library
-    (`_winner_not_in_library`, presence-checked); an alias only while its
-    library twin (`alias_path`) is still a regular file; a row with neither
-    on record has no surviving copy anyone has vouched for and is refused.
+    NO PRODUCTION CALLER YET: there is no purge command. Any future purge of
+    the quarantine must call this immediately before deleting, and delete
+    only the ids it returns — the answer is about the library as it is now.
+
+    A cluster loser is purgeable only while its winner is proven in the
+    library (`_winner_not_in_library`, the same check `apply_decisions` runs:
+    full sha256 against the recorded hash, legacy dest_paths resolved and
+    written back). An alias only while its library twin (`alias_path`) still
+    hashes to the alias's own recorded sha256. A row with neither on record
+    has no surviving copy anyone has vouched for and is refused. Every check
+    re-reads files in full, so this is as slow as the winners are large.
     Diagnosed 2026-10: the by-id apply walk could quarantine a loser whose
     winner then failed to move — purging that loser would lose the shot."""
     rows = conn.execute(
-        "SELECT a.id, a.alias_path, c.winner_asset_id FROM asset a"
+        "SELECT a.id, a.alias_path, a.sha256, c.winner_asset_id FROM asset a"
         " LEFT JOIN membership m ON m.asset_id = a.id"
         " LEFT JOIN cluster c ON c.id = m.cluster_id"
         " WHERE a.status = ? ORDER BY a.id",
@@ -1865,14 +1951,20 @@ def purge_candidates(conn: sqlite3.Connection) -> tuple[list[int], list[tuple[in
     eligible: list[int] = []
     refused: list[tuple[int, str]] = []
     by_winner: dict[int, str | None] = {}
-    for asset_id, alias_path, winner_id in rows:
+    for asset_id, alias_path, sha, winner_id in rows:
         if winner_id is not None and winner_id != asset_id:
             if winner_id not in by_winner:
-                by_winner[winner_id] = _winner_not_in_library(conn, winner_id, verify=False)
+                by_winner[winner_id] = _winner_not_in_library(
+                    conn, winner_id, originals_root=originals_root,
+                )
             reason = by_winner[winner_id]
         elif alias_path:
-            reason = (None if _distinct_regular(Path(alias_path), None)
-                      else f"library twin {alias_path} is gone")
+            if not sha:
+                reason = "alias has no recorded sha256 to verify its library twin against"
+            elif _holds_recorded_bytes(Path(alias_path), sha):
+                reason = None
+            else:
+                reason = f"library twin {alias_path} is gone or no longer holds these bytes"
         else:
             reason = "no winner or library twin on record"
         if reason is None:

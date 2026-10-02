@@ -494,7 +494,7 @@ def test_commit_cluster_decision_auto_advances_clustered_only(tmp_path):
         1: manifest.CLUSTERED, 2: manifest.CLUSTERED, 3: manifest.CANONICAL,
     })
     members = [_asset(1), _asset(2), _asset(3, source="originals")]
-    engine.commit_cluster_decision(conn, 1, members, "auto", winner_id=3,
+    engine.commit_cluster_decision(conn, 1, members, "auto", winner_id=3, decided_by="machine",
                                    confidence=0.9)
 
     decision, winner, confidence = conn.execute(
@@ -516,7 +516,8 @@ def test_commit_cluster_decision_auto_advances_clustered_only(tmp_path):
 def test_commit_cluster_decision_kept_all_touches_no_status(tmp_path):
     conn = _seed_cluster(tmp_path, {1: manifest.CLUSTERED, 2: manifest.CLUSTERED})
     members = [_asset(1), _asset(2)]
-    engine.commit_cluster_decision(conn, 1, members, "kept_all", winner_id=1)
+    engine.commit_cluster_decision(conn, 1, members, "kept_all", winner_id=1,
+                                   decided_by="machine")
 
     decision, winner = conn.execute(
         "SELECT decision, winner_asset_id FROM cluster WHERE id=1"
@@ -534,7 +535,7 @@ def test_commit_cluster_decision_kept_all_touches_no_status(tmp_path):
 
 def test_commit_cluster_decision_commits_immediately(tmp_path):
     conn = _seed_cluster(tmp_path, {1: manifest.CLUSTERED, 2: manifest.CLUSTERED})
-    engine.commit_cluster_decision(conn, 1, [_asset(1), _asset(2)], "auto",
+    engine.commit_cluster_decision(conn, 1, [_asset(1), _asset(2)], "auto", decided_by="machine",
                                    winner_id=1)
     # A second connection must see the decision without conn committing again
     # (the review tool's per-request connections rely on this).

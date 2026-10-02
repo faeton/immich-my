@@ -18,24 +18,37 @@ continuously, so entries are dated rather than versioned.
   fired. Both now use `-fast` (slower, accepted). `immy dedup fingerprint
   --refresh-meta` re-reads those ids (and `edited`) for rows already
   fingerprinted: fills NULLs only, never sizes/hashes/status, idempotent,
-  reads promoted/quarantined rows at their `dest_path`. An `auto` cluster
-  that gains an id and has moved nothing is reopened (`pending`, members
-  back to `clustered`; re-run `dedup decide`); in one already applied the
-  moves stand and members still `decided` drop to `clustered`, so
-  promote-rest keeps them. Rows promoted before schema v4 recorded no
-  `dest_path` and are counted `missing`, not guessed.
+  reads promoted/quarantined rows at their `dest_path`. Clusters are
+  reconsidered in the same transaction as each batch's metadata, so a
+  killed run never leaves an id recorded and its stale merge executable.
+  Only merges `decide` made are acted on (schema v5 adds
+  `cluster.decided_by`: `machine` from `decide`, `human` from the review
+  tool; existing clusters migrate as unknown). Such an `auto` cluster that
+  gains an id and has moved nothing is reopened (`pending`, members back to
+  `clustered`; re-run `dedup decide`); in one already applied the moves
+  stand and members still `decided` drop to `clustered`, so promote-rest
+  keeps them. A person's merge, or one of unknown provenance, is never
+  changed: when a burst / Live / edited guard would now fire on it, its
+  cluster id is listed for review. Rows promoted before schema v4 recorded
+  no `dest_path` and are counted `missing`, not guessed.
 - **`dedup apply` could quarantine a loser whose winner never reached the
   library.** Rows were walked by asset id, so a lower-id loser moved
   before its winner was even tried, and a failed winner left the shot's
   only copy in quarantine. Apply now goes cluster by cluster, winner
   first, and quarantines a loser only when the winner was promoted by this
-  run, or is `promoted` with a recorded `dest_path` that still hashes to
-  its recorded sha256, or is the `canonical` library file. Otherwise the
-  loser stays `decided`, is counted as `losers held` with its reason, and
-  is retried on the next run. `engine.purge_candidates` is the gate for
-  any quarantine purge: it refuses a quarantined row whose winner is not
-  promoted/canonical with its file present (or an alias whose library twin
-  is gone).
+  run or is proven in the library now: the file the manifest points at
+  (dest_path; for a pre-v4 promote the expected path or its `__<id>`
+  collision name, then recorded; a canonical row's own path) hashes in full
+  to the sha256 recorded for it (a canonical row may use its `library_file`
+  hash from `dedup index-library`). No recorded hash, a missing or changed
+  file, or two matching candidates: the loser stays `decided`, is counted
+  as `losers held` with its reason, and is retried on the next run.
+  `engine.purge_candidates` applies the same proof to every quarantined
+  row (an alias: its library twin must still hash to the alias's sha256).
+  There is no purge command yet; any future purge must call it
+  immediately before deleting and delete only what it returns. Pre-v4
+  rows (all of n5's current quarantine) carry no sha256, so they are
+  refused until a hash can be established.
 
 ## 2026-10-02 — capture time: wall-clock localDateTime, sidecars win
 

@@ -3336,6 +3336,15 @@ def _dedup_refresh_meta(engine_mod, manifest_path: Path, batch_size: int) -> Non
     )
     if result["clusters_reopened"]:
         console.print("re-run `dedup decide` to re-decide the reopened clusters")
+    flagged = result["needs_review"]
+    if flagged:
+        shown = ", ".join(str(c) for c in flagged[:50])
+        more = f" (+{len(flagged) - 50} more)" if len(flagged) > 50 else ""
+        console.print(
+            f"[yellow]{len(flagged)} merge(s) not made by `decide` (a person's, or "
+            f"from before that was recorded) now trip a burst / Live / edited guard; "
+            f"left as they are — review them:[/yellow] clusters {shown}{more}"
+        )
 
 
 @dedup_app.command("index-library")
