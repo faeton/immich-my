@@ -4,6 +4,32 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — `process`: transaction + journal atomicity
+
+### Fixed
+
+- **One failed enricher statement silently dropped the whole asset.** The
+  derivatives (dims/duration), CLIP, faces, transcript and caption writes
+  swallowed SQL errors with no savepoint, so Postgres aborted the asset's
+  transaction and the per-asset COMMIT quietly turned into a ROLLBACK. Each
+  enricher now runs in its own savepoint (`Sink.savepoint()`), so a failure
+  costs only that phase. As a backstop, `PgSink.commit` refuses to COMMIT an
+  aborted transaction (`TransactionAborted`): the asset is reported failed and
+  the trip exits non-zero.
+- **The journal claimed work that was rolled back.** Phases were marked done
+  before the commit, and the commit-failure branch even flushed them, so
+  e.g. "CLIP done" stuck for assets with no `smart_search` row. Journal marks
+  are now staged (`Journal.stage` / `commit_staged` / `discard_staged`) and
+  become durable only after the asset's commit succeeds (offline: after the
+  cache entry is on disk). Applies to the parallel caption pool too.
+- **A stale journal asset id overrode the DB's.** On an `ON CONFLICT` resume
+  the id resolved from the DB now wins; the journal's id is used only when no
+  row resolves, and a mismatch is warned about and rewritten.
+- **Cached phases were trusted for a re-inserted row.** If this run inserted
+  the asset row (or its id changed), the journal's derivatives/CLIP/faces/
+  transcript/caption entries describe a row that is gone; they are now cleared
+  and the phases re-run.
+
 ## 2026-10-02 — Immich 3.0.2 schema contract
 
 ### Fixed

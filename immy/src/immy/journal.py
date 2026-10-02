@@ -56,6 +56,11 @@ class Journal:
     # this, a 3k-asset trip paid ~1–2 s per file rewriting the journal
     # even when no phase ran.
     _dirty: bool = False
+    # Staged (not yet durable) marks for the unit of work in flight —
+    # `checksum → worker → record`, where a `None` record is a staged
+    # `clear_worker`. `None` (the attribute) means "not staging": marks go
+    # straight into `entries`. See `stage()`.
+    _staged: dict[str, dict[str, dict[str, Any] | None]] | None = None
 
     @classmethod
     def load(cls, trip_folder: Path) -> "Journal":
@@ -83,13 +88,53 @@ class Journal:
                 entries[str(cs)] = clean
         return cls(path=p, entries=entries)
 
+    def _lookup(self, checksum_hex: str, worker: str) -> dict[str, Any] | None:
+        staged = (self._staged or {}).get(checksum_hex, {})
+        if worker in staged:
+            return staged[worker]
+        return self.entries.get(checksum_hex, {}).get(worker)
+
     def is_done(self, checksum_hex: str, worker: str, version: str) -> bool:
-        rec = self.entries.get(checksum_hex, {}).get(worker)
+        rec = self._lookup(checksum_hex, worker)
         return bool(rec and rec.get("version") == version)
 
     def get(self, checksum_hex: str, worker: str) -> dict[str, Any] | None:
-        rec = self.entries.get(checksum_hex, {}).get(worker)
+        rec = self._lookup(checksum_hex, worker)
         return dict(rec) if rec else None
+
+    # --- staging: journal marks become durable only after the DB commit ---
+    #
+    # `process_trip` marks phases as they finish, but the Postgres writes
+    # behind them are only durable once the asset's transaction commits. If
+    # the marks were flushed first, a failed/aborted commit would leave the
+    # journal claiming work that was rolled back (e.g. "clip done" with no
+    # smart_search row), and the next run would skip it forever. So: stage
+    # marks while the asset is in flight, `commit_staged()` right after the
+    # sink commit succeeds, `discard_staged()` when it doesn't. `flush()`
+    # only ever writes committed entries.
+
+    def stage(self) -> None:
+        """Start a unit of work: subsequent marks/clears are staged. Any
+        staged leftovers from an earlier unit that never committed (an
+        exception unwound past it) are dropped — they can never be
+        promoted."""
+        self._staged = {}
+
+    def commit_staged(self) -> None:
+        """Promote staged marks/clears into `entries` (dirtying the journal)
+        and stop staging. Call only after the matching DB commit."""
+        staged, self._staged = self._staged or {}, None
+        for cs, workers in staged.items():
+            for worker, rec in workers.items():
+                if rec is None:
+                    self._clear(cs, worker)
+                else:
+                    self.entries.setdefault(cs, {})[worker] = rec
+                    self._dirty = True
+
+    def discard_staged(self) -> None:
+        """Drop staged marks/clears (their DB writes were rolled back)."""
+        self._staged = None
 
     def mark_done(
         self,
@@ -101,10 +146,20 @@ class Journal:
         rec: dict[str, Any] = {"version": version, "completed_at": int(time.time())}
         if meta:
             rec["meta"] = dict(meta)
+        if self._staged is not None:
+            self._staged.setdefault(checksum_hex, {})[worker] = rec
+            return
         self.entries.setdefault(checksum_hex, {})[worker] = rec
         self._dirty = True
 
     def clear_worker(self, checksum_hex: str, worker: str) -> None:
+        if self._staged is not None:
+            if self._lookup(checksum_hex, worker) is not None:
+                self._staged.setdefault(checksum_hex, {})[worker] = None
+            return
+        self._clear(checksum_hex, worker)
+
+    def _clear(self, checksum_hex: str, worker: str) -> None:
         if checksum_hex in self.entries:
             removed = self.entries[checksum_hex].pop(worker, None)
             if not self.entries[checksum_hex]:

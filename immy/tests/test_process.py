@@ -912,6 +912,23 @@ def _caption_conn():
     return conn
 
 
+def _existing_row_conn():
+    """Like `_caption_conn`, but the asset row already exists (a re-run over
+    a captioned trip): the INSERT … ON CONFLICT DO NOTHING RETURNING id
+    yields no row and the follow-up SELECT resolves it. A row inserted
+    *this* run would rightly invalidate every cached phase."""
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    last = {"sql": ""}
+    cur.execute.side_effect = lambda sql, params=None: last.__setitem__("sql", sql)
+    cur.fetchone.side_effect = lambda: (
+        None if "INSERT INTO asset (" in last["sql"] else ("uuid-x",))
+    conn.cursor.return_value = cur
+    return conn
+
+
 def test_caption_fill_missing_keeps_prior_model_caption(tmp_path: Path, monkeypatch):
     """With caption_fill_missing_only, an asset already captioned by a
     PREVIOUS model id is kept as-is — the VLM is never called even though
@@ -937,7 +954,7 @@ def test_caption_fill_missing_keeps_prior_model_caption(tmp_path: Path, monkeypa
                                        endpoint="http://example.invalid/v1")
 
     results = process_mod.process_trip(
-        target, _caption_conn(), LIB,
+        target, _existing_row_conn(), LIB,
         compute_captions=True, caption_fill_missing_only=True,
         captioner_config=cfg,
     )

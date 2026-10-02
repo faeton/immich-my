@@ -506,6 +506,12 @@ class _CaptionJob:
     context: str | None = None
 
 
+# Journal workers that enrich an existing asset row (everything but
+# "ingest"). Their entries describe one specific row; when the row is
+# (re)inserted or its id changes they are stale and get cleared.
+_ENRICHER_WORKERS = ("derivatives", "clip", "faces", "transcript", "caption")
+
+
 def process_trip(
     trip_folder: Path,
     conn: psycopg.Connection | None,
@@ -541,8 +547,12 @@ def process_trip(
     paths: WritablePaths | None = None,
 ) -> list[ProcessResult]:
     """Read trip folder, insert one asset+exif row per media file, return
-    per-file results. Caller is responsible for transaction boundaries —
-    we expect a single commit after the list.
+    per-file results. By default each asset is its own transaction
+    (`commit_per_asset=True`): enricher writes run in savepoints, the asset
+    commits, and only then do its journal marks become durable. With
+    `commit_per_asset=False` the caller owns the single trip commit and must
+    follow it with `journal.commit_staged(); journal.flush()` (pass the
+    `journal` in to do so) — otherwise the trip's marks are dropped.
 
     When `compute_derivatives=True`, also generate thumbnail + preview via
     pyvips and stage them under `.audit/derivatives/` using the same
@@ -674,9 +684,34 @@ def process_trip(
         finally:
             timings[label] = time.monotonic() - t0
 
+    # Journal marks are staged and become durable only after the Postgres
+    # commit that holds the matching writes (`_commit_unit`). Per-asset
+    # mode stages one asset at a time; the legacy single-transaction mode
+    # stages the whole trip — the caller commits, then must call
+    # `journal.commit_staged(); journal.flush()` itself.
+    if not commit_per_asset:
+        journal.stage()
+
+    def _commit_unit(what: str) -> None:
+        if not commit_per_asset:
+            return
+        try:
+            sink.commit()
+        except Exception as e:
+            # Fail loud: the asset's writes are gone, so its staged journal
+            # marks must go too — flushing them would leave ghost entries
+            # that make the next run skip rolled-back work.
+            journal.discard_staged()
+            raise RuntimeError(
+                f"{what}: commit failed, asset rolled back: {e}") from e
+        journal.commit_staged()
+        journal.flush()
+
     for idx, exif_row in enumerate(rows, start=1):
         timings: dict[str, float] = {}
         asset_t0 = time.monotonic()
+        if commit_per_asset:
+            journal.stage()
 
         # Header line: printed before any work so the user sees which
         # file is in progress while it's still running. Size helps when
@@ -700,9 +735,13 @@ def process_trip(
             "exif", timings,
         )
         cs_hex = asset.checksum.hex()
+        minted_id = asset.id
         inserted = _phase(
             lambda: sink.insert_asset_and_exif(asset, exif), "insert", timings,
         )
+        # On conflict the sink swaps in the existing row's id; that id is
+        # the truth (the journal's recorded id can be stale).
+        row_resolved = not inserted and asset.id != minted_id
         if inserted:
             journal.mark_done(
                 cs_hex, "ingest", INGEST_VERSION,
@@ -734,14 +773,38 @@ def process_trip(
         # and an enricher would leave assets stranded — the resume run
         # sees inserted=False and would skip every enricher.
         we_own = inserted or journal.is_done(cs_hex, "ingest", INGEST_VERSION)
-        # If the journal recorded a prior asset_id from when we inserted
-        # this row in an earlier run, prefer it — `asset.id` is currently
-        # a fresh UUID from build_rows that won't match the DB row.
+        # `row_fresh`: the row the later phases would enrich is not the one
+        # the journal's phase entries describe — we just (re)inserted it, or
+        # the DB row's id differs from the one journaled. Cached phases must
+        # not be trusted then (e.g. "clip done" for a row whose smart_search
+        # never committed, or derivatives staged under another id).
+        row_fresh = inserted
         if not inserted and we_own:
             prior_ingest = journal.get(cs_hex, "ingest")
-            if prior_ingest and prior_ingest.get("meta", {}).get("asset_id"):
-                asset.id = str(prior_ingest["meta"]["asset_id"])
+            prior_id = (prior_ingest or {}).get("meta", {}).get("asset_id")
+            if row_resolved:
+                # DB id wins. A different journaled id means the journal is
+                # stale: warn and rewrite it (staged with the asset).
+                if prior_id and str(prior_id) != asset.id:
+                    _emit(
+                        f"    !! {exif_row.path.name}: journal asset_id "
+                        f"{prior_id} != DB asset_id {asset.id}; using DB id, "
+                        "rewriting journal"
+                    )
+                    journal.mark_done(
+                        cs_hex, "ingest", INGEST_VERSION,
+                        meta={"asset_id": asset.id},
+                    )
+                    row_fresh = True
+            elif prior_id:
+                # No DB row resolved by the sink: fall back to the id we
+                # recorded when we inserted it in an earlier run —
+                # `asset.id` is a fresh UUID from build_rows.
+                asset.id = str(prior_id)
                 exif.asset_id = asset.id
+        if row_fresh:
+            for worker in _ENRICHER_WORKERS:
+                journal.clear_worker(cs_hex, worker)
         derivs: list[DerivativeFile] | None = None
         clip_embedded = False
         # Derivatives skip-because-already-done: rebuild DerivativeFile
@@ -906,44 +969,47 @@ def process_trip(
                     " + " + " + ".join(extra) if extra else "")
             _emit(f"    derivatives… ({label})")
             try:
-                result = _phase(
-                    lambda: derivatives_mod.compute_for_asset(
-                        source_media=exif_row.path,
-                        asset_id=asset.id,
-                        owner_id=library.owner_id,
-                        asset_type=asset.asset_type,
-                        trip_folder=trip_folder,
-                        transcode_videos=transcode_videos,
-                        derivative_source=proxy,
-                        preproc_vf=dewarp,
-                        mirror_from=mirror,
-                        staging_dir=paths.derivatives_dir,
-                    ),
-                    "derivatives", timings,
-                )
-                if proxy is not None and mirror is None:
-                    proxy_deriv_cache[proxy] = result
-                derivs = result.files
-                if result.width is not None and result.height is not None:
-                    sink.update_asset_dims(
-                        asset.id, result.width, result.height,
+                with sink.savepoint():
+                    result = _phase(
+                        lambda: derivatives_mod.compute_for_asset(
+                            source_media=exif_row.path,
+                            asset_id=asset.id,
+                            owner_id=library.owner_id,
+                            asset_type=asset.asset_type,
+                            trip_folder=trip_folder,
+                            transcode_videos=transcode_videos,
+                            derivative_source=proxy,
+                            preproc_vf=dewarp,
+                            mirror_from=mirror,
+                            staging_dir=paths.derivatives_dir,
+                        ),
+                        "derivatives", timings,
                     )
-                    asset.width, asset.height = result.width, result.height
-                if result.duration is not None and result.duration != asset.duration:
-                    sink.update_asset_duration(asset.id, result.duration)
-                    asset.duration = result.duration
+                    if proxy is not None and mirror is None:
+                        proxy_deriv_cache[proxy] = result
+                    derivs = result.files
+                    if result.width is not None and result.height is not None:
+                        sink.update_asset_dims(
+                            asset.id, result.width, result.height,
+                        )
+                        asset.width, asset.height = result.width, result.height
+                    if result.duration is not None and result.duration != asset.duration:
+                        sink.update_asset_duration(asset.id, result.duration)
+                        asset.duration = result.duration
+                    if derivs is not None:
+                        deriv_payload = [
+                            {
+                                "kind": d.kind,
+                                "relative_path": d.relative_path,
+                                "staged_path": str(d.staged_path),
+                                "is_progressive": d.is_progressive,
+                                "is_transparent": d.is_transparent,
+                            }
+                            for d in derivs
+                        ]
+                        sink.record_derivatives(asset.id, deriv_payload)
+                # Journal only once the savepoint released cleanly.
                 if derivs is not None:
-                    deriv_payload = [
-                        {
-                            "kind": d.kind,
-                            "relative_path": d.relative_path,
-                            "staged_path": str(d.staged_path),
-                            "is_progressive": d.is_progressive,
-                            "is_transparent": d.is_transparent,
-                        }
-                        for d in derivs
-                    ]
-                    sink.record_derivatives(asset.id, deriv_payload)
                     journal.mark_done(
                         cs_hex, "derivatives", DERIV_VERSION,
                         meta={"files": deriv_payload},
@@ -970,23 +1036,24 @@ def process_trip(
             if preview is not None and preview.is_file():
                 _emit("    CLIP embedding…")
                 try:
-                    def _do_clip() -> None:
-                        nonlocal clip_embedded
-                        embedding = clip_mod.embed(
-                            preview, model_name=clip_model,
-                            backend=clip_backend, endpoint=clip_endpoint,
-                        )
-                        if expected_dim is not None and len(embedding) != expected_dim:
-                            raise RuntimeError(
-                                f"CLIP dim mismatch: model {clip_model!r} produced "
-                                f"{len(embedding)}, smart_search expects {expected_dim}"
+                    with sink.savepoint():
+                        def _do_clip() -> None:
+                            nonlocal clip_embedded
+                            embedding = clip_mod.embed(
+                                preview, model_name=clip_model,
+                                backend=clip_backend, endpoint=clip_endpoint,
                             )
-                        sink.upsert_clip(
-                            asset.id, list(embedding),
-                            clip_mod.to_pgvector_literal(embedding),
-                        )
-                        clip_embedded = True
-                    _phase(_do_clip, "clip", timings)
+                            if expected_dim is not None and len(embedding) != expected_dim:
+                                raise RuntimeError(
+                                    f"CLIP dim mismatch: model {clip_model!r} produced "
+                                    f"{len(embedding)}, smart_search expects {expected_dim}"
+                                )
+                            sink.upsert_clip(
+                                asset.id, list(embedding),
+                                clip_mod.to_pgvector_literal(embedding),
+                            )
+                            clip_embedded = True
+                        _phase(_do_clip, "clip", timings)
                     if clip_embedded:
                         journal.mark_done(cs_hex, "clip", CLIP_VERSION)
                 except Exception:
@@ -1015,12 +1082,13 @@ def process_trip(
             if preview is not None and preview.is_file():
                 _emit("    faces…")
                 try:
-                    faces_detected = _phase(
-                        lambda: _process_faces(
-                            sink, asset.id, preview, faces_model,
-                        ),
-                        "faces", timings,
-                    )
+                    with sink.savepoint():
+                        faces_detected = _phase(
+                            lambda: _process_faces(
+                                sink, asset.id, preview, faces_model,
+                            ),
+                            "faces", timings,
+                        )
                     journal.mark_done(
                         cs_hex, "faces", FACES_VERSION,
                         meta={"count": faces_detected},
@@ -1045,18 +1113,20 @@ def process_trip(
             make = _str(exif_row.get("EXIF:Make", "QuickTime:Make"))
             _emit("    transcript… (ffprobe → volumedetect → whisper if audio)")
             try:
-                transcript_info = _phase(
-                    lambda: _process_transcript(
-                        sink, asset.id, exif_row.path, transcript_model,
-                        make=make, prompt=transcript_prompt,
-                        backend=transcript_backend,
-                        endpoint=transcript_endpoint,
-                        paths=paths,
-                    ),
-                    "transcript", timings,
-                )
+                with sink.savepoint():
+                    transcript_info = _phase(
+                        lambda: _process_transcript(
+                            sink, asset.id, exif_row.path, transcript_model,
+                            make=make, prompt=transcript_prompt,
+                            backend=transcript_backend,
+                            endpoint=transcript_endpoint,
+                            paths=paths,
+                        ),
+                        "transcript", timings,
+                    )
+                    if transcript_info and "skipped" not in transcript_info:
+                        sink.record_transcript(asset.id, transcript_info)
                 if transcript_info and "skipped" not in transcript_info:
-                    sink.record_transcript(asset.id, transcript_info)
                     journal.mark_done(
                         cs_hex, "transcript", TRANSCRIPT_VERSION,
                         meta=transcript_info,
@@ -1219,19 +1289,21 @@ def process_trip(
             _caption_context = _srtgeo.caption_context_for(
                 exif_row.path, trip_folder)
             try:
-                caption_info = _phase(
-                    lambda: _process_caption(
-                        sink, asset.id, exif_row.path,
-                        captioner_config, preview=caption_preview,
-                        recaption=recaption,
-                        require_preview=asset.asset_type == "VIDEO",
-                        paths=paths,
-                        context=_caption_context,
-                    ),
-                    "caption", timings,
-                )
+                with sink.savepoint():
+                    caption_info = _phase(
+                        lambda: _process_caption(
+                            sink, asset.id, exif_row.path,
+                            captioner_config, preview=caption_preview,
+                            recaption=recaption,
+                            require_preview=asset.asset_type == "VIDEO",
+                            paths=paths,
+                            context=_caption_context,
+                        ),
+                        "caption", timings,
+                    )
+                    if caption_info:
+                        sink.record_caption(asset.id, caption_info)
                 if caption_info:
-                    sink.record_caption(asset.id, caption_info)
                     journal.mark_done(
                         cs_hex, "caption", CAPTION_VERSION,
                         meta=caption_info,
@@ -1289,19 +1361,9 @@ def process_trip(
         # a re-run skips committed assets via journal lookups and
         # resumes precisely at the unfinished one. Tests that want the
         # legacy "single trip transaction" semantics pass
-        # commit_per_asset=False.
-        if commit_per_asset:
-            try:
-                sink.commit()
-            except Exception:
-                # If the per-asset commit fails, surface it — the asset's
-                # work is lost and the journal entries we just wrote
-                # won't match DB state. Better to fail loud than to keep
-                # accumulating ghost journal entries for non-committed
-                # rows.
-                journal.flush()
-                raise
-        journal.flush()
+        # commit_per_asset=False. The asset's journal marks become durable
+        # only here, after its commit succeeded.
+        _commit_unit(exif_row.path.name)
 
     # --- caption worker pool (only when caption_workers > 1) ---------------
     # The sequential pass above did everything but the VLM calls; run them
@@ -1381,25 +1443,34 @@ def process_trip(
                     continue  # user/Whisper text wins — don't record or count
                 _emit(f"    caption… (VLM @ {captioner_config.model})")
                 description = captions_mod.format_description(info["text"])
-                sink.update_description_if_ai_or_empty(
-                    job.asset_id, description, file_name=job.media.name)
-                _mirror_description_to_xmp(
-                    sink, job.asset_id, job.media, description,
-                    xmp_path=paths.xmp_path(job.media))
-                sink.record_caption(job.asset_id, info)
+                if commit_per_asset:
+                    journal.stage()
+                try:
+                    with sink.savepoint():
+                        sink.update_description_if_ai_or_empty(
+                            job.asset_id, description, file_name=job.media.name)
+                        _mirror_description_to_xmp(
+                            sink, job.asset_id, job.media, description,
+                            xmp_path=paths.xmp_path(job.media))
+                        sink.record_caption(job.asset_id, info)
+                except Exception as e:
+                    if on_caption_error == "raise":
+                        raise
+                    reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
+                    _emit(f"    {job.media.name} | caption… FAILED: {reason}")
+                    continue
                 journal.mark_done(
                     job.cs_hex, "caption", CAPTION_VERSION, meta=info,
                 )
+                _commit_unit(job.media.name)
                 results[job.result_idx].caption = info
                 snippet = info["text"][:60].replace("\n", " ")
                 _emit(f'    {job.media.name} | caption: "{snippet}…"')
-                if commit_per_asset:
-                    sink.commit()
-                journal.flush()
         except KeyboardInterrupt:
             # Cancel queued work; threads already inside a urllib call can't
             # be force-stopped (they unwind on their own timeout). Persist
-            # whatever already committed, then propagate.
+            # whatever already committed (flush never writes staged marks),
+            # then propagate.
             ex.shutdown(wait=False, cancel_futures=True)
             journal.flush()
             raise

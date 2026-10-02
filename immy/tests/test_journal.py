@@ -78,6 +78,63 @@ def test_journal_clear_worker(tmp_path: Path):
     assert j.is_done("cs1", "faces", "v1") is True
 
 
+def test_journal_staged_marks_not_flushed_until_committed(tmp_path: Path):
+    """Marks made while staging are visible to queries (later phases of the
+    same asset read them) but never reach disk until `commit_staged()` —
+    the caller promotes them only after the DB commit succeeded."""
+    j = Journal.load(tmp_path)
+    j.mark_done("cs0", "ingest", "v1")
+    j.flush()
+    j.stage()
+    j.mark_done("cs1", "ingest", "v1", meta={"asset_id": "a"})
+    assert j.is_done("cs1", "ingest", "v1") is True
+    assert j.get("cs1", "ingest")["meta"]["asset_id"] == "a"
+    j.flush()
+    assert Journal.load(tmp_path).is_done("cs1", "ingest", "v1") is False
+    j.commit_staged()
+    j.flush()
+    assert Journal.load(tmp_path).is_done("cs1", "ingest", "v1") is True
+
+
+def test_journal_discard_staged_drops_marks_and_clears(tmp_path: Path):
+    j = Journal.load(tmp_path)
+    j.mark_done("cs1", "clip", "v1")
+    j.flush()
+    j.stage()
+    j.mark_done("cs1", "faces", "v1")
+    j.clear_worker("cs1", "clip")
+    assert j.is_done("cs1", "clip", "v1") is False
+    j.discard_staged()
+    assert j.is_done("cs1", "clip", "v1") is True
+    assert j.is_done("cs1", "faces", "v1") is False
+
+
+def test_journal_staged_clear_applies_on_commit(tmp_path: Path):
+    j = Journal.load(tmp_path)
+    j.mark_done("cs1", "clip", "v1")
+    j.mark_done("cs1", "faces", "v1")
+    j.flush()
+    j.stage()
+    j.clear_worker("cs1", "clip")
+    j.commit_staged()
+    j.flush()
+    j2 = Journal.load(tmp_path)
+    assert j2.is_done("cs1", "clip", "v1") is False
+    assert j2.is_done("cs1", "faces", "v1") is True
+
+
+def test_journal_stage_discards_leftover_uncommitted_marks(tmp_path: Path):
+    """An exception mid-asset leaves staged marks behind; the next asset's
+    `stage()` must start clean so they can never be promoted later."""
+    j = Journal.load(tmp_path)
+    j.stage()
+    j.mark_done("ghost", "clip", "v1")
+    j.stage()
+    j.commit_staged()
+    j.flush()
+    assert Journal.load(tmp_path).entries == {}
+
+
 def test_journal_load_tolerates_malformed_entries(tmp_path: Path):
     # A version-less or non-dict record should be silently dropped, not
     # crash the loader. A corrupted entry just re-runs its phase.
@@ -104,6 +161,24 @@ def _make_conn(asset_uuid: str = "uuid-x") -> tuple[MagicMock, MagicMock]:
     cur.__enter__.return_value = cur
     cur.__exit__.return_value = False
     cur.fetchone.return_value = (asset_uuid,)
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def _make_existing_conn(asset_uuid: str = "uuid-x") -> tuple[MagicMock, MagicMock]:
+    """Mock conn modelling a resumed run: the asset row already exists, so
+    `INSERT … ON CONFLICT DO NOTHING RETURNING id` yields no row and the
+    follow-up SELECT resolves `asset_uuid`. (`_make_conn` answers every
+    fetchone with a row, i.e. models a fresh insert each run — and a
+    (re)inserted row correctly invalidates the journal's cached phases.)"""
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    last = {"sql": ""}
+    cur.execute.side_effect = lambda sql, params=None: last.__setitem__("sql", sql)
+    cur.fetchone.side_effect = lambda: (
+        None if "INSERT INTO asset (" in last["sql"] else (asset_uuid,))
     conn.cursor.return_value = cur
     return conn, cur
 
@@ -139,7 +214,7 @@ def test_process_trip_skips_caption_when_journal_says_done(
     """
     target = tmp_path / "dji-srt-pair"
     shutil.copytree(FIXTURES / "dji-srt-pair", target)
-    conn, _ = _make_conn()
+    conn, _ = _make_existing_conn()
 
     # Stand in for derivatives so the caption gate downstream sees a
     # preview file. Captions don't strictly require a preview (they fall
@@ -274,9 +349,9 @@ def test_process_trip_recaption_ignores_journal(tmp_path: Path, monkeypatch):
 
 def test_process_trip_resumes_after_simulated_crash(tmp_path: Path, monkeypatch):
     """End-to-end resume: copy a 1-asset trip, run process once, simulate
-    a crash by deleting only the DB-side state (mock conn), keep the
-    journal + staged derivatives, run again, assert the second run skips
-    derivatives via the journal-cached path.
+    a crash/restart with a fresh connection on which the committed asset
+    row still exists, keep the journal + staged derivatives, run again,
+    assert the second run skips derivatives via the journal-cached path.
     """
     target = tmp_path / "dji-srt-pair"
     shutil.copytree(FIXTURES / "dji-srt-pair", target)
@@ -312,7 +387,8 @@ def test_process_trip_resumes_after_simulated_crash(tmp_path: Path, monkeypatch)
     # Second pass with a fresh mock conn: derivatives must NOT recompute
     # because the journal says done at DERIVATIVES_VERSION and the
     # staged file still exists.
-    conn2, cur2 = _make_conn(asset_uuid="uuid-x")
+    asset_id = next(iter(Journal.load(target).entries.values()))["ingest"]["meta"]["asset_id"]
+    conn2, cur2 = _make_existing_conn(asset_uuid=asset_id)
     process_mod.process_trip(
         target, conn2, LIB, compute_derivatives=True,
         compute_clip=False, compute_faces=False,
@@ -357,7 +433,8 @@ def test_process_trip_reruns_derivatives_when_staged_files_missing(
     # Wipe the staged dir but keep the journal.
     staged.unlink()
 
-    conn2, _ = _make_conn(asset_uuid="uuid-x")
+    asset_id = next(iter(Journal.load(target).entries.values()))["ingest"]["meta"]["asset_id"]
+    conn2, _ = _make_existing_conn(asset_uuid=asset_id)
     process_mod.process_trip(
         target, conn2, LIB, compute_derivatives=True,
         compute_clip=False, compute_faces=False,

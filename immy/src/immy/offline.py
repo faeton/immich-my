@@ -28,6 +28,7 @@ Offline runs read that. If absent, the user is told to run online once.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -36,11 +37,12 @@ import uuid
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterator, Protocol
+from typing import Any, ContextManager, Iterator, Protocol
 
 import numpy as np
 import psycopg
 import yaml
+from psycopg import pq
 
 from . import pg as pg_mod
 from . import video as video_mod
@@ -163,6 +165,7 @@ class Sink(Protocol):
     def record_derivatives(self, asset_id: str, derivatives: list[dict]) -> None: ...
     def record_transcript(self, asset_id: str, info: dict) -> None: ...
     def record_caption(self, asset_id: str, info: dict) -> None: ...
+    def savepoint(self) -> ContextManager[Any]: ...
     def commit(self) -> None: ...
     def rollback(self) -> None: ...
     def close(self) -> None: ...
@@ -258,6 +261,14 @@ WHERE "assetId" = %(asset_id)s
        OR lower(description) = 'default' OR description LIKE 'DCIM%%'
        OR description = %(file_name)s OR description = %(file_stem)s)
 """
+
+
+class TransactionAborted(RuntimeError):
+    """The asset's transaction was aborted by an earlier failed statement.
+
+    Postgres answers COMMIT on an aborted transaction with a silent
+    ROLLBACK (psycopg's `commit()` does not raise), so committing anyway
+    would drop the whole asset while the caller believes it landed."""
 
 
 class PgSink:
@@ -388,7 +399,18 @@ class PgSink:
     def faces_recorded(self, asset_id: str) -> bool:
         return False
 
+    def savepoint(self) -> ContextManager[Any]:
+        """Isolate one enricher's writes. Inside the asset's open
+        transaction psycopg emits SAVEPOINT; an exception in the block rolls
+        back to it (healing an aborted transaction) and re-raises, so a
+        failed CLIP/faces/caption statement can't poison the asset row."""
+        return self.conn.transaction()
+
     def commit(self) -> None:
+        if self.conn.info.transaction_status == pq.TransactionStatus.INERROR:
+            raise TransactionAborted(
+                "transaction aborted by an earlier failed statement; "
+                "refusing to COMMIT (Postgres would silently roll back)")
         self.conn.commit()
 
     def rollback(self) -> None:
@@ -707,8 +729,16 @@ class OfflineSink:
         entry = self._entry_or_none(asset_id)
         return bool(entry and entry.get("faces"))
 
+    def savepoint(self) -> ContextManager[Any]:
+        # No transaction to scope: each write above lands on disk (atomic
+        # tmp + rename) before it returns, so a failed phase simply never
+        # reaches its journal mark.
+        return contextlib.nullcontext()
+
     def commit(self) -> None:
         # Entries were already flushed per-phase; nothing further needed.
+        # The caller promotes its staged journal marks after this returns,
+        # i.e. only once the cache entry they describe is on disk.
         pass
 
     def rollback(self) -> None:
