@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from immy.exif import ExifRow
 from immy.rules.bloat_candidate import _propose

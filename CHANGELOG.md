@@ -4,6 +4,25 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — docs drift + ruff baseline
+
+### Changed
+
+- Docs now describe the live deployment: **n5 (TrueNAS SCALE), Immich 3.0.2**.
+  `DEPLOY.md` carries a current-deployment banner and marks the DS923+ layout as
+  history; `ARCHITECTURE.md`, `README.md`, `TESTING.md`, `SIDECAR.md`,
+  `LANDSCAPE.md` no longer call the Synology the primary (it remains the **vv**
+  cold-backup target). `IMMICH-INGEST.md` is retitled as a v2.7.5 schema reading
+  with 3.0.2 deltas called out. README "Known gaps" drops shipped items
+  (`similar`, `apple-people --apply`, `doctor`, `status`).
+- **ruff** added to the dev group with a `[tool.ruff.lint]` baseline of
+  pyflakes `F` + `E9`. Findings fixed in `src/` and `tests/` with no behaviour
+  change: unused imports/locals, placeholder-less f-strings, and the genuine
+  `F821` in `transcripts.py` (`Callable` was never imported; annotation-only, so
+  harmless at runtime thanks to `from __future__ import annotations`).
+  `process.pg_mod` is kept (`# noqa: F401`) because tests patch it by dotted path.
+  `uv.lock` was updated with `--no-sync` (the `insightface` build fails on n5).
+
 ## 2026-10-02 — security: servers bind loopback, API key off the command line
 
 ### Security

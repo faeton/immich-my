@@ -5,16 +5,15 @@ test is a **golden path** (happy case) plus at least one **failure mode** that
 exercises the thing the phase was supposed to protect against.
 
 Conventions:
-- `${NAS_HOST}` = the DS923+ over Tailscale.
+- `${NAS_HOST}` = n5 (TrueNAS SCALE) over Tailscale.
 - `${MAC_HOST}` = the MacBook / ML node.
-- Commands run on the NAS use the full docker path (`/usr/local/bin/docker`)
-  because DSM's default shell `$PATH` doesn't include it.
+- Commands run on n5 may need `sudo docker` (the user is not in the docker group).
 
 ## Phase 0 — Base stack
 
 | # | Test | Pass criteria |
 |---|---|---|
-| 0.1 | Containers healthy after host reboot | `docker compose ps` from `${DOCKER_ROOT}` shows all four containers `healthy` after a full DSM reboot, without manual intervention. |
+| 0.1 | Containers healthy after host reboot | `docker compose ps` from `${DOCKER_ROOT}` shows all four containers `healthy` after a full host reboot, without manual intervention. |
 | 0.2 | Web UI reachable over Tailscale | `${IMMICH_URL}` loads the Immich login in < 3 s from the Mac and iPhone. |
 | 0.3 | Admin account sign-in works | Can log in with the account created at first boot; no banner warnings in Admin → Server Stats. |
 | 0.4 | iOS app round-trip | From the Immich iOS app, point at the Tailscale URL, log in, take one photo, trigger backup. Photo appears in web UI timeline within 60 s. |
@@ -38,9 +37,9 @@ against the real NAS PG whenever a Y slice lands.
 
 | # | Test | Pass criteria |
 |---|---|---|
-| Y.1 | `immy process` inserts idempotent rows | ✅ Unit: `sha1("path:"+abs)` is 20 bytes and matches the handwritten spec; `build_rows` populates owner/library/type/checksum/dates from fixtures; `insert_asset` emits two `execute` calls (asset then exif) with the right params; on checksum conflict the exif INSERT is suppressed. CLI: `--dry-run` touches no cursor and writes no marker; real run commits, drops `.audit/y_processed.yml`, and re-run reports "0 new, 1 already present". Promote: with marker present, `fake.scan_library` is never called. Smoke-tested against the DS923+ PG with the DJI fixture — row + exif + GPS all landed as expected. |
+| Y.1 | `immy process` inserts idempotent rows | ✅ Unit: `sha1("path:"+abs)` is 20 bytes and matches the handwritten spec; `build_rows` populates owner/library/type/checksum/dates from fixtures; `insert_asset` emits two `execute` calls (asset then exif) with the right params; on checksum conflict the exif INSERT is suppressed. CLI: `--dry-run` touches no cursor and writes no marker; real run commits, drops `.audit/y_processed.yml`, and re-run reports "0 new, 1 already present". Promote: with marker present, `fake.scan_library` is never called. Smoke-tested against the live Immich PG with the DJI fixture — row + exif + GPS all landed as expected. |
 | Y.2 | Thumbnail + preview derivatives | ✅ Unit: `relative_path_for` produces Immich's 2+2 bucketed `thumbs/<userId>/<xx>/<yy>/<id>_{thumbnail.webp,preview.jpeg}`; `compute_for_asset` writes real pyvips output at 250 px (WebP) / 1440 px (JPEG progressive) and skips VIDEO types. `process_trip(compute_derivatives=True)` stages files only for newly-inserted IMAGE rows; checksum conflicts don't restage. Marker extension round-trips through `read_marker`. Promote: `_push_derivatives` rsyncs `.audit/derivatives/` into `media.host_root`, then UPSERTs `asset_file` with `path = media.container_root + /thumbs/...` via two execs per asset; rsync error propagates as `status=error`. 14 unit tests (133 total passing). |
-| Y.3 | CLIP `smart_search` row | ✅ Unit: model-name mapping, lazy cache, L2 normalization, pgvector literal rendering, smart-search dimension read, and UPSERT SQL. Process coverage verifies `compute_clip` requires derivatives and records marker/journal state. Hardware smoke on DS923+ PG confirmed CLIP rows for image assets. |
+| Y.3 | CLIP `smart_search` row | ✅ Unit: model-name mapping, lazy cache, L2 normalization, pgvector literal rendering, smart-search dimension read, and UPSERT SQL. Process coverage verifies `compute_clip` requires derivatives and records marker/journal state. Hardware smoke on the live Immich PG confirmed CLIP rows for image assets. |
 | Y.4 | Faces | ✅ Unit: face-detection/embedding write paths, ML face replacement, user-tagged face preservation, pgvector literal rendering, and journal caching. Hardware smoke confirmed `asset_face` + `face_search` rows appear and People panel can use them. |
 | Y.5 | Video proxy | ✅ Unit: ffprobe metadata, rotation handling, poster extraction, encoded-video relative paths, derivative marker payloads, and promote-side `asset_file` UPSERT. Hardware smoke confirmed video duration/dimensions and playable encoded video. |
 | Y.6 | Accelerator uninstalled | ✅ Manual smoke: `immich-accelerator` was uninstalled 2026-04-20, then a fresh test trip processed/promoted with `immy` alone. Current maintenance task: add `immy doctor` schema/version probes before direct DB writes. |
@@ -185,9 +184,8 @@ the authoritative check is always the command above.
 ## Ad-hoc smoke checks (any time)
 
 - `docker compose ps` on `${NAS_HOST}` — all 4 containers `healthy`.
-- `df -h /volume1` — headroom left (flag at < 20 %).
-- `${SHARED_LIBRARY}/` free-space trend (graph in DSM Resource
-  Monitor) — not growing unexpectedly fast.
+- `df -h /mnt/tank` — headroom left (flag at < 20 %).
+- `${SHARED_LIBRARY}/` free-space trend (TrueNAS Reporting graph) — not growing unexpectedly fast.
 - `docker compose logs immich-server --since 1h | grep -i error` — empty.
 - One manual photo upload round-trip, then delete.
 
@@ -195,7 +193,7 @@ the authoritative check is always the command above.
 
 - **Cold restore.** Spin up a scratch NAS/VM, restore the latest `pg_dumpall`
   + `library/` tarball, confirm Immich comes up with faces + albums intact.
-- **Mac died, buy new one.** Pretend the Mac is gone. Confirm the Syno-only
+- **Mac died, buy new one.** Pretend the Mac is gone. Confirm the NAS-only
   path still serves browsing, search, upload. (Phase 1 fallback path.)
 - **Ransomware-ish.** Delete a day's folder under `library/`. Confirm Hyper
   Backup / external snapshot can restore just that folder.

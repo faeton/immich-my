@@ -26,7 +26,7 @@ import subprocess
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path, PurePosixPath
-from typing import Callable, Iterable, Sequence
+from typing import Callable, Sequence
 
 from .. import clip as clip_mod
 from ..dedup import manifest as manifest_mod

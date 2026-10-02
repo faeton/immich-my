@@ -93,7 +93,7 @@ def build_plan(folder: Path, config: Config) -> Plan:
     if config.originals_root is None:
         raise RuntimeError(
             "originals_root not configured. Set `originals_root:` in "
-            f"~/.immy/config.yml (or $IMMY_CONFIG)."
+            "~/.immy/config.yml (or $IMMY_CONFIG)."
         )
 
     rows = read_folder(folder)

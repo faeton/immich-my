@@ -4,7 +4,6 @@ orphans that have no local source)."""
 
 from __future__ import annotations
 
-from pathlib import Path
 
 from unittest.mock import MagicMock
 

@@ -8,10 +8,7 @@ are faked.
 
 from __future__ import annotations
 
-import shutil
-import struct
 import subprocess
-import zlib
 from pathlib import Path
 from unittest.mock import MagicMock
 

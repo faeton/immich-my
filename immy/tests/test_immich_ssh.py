@@ -107,7 +107,6 @@ def test_no_ssh_host_keeps_urllib_path(monkeypatch):
     def forbidden(*a, **k):
         raise AssertionError("subprocess.run must not run on the urllib path")
     monkeypatch.setattr(subprocess, "run", forbidden)
-    calls = []
     monkeypatch.setattr(
         ImmichClient, "_request_ssh",
         lambda self, *a, **k: (_ for _ in ()).throw(

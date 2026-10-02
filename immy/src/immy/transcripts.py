@@ -22,6 +22,7 @@ from __future__ import annotations
 import re
 import shutil
 import subprocess
+from collections.abc import Callable
 from pathlib import Path
 
 from . import video as video_mod
@@ -370,7 +371,7 @@ def transcribe(
     prompt: str | None = None,
     backend: str = "mlx",
     endpoint: str | None = None,
-    sidecar_path: "Callable[[Path, str], Path] | None" = None,
+    sidecar_path: Callable[[Path, str], Path] | None = None,
 ) -> TranscriptResult | HallucinationOnly | None:
     """Transcribe one video; write the .srt sidecar; return the excerpt.
 

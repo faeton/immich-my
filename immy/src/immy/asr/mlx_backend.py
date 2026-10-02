@@ -94,7 +94,6 @@ class MlxWhisperBackend:
         language: str | None,
         prompt: str | None,
     ) -> BackendTranscript:
-        from .. import transcripts as t
         from .plan import build_speech_plan
 
         _require_mlx_whisper()

@@ -24,7 +24,6 @@ from immy.clustering import (
     extract_cluster_key,
     haversine_km,
     name_for_cluster,
-    stable_key_for_cluster,
 )
 
 

@@ -237,7 +237,7 @@ def test_trip_gps_anchor_applies_to_all_gps_less_files(trip_anchor_fixture: Path
 
 def test_interactive_prompt_writes_coords_to_notes(trip_anchor_fixture: Path):
     # Strip coords from the fixture's TRIP.md; simulate the "no anchor yet" case.
-    from immy.notes import parse_frontmatter, update_frontmatter
+    from immy.notes import parse_frontmatter
     notes = trip_anchor_fixture / "TRIP.md"
     import yaml
     text = notes.read_text()

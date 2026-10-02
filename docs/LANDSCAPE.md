@@ -76,7 +76,7 @@ Sources:
   broader Apple Silicon optimisation: ML + VideoToolbox + Core Image thumbs.
 - [`immich_ml_balancer`](https://github.com/apetersson/immich_ml_balancer) —
   load-balance multiple ML workers, so the Mac can be a burst accelerator
-  while the Syno CPU worker is the always-on fallback.
+  while the n5 CPU worker is the always-on fallback.
 
 These are unofficial but real and actively used. Low risk because they're
 stateless HTTP workers.

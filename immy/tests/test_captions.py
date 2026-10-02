@@ -5,7 +5,6 @@ tests depending on a running LM Studio / network)."""
 from __future__ import annotations
 
 import base64
-import json
 from pathlib import Path
 from unittest.mock import patch
 

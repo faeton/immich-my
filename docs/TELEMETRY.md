@@ -50,7 +50,7 @@ locks them — the only channel that holds.
 
 ## Why we reverse-geocode ourselves
 
-Immich v2.7.5 only reverse-geocodes coordinates it reads **fresh from a file**
+Immich (read at v2.7.5; re-verify on 3.x) only reverse-geocodes coordinates it reads **fresh from a file**
 (`metadata.service.ts`: `if (hasGeo(fileExif))`), never the value already in the
 DB. Our drone videos have no file GPS and the originals are read-only — so **no
 Immich path will ever geocode them** (refresh skips the GPS block for locked

@@ -7,7 +7,6 @@ without a server; the live contract is verified separately against the NAS.
 
 from __future__ import annotations
 
-import io
 import json
 from pathlib import Path
 

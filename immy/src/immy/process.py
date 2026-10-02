@@ -43,13 +43,13 @@ from . import faces as faces_mod
 from . import insta360 as insta360_mod
 from . import journal as journal_mod
 from . import offline as offline_mod
-from . import pg as pg_mod
+from . import pg as pg_mod  # noqa: F401  (tests patch immy.process.pg_mod.*)
 from . import raw as raw_mod
 from . import sidecar as sidecar_mod
 from . import transcripts as transcripts_mod
 from . import video as video_mod
 from .derivatives import DerivativeFile
-from .exif import ExifRow, MEDIA_EXTS, read_folder
+from .exif import ExifRow, read_folder
 from .heartbeat import Heartbeat
 from .journal import Journal
 from .offline import Sink

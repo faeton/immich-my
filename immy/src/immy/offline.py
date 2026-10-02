@@ -33,8 +33,7 @@ import json
 import os
 import tempfile
 import time
-import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, ContextManager, Iterator, Protocol
@@ -885,12 +884,12 @@ def sync_trip(
             # captions command and the sync command run concurrently.
             fresh = _load_entry(yml_path)
             if not fresh or _content_changed(data, fresh):
-                _emit(f"    → synced (entry changed underfoot; re-sync next pass)")
+                _emit("    → synced (entry changed underfoot; re-sync next pass)")
                 continue
             data["synced"] = True
             data["synced_at"] = int(time.time())
             _dump_entry(yml_path, data)
-            _emit(f"    → synced")
+            _emit("    → synced")
         except Exception as exc:
             conn.rollback()
             failed += 1

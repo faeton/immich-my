@@ -12,7 +12,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import pytest
 
 from immy import bloat as bloat_mod
 

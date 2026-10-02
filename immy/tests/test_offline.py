@@ -18,7 +18,6 @@ import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 import yaml
 
 from immy import captions as captions_mod

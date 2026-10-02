@@ -285,7 +285,6 @@ def test_promote_drains_offline_cache_when_pending(
 
     # pg_mod.connect raises — simulates tailnet down. promote must not
     # crash, and must surface the failure in its summary.
-    from immy import promote as promote_mod
     monkeypatch.setattr(
         "immy.promote.pg_mod.connect",
         lambda cfg: (_ for _ in ()).throw(RuntimeError("tailnet down")),

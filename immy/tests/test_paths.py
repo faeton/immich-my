@@ -9,8 +9,6 @@ nothing lands under the (read-only) originals.
 
 from __future__ import annotations
 
-import os
-import stat
 from pathlib import Path
 
 from immy.paths import resolve_writable_paths

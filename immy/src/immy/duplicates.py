@@ -359,7 +359,7 @@ def _human_bytes(n: int) -> str:
 def render_markdown(summary: ScanSummary, root: Path) -> str:
     """Render the full Markdown report — summary + per-tier tables."""
     lines: list[str] = []
-    lines.append(f"# Duplicate scan report")
+    lines.append("# Duplicate scan report")
     lines.append("")
     lines.append(f"- Root: `{root}`")
     lines.append(f"- Files scanned: {summary.files_scanned:,}")

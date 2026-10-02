@@ -12,7 +12,6 @@ import shutil
 from pathlib import Path
 from unittest.mock import MagicMock
 
-import pytest
 
 from immy import journal as journal_mod
 from immy import process as process_mod
@@ -193,7 +192,6 @@ def test_process_trip_marks_ingest_in_journal(tmp_path: Path):
     assert len(results) == 1
     j = Journal.load(target)
     # The ingest entry uses the path-checksum hex as key.
-    cs_hex = results[0].container_path  # rebuild from the result instead
     # Easier: just check journal has exactly one entry with an "ingest"
     # worker referencing the inserted asset id.
     assert len(j.entries) == 1

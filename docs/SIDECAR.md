@@ -37,12 +37,12 @@ hosts. For the broader architecture and phased rollout, see
 
 - One Python package (`sidecar/`), many entry points. Each worker is a
   long-running process; they coordinate only through the database.
-- State lives in a dedicated `sidecar` database on the Syno's existing
+- State lives in a dedicated `sidecar` database on the NAS's existing
   Postgres instance — the same server Immich uses, a different database.
 - No `pgvector` in the sidecar DB. CLIP and face embeddings stay in
   Immich's own tables where pgvector already lives; the sidecar pushes
   results to Immich via REST.
-- Mac workers reach the DB over Tailscale. Syno-side workers reach it
+- Mac workers reach the DB over Tailscale. NAS-side (n5) workers reach it
   over the docker network.
 
 ## `immy` — metadata forensics CLI
@@ -678,7 +678,7 @@ over SMB → open `.insv` in Insta360 Studio → re-export → drop result into
 
 Considered and rejected:
 
-- **SQLite on the Mac.** Syno-side fallback workers (stock Immich CPU
+- **SQLite on the Mac.** NAS-side (n5) fallback workers (stock Immich CPU
   ML, watcher, non-Metal workers) can't reach it. Mac sleep makes the
   queue unreachable. Non-starter.
 - **A second Postgres container.** Pure ops burden — another instance
@@ -690,7 +690,7 @@ Considered and rejected:
 
 The separate-database option keeps a single Postgres process but
 isolates the sidecar's schema, backups (`pg_dump sidecar`), and
-migrations. Mac → Syno connectivity is already solved by Tailscale
+migrations. Mac → n5 connectivity is already solved by Tailscale
 (Phase 0 is Tailscale-first).
 
 ## Schema
@@ -813,16 +813,16 @@ points. Split by host along the Metal line:
 
 | Process | Host | Purpose |
 |---|---|---|
-| `sidecar-watcher` | Syno | Inbox poller. Enqueues `preview_extractor` + `bloat_detector` |
-| `sidecar-worker preview_extractor` | Syno | exiftool header read, embedded JPEG / LRV harvest |
-| `sidecar-worker bloat_detector` | Syno | bits/pixel/frame scoring — detection only, no transcode |
+| `sidecar-watcher` | n5 | Inbox poller. Enqueues `preview_extractor` + `bloat_detector` |
+| `sidecar-worker preview_extractor` | n5 | exiftool header read, embedded JPEG / LRV harvest |
+| `sidecar-worker bloat_detector` | n5 | bits/pixel/frame scoring — detection only, no transcode |
 | `sidecar-worker transcoder` | Mac | `hevc_videotoolbox`, only after per-folder confirm (see [feedback_transcode_confirm](../)) |
 | `sidecar-worker whisper` | Mac | `whisper.cpp` Metal → `.srt` sidecar |
 | `sidecar-worker captioner` | Mac | local VLM via LM Studio (Gemma / Qwen-VL) → description prefix |
 | `sidecar-worker clip_sync`, `face_sync` | Mac | Push embeddings/results to Immich via REST |
-| `sidecar-web` | Syno | FastAPI: `/gap` + `/transcode` confirm UIs |
+| `sidecar-web` | n5 | FastAPI: `/gap` + `/transcode` confirm UIs |
 
-Syno processes ship as a second docker-compose project alongside
+n5 processes ship as a second docker-compose project alongside
 `${COMPOSE_PROJECT}`. Mac processes start under `launchd` so they survive reboots
 and respect sleep/wake. All read the same `DATABASE_URL`.
 

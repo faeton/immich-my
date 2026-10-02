@@ -1,6 +1,6 @@
-# Immich v2.7.5 Ingest Pipeline — Reference for Phase Y (Sidecar Pre-Ingest)
+# Immich Ingest Pipeline (schema as of v2.7.5; live 3.0.2) — Reference for Phase Y (Sidecar Pre-Ingest)
 
-> **Reference doc.** Exhaustive Immich v2.7.5 DB schema + ingest pipeline, used when implementing/maintaining direct-to-Postgres writes. Skip for onboarding — read [ARCHITECTURE.md](ARCHITECTURE.md) first.
+> **Reference doc.** Exhaustive Immich DB schema (v2.7.5 reading, with 3.0.2 deltas in the note below) + ingest pipeline, used when implementing/maintaining direct-to-Postgres writes. Skip for onboarding — read [ARCHITECTURE.md](ARCHITECTURE.md) first.
 
 > Working reference for `immy` direct-write Y.1–Y.5. All citations are to
 > `immich-app/immich@v2.7.5` on GitHub, and to the local `immich-accelerator`

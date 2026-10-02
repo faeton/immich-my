@@ -33,10 +33,8 @@ from typing import Iterable
 
 from .exif import ExifRow, read_folder
 from .rules.bloat_candidate import (
-    HEVC_FAT_BPP,
     PRESERVE_EXTS,
     VIDEO_EXTS,
-    _codec,
     _is_insta360,
     _num,
     _preserve_by_folder,

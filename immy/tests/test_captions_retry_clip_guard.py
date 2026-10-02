@@ -417,7 +417,6 @@ def test_offline_prior_caption_with_other_hash_is_regenerated(tmp_path, monkeypa
 
 
 def _sync_with_clip(tmp_path, monkeypatch, provenance, immich_model):
-    import numpy as np
     from immy import offline as offline_mod
     target = tmp_path / "dji-srt-pair"
     shutil.copytree(FIXTURES / "dji-srt-pair", target)

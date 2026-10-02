@@ -1,10 +1,21 @@
 # Deploy — Phase 0 Layout
 
+> **Current deployment (2026-10): n5, not the Synology.** Immich 3.0.2 runs on
+> **n5** (TrueNAS SCALE, ZFS) as the TrueNAS-managed `ix-immich` app. immy runs
+> beside it as a standalone compose project under `/mnt/flash/immy` joined to
+> `ix-immich_default` — see [`immy/deploy/n5/README.md`](../immy/deploy/n5/README.md);
+> nightly backup to **vv** (a Synology, cold backup target) is in
+> [`immy/deploy/n5/backup/README.md`](../immy/deploy/n5/backup/README.md). Postgres is
+> published on the host at `15432` (internal `5432`). The sections below are the
+> original **Phase 0 Synology DS923+ layout**, kept as history: the DSM / Container
+> Manager / `/volume1` / Synology-Tailscale / Hyper Backup specifics no longer
+> describe the live system.
+
 Example self-hosted layout for this project. Public docs use `${...}`
 placeholders from the repo-root `.env.example`; copy that file to `.env`
 locally if you want shell snippets here to expand cleanly.
 
-## Host
+## Host (historical: Synology DS923+, pre-n5)
 
 - Synology DS923+, DSM 7.2+, Container Manager installed.
 - NVMe slots: **SSD read/write cache** (`md3`, RAID1) in front of `/volume1`.

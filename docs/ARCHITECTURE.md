@@ -1,6 +1,6 @@
 # Architecture
 
-State lives on the Synology. Compute is replaceable. The browse path never
+State lives on the NAS (n5, TrueNAS SCALE; formerly a Synology DS923+). Compute is replaceable. The browse path never
 touches remote originals. Enrichment is idempotent and queue-based.
 
 ## Components
@@ -27,7 +27,7 @@ touches remote originals. Enrichment is idempotent and queue-based.
                        └──────────┬─────────────────────────────┘
                                   │ HTTP (Immich REST) + SMB (library)
                                   ▼
-┌───────────────────── DS923+ (always on) ──────────────────────┐
+┌───────────────────── n5 NAS (always on) ──────────────────────┐
 │                                                              │
 │  Immich server (web UI + API + jobs)                         │
 │  Postgres (catalog, pgvector, faces, events)                 │
@@ -35,15 +35,13 @@ touches remote originals. Enrichment is idempotent and queue-based.
 │  Nominatim (reverse geocoding)                               │
 │                                                              │
 │  Storage layout:                                             │
-│    /volume1/library/inbox/        (writeable, polled)        │
-│    /volume1/library/originals/    (read-only external lib)   │
-│    /volumeNVMe/immich/thumbs/     (derivatives)              │
-│    /volumeNVMe/immich/proxies/    (H.264 proxies)            │
-│    /volumeNVMe/immich/transcripts/                           │
-│    /volumeNVMe/postgres/          (chattr +C, BTRFS no-CoW)  │
+│    /mnt/tank/media/…              (ZFS: originals, library)  │
+│    /mnt/flash/immy/{state,sidecars}  (immy state, NVMe pool) │
+│    Immich thumbs/encoded-video/   (derivatives, ix-immich)   │
+│    Postgres                       (ix-immich app dataset)    │
 │                                                              │
 │  Fallback ML: Immich's stock CPU ML container (always on)    │
-│  Immich ML URL → balanced: Mac primary, Syno fallback        │
+│  Immich ML URL → balanced: Mac primary, n5 fallback        │
 │                                                              │
 └──────────────────────────────────────────────────────────────┘
 ```
@@ -52,8 +50,8 @@ touches remote originals. Enrichment is idempotent and queue-based.
 
 | Tier | Where | What lives there | Readable when Mac asleep? |
 |---|---|---|---|
-| 0 — hot | Syno NVMe pool | thumbs, proxies, transcripts, captions, embeddings, Postgres | ✅ |
-| 1 — originals | Syno HDD pool, NAS over SMB, external drives, rclone | untouched originals | ✅ if mounted |
+| 0 — hot | n5 NVMe pool (`flash`) | thumbs, proxies, transcripts, captions, embeddings, Postgres | ✅ |
+| 1 — originals | n5 HDD pool (`tank`), NAS over SMB, external drives, rclone | untouched originals | ✅ if mounted |
 | 2 — cold / offline | Unplugged drives, S3 archive | catalog stubs only (ghost assets) | ✅ browse only |
 
 Rule: after first ingest, **originals are never re-read for browsing**. Only
@@ -109,7 +107,7 @@ fingerprint; full-file hash only on explicit dedup sweeps.
 - On the Mac: `immich-ml-metal` runs **Apple Vision** for detection (on ANE,
   essentially free) and **CoreML ArcFace** for embeddings (10–50× vs Ryzen R1600).
 - First backfill: run on the Mac. 50k photos ≈ 1 hour.
-- Steady state: new photos embed in seconds either on Mac or Syno CPU fallback.
+- Steady state: new photos embed in seconds either on Mac or n5 CPU fallback.
 
 ## AI enrichment
 
@@ -119,10 +117,10 @@ via Immich REST. Idempotent — re-running is a no-op.
 
 | Worker | Input | Output | Backend |
 |---|---|---|---|
-| CLIP embedder | poster frame | 768-d vector → smart-search | MLX on Mac, ONNX on Syno |
+| CLIP embedder | poster frame | 768-d vector → smart-search | MLX on Mac, ONNX on n5 |
 | Whisper | proxy audio track | `.srt` sidecar + description | `whisper.cpp` Metal on Mac |
 | Captioner | poster frame | description prefix "AI: …" | local VLM via LM Studio (Gemma / Qwen-VL), any OpenAI-compat backend |
-| Face detect + embed | poster frame | faces table | Apple Vision + ArcFace on Mac, InsightFace on Syno |
+| Face detect + embed | poster frame | faces table | Apple Vision + ArcFace on Mac, InsightFace on n5 |
 
 ## Drone telemetry (SRT)
 
@@ -141,7 +139,7 @@ video container. `immy srt` parses it and lands the data in Immich — see
 
 ## Event clustering
 
-- Nightly cron on the Mac or Syno.
+- Nightly cron on the Mac or n5.
 - Pulls all assets via `/api/search/metadata`.
 - DBSCAN on `(unix_timestamp_scaled, lat, lon)` with ε tuned so that typical
   trips become single clusters (≈ 6 h time, ≈ 30 km space).
@@ -178,7 +176,7 @@ Unique advantage vs stock Immich: 20 TB of archive drives stay searchable.
 - Jobs keyed by `(asset_checksum, worker_name, worker_version)`.
 - Workers can die, drives can unmount, the Mac can sleep — on resume the queue
   picks up where it left off.
-- Mac unavailable? Workers that require Metal pause; Syno CPU workers
+- Mac unavailable? Workers that require Metal pause; n5 CPU workers
   (Immich stock ML) continue at lower throughput. No lost jobs.
 
 ## Sync to Immich

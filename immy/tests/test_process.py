@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import MagicMock
 
@@ -828,7 +828,6 @@ def test_process_cli_errors_without_pg_config(tmp_path, monkeypatch):
 
 def test_promote_skips_scan_when_marker_present(config_full, tmp_path, monkeypatch):
     """With `.audit/y_processed.yml`, promote must NOT POST to /scan."""
-    from immy import immich as immich_mod
     from immy import promote as promote_mod
 
     target = tmp_path / "dji-srt-pair"

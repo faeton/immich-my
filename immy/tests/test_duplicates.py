@@ -11,7 +11,6 @@ import hashlib
 import os
 from pathlib import Path
 
-import pytest
 
 from immy import duplicates as dup
 from immy import snapshot as snap
