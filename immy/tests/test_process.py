@@ -864,6 +864,11 @@ def test_promote_skips_scan_when_marker_present(config_full, tmp_path, monkeypat
     monkeypatch.setattr(
         promote_mod, "_sync_album",
         lambda *a, **kw: {"name": "dji-srt-pair", "status": "skipped"})
+    # ...nor the schema preflight / any other promote write connection:
+    # Postgres "down" (those steps fail open by design).
+    def _pg_down(cfg):
+        raise OSError("pg unreachable (test stub)")
+    monkeypatch.setattr(pg_mod, "connect", _pg_down)
 
     result = runner.invoke(app, ["promote", str(target)])
     assert result.exit_code == 0, result.stdout
