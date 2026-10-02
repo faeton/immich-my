@@ -4,6 +4,29 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — face→person links, promote path scope, trash status
+
+### Fixed
+
+- **Re-running faces orphaned people.** `replace_asset_faces` deleted every
+  `machine-learning` face on the asset — including the ones Immich had linked
+  to a person (68,919 of 93,470 in the live library) — and re-inserted them
+  unassigned. Faces with a `personId` are now never deleted; only unassigned
+  ML faces are replaced, and a new detection overlapping a kept person face
+  (IoU ≥ 0.5, normalized coords) is skipped so the person keeps exactly one
+  face there.
+- **`promote` album sync / `repair-thumbs` matched other trips.** The trip
+  path went into `LIKE` unescaped, so `_`/`%` in a folder name were
+  wildcards (`2024_06-x` also hit `2024-06-x`), and rows with a NULL
+  `libraryId` were admitted. The prefix is now escaped (`pg.like_prefix`,
+  `ESCAPE '\'`) and every query is scoped to the configured library only.
+- **Un-trashed assets stayed hidden.** Immich 3.x tracks trash in
+  `asset.status` (`active|trashed|deleted`) as well as `deletedAt`; promote's
+  un-offline / `--resurrect-deleted` UPDATEs cleared only `deletedAt`, leaving
+  `status='trashed'`. They now set `status='active'`, never touch rows already
+  `deleted` (pending hard-delete), and the album list / skipped-trash count
+  account for `status`.
+
 ## 2026-10-02 — `process`: transaction + journal atomicity
 
 ### Fixed

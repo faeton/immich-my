@@ -762,6 +762,10 @@ def _sync_album(
     clearing it would resurrect assets the user soft-deleted in the Immich
     UI, silently undoing an explicit action. Pass `resurrect_deleted=True`
     (CLI `--resurrect-deleted`) to also un-delete rows under this path.
+    Un-trashing also flips `status` 'trashed' → 'active' (Immich 3.x hides
+    trashed rows by status, not just `deletedAt`); rows already `deleted`
+    (pending hard-delete) are never touched. The path prefix is LIKE-escaped
+    and every query is scoped to the configured library only.
 
     Idempotent: `PUT /api/albums/{id}/assets` reports already-present
     assets as duplicates rather than failing. Never raises — album sync
@@ -805,17 +809,20 @@ def _sync_album(
     try:
         library = pg_mod.fetch_library_info(conn, config.immich.library_id)
         prefix = f"{library.container_root.rstrip('/')}/{path_name}/"
-        like = prefix + "%"
+        like = pg_mod.like_prefix(prefix)
         with conn.cursor() as cur:
             if resurrect_deleted:
                 # Explicit opt-in: un-trash EVERYTHING under this path,
                 # including assets the user soft-deleted in the UI while they
                 # were online.
                 cur.execute(
-                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
-                    'WHERE "originalPath" LIKE %s '
-                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
-                    'AND ("isOffline" = true OR "deletedAt" IS NOT NULL)',
+                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL, '
+                    "status = 'active' "
+                    'WHERE "originalPath" LIKE %s ' "ESCAPE '\\' "
+                    'AND "libraryId" = %s '
+                    "AND status <> 'deleted' "
+                    'AND ("isOffline" = true OR "deletedAt" IS NOT NULL '
+                    "     OR status = 'trashed')",
                     (like, config.immich.library_id),
                 )
             else:
@@ -835,9 +842,11 @@ def _sync_album(
                 # no "who trashed" signal to distinguish that from auto-trash,
                 # and it can't happen to the never-promoted backlog this fixes.
                 cur.execute(
-                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL '
-                    'WHERE "originalPath" LIKE %s '
-                    'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                    'UPDATE asset SET "isOffline" = false, "deletedAt" = NULL, '
+                    "status = 'active' "
+                    'WHERE "originalPath" LIKE %s ' "ESCAPE '\\' "
+                    'AND "libraryId" = %s '
+                    "AND status <> 'deleted' "
                     'AND "isOffline" = true',
                     (like, config.immich.library_id),
                 )
@@ -853,9 +862,11 @@ def _sync_album(
             # forever.
             cur.execute(
                 'SELECT a.id FROM asset a '
-                'WHERE a."originalPath" LIKE %s '
-                'AND (a."libraryId" = %s OR a."libraryId" IS NULL) '
-                'AND a."deletedAt" IS NULL AND ('
+                'WHERE a."originalPath" LIKE %s ' "ESCAPE '\\' "
+                'AND a."libraryId" = %s '
+                'AND a."deletedAt" IS NULL '
+                "AND a.status = 'active' "
+                'AND ('
                 '  a."isOffline" = true '
                 '  OR NOT EXISTS (SELECT 1 FROM asset_file f '
                 '       WHERE f."assetId" = a.id AND f.type = %s) '
@@ -869,9 +880,10 @@ def _sync_album(
 
             cur.execute(
                 'SELECT id FROM asset '
-                'WHERE "originalPath" LIKE %s '
-                'AND ("libraryId" = %s OR "libraryId" IS NULL) '
+                'WHERE "originalPath" LIKE %s ' "ESCAPE '\\' "
+                'AND "libraryId" = %s '
                 'AND "deletedAt" IS NULL '
+                "AND status = 'active' "
                 'ORDER BY "originalPath"',
                 (like, config.immich.library_id),
             )
@@ -882,9 +894,11 @@ def _sync_album(
             # is never silent. `--resurrect-deleted` would include them.
             cur.execute(
                 'SELECT count(*) FROM asset '
-                'WHERE "originalPath" LIKE %s '
-                'AND ("libraryId" = %s OR "libraryId" IS NULL) '
-                'AND "deletedAt" IS NOT NULL',
+                'WHERE "originalPath" LIKE %s ' "ESCAPE '\\' "
+                'AND "libraryId" = %s '
+                "AND status <> 'deleted' "
+                'AND ("deletedAt" IS NOT NULL '
+                "     OR status = 'trashed')",
                 (like, config.immich.library_id),
             )
             summary["trashed_skipped"] = int((cur.fetchone() or [0])[0])

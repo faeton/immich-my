@@ -69,6 +69,18 @@ def fetch_library_info(conn: psycopg.Connection, library_id: str) -> LibraryInfo
     )
 
 
+def like_prefix(prefix: str) -> str:
+    """A LIKE pattern matching strings that start with `prefix` literally.
+
+    `_` and `%` are LIKE wildcards and both are legal in trip folder names
+    (`2024_06-trip` would otherwise also match `2024X06-trip/...`), so they
+    — and the escape char itself — are backslash-escaped. Use with
+    `LIKE %s ESCAPE '\\'`.
+    """
+    escaped = prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return escaped + "%"
+
+
 # --- smart_search (Y.3 CLIP) ---------------------------------------------
 
 # pgvector exposes its configured dimension via `format_type(atttypid,
@@ -131,9 +143,20 @@ def upsert_smart_search(
 
 # --- asset_face + face_search (Y.4) --------------------------------------
 
-_DELETE_FACES_FOR_ASSET = """
+# Rows carrying a `personId` are Immich's face→person links (clustered or
+# named by the user) — the bulk of ML faces in a live library. They are never
+# deleted; only unassigned ML detections are replaced.
+_SELECT_ASSIGNED_FACE_BOXES = """
+SELECT "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
+       "imageWidth", "imageHeight"
+FROM asset_face
+WHERE "assetId" = %(asset_id)s AND "personId" IS NOT NULL
+"""
+
+_DELETE_UNASSIGNED_ML_FACES = """
 DELETE FROM asset_face
 WHERE "assetId" = %(asset_id)s AND "sourceType" = 'machine-learning'
+  AND "personId" IS NULL
 """
 
 _INSERT_ASSET_FACE = """
@@ -153,6 +176,30 @@ INSERT INTO face_search ("faceId", embedding)
 VALUES (%(face_id)s, %(embedding)s::vector)
 """
 
+# A new detection whose box overlaps a kept person-assigned face at least this
+# much (intersection-over-union) is the same face found again — skipped, so
+# the person keeps exactly one face there.
+SAME_FACE_IOU = 0.5
+
+_Box = tuple[float, float, float, float]
+
+
+def _normalized_box(x1, y1, x2, y2, width, height) -> _Box:
+    """Bbox in 0..1 image units; pixel units when the size is unknown (0)."""
+    if width and height and width > 0 and height > 0:
+        return (x1 / width, y1 / height, x2 / width, y2 / height)
+    return (float(x1), float(y1), float(x2), float(y2))
+
+
+def _box_iou(a: _Box, b: _Box) -> float:
+    ix = max(0.0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0.0, min(a[3], b[3]) - max(a[1], b[1]))
+    inter = ix * iy
+    area_a = max(0.0, a[2] - a[0]) * max(0.0, a[3] - a[1])
+    area_b = max(0.0, b[2] - b[0]) * max(0.0, b[3] - b[1])
+    union = area_a + area_b - inter
+    return inter / union if union > 0 else 0.0
+
 
 def replace_asset_faces(
     conn: psycopg.Connection,
@@ -161,21 +208,34 @@ def replace_asset_faces(
     image_height: int,
     faces: list[dict],
 ) -> int:
-    """Replace the ML-detected faces for one asset.
+    """Replace the unassigned ML-detected faces for one asset.
 
-    Any existing `asset_face` rows with `sourceType='machine-learning'`
-    for this asset are deleted (CASCADE wipes their `face_search` too),
-    then every face in `faces` is inserted fresh along with its 512-dim
-    ArcFace embedding. User-tagged faces (`sourceType='exif'`) are
-    untouched. Idempotent — re-running `immy process` with `--with-faces`
-    regenerates the rows.
+    Faces linked to a person (`personId` set — Immich's clustering or a
+    user's naming) are never touched: deleting them would orphan the
+    person. Only `sourceType='machine-learning'` rows with no `personId` are
+    deleted (CASCADE wipes their `face_search` too). Each face in `faces` is
+    then inserted with its 512-dim ArcFace embedding — except one whose box
+    overlaps a kept person-assigned face at IoU >= `SAME_FACE_IOU` (compared
+    in normalized coordinates), which is the same face re-detected. User-
+    tagged faces (`sourceType='exif'`) are untouched. Idempotent —
+    re-running `immy process` with `--with-faces` regenerates the rows.
 
     Each face dict must carry: `id` (new uuid), `x1`, `y1`, `x2`, `y2`,
-    and `embedding` (pgvector text literal).
+    and `embedding` (pgvector text literal). Returns the number of faces
+    inserted.
     """
+    written = 0
     with conn.cursor() as cur:
-        cur.execute(_DELETE_FACES_FOR_ASSET, {"asset_id": asset_id})
+        cur.execute(_SELECT_ASSIGNED_FACE_BOXES, {"asset_id": asset_id})
+        assigned = [_normalized_box(*row) for row in cur.fetchall()]
+        cur.execute(_DELETE_UNASSIGNED_ML_FACES, {"asset_id": asset_id})
         for face in faces:
+            box = _normalized_box(
+                face["x1"], face["y1"], face["x2"], face["y2"],
+                image_width, image_height,
+            )
+            if any(_box_iou(box, kept) >= SAME_FACE_IOU for kept in assigned):
+                continue
             cur.execute(_INSERT_ASSET_FACE, {
                 "id": face["id"],
                 "asset_id": asset_id,
@@ -188,7 +248,8 @@ def replace_asset_faces(
                 "face_id": face["id"],
                 "embedding": face["embedding"],
             })
-    return len(faces)
+            written += 1
+    return written
 
 
 # --- apple-people: naming Immich's existing (unnamed) face clusters ------

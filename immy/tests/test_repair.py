@@ -6,7 +6,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from immy.repair import _resolve_source
+from unittest.mock import MagicMock
+
+from immy.pg import LibraryInfo
+from immy.repair import _resolve_source, find_broken
 
 
 def test_resolve_maps_originalpath_to_mac_file(tmp_path):
@@ -52,3 +55,23 @@ def test_resolve_other_trip_prefix_returns_none(tmp_path):
         "/mnt/external/originals", trip,
     )
     assert src is None
+
+
+def test_find_broken_escapes_trip_and_scopes_to_library():
+    """`_`/`%` in a trip name are LIKE wildcards — escaped so a sibling trip
+    never matches — and NULL-libraryId rows are out of scope."""
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchall.return_value = []
+    conn = MagicMock()
+    conn.cursor.return_value = cur
+    lib = LibraryInfo(id="lib-1", owner_id="o", container_root="/mnt/external/originals")
+
+    find_broken(conn, "lib-1", lib, "2024_06-trip")
+
+    sql, params = cur.execute.call_args.args
+    assert "ESCAPE" in sql
+    assert '"libraryId" IS NULL' not in sql
+    assert params["prefix"] == "/mnt/external/originals/2024\\_06-trip/%"
+    assert params["lib"] == "lib-1"

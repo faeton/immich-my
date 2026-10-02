@@ -59,3 +59,123 @@ def test_use_per_face_inference_skips_dynamic_shapes():
         output_shape = [None, faces_mod.ARCFACE_EMBEDDING_DIM]
 
     assert faces_mod._use_per_face_inference(Model(), 2) is False
+
+
+# --- pg.replace_asset_faces: never orphan a person's face ------------------
+
+
+class _FaceTable:
+    """In-memory `asset_face` that interprets exactly the statements
+    `pg.replace_asset_faces` issues — so the test checks which rows survive,
+    not which SQL strings were sent."""
+
+    def __init__(self, rows):
+        self.rows = [dict(r) for r in rows]
+        self.face_search: list[str] = []
+        self._result: list[tuple] = []
+
+    # connection API
+    def cursor(self):
+        return self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    # cursor API
+    def execute(self, sql, params=None):
+        text = " ".join(sql.split())
+        aid = (params or {}).get("asset_id")
+        if text.startswith("SELECT") and '"personId" IS NOT NULL' in text:
+            self._result = [
+                (r["x1"], r["y1"], r["x2"], r["y2"], r["w"], r["h"])
+                for r in self.rows
+                if r["asset"] == aid and r["person"] is not None
+            ]
+        elif text.startswith("DELETE FROM asset_face"):
+            assert "\"sourceType\" = 'machine-learning'" in text
+            only_unassigned = '"personId" IS NULL' in text
+            self.rows = [
+                r for r in self.rows
+                if not (r["asset"] == aid and r["source"] == "machine-learning"
+                        and (r["person"] is None or not only_unassigned))
+            ]
+        elif text.startswith("INSERT INTO asset_face"):
+            self.rows.append({
+                "id": params["id"], "asset": aid, "person": None,
+                "source": "machine-learning",
+                "x1": params["x1"], "y1": params["y1"],
+                "x2": params["x2"], "y2": params["y2"],
+                "w": params["image_width"], "h": params["image_height"],
+            })
+        elif text.startswith("INSERT INTO face_search"):
+            self.face_search.append(params["face_id"])
+        else:  # pragma: no cover - a statement the fake doesn't model
+            raise AssertionError(f"unexpected SQL: {sql}")
+
+    def fetchall(self):
+        return self._result
+
+
+def _row(fid, person, x1, y1, x2, y2, *, w=1000, h=1000,
+         source="machine-learning", asset="a1"):
+    return {"id": fid, "asset": asset, "person": person, "source": source,
+            "x1": x1, "y1": y1, "x2": x2, "y2": y2, "w": w, "h": h}
+
+
+def _new(fid, x1, y1, x2, y2):
+    return {"id": fid, "x1": x1, "y1": y1, "x2": x2, "y2": y2, "embedding": "[0]"}
+
+
+def test_replace_asset_faces_keeps_person_assigned_faces():
+    from immy import pg as pg_mod
+
+    table = _FaceTable([
+        _row("named", "person-1", 100, 100, 200, 200),
+        _row("unassigned", None, 500, 500, 600, 600),
+        _row("exif", None, 700, 700, 800, 800, source="exif"),
+        _row("other-asset", None, 0, 0, 10, 10, asset="a2"),
+    ])
+    pg_mod.replace_asset_faces(table, "a1", 1000, 1000, [
+        _new("fresh", 300, 300, 400, 400),
+    ])
+    ids = {r["id"] for r in table.rows}
+    assert "named" in ids                 # the person keeps their face
+    assert "unassigned" not in ids        # stale unassigned ML face replaced
+    assert {"exif", "other-asset", "fresh"} <= ids
+
+
+def test_replace_asset_faces_skips_new_box_overlapping_assigned_face():
+    """A re-detection of the same face (IoU >= 0.5, compared in normalized
+    coords so a different detection resolution still matches) is dropped:
+    the person keeps exactly one face there. A non-overlapping new box is
+    inserted with its embedding."""
+    from immy import pg as pg_mod
+
+    table = _FaceTable([
+        # stored at 2000x2000 → normalized (0.1,0.1)-(0.2,0.2)
+        _row("named", "person-1", 200, 200, 400, 400, w=2000, h=2000),
+    ])
+    written = pg_mod.replace_asset_faces(table, "a1", 1000, 1000, [
+        _new("dup", 102, 98, 205, 201),       # same face, new run
+        _new("elsewhere", 600, 600, 700, 700),
+    ])
+    ids = [r["id"] for r in table.rows]
+    assert ids.count("named") == 1
+    assert "dup" not in ids
+    assert "elsewhere" in ids
+    assert table.face_search == ["elsewhere"]
+    assert written == 1
+
+
+def test_replace_asset_faces_low_overlap_box_is_inserted():
+    from immy import pg as pg_mod
+
+    table = _FaceTable([_row("named", "person-1", 100, 100, 200, 200)])
+    # IoU = 2500 / 17500 ≈ 0.14 — a neighbouring face, not the same one.
+    pg_mod.replace_asset_faces(table, "a1", 1000, 1000, [
+        _new("neighbour", 150, 150, 250, 250),
+    ])
+    assert {r["id"] for r in table.rows} == {"named", "neighbour"}

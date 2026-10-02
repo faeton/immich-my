@@ -42,8 +42,8 @@ from .promote import _INSERT_ASSET_FILE
 _BROKEN_SQL = """
 SELECT a.id, a."originalPath", a.type
 FROM asset a
-WHERE a."originalPath" LIKE %(prefix)s
-  AND (a."libraryId" = %(lib)s OR a."libraryId" IS NULL)
+WHERE a."originalPath" LIKE %(prefix)s ESCAPE '\\'
+  AND a."libraryId" = %(lib)s
   AND a."deletedAt" IS NULL
   AND (
     NOT EXISTS (SELECT 1 FROM asset_file f
@@ -80,7 +80,7 @@ class TripRepair:
 def find_broken(conn, library_id: str, library, trip_name: str) -> list[tuple[str, str, str]]:
     prefix = f"{library.container_root.rstrip('/')}/{trip_name}/"
     with conn.cursor() as cur:
-        cur.execute(_BROKEN_SQL, {"prefix": prefix + "%", "lib": library_id, "ph": _PLACEHOLDER})
+        cur.execute(_BROKEN_SQL, {"prefix": pg_mod.like_prefix(prefix), "lib": library_id, "ph": _PLACEHOLDER})
         return [(str(r[0]), str(r[1]), str(r[2])) for r in cur.fetchall()]
 
 

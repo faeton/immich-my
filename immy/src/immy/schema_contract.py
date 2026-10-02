@@ -36,7 +36,7 @@ WRITE_COLUMNS: dict[str, tuple[str, ...]] = {
         "id", "ownerId", "type", "originalPath", "originalFileName",
         "checksum", "checksumAlgorithm", "fileCreatedAt", "fileModifiedAt",
         "localDateTime", "duration", "libraryId", "isExternal",
-        "width", "height", "isOffline", "deletedAt",
+        "width", "height", "isOffline", "deletedAt", "status",
     ),
     "asset_exif": (
         "assetId", "description", "make", "model", "lensModel", "orientation",

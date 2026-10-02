@@ -582,7 +582,7 @@ def test_rsync_derivatives_runs_remote_as_root(monkeypatch):
     assert "--rsync-path=sudo rsync" not in seen["args"]  # local → no sudo
 
 
-def _sql_recording_pg(config_file, monkeypatch, *, trashed_skipped=0):
+def _sql_recording_pg(config_file, monkeypatch, *, trashed_skipped=0, params=None):
     """Fake pg whose cursor records every executed SQL string. fetchall →
     one asset id; fetchone → the trashed_skipped count. Also enables the
     `pg:` block in the config so `_sync_album` doesn't short-circuit."""
@@ -600,7 +600,13 @@ def _sql_recording_pg(config_file, monkeypatch, *, trashed_skipped=0):
     cur.rowcount = 1
     cur.fetchall.return_value = [("asset-1",)]
     cur.fetchone.return_value = (trashed_skipped,)
-    cur.execute.side_effect = lambda sql, params=None: executed.append(" ".join(sql.split()))
+    recorded_params = params if params is not None else []
+
+    def _execute(sql, p=None):
+        executed.append(" ".join(sql.split()))
+        recorded_params.append(p)
+
+    cur.execute.side_effect = _execute
     fake_conn.cursor.return_value = cur
     monkeypatch.setattr(promote_mod.pg_mod, "connect", lambda cfg: fake_conn)
     monkeypatch.setattr(
@@ -643,6 +649,64 @@ def test_resurrect_deleted_untrashes_everything(no_schema_guard, config_file, dj
     assert result.exit_code == 0, result.stdout
     u = [s for s in executed if s.startswith("UPDATE asset")][0]
     assert '"deletedAt" IS NOT NULL' in u  # online soft-deletes included
+
+
+def test_untrash_sets_status_active_and_never_touches_deleted(no_schema_guard, config_file, dji_ready, monkeypatch):
+    """Immich 3.x tracks trash in `status` too (`active|trashed|deleted`):
+    clearing deletedAt alone leaves the row `trashed` (still hidden). Both
+    un-trash forms flip it back to `active` and never touch rows already
+    `deleted` (pending hard-delete)."""
+    for extra in ([], ["--resurrect-deleted"]):
+        executed = _sql_recording_pg(config_file, monkeypatch)
+        fake = FakeClient(indexed=_indexed_set(dji_ready))
+        monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+        monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+        result = runner.invoke(app, ["promote", str(dji_ready), *extra])
+        assert result.exit_code == 0, result.stdout
+        u = [s for s in executed if s.startswith("UPDATE asset")][0]
+        assert "status = 'active'" in u, (extra, u)
+        assert "status <> 'deleted'" in u, (extra, u)
+        if extra:  # explicit resurrect also picks up trashed-by-status rows
+            assert "status = 'trashed'" in u
+
+
+def test_album_queries_scope_on_status(no_schema_guard, config_file, dji_ready, monkeypatch):
+    """The album's asset list excludes `trashed` rows; the skipped count
+    counts them (but not `deleted` ones, which no flag can bring back)."""
+    executed = _sql_recording_pg(config_file, monkeypatch)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    ids_q = [s for s in executed if s.startswith("SELECT id FROM asset")][0]
+    assert "status = 'active'" in ids_q
+    count_q = [s for s in executed if s.startswith("SELECT count(*) FROM asset")][0]
+    assert "status = 'trashed'" in count_q and "status <> 'deleted'" in count_q
+
+
+def test_album_sync_escapes_trip_path_and_scopes_to_library(no_schema_guard, config_file, tmp_path, monkeypatch):
+    """A trip named `2024_06-50%` must not LIKE-match `2024X06-50abc/...`
+    (`_`/`%` are wildcards), and rows with a NULL libraryId (upload library,
+    other owners) are never in scope for a write."""
+    params: list = []
+    executed = _sql_recording_pg(config_file, monkeypatch, params=params)
+    from immy.config import load as load_config
+    from types import SimpleNamespace
+
+    config = load_config(config_file[0])
+    plan = SimpleNamespace(folder=tmp_path / "2024_06-50%")
+    promote_mod._sync_album(FakeClient(), plan, config)
+
+    like_stmts = [(s, p) for s, p in zip(executed, params) if "LIKE" in s]
+    assert like_stmts
+    for sql, p in like_stmts:
+        assert "ESCAPE '\\'" in sql, sql
+        assert '"libraryId" IS NULL' not in sql, sql
+        assert p[0] == "/mnt/external/originals/2024\\_06-50\\%/%", p
+        assert p[1] == "lib-1"
 
 
 def test_promote_warns_on_trashed_skipped(no_schema_guard, config_file, dji_ready, monkeypatch):
@@ -852,3 +916,22 @@ def test_promote_validates_schema_on_later_connections_when_preflight_cannot_con
         c.cursor.assert_not_called()   # no INSERT/UPDATE issued
         c.commit.assert_not_called()
     assert "localDateTime" in flat, flat
+
+
+def test_like_prefix_matches_only_the_literal_prefix():
+    """`pg.like_prefix` + `ESCAPE '\\'` matches paths under exactly that
+    prefix — `_`, `%` and `\\` in the prefix are literal, not wildcards."""
+    import sqlite3
+
+    from immy import pg as pg_mod
+
+    db = sqlite3.connect(":memory:")
+    pattern = pg_mod.like_prefix("/o/2024_06 50%\\x/")
+
+    def hit(path):
+        return db.execute("SELECT ? LIKE ? ESCAPE '\\'", (path, pattern)).fetchone()[0] == 1
+
+    assert hit("/o/2024_06 50%\\x/a.jpg")
+    assert not hit("/o/2024X06 50%\\x/a.jpg")     # `_` is not a wildcard
+    assert not hit("/o/2024_06 50abc\\x/a.jpg")   # `%` is not a wildcard
+    assert not hit("/o/2024_06 50%\\x-other/a.jpg")
