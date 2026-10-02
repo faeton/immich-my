@@ -825,8 +825,18 @@ def sync_trip(
     library: LibraryInfo | None = None,
     progress: Any = None,
     offline_root: Path | None = None,
+    journal_path: Path | None = None,
+    marker_path: Path | None = None,
 ) -> dict:
     """Replay every unsynced `.audit/offline/*.yml` entry into Postgres.
+
+    A CLIP vector the guard withholds (legacy / mlx / model mismatch) leaves
+    Immich without one, while the journal (`journal_path`) still says CLIP
+    is done and the marker (`marker_path`) claims the step — so nothing
+    would ever rewrite it. Before such an entry is replayed, its `clip`
+    journal entry is cleared and `clip` dropped from the marker's steps; a
+    normal `immy process` then recomputes it. Both default to the trip's
+    `.audit/` (Mac layout); NAS callers pass `WritablePaths`'.
 
     `library` is the live library info fetched from the DB at sync time —
     used to substitute placeholder `owner_id`/`library_id` values that
@@ -851,6 +861,16 @@ def sync_trip(
     immich_model = pg_mod.fetch_immich_clip_model(conn)
     entries = list(iter_entries(trip_folder, offline_root=offline_root))
     _emit(f"sync-offline: {len(entries)} entry(ies) to consider")
+    # Invalidate up front (one journal write), before any entry is stamped
+    # synced: a crash after stamping must not leave CLIP claimed done.
+    withheld = [
+        data["asset"]["checksum"] for _, data in entries
+        if not data.get("synced") and data.get("clip")
+        and _clip_replay_refusal(data["clip"], immich_model) is not None
+    ]
+    if withheld:
+        _invalidate_clip(
+            trip_folder, withheld, journal_path=journal_path, marker_path=marker_path)
 
     for idx, (yml_path, data) in enumerate(entries, start=1):
         if data.get("synced"):
@@ -901,6 +921,34 @@ def sync_trip(
         "failed": failed,
         "clip_refused": clip_refused,
     }
+
+
+def _invalidate_clip(
+    trip_folder: Path, checksums: list[str], *,
+    journal_path: Path | None, marker_path: Path | None,
+) -> None:
+    """Forget CLIP for these assets: clear their journal `clip` entries and
+    drop `clip` from the marker's recorded steps (so the cached-trip skip
+    can't hide the work)."""
+    from . import journal as journal_mod
+
+    jpath = journal_path if journal_path is not None else journal_mod.journal_path(trip_folder)
+    journal = journal_mod.Journal.load_path(jpath)
+    for cs in checksums:
+        journal.clear_worker(cs, "clip")
+    journal.flush()
+
+    mpath = marker_path if marker_path is not None else (
+        trip_folder / AUDIT_DIR / Y_MARKER_FILENAME)
+    if not mpath.is_file():
+        return
+    marker = yaml.safe_load(mpath.read_text()) or {}
+    steps = marker.get("steps")
+    if isinstance(steps, dict) and "clip" in steps:
+        steps.pop("clip")
+        tmp = mpath.with_suffix(mpath.suffix + ".tmp")
+        tmp.write_text(yaml.safe_dump(marker, sort_keys=False))
+        os.replace(tmp, mpath)
 
 
 def _clip_replay_refusal(clip: dict, immich_model: str | None) -> str | None:

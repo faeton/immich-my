@@ -1618,6 +1618,7 @@ def _run_one_trip(
             transcript_endpoint=transcript_endpoint,
             progress=_progress,
             paths=paths,
+            force=force,
         )
         # process_trip commits per asset by default (commit_per_asset=True),
         # so the trip-level commit here is a defensive no-op for the
@@ -2035,12 +2036,13 @@ def sync_offline(
 
     # Same resolver `process --offline` used: NAS → state_root/<trip>/.audit
     # /offline; Mac (no roots) → `<trip>/.audit/offline`, unchanged.
-    offline_root = process_mod.resolve_writable_paths(
+    sync_paths = process_mod.resolve_writable_paths(
         folder,
         originals_root=config.originals_root,
         state_root=config.state_root,
         sidecars_root=config.sidecars_root,
-    ).offline_dir
+    )
+    offline_root = sync_paths.offline_dir
     entries = list(offline_mod.iter_entries(folder, offline_root=offline_root))
     if not entries:
         console.print(
@@ -2088,6 +2090,8 @@ def sync_offline(
         summary = offline_mod.sync_trip(
             folder, conn, library=library, progress=_progress,
             offline_root=offline_root,
+            journal_path=sync_paths.journal_path,
+            marker_path=sync_paths.marker_path,
         )
     finally:
         if not conn.closed:
@@ -2103,7 +2107,8 @@ def sync_offline(
         console.print(
             f"[yellow]CLIP vectors withheld for {summary['clip_refused']} "
             "asset(s)[/yellow] (model mismatch / mlx not allowed / no provenance); "
-            "rows otherwise synced."
+            "rows otherwise synced. Their CLIP journal entries were cleared — "
+            "a normal `immy process` recomputes them."
         )
     if summary["failed"]:
         raise typer.Exit(code=1)

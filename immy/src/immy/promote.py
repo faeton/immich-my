@@ -693,7 +693,8 @@ def _drain_offline_cache(
     refusing to rsync because a few sync entries failed would block
     the path we actually need, NAS file upload.
     """
-    offline_root = (paths or _trip_paths(folder, config)).offline_dir
+    paths = paths or _trip_paths(folder, config)
+    offline_root = paths.offline_dir
     entries = list(offline_mod.iter_entries(folder, offline_root=offline_root))
     if not entries:
         return None
@@ -740,7 +741,8 @@ def _drain_offline_cache(
 
     try:
         result = offline_mod.sync_trip(
-            folder, conn, library=library, offline_root=offline_root)
+            folder, conn, library=library, offline_root=offline_root,
+            journal_path=paths.journal_path, marker_path=paths.marker_path)
     finally:
         if not conn.closed:
             conn.close()

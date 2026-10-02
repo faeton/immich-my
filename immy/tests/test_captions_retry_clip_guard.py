@@ -472,3 +472,101 @@ def test_sync_accepts_mlx_when_allowed_at_generation(tmp_path, monkeypatch):
                              {**OK_PROV, "backend": "mlx", "allow_mlx": True},
                              "ViT-B-32__openai")
     assert ups == ["replayed-uuid"] and s["clip_refused"] == 0
+
+
+# --- final review G: a withheld CLIP vector must be recomputable -------------
+
+
+def _seed_clip_done(target):
+    """Journal says CLIP done and the marker claims the step — the state an
+    offline run leaves behind."""
+    from immy import journal as journal_mod
+    from immy import offline as offline_mod
+    root = target.parent / "off"
+    cs = next(iter(offline_mod.iter_entries(target, offline_root=root)))[1]["asset"]["checksum"]
+    j = journal_mod.Journal.load(target)
+    j.mark_done(cs, "clip", "clip:legacy")
+    j.mark_done(cs, "ingest", "v1")
+    j.flush()
+    process_mod.write_marker(target, [], provenance=process_mod.marker_provenance(
+        db={"database": "immich", "library_id": "lib-1"}, offline=True,
+        steps={"ingest": "v1", "clip": "clip:legacy"}))
+    return cs
+
+
+def test_sync_withheld_clip_invalidates_journal_and_marker(tmp_path, monkeypatch):
+    import yaml as _yaml
+    from immy import journal as journal_mod
+    from immy import offline as offline_mod
+    target = tmp_path / "dji-srt-pair"
+    seeded = {}
+    real_sync = offline_mod.sync_trip
+
+    def _sync(*a, **kw):
+        seeded["cs"] = _seed_clip_done(target)
+        return real_sync(*a, **kw)
+    monkeypatch.setattr(offline_mod, "sync_trip", _sync)
+
+    summary, ups = _sync_with_clip(tmp_path, monkeypatch, None, "ViT-B-32__openai")
+
+    assert ups == [] and summary["clip_refused"] == 1
+    j = journal_mod.Journal.load(target)
+    assert j.get(seeded["cs"], "clip") is None, "withheld CLIP still journaled done"
+    assert j.is_done(seeded["cs"], "ingest", "v1")
+    marker = _yaml.safe_load((target / ".audit" / "y_processed.yml").read_text())
+    assert "clip" not in marker["steps"]
+    assert marker["steps"]["ingest"] == "v1"
+
+
+def test_sync_accepted_clip_leaves_journal_alone(tmp_path, monkeypatch):
+    from immy import journal as journal_mod
+    from immy import offline as offline_mod
+    target = tmp_path / "dji-srt-pair"
+    seeded = {}
+    real_sync = offline_mod.sync_trip
+
+    def _sync(*a, **kw):
+        seeded["cs"] = _seed_clip_done(target)
+        return real_sync(*a, **kw)
+    monkeypatch.setattr(offline_mod, "sync_trip", _sync)
+
+    summary, ups = _sync_with_clip(tmp_path, monkeypatch, OK_PROV, "ViT-B-32__openai")
+    assert ups == ["replayed-uuid"]
+    assert journal_mod.Journal.load(target).is_done(seeded["cs"], "clip", "clip:legacy")
+
+
+def test_force_recomputes_clip_despite_journal(tmp_path, monkeypatch):
+    """`process --force` must recompute CLIP even when the journal says
+    done (the only in-tool way to rewrite a vector Immich lacks)."""
+    from immy import offline as offline_mod
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    monkeypatch.setattr("immy.process.derivatives_mod.compute_for_asset", lambda **kw: _fake_deriv(tmp_path, kw))
+    calls = {"n": 0}
+
+    def _embed(path, **kw):
+        calls["n"] += 1
+        return [0.1, 0.2, 0.3, 0.4]
+    monkeypatch.setattr("immy.process.clip_mod.embed", _embed)
+    root = tmp_path / "off"
+    kw = dict(compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
+    sink = offline_mod.OfflineSink(target, LIB, offline_root=root, clip_dim=4)
+    process_mod.process_trip(target, None, LIB, sink=sink, **kw)
+    assert calls["n"] == 1
+    sink = offline_mod.OfflineSink(target, LIB, offline_root=root, clip_dim=4)
+    process_mod.process_trip(target, None, LIB, sink=sink, **kw)
+    assert calls["n"] == 1  # journal-cached
+    sink = offline_mod.OfflineSink(target, LIB, offline_root=root, clip_dim=4)
+    process_mod.process_trip(target, None, LIB, sink=sink, force=True, **kw)
+    assert calls["n"] == 2
+
+
+def _fake_deriv(tmp_path, kw):
+    from immy.derivatives import DerivativeFile, DerivativeResult
+    p = tmp_path / "out" / f"{kw['asset_id']}_preview.jpeg"
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_bytes(b"fake")
+    return DerivativeResult(files=[DerivativeFile(
+        kind="preview", staged_path=p,
+        relative_path="thumbs/o/aa/bb/x_preview.jpeg",
+        is_progressive=True, is_transparent=False)], width=1, height=1)

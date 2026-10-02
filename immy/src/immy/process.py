@@ -714,6 +714,7 @@ def process_trip(
     compute_transcripts: bool = False,
     compute_captions: bool = False,
     recaption: bool = False,
+    force: bool = False,  # `process --force`: recompute CLIP despite the journal
     caption_fill_missing_only: bool = False,
     captioner_config: captions_mod.CaptionerConfig | None = None,
     caption_workers: int = 1,
@@ -1241,6 +1242,7 @@ def process_trip(
         if (
             compute_clip and we_own and asset.asset_type == "IMAGE"
             and derivs is not None
+            and not force
             and journal.is_done(cs_hex, "clip", CLIP_VERSION)
         ):
             clip_embedded = True
