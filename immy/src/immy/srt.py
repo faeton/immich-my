@@ -228,7 +228,8 @@ def iter_frames(text: str) -> Iterator[SrtFrame]:
         f = _parse_block(block, i)
         if f.latitude is not None and f.longitude is not None:
             labelled.append((f.latitude, f.longitude))
-            continue
+        # GPS()/HOME() are evidence (incl. the `M` dialect signature) even in a
+        # cue that also carries labelled coordinates.
         mp = _RE_GPS_PAREN.search(block)
         if mp:
             parens.append((float(mp.group(1)), float(mp.group(2)), bool(mp.group(4))))

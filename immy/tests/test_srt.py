@@ -205,3 +205,13 @@ def test_below_sea_level_altitude_roundtrips_negative(tmp_path: Path):
         capture_output=True, text=True, check=True,
     ).stdout.strip()
     assert float(out) == -12.0
+
+
+def test_m_signature_and_home_evidence_collected_from_labelled_cues(tmp_path: Path):
+    p = tmp_path / "x.SRT"
+    p.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n[latitude: 47.37] [longitude: 8.54] GPS(47.37,8.54,0M)\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nHOME(47.37,8.54)\nGPS(47.3701,8.5401,12)\n"
+    )
+    fr = srt.parse_track(p)
+    assert [(f.latitude, f.longitude) for f in fr] == [(47.37, 8.54), (47.3701, 8.5401)]
