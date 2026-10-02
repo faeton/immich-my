@@ -775,11 +775,16 @@ def _promote_verify(folder: Path, config, *, into_album: str | None) -> None:
     if res.ok:
         console.print("[green]✓[/green] album matches the local trip")
         return
-    console.print(f"[red]mismatch[/red] — {len(res.missing)} local file(s) not in the album")
-    for name in res.missing[:_VERIFY_MAX_EXAMPLES]:
-        console.print(f"  missing: {name}", markup=False, highlight=False)
-    if len(res.missing) > _VERIFY_MAX_EXAMPLES:
-        console.print(f"  [dim]… and {len(res.missing) - _VERIFY_MAX_EXAMPLES} more[/dim]")
+    console.print(
+        f"[red]mismatch[/red] — {len(res.missing)} local file(s) not in the album, "
+        f"{len(res.extra)} in the album but not local"
+    )
+    # Examples share one budget; missing first (the actionable direction).
+    examples = [("missing", n) for n in res.missing] + [("extra", n) for n in res.extra]
+    for kind, name in examples[:_VERIFY_MAX_EXAMPLES]:
+        console.print(f"  {kind}: {name}", markup=False, highlight=False)
+    if len(examples) > _VERIFY_MAX_EXAMPLES:
+        console.print(f"  [dim]… and {len(examples) - _VERIFY_MAX_EXAMPLES} more[/dim]")
     raise typer.Exit(code=1)
 
 
@@ -1439,19 +1444,34 @@ app.add_typer(bloat_app, name="bloat")
 # --- `immy process` (Phase Y.1) -------------------------------------------
 
 
-def _resolve_offline_library(folder: Path) -> tuple[object | None, bool]:
+def _resolve_offline_library(
+    folder: Path, config=None,
+) -> tuple[object | None, bool]:
     """Return (library, recovered_from_marker) for offline mode.
 
     Checks global cache, then tries to recover container_root from any
     marker under `folder` or its siblings. Owner/library UUIDs stay as
-    placeholders; sync-offline fills them in at push time.
+    placeholders; sync-offline fills them in at push time. Markers are read
+    where process wrote them (`WritablePaths.marker_path`: state_root on the
+    NAS, `<trip>/.audit` on the Mac).
     """
     library = offline_mod.load_cached_library()
     if library is not None:
         return library, False
-    root = offline_mod.derive_container_root_from_marker(folder)
+
+    def _marker_for(trip: Path) -> Path:
+        return process_mod.resolve_writable_paths(
+            trip,
+            originals_root=getattr(config, "originals_root", None),
+            state_root=getattr(config, "state_root", None),
+            sidecars_root=getattr(config, "sidecars_root", None),
+        ).marker_path
+
+    root = offline_mod.derive_container_root_from_marker(
+        folder, marker=_marker_for(folder))
     if root is None and folder.parent.is_dir():
-        derived = offline_mod.derive_library_from_any_trip(folder.parent)
+        derived = offline_mod.derive_library_from_any_trip(
+            folder.parent, marker_for=_marker_for)
         if derived is not None:
             return derived, True
     elif root is not None:
@@ -1880,7 +1900,7 @@ def process(
     try:
         for folder in folders:
             if offline:
-                library, recovered = _resolve_offline_library(folder)
+                library, recovered = _resolve_offline_library(folder, config)
                 if library is None:
                     console.print(
                         f"[red]{folder.name}: --offline needs library info[/red]; "

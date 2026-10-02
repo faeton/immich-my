@@ -87,7 +87,9 @@ def load_cached_library() -> LibraryInfo | None:
     )
 
 
-def derive_container_root_from_marker(trip_folder: Path) -> str | None:
+def derive_container_root_from_marker(
+    trip_folder: Path, *, marker: Path | None = None,
+) -> str | None:
     """Infer Immich's library container_root from an existing
     `.audit/y_processed.yml` by stripping the trip folder name + rel path
     from the first asset's originalPath.
@@ -97,7 +99,10 @@ def derive_container_root_from_marker(trip_folder: Path) -> str | None:
     run offline without bringing the tailnet up. `owner_id` and
     `library_id` stay unresolved; `sync-offline` fills them from DB.
     """
-    marker = trip_folder / AUDIT_DIR / "y_processed.yml"
+    # `marker` is where process wrote it (`WritablePaths.marker_path` —
+    # under state_root on the NAS); unset → `<trip>/.audit/y_processed.yml`.
+    if marker is None:
+        marker = trip_folder / AUDIT_DIR / Y_MARKER_FILENAME
     if not marker.is_file():
         return None
     data = yaml.safe_load(marker.read_text()) or {}
@@ -113,7 +118,9 @@ def derive_container_root_from_marker(trip_folder: Path) -> str | None:
     return None
 
 
-def derive_library_from_any_trip(trips_root: Path) -> LibraryInfo | None:
+def derive_library_from_any_trip(
+    trips_root: Path, *, marker_for: Any = None,
+) -> LibraryInfo | None:
     """Walk a parent directory (e.g. ~/Media/Trips) looking for any trip
     with a processed marker; return a synthetic LibraryInfo whose
     container_root is correct but owner_id/library_id are placeholders.
@@ -125,7 +132,8 @@ def derive_library_from_any_trip(trips_root: Path) -> LibraryInfo | None:
     for sub in sorted(trips_root.iterdir()):
         if not sub.is_dir():
             continue
-        root = derive_container_root_from_marker(sub)
+        root = derive_container_root_from_marker(
+            sub, marker=marker_for(sub) if marker_for is not None else None)
         if root:
             return LibraryInfo(
                 id="__offline_placeholder__",

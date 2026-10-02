@@ -1162,3 +1162,75 @@ def test_promote_verify_missing_album_exits_1(config_file, dji_ready, monkeypatc
     result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
     assert result.exit_code == 1, result.stdout
     assert "DJI_0001.JPG" in result.stdout
+
+
+def test_promote_marker_for_other_library_rejected_without_pg_block(
+    config_file, dji_ready, monkeypatch,
+):
+    """No `pg:` in config, but the API still targets library lib-1: a
+    marker recorded for another library must not skip lib-1's scan."""
+    _write_marker_with_db(dji_ready, {**_THIS_DB, "library_id": "lib-OTHER"})
+    fake = FakeClient()
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert fake.scans == ["lib-1"]
+    assert "different database" in " ".join(result.stdout.split())
+
+
+def test_promote_marker_same_library_without_pg_block_skips_scan(
+    config_file, dji_ready, monkeypatch,
+):
+    _write_marker_with_db(dji_ready, _THIS_DB)
+    fake = FakeClient()
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert fake.scans == []
+
+
+def test_promote_verify_empty_trip_without_album_fails(config_file, tmp_path, monkeypatch):
+    """Boundary: 0 local files and no album is not a pass — the album must exist."""
+    trip = tmp_path / "empty-trip"
+    trip.mkdir()
+    _verify_pg(config_file, monkeypatch, assets=[], members=[])
+    fake = FakeClient(existing_albums=[])
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    result = runner.invoke(app, ["promote", str(trip), "--verify"])
+    assert result.exit_code == 1, result.stdout
+    assert "album not found" in result.stdout
+
+
+def test_promote_verify_extra_only_lists_extras(config_file, dji_ready, monkeypatch):
+    """Album holds a trip-path asset with no local file: counts differ and
+    the extra name is shown (not a bare '0 missing')."""
+    _verify_pg(
+        config_file, monkeypatch,
+        assets=[(_ROOT + "DJI_0001.JPG", "timeline"), (_ROOT + "GONE.JPG", "timeline")],
+        members=[_ROOT + "DJI_0001.JPG", _ROOT + "GONE.JPG"],
+    )
+    fake = FakeClient(existing_albums=_ALBUM)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
+    assert result.exit_code == 1, result.stdout
+    flat = " ".join(result.stdout.split())
+    assert "extra: GONE.JPG" in flat, flat
+    assert "1 in the album but not local" in flat, flat
+
+
+def test_verify_examples_share_a_combined_limit_of_20(config_file, dji_ready, monkeypatch):
+    for i in range(15):
+        (dji_ready / f"NEW_{i:02d}.JPG").write_bytes(b"x")
+    _verify_pg(
+        config_file, monkeypatch,
+        assets=[(_ROOT + f"OLD_{i:02d}.JPG", "timeline") for i in range(15)],
+        members=[_ROOT + "DJI_0001.JPG"] + [_ROOT + f"OLD_{i:02d}.JPG" for i in range(15)],
+    )
+    fake = FakeClient(existing_albums=_ALBUM)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
+    assert result.exit_code == 1, result.stdout
+    lines = result.stdout.splitlines()
+    shown = [l for l in lines if l.strip().startswith(("missing:", "extra:"))]
+    assert len(shown) == 20
+    assert any(l.strip().startswith("extra:") for l in shown)

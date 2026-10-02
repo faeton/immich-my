@@ -37,8 +37,11 @@ continuously, so entries are dated rather than versioned.
   first `process` run after upgrading re-scans every trip once** (the journal
   keeps it cheap: finished work is skipped). `promote` treats a marker whose
   `db` differs from the current config as "not processed for this DB": it
-  warns and takes the library-scan path instead of skipping it. Markers without
-  a `db` block are still trusted by `promote`.
+  warns and takes the library-scan path instead of skipping it (every identity
+  field known on both sides is compared, so a config without `pg:` still
+  rejects a marker for another `library_id`). Markers without a `db` block are
+  still trusted by `promote`. The offline library fallback
+  (`derive_container_root_from_marker`) reads markers under `state_root` too.
 
 ### Added
 
@@ -47,7 +50,8 @@ continuously, so entries are dated rather than versioned.
   media files `process` ingests, plus local files Immich holds as visible
   assets, minus Live-photo motion halves Immich keeps `visibility='hidden'`
   (Immich 3.0.2 never puts hidden assets in albums). Prints both counts; on
-  mismatch lists up to 20 missing names and exits 1. No rsync, scan or writes.
+  mismatch (or a missing album) lists up to 20 missing/extra names and exits 1.
+  No rsync, scan or writes.
 
 ## 2026-10-02 — atomic snapshot, backups cover immy state
 

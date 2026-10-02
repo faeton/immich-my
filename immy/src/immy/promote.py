@@ -397,15 +397,21 @@ def _marker_for_current_db(
     """Return `(marker, warning)`. A marker whose recorded DB identity
     (host/port/database/library_id) differs from the current config proves
     nothing about THIS database — treat the trip as not processed and say
-    why. A legacy marker without a `db` block is trusted as before."""
+    why. Every field known on BOTH sides is compared, so a config without
+    `pg:` still rejects a marker for another `library_id`. A legacy marker
+    without a `db` block is trusted as before."""
     if not marker_path.is_file():
         return None, None
     marker = y_read_marker(marker_path.parent, marker=marker_path)
     recorded = marker.get("db") if marker else None
-    if not isinstance(recorded, dict) or config.pg is None or config.immich is None:
+    if not isinstance(recorded, dict):
         return marker, None
-    current = marker_db_identity(config.pg, config.immich.library_id)
-    if recorded == current:
+    current = marker_db_identity(
+        config.pg, config.immich.library_id if config.immich else None)
+    if all(
+        recorded.get(k) is None or v is None or recorded.get(k) == v
+        for k, v in current.items()
+    ):
         return marker, None
     return None, (
         "y_processed.yml was written against a different database "
@@ -566,7 +572,12 @@ class VerifyResult:
 
     @property
     def ok(self) -> bool:
-        return self.album_count == self.expected_count and not self.missing
+        return (
+            self.album_found
+            and self.album_count == self.expected_count
+            and not self.missing
+            and not self.extra
+        )
 
 
 _VERIFY_TRIP_ASSETS_SQL = (

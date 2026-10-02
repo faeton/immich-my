@@ -615,3 +615,42 @@ def test_sync_offline_cli_reads_state_root_cache(tmp_path: Path, monkeypatch):
     assert result.exit_code == 0, result.stdout
     assert "nothing to sync" not in result.stdout
     assert "synced=1" in result.stdout
+
+
+def test_derive_container_root_reads_marker_from_state_root(tmp_path: Path):
+    """NAS: the marker lives under state_root, not the :ro trip."""
+    from immy.paths import resolve_writable_paths
+
+    originals = tmp_path / "originals"
+    trip = originals / "trip-x"
+    trip.mkdir(parents=True)
+    paths = resolve_writable_paths(trip, originals_root=originals,
+                                   state_root=tmp_path / "state")
+    process_mod.write_marker(trip, [process_mod.ProcessResult(
+        asset_id="id-1", container_path="/mnt/ext/trip-x/a.jpg", inserted=True,
+    )], marker=paths.marker_path)
+    assert offline_mod.derive_container_root_from_marker(trip) is None
+    assert offline_mod.derive_container_root_from_marker(
+        trip, marker=paths.marker_path) == "/mnt/ext"
+
+
+def test_resolve_offline_library_uses_state_root_marker(tmp_path: Path):
+    """`process --offline` without a cached library recovers container_root
+    from a sibling trip's marker — under state_root on the NAS."""
+    from types import SimpleNamespace
+    from immy.cli import _resolve_offline_library
+    from immy.paths import resolve_writable_paths
+
+    originals, state = tmp_path / "originals", tmp_path / "state"
+    done, new = originals / "trip-done", originals / "trip-new"
+    done.mkdir(parents=True)
+    new.mkdir()
+    process_mod.write_marker(done, [process_mod.ProcessResult(
+        asset_id="id-1", container_path="/mnt/ext/trip-done/a.jpg", inserted=True,
+    )], marker=resolve_writable_paths(
+        done, originals_root=originals, state_root=state).marker_path)
+    cfg = SimpleNamespace(originals_root=originals, state_root=state, sidecars_root=None)
+
+    lib, recovered = _resolve_offline_library(new, cfg)
+    assert recovered is True and lib.container_root == "/mnt/ext"
+    assert _resolve_offline_library(new, None) == (None, False)
