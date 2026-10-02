@@ -3734,15 +3734,29 @@ def dedup_apply(
         console.print(f"[yellow]held:[/yellow] {sample}")
 
 
+_LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def _warn_if_exposed(host: str) -> None:
+    """The review/pano web UIs have no authentication: say so when the bind
+    address is not loopback."""
+    if host not in _LOOPBACK_HOSTS:
+        console.print(
+            f"[yellow]warning:[/yellow] binding {host} — this server has no "
+            "authentication; anyone who can reach it can use it."
+        )
+
+
 @dedup_app.command("review-server")
 def dedup_review_server(
     manifest_path: Path = _MANIFEST_OPT,
     port: int = typer.Option(8765, "--port"),
     host: str = typer.Option(
-        "0.0.0.0", "--host",
-        help="Bind address INSIDE the container. Must be 0.0.0.0 for a "
-        "docker `--publish` to reach it — restrict exposure on the host "
-        "side instead (`--publish 127.0.0.1:8765:8765`).",
+        "127.0.0.1", "--host",
+        help="Bind address. Default is loopback-only (the UI has no "
+        "authentication). Inside docker pass `--host 0.0.0.0` so a `--publish` "
+        "can reach it, and restrict exposure on the host side instead "
+        "(`--publish 127.0.0.1:8765:8765`).",
     ),
     thumb_dir: Path = typer.Option(
         Path("/scratch/dedup-review-tool"), "--thumb-dir",
@@ -3757,12 +3771,13 @@ def dedup_review_server(
 
         sudo docker compose -f deploy/n5/compose.yaml run --rm \\
           --publish 127.0.0.1:8765:8765 \\
-          immy dedup review-server --manifest /state/manifest.sqlite
+          immy dedup review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 
     then `ssh -L 8765:localhost:8765 n5` and open http://localhost:8765.
     """
     from .dedup import review as review_mod
 
+    _warn_if_exposed(host)
     console.print(f"serving dedup review on http://{host}:{port} — Ctrl-C to stop")
     review_mod.serve(manifest_path, thumb_dir, host, port)
 
@@ -4122,10 +4137,11 @@ def triage_review_server(
     manifest_path: Path = _MANIFEST_OPT,
     port: int = typer.Option(8766, "--port"),
     host: str = typer.Option(
-        "0.0.0.0", "--host",
-        help="Bind address INSIDE the container. Must be 0.0.0.0 for a "
-        "docker `--publish` to reach it — restrict exposure on the host "
-        "side instead (`--publish <tailscale-ip>:8766:8766`).",
+        "127.0.0.1", "--host",
+        help="Bind address. Default is loopback-only (the UI has no "
+        "authentication). Inside docker pass `--host 0.0.0.0` so a `--publish` "
+        "can reach it, and restrict exposure on the host side instead "
+        "(`--publish <tailscale-ip>:8766:8766`).",
     ),
     frames_dir: Path = typer.Option(
         Path("/scratch/triage-frames"), "--frames-dir",
@@ -4148,12 +4164,13 @@ def triage_review_server(
 
         sudo docker compose -f deploy/n5/compose.yaml run --rm \\
           --name immy-triage-review --publish 100.115.236.50:8766:8766 \\
-          immy triage review-server --manifest /state/manifest.sqlite
+          immy triage review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 
     then open http://n5.bee-ruffe.ts.net:8766 from anywhere on the tailnet.
     """
     from .triage import review as review_mod
 
+    _warn_if_exposed(host)
     console.print(f"serving triage review on http://{host}:{port} — Ctrl-C to stop")
     review_mod.serve(manifest_path, frames_dir, root, fs_root, host, port)
 
@@ -4162,7 +4179,11 @@ def triage_review_server(
 def pano_server(
     manifest_path: Path = _MANIFEST_OPT,
     port: int = typer.Option(8767, "--port"),
-    host: str = typer.Option("0.0.0.0", "--host"),
+    host: str = typer.Option(
+        "127.0.0.1", "--host",
+        help="Bind address. Default is loopback-only (no authentication); "
+        "inside docker pass `--host 0.0.0.0`.",
+    ),
     poster_dir: Path = typer.Option(
         Path("/scratch/pano-posters"), "--poster-dir",
         help="Lazily-filled poster cache (one JPEG per recording).",
@@ -4176,10 +4197,11 @@ def pano_server(
 
         sudo docker compose -f deploy/n5/compose.yaml run --rm \\
           --name immy-360-viewer --publish 100.115.236.50:8767:8767 \\
-          immy pano-server --manifest /state/manifest.sqlite
+          immy pano-server --host 0.0.0.0 --manifest /state/manifest.sqlite
     """
     from . import pano as pano_mod
 
+    _warn_if_exposed(host)
     console.print(f"serving 360 viewer on http://{host}:{port} — Ctrl-C to stop")
     pano_mod.serve(manifest_path, poster_dir, root, fs_root, host, port)
 

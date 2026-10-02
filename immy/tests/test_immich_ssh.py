@@ -40,10 +40,10 @@ def test_ssh_used_when_host_set(monkeypatch):
     remote = cmd[-1]
     assert remote.startswith("curl ")
     assert "http://127.0.0.1:2283/api/jobs" in remote
-    assert "x-api-key: KEY" in remote
     assert "-X GET" in remote
-    # GET has no body → nothing piped, no Content-Type.
-    assert cap["input"] is None
+    # key travels on stdin as a curl config, never in any argv.
+    assert "-K -" in remote
+    assert cap["input"] == b'header = "x-api-key: KEY"\n'
     assert "Content-Type" not in remote
 
 
@@ -54,11 +54,23 @@ def test_ssh_post_pipes_body_over_stdin(monkeypatch):
                              body={"command": "start", "force": True})
     assert out is None  # empty body → None, like urllib path
     remote = cap["cmd"][-1]
-    assert "--data-binary @-" in remote
     assert "Content-Type: application/json" in remote
-    # JSON goes over stdin, never into the shell-quoted command.
-    assert cap["input"] == b'{"command": "start", "force": true}'
+    # JSON + key go over stdin (one curl config), never into any argv.
+    assert cap["input"] == (
+        b'header = "x-api-key: KEY"\n'
+        b'data-binary = "{\\"command\\": \\"start\\", \\"force\\": true}"\n'
+    )
     assert "force" not in remote
+
+
+def test_ssh_api_key_never_in_argv(monkeypatch):
+    cap = {}
+    monkeypatch.setattr(subprocess, "run", _fake_run(b"\n200", capture=cap))
+    key = 'sec"ret\\key'
+    c = ImmichClient(url="http://127.0.0.1:2283", api_key=key, ssh_host="n5")
+    c._request("POST", "/api/x", body={"a": 1})
+    assert not any("sec" in a for a in cap["cmd"])
+    assert b'header = "x-api-key: sec\\"ret\\\\key"\n' in cap["input"]
 
 
 def test_ssh_http_error_mirrors_request(monkeypatch):

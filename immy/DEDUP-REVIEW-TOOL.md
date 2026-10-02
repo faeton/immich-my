@@ -20,7 +20,7 @@ interface, `100.115.236.50`):
 sudo docker compose -f /mnt/flash/immy/src-immy/deploy/n5/compose.yaml run --rm \
   -d --name immy-dedup-review \
   --publish 100.115.236.50:8765:8765 \
-  immy dedup review-server --manifest /state/manifest.sqlite
+  immy dedup review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 ```
 
 Open http://100.115.236.50:8765 (or http://n5:8765 with MagicDNS). Stop with
@@ -28,7 +28,8 @@ Open http://100.115.236.50:8765 (or http://n5:8765 with MagicDNS). Stop with
 mode, publish `127.0.0.1:8765:8765` instead and use
 `ssh -L 8765:localhost:8765 n5`.
 
-Note the app binds `0.0.0.0` **inside** the container — a docker `--publish`
+The app defaults to `127.0.0.1` (no authentication), so the command above passes
+`--host 0.0.0.0` explicitly: inside the container — a docker `--publish`
 forwards to the container's eth0, not its loopback, so an in-container
 127.0.0.1 bind would be unreachable. The interface prefix on the publish
 spec is what limits exposure.

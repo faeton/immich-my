@@ -91,7 +91,7 @@ On n5 (frames + manifest live in the standard container mounts):
 ```sh
 sudo docker compose -f deploy/n5/compose.yaml run --rm \
   --name immy-triage-review --publish 100.115.236.50:8766:8766 \
-  immy triage review-server --manifest /state/manifest.sqlite
+  immy triage review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 ```
 
 then open `http://n5.bee-ruffe.ts.net:8766` from anywhere on the tailnet

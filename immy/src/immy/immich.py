@@ -53,6 +53,15 @@ class ImmichError(RuntimeError):
     """Any non-2xx response or transport failure."""
 
 
+def _curl_config_quote(value: str) -> str:
+    """Escape `value` for a double-quoted curl config (`-K`) string."""
+    return (
+        value.replace("\\", "\\\\").replace('"', '\\"')
+        .replace("\n", "\\n").replace("\r", "\\r")
+        .replace("\t", "\\t").replace("\v", "\\v")
+    )
+
+
 @dataclass
 class ImmichClient:
     url: str
@@ -97,8 +106,9 @@ class ImmichClient:
         Immich API is localhost-bound and not reachable from the laptop (no
         port-forwarding, TLS handshake fails on the tailscale IP).
 
-        The request body is piped to curl over stdin (`--data-binary @-`) so JSON
-        never has to survive remote-shell quoting; the remote argv is otherwise
+        The API key and request body are piped to curl over stdin as a `-K -`
+        config (see below) so neither appears in any argv and JSON never has to
+        survive remote-shell quoting; the remote argv is otherwise
         `shlex.quote`d into one command string (ssh joins args with bare spaces,
         so pre-quoting is mandatory). A trailing `-w '\\n%{http_code}'` carries
         the status out-of-band — curl exits 0 on HTTP 4xx/5xx (no `-f`), so we
@@ -107,21 +117,28 @@ class ImmichClient:
         data = json.dumps(body).encode() if body is not None else None
         curl = [
             "curl", "-sS", "-X", method,
-            "-H", f"x-api-key: {self.api_key}",
+            "-K", "-",  # secrets (and the body) come from stdin, never argv
             "-H", "Accept: application/json",
             "-w", "\n%{http_code}",
         ]
         if data is not None:
-            curl += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
+            curl += ["-H", "Content-Type: application/json"]
         curl.append(url)
         remote = " ".join(shlex.quote(a) for a in curl)
+        # stdin = a curl config (`-K -`): the API key must not appear in the
+        # local ssh argv or the remote curl argv (both visible in `ps`). curl
+        # reads stdin once, so the body rides in the same config.
+        config = f'header = "x-api-key: {_curl_config_quote(self.api_key)}"\n'
+        if data is not None:
+            config += f'data-binary = "{_curl_config_quote(data.decode())}"\n'
+        stdin = config.encode()
         ssh = [
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             self.ssh_host, remote,
         ]
         try:
             proc = subprocess.run(
-                ssh, input=data, capture_output=True,
+                ssh, input=stdin, capture_output=True,
                 timeout=self.timeout + 15,  # ssh connect/auth overhead
             )
         except subprocess.TimeoutExpired as e:

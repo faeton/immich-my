@@ -4,6 +4,24 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — security: servers bind loopback, API key off the command line
+
+### Security
+
+- **`dedup review-server`, `triage review-server`, `pano-server` now default
+  to `--host 127.0.0.1`** (was `0.0.0.0`, with no authentication). A
+  non-loopback `--host` prints a one-line "no authentication" warning.
+  Inside docker pass `--host 0.0.0.0` explicitly so `--publish` can reach the
+  server (docstrings, `DEDUP-REVIEW-TOOL.md`, `TRIAGE.md` updated). Nothing in
+  `deploy/n5/compose.yaml` or `run-batch.sh` starts these servers.
+  **Action needed:** the deployed compose/launch commands on n5 (a copy
+  outside this repo) must add `--host 0.0.0.0`, or the published ports stop
+  answering.
+- **The ssh+curl Immich transport no longer puts `x-api-key` in any argv**
+  (local `ssh` or remote `curl`, both visible in `ps`). curl now runs with
+  `-K -` and the key header (plus the JSON body, since stdin can be read only
+  once) is written to stdin as a curl config with quotes/backslashes escaped.
+
 ## 2026-10-02 — caption retry/sanitising/prompt hash, CLIP model guard
 
 ### Fixed
