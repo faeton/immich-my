@@ -267,6 +267,8 @@ def _make_snapshot(path: Path, rows: list[tuple]) -> None:
             normalized,
         )
         db.commit()
+        snap.write_meta(db, server_host="t", library_id=None,
+                        asset_count=len(normalized))
     finally:
         db.close()
 

@@ -20,6 +20,7 @@ if something external needs the text form.
 from __future__ import annotations
 
 import base64
+import os
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -31,6 +32,13 @@ from typing import Iterable
 # fully offline. `find-duplicates` (the v1 consumer) reads only the assets
 # columns it always read, so a v2 file is backward-compatible for it.
 SCHEMA_VERSION = 2
+
+# meta key set to "1" once a snapshot is fully written (see write_meta).
+COMPLETE_KEY = "complete"
+
+
+class IncompleteSnapshotError(RuntimeError):
+    """The snapshot file is truncated / unfinished — re-run `immy snapshot`."""
 
 _CREATE_SCHEMA = """
 CREATE TABLE IF NOT EXISTS assets (
@@ -246,6 +254,19 @@ def create(path: Path) -> sqlite3.Connection:
     return db
 
 
+def temp_path(path: Path) -> Path:
+    """Where to build a snapshot destined for `path`. Same directory, so the
+    final `os.replace` is an atomic same-filesystem rename."""
+    return path.with_name(path.name + ".tmp")
+
+
+def publish(tmp: Path, final: Path) -> None:
+    """Atomically move a finished snapshot over `final`. The previous
+    snapshot stays intact until this instant; a crash before it leaves only
+    a stray temp file, never a truncated `final`."""
+    os.replace(tmp, final)
+
+
 def write_rows(db: sqlite3.Connection, rows: Iterable[AssetRow]) -> int:
     """Insert `rows` into the snapshot. Returns the count written."""
     count = 0
@@ -307,6 +328,9 @@ def write_meta(db: sqlite3.Connection, *, server_host: str,
         ("server_host", server_host),
         ("library_id", library_id or ""),
         ("asset_count", str(asset_count)),
+        # Written last, in the same transaction as asset_count: readers
+        # refuse a file that lacks it (or whose count disagrees).
+        (COMPLETE_KEY, "1"),
     ]
     db.executemany(
         "INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", rows,
@@ -334,7 +358,38 @@ def open_for_read(path: Path) -> sqlite3.Connection:
     # `mode=ro` via URI prevents accidental writes; SQLite otherwise opens
     # read-write by default.
     uri = f"file:{path}?mode=ro"
-    return sqlite3.connect(uri, uri=True)
+    db = sqlite3.connect(uri, uri=True)
+    try:
+        _require_complete(db, path)
+    except BaseException:
+        db.close()
+        raise
+    return db
+
+
+def _require_complete(db: sqlite3.Connection, path: Path) -> None:
+    """Refuse an unfinished snapshot.
+
+    Complete means: meta `asset_count` equals the assets row count, and the
+    `complete` marker is "1" when present. Files written before the marker
+    existed have no `complete` key; they are trusted only if the count
+    matches (a partial write cannot satisfy that unless it was a no-op)."""
+    hint = f"snapshot {path} is incomplete — re-run `immy snapshot`"
+    try:
+        meta = read_meta(db)
+        rows = db.execute("SELECT COUNT(*) FROM assets").fetchone()[0]
+    except sqlite3.Error as e:
+        raise IncompleteSnapshotError(f"{hint} ({e})") from e
+    if COMPLETE_KEY in meta and meta[COMPLETE_KEY] != "1":
+        raise IncompleteSnapshotError(f"{hint} (completeness marker unset)")
+    try:
+        expected = int(meta["asset_count"])
+    except (KeyError, ValueError):
+        raise IncompleteSnapshotError(f"{hint} (no asset_count in meta)")
+    if expected != rows:
+        raise IncompleteSnapshotError(
+            f"{hint} (meta asset_count={expected} but {rows} rows)"
+        )
 
 
 def match_name_size(db: sqlite3.Connection, filename: str,

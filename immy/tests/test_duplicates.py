@@ -19,7 +19,8 @@ from immy import snapshot as snap
 
 def _seed_snapshot(path: Path, rows: list[snap.AssetRow]) -> None:
     db = snap.create(path)
-    snap.write_rows(db, rows)
+    count = snap.write_rows(db, rows)
+    snap.write_meta(db, server_host="t", library_id=None, asset_count=count)
     db.close()
 
 

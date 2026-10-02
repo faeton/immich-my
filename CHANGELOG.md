@@ -4,6 +4,29 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — atomic snapshot, backups cover immy state
+
+### Fixed
+
+- **`immy snapshot` unlinked the old snapshot before fetching**, so an
+  interrupted run (Postgres drop, Ctrl-C) left a truncated or missing file
+  that `find-duplicates` / `match` then trusted. It now builds
+  `<out>.tmp` beside the target and `os.replace`s it only after the rows,
+  albums and meta are written; a failed run removes the temp file and keeps
+  the previous snapshot. `write_meta` also sets a `complete` marker.
+- **Readers refuse an incomplete snapshot.** `snapshot.open_for_read` (used by
+  `find-duplicates`, `match`, `apple-people`) raises `IncompleteSnapshotError`
+  (CLI: exit 2, "re-run `immy snapshot`") when meta `asset_count` is missing or
+  differs from the row count, or the marker is unset. Snapshots written before
+  the marker existed are accepted only if `asset_count` matches.
+- **Backups missed immy's own state.** `deploy/n5/backup/nightly-mirror.sh`
+  now also mirrors `/mnt/flash/immy/state` and `/mnt/flash/immy/sidecars` (from
+  a transient snapshot of the `flash` dataset) and the dedup
+  `/mnt/tank/media/state/manifest.sqlite` (via `sqlite3 .backup` into a staging
+  dir with an integrity check, never a raw copy) to vv `immy/`. Script change
+  only: not run, and the installed copy under `/mnt/tank/scripts/` is unchanged.
+  See `deploy/n5/backup/README.md`.
+
 ## 2026-10-02 — dedup: maker notes read, losers wait for their winner
 
 ### Fixed

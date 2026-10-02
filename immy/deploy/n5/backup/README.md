@@ -11,13 +11,20 @@ offsite leg of 3-2-1. `nightly-mirror.sh` keeps vv a byte-level standby.
 2. **pg_dump first** — `pg_dumpall | gzip` → `backups/nightly/`, integrity- and
    size-checked, with a self-describing `RESTORE-RECIPE.txt` (image tags + steps).
    Dump-before-files: a DB referencing missing files is worse than extra files.
+   Also copies the dedup `manifest.sqlite` (live WAL DB, `/mnt/tank/media/state/`)
+   into a faeton-owned staging dir with `sudo sqlite3 .backup`, then requires
+   `PRAGMA integrity_check` = `ok`. A live SQLite file is never copied raw.
 3. **Snapshot + mirror files** — atomic ZFS snapshot, then rsync from the
    `.zfs/snapshot/<snap>/` view (immune to concurrent writes) → vv:
    `originals/` and `media/{library,profile,upload}/`.
    `encoded-video/`, `thumbs/`, `media/backups/` are **not** mirrored — they
    regenerate. The snapshot is destroyed after the run.
-4. **Push dump → vv:db/** (after files, so vv's dump never references files not
-   yet mirrored), then prune to the newest `KEEP_DUMPS`.
+   immy's own state is mirrored from a transient snapshot of the **`flash`**
+   dataset (the pool-root dataset; `/mnt/flash/immy/{state,sidecars}` are plain
+   directories in it, not child datasets) → vv `immy/state/`, `immy/sidecars/`.
+   Without this they had no backup at all.
+4. **Push dump → vv:db/** and the manifest copy → vv `immy/manifest/` (after
+   files, so vv's dump never references files not yet mirrored), then prune to the newest `KEEP_DUMPS`.
 
 Heartbeats to **Healthchecks** (`/start`, success, `/fail` with the log tail) so a
 *missed* run alerts, not just a failed one. `flock` prevents overlap. Logs in
@@ -68,6 +75,23 @@ sudo midclt call cronjob.create '{
 }'
 sudo midclt call cronjob.query   # verify; also visible in the SCALE UI
 ```
+
+## Backup roots (as of 2026-10-02)
+| Source | Method | vv destination |
+|---|---|---|
+| `tank/immich/originals` | ZFS snapshot view, rsync `--delete` | `originals/` |
+| `tank/immich/media/{library,profile,upload}` | ZFS snapshot view | `media/<sub>/` |
+| `/mnt/flash/immy/state` | `flash` snapshot view | `immy/state/` |
+| `/mnt/flash/immy/sidecars` | `flash` snapshot view | `immy/sidecars/` |
+| `/mnt/tank/media/state/manifest.sqlite` | `sqlite3 .backup` -> staging -> rsync | `immy/manifest/` |
+| pg_dumpall + recipe | gzip, verified | `db/` |
+
+Upgrading an existing install: the script now needs `sudo zfs snapshot` rights
+on `flash` too, and `sqlite3` on PATH (preflight checks both). New vv dirs under
+`immy/` are created by the first live run; a `DRY_RUN=1` run reports "would
+create" instead (it never writes to vv). Install-time note: the installed copy at
+`/mnt/tank/scripts/immich-mirror/` is separate from this repo file — copy the
+script over and dry-run before trusting it.
 
 ## Config
 All knobs live in `mirror.env` (see `mirror.env.example`). Only `HC_URL` must be

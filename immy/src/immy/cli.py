@@ -2486,7 +2486,10 @@ def snapshot(
         f"[bold]snapshot[/bold] {config.pg.host}:{config.pg.port}/{config.pg.database}"
         f" → [cyan]{out}[/cyan]"
     )
-    db = snapshot_mod.create(out)
+    # Build beside the target and os.replace at the end: the previous snapshot
+    # survives a failed/interrupted run instead of being unlinked up front.
+    tmp_out = snapshot_mod.temp_path(out)
+    db = snapshot_mod.create(tmp_out)
     try:
         count = snapshot_mod.write_rows(
             db, snapshot_mod.fetch_rows(conn, library_id),
@@ -2503,8 +2506,13 @@ def snapshot(
             library_id=library_id,
             asset_count=count,
         )
-    finally:
         db.close()
+        snapshot_mod.publish(tmp_out, out)
+    except BaseException:
+        db.close()
+        tmp_out.unlink(missing_ok=True)
+        raise
+    finally:
         conn.close()
 
     size_mb = out.stat().st_size / (1024 * 1024)
@@ -2512,6 +2520,15 @@ def snapshot(
         f"  [green]✓[/green] {count:,} asset(s), {album_count:,} album(s)"
         f" → {size_mb:.1f} MB at [cyan]{out}[/cyan]"
     )
+
+
+def _open_snapshot_or_exit(path: Path):
+    """open_for_read, but an incomplete snapshot is a clean exit-2 error."""
+    try:
+        return snapshot_mod.open_for_read(path)
+    except snapshot_mod.IncompleteSnapshotError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
 
 
 @app.command("backfill-dates")
@@ -2714,15 +2731,19 @@ def find_duplicates(
         f"[bold]find-duplicates[/bold] {path} "
         f"[dim](mode: {hash_mode.value}, snapshot: {snapshot_path})[/dim]"
     )
-    summary = duplicates_mod.scan(
-        path, snapshot_path,
-        hash_mode=hash_mode,
-        ignore_globs=ignore_globs,
-        min_size=min_size,
-        follow_symlinks=follow_symlinks,
-        into_bundles=into_bundles,
-        progress=_tick,
-    )
+    try:
+        summary = duplicates_mod.scan(
+            path, snapshot_path,
+            hash_mode=hash_mode,
+            ignore_globs=ignore_globs,
+            min_size=min_size,
+            follow_symlinks=follow_symlinks,
+            into_bundles=into_bundles,
+            progress=_tick,
+        )
+    except snapshot_mod.IncompleteSnapshotError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
 
     report_md = out if out else (path / "dupes.md")
     report_md.parent.mkdir(parents=True, exist_ok=True)
@@ -2797,7 +2818,7 @@ def match(
         )
         raise typer.Exit(code=2)
 
-    db = snapshot_mod.open_for_read(snapshot_path)
+    db = _open_snapshot_or_exit(snapshot_path)
     try:
         try:
             snapshot_mod.require_schema(db)
@@ -2973,7 +2994,7 @@ def apple_people(
         console.print("[yellow]no named persons found (or all below --min-faces).[/yellow]")
         raise typer.Exit(code=0)
 
-    snap = snapshot_mod.open_for_read(snapshot_path)
+    snap = _open_snapshot_or_exit(snapshot_path)
     try:
         matches = apple_photos_mod.match_to_snapshot(persons, snap)
         snap_meta = snapshot_mod.read_meta(snap)

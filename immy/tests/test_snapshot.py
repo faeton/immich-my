@@ -199,14 +199,14 @@ def test_write_meta_stores_expected_keys(tmp_path: Path) -> None:
     p = tmp_path / "snap.sqlite"
     db = snap.create(p)
     snap.write_meta(db, server_host="pg.example:5432",
-                    library_id="lib-1", asset_count=42)
+                    library_id="lib-1", asset_count=0)
     db.close()
     db = snap.open_for_read(p)
     meta = snap.read_meta(db)
     db.close()
     assert meta["server_host"] == "pg.example:5432"
     assert meta["library_id"] == "lib-1"
-    assert meta["asset_count"] == "42"
+    assert meta["asset_count"] == "0"
     assert meta["schema_version"] == str(snap.SCHEMA_VERSION)
     assert "created_at" in meta
 
@@ -218,6 +218,8 @@ def test_match_name_size_returns_snapshot_match(tmp_path: Path) -> None:
         _make_row("a", "photo.jpg", 500, b"\xaa" * 20),
         _make_row("b", "other.jpg", 500),
     ])
+    snap.write_meta(db, server_host="t", library_id=None,
+                    asset_count=db.execute("SELECT COUNT(*) FROM assets").fetchone()[0])
     db.close()
     rd = snap.open_for_read(p)
     try:
@@ -233,6 +235,8 @@ def test_match_name_size_empty_on_miss(tmp_path: Path) -> None:
     p = tmp_path / "snap.sqlite"
     db = snap.create(p)
     snap.write_rows(db, [_make_row("a", "photo.jpg", 500)])
+    snap.write_meta(db, server_host="t", library_id=None,
+                    asset_count=db.execute("SELECT COUNT(*) FROM assets").fetchone()[0])
     db.close()
     rd = snap.open_for_read(p)
     try:
@@ -250,6 +254,8 @@ def test_match_checksum(tmp_path: Path) -> None:
         _make_row("b", "renamed.jpg", 500, b"\xaa" * 20),
         _make_row("c", "other.jpg", 500, b"\xbb" * 20),
     ])
+    snap.write_meta(db, server_host="t", library_id=None,
+                    asset_count=db.execute("SELECT COUNT(*) FROM assets").fetchone()[0])
     db.close()
     rd = snap.open_for_read(p)
     try:
@@ -277,3 +283,102 @@ def test_empty_library_produces_valid_snapshot(tmp_path: Path) -> None:
     (n,) = rd.execute("SELECT count(*) FROM assets").fetchone()
     assert n == 0
     rd.close()
+
+
+# --- atomic write + completeness (audit task 7) ----------------------------
+
+
+def _complete_snapshot(p: Path, n: int = 2) -> None:
+    db = snap.create(p)
+    count = snap.write_rows(
+        db, [_make_row(f"a{i}", f"p{i}.jpg", 10 + i) for i in range(n)],
+    )
+    snap.write_meta(db, server_host="pg", library_id=None, asset_count=count)
+    db.close()
+
+
+def test_complete_snapshot_opens(tmp_path: Path) -> None:
+    p = tmp_path / "snap.sqlite"
+    _complete_snapshot(p)
+    rd = snap.open_for_read(p)
+    try:
+        assert snap.read_meta(rd)["complete"] == "1"
+    finally:
+        rd.close()
+
+
+def test_open_for_read_refuses_snapshot_without_meta(tmp_path: Path) -> None:
+    p = tmp_path / "snap.sqlite"
+    db = snap.create(p)
+    snap.write_rows(db, [_make_row("a", "photo.jpg", 500)])
+    db.close()
+    with pytest.raises(snap.IncompleteSnapshotError, match="incomplete"):
+        snap.open_for_read(p)
+
+
+def test_open_for_read_refuses_asset_count_mismatch(tmp_path: Path) -> None:
+    p = tmp_path / "snap.sqlite"
+    _complete_snapshot(p, n=3)
+    raw = sqlite3.connect(p)
+    raw.execute("DELETE FROM assets WHERE asset_id = 'a0'")
+    raw.commit()
+    raw.close()
+    with pytest.raises(snap.IncompleteSnapshotError, match="asset_count"):
+        snap.open_for_read(p)
+
+
+def test_open_for_read_refuses_marker_not_set(tmp_path: Path) -> None:
+    p = tmp_path / "snap.sqlite"
+    _complete_snapshot(p)
+    raw = sqlite3.connect(p)
+    raw.execute("UPDATE meta SET value = '0' WHERE key = 'complete'")
+    raw.commit()
+    raw.close()
+    with pytest.raises(snap.IncompleteSnapshotError):
+        snap.open_for_read(p)
+
+
+def test_open_for_read_accepts_legacy_snapshot_when_count_matches(
+    tmp_path: Path,
+) -> None:
+    """Pre-marker snapshots: trusted only if meta asset_count == row count."""
+    p = tmp_path / "snap.sqlite"
+    _complete_snapshot(p)
+    raw = sqlite3.connect(p)
+    raw.execute("DELETE FROM meta WHERE key = 'complete'")
+    raw.commit()
+    raw.close()
+    snap.open_for_read(p).close()
+    raw = sqlite3.connect(p)
+    raw.execute("DELETE FROM assets WHERE asset_id = 'a0'")
+    raw.commit()
+    raw.close()
+    with pytest.raises(snap.IncompleteSnapshotError):
+        snap.open_for_read(p)
+
+
+def test_publish_replaces_atomically_and_failure_keeps_old(
+    tmp_path: Path,
+) -> None:
+    final = tmp_path / "snap.sqlite"
+    _complete_snapshot(final, n=2)
+    tmp = snap.temp_path(final)
+    assert tmp.parent == final.parent  # same dir => os.replace is atomic
+    # A crashed run: temp half-written, never published. Old file intact.
+    db = snap.create(tmp)
+    snap.write_rows(db, [_make_row("x", "x.jpg", 1)])
+    db.close()
+    rd = snap.open_for_read(final)
+    try:
+        assert rd.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 2
+    finally:
+        rd.close()
+    # A finished run publishes over it.
+    _complete_snapshot(tmp, n=5)
+    snap.publish(tmp, final)
+    assert not tmp.exists()
+    rd = snap.open_for_read(final)
+    try:
+        assert rd.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 5
+    finally:
+        rd.close()
