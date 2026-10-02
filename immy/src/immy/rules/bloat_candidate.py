@@ -35,6 +35,7 @@ import re
 from pathlib import Path
 
 from ..exif import ExifRow
+from ..filenames import parse_insta360
 from .registry import Finding, Rule, register
 
 
@@ -66,7 +67,16 @@ def _is_insta360(path: Path, raw: dict) -> bool:
         v = raw.get(k)
         if isinstance(v, str) and "insta360" in v.lower():
             return True
-    return False
+    # Exported 5.7K/7.7K equirectangular: exactly 2:1 and at least 5760 wide.
+    w = _num(raw, "QuickTime:ImageWidth", "Composite:ImageWidth", "EXIF:ExifImageWidth")
+    h = _num(raw, "QuickTime:ImageHeight", "Composite:ImageHeight", "EXIF:ExifImageHeight")
+    if w and h and w >= 5760 and w == 2 * h:
+        return True
+    # Any path segment mentioning 360 (Incoming360, Insta360, ...).
+    if any("360" in part for part in path.parts):
+        return True
+    # Insta360 camera-native filename (VID_/LRV_/PRO_ timestamp_lens_serial).
+    return parse_insta360(path) is not None
 
 
 def _preserve_by_name(path: Path) -> bool:

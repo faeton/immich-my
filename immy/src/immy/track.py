@@ -7,7 +7,8 @@ including camera settings GPX has no place for — plus a summary header.
 
 Times come from the drone's own clock and are emitted naive (GPX gets a
 trailing `Z` only because the format wants one); they are not timezone-
-corrected. The geotag path reads the track via `srt.parse_track`
+corrected. The GPX carries `creator="immy"` so `geotag-from-gpx` skips it
+(it would read the naive local time as UTC). The geotag path reads the track via `srt.parse_track`
 directly, so this caveat only affects external consumers of the GPX.
 """
 

@@ -25,7 +25,7 @@ the NAS they mirror under `sidecars_root`, never beside the read-only originals.
 `parse_track()` returns one `SrtFrame` per cue: `lat`/`lon`, `rel_alt` (above
 takeoff) / `abs_alt` (MSL), and `iso`/`shutter`/`fnum`/`ev`/`focal_len`. It
 handles the combined `[rel_alt: .. abs_alt: ..]` bracket, the legacy
-`[altitude:]`, and the old `GPS(lat,lon,alt)` form. `first_valid_fix()` skips
+`[altitude:]`, `longtitude`, and the old `GPS(lon,lat,sats)` form (see `srt.py`). `first_valid_fix()` skips
 the `(0,0)` "null-island" fixes a drone emits before it gets a satellite lock on
 takeoff. The legacy first-fix `parse()` API is preserved (used by `dates`,
 `backfill_dates`, the `dji-*` audit rules).

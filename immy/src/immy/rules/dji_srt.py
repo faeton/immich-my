@@ -51,8 +51,13 @@ def _propose_gps(rows: list[ExifRow], folder: Path) -> list[Finding]:
             "GPSLongitudeRef": "E" if tele.longitude >= 0 else "W",
         }
         if tele.altitude is not None:
-            patch["GPSAltitude"] = f"{tele.altitude:.2f}"
-            patch["GPSAltitudeRef"] = "0" if tele.altitude >= 0 else "1"
+            # Write |alt| plus the print-form Ref. A plain numeric Ref "1" is
+            # not accepted by exiftool for XMP (it stores Ref=0), so a below-
+            # sea-level fix would read back as a positive altitude.
+            patch["GPSAltitude"] = f"{abs(tele.altitude):.2f}"
+            patch["GPSAltitudeRef"] = (
+                "Above Sea Level" if tele.altitude >= 0 else "Below Sea Level"
+            )
         out.append(Finding(
             rule="dji-gps-from-srt",
             confidence="high",

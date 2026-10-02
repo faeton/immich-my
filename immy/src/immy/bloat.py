@@ -22,6 +22,7 @@ cheap to pull into tests and into the `immy audit` preview.
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import json
 import shutil
@@ -431,6 +432,20 @@ def _verify(src: Path, dst: Path, tolerance: float = 0.5) -> None:
         )
 
 
+@functools.lru_cache(maxsize=1)
+def _hevc_encoder() -> str:
+    """`hevc_videotoolbox` when this ffmpeg has it (Mac, unchanged); else
+    `libx265` so the transcode doesn't hard-fail on Linux/NAS."""
+    try:
+        out = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-encoders"],
+            capture_output=True, text=True, check=True,
+        ).stdout
+    except (OSError, subprocess.CalledProcessError):
+        return "hevc_videotoolbox"
+    return "hevc_videotoolbox" if "hevc_videotoolbox" in out else "libx265"
+
+
 def transcode_one(
     c: BloatCandidate,
     *,
@@ -452,11 +467,12 @@ def transcode_one(
     if shutil.which("ffmpeg") is None:
         raise TranscodeError("ffmpeg not on PATH")
 
-    tmp = dst.with_suffix(dst.suffix + ".part")
+    # Keep the real extension last so ffmpeg infers the muxer.
+    tmp = dst.with_name(f"{dst.stem}.part{dst.suffix}")
     cmd = [
         "ffmpeg", "-y", "-hide_banner", "-loglevel", "warning",
         "-i", str(c.path),
-        "-c:v", "hevc_videotoolbox", "-tag:v", "hvc1",
+        "-c:v", _hevc_encoder(), "-tag:v", "hvc1",
         "-b:v", str(c.target_bitrate),
         "-c:a", "copy",
         str(tmp),

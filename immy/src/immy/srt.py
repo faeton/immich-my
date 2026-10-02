@@ -9,7 +9,9 @@ telemetry fields. Three field dialects appear in the wild:
   with `[iso: 100] [shutter: 1/500.0] [fnum: 280] [ev: 0] [focal_len: 240]`.
   Note `rel_alt`/`abs_alt` share a single bracket, and the older firmware
   emits `[altitude: 120.0]` instead (treated as a relative height).
-- Older (parenthesised): `GPS(12.345,67.890,100.0)`.
+- Older (parenthesised): `GPS(lon,lat,sats)` with `BAROMETER:` altitude, integer
+  fields, an optional `M` unit and dotted dates (`2017.08.19`). Newer firmware
+  also misspells `[longtitude: ..]`.
 
 `parse_track` returns every frame; `parse` keeps the historical
 first-fix-only `SrtTelemetry` API (used by `dates`, `backfill_dates`,
@@ -33,11 +35,19 @@ from typing import Iterator
 # the next whitespace, which keeps `1/500.0` (shutter) and `-20.296270`
 # (latitude) intact.
 _RE_KV = re.compile(r"([A-Za-z_]\w*)\s*:\s*(\S+)")
+# Old firmware: `GPS(lon,lat,n)` — longitude FIRST, fields may be integers,
+# and the third may carry an `M` unit (`15M`). The third field is a satellite
+# count on Phantom-era files (altitude is then `BAROMETER:`), an altitude only
+# when it has the `M` unit.
+_RE_NUM = r"-?\d+(?:\.\d+)?"
 _RE_GPS_PAREN = re.compile(
-    r"GPS\s*\(\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*,\s*(-?\d+\.\d+)\s*\)"
+    rf"GPS\s*\(\s*({_RE_NUM})\s*,\s*({_RE_NUM})\s*(?:,\s*({_RE_NUM})\s*(M)?\s*)?\)",
+    re.IGNORECASE,
 )
+_RE_BAROMETER = re.compile(rf"BAROMETER\s*:\s*({_RE_NUM})", re.IGNORECASE)
+# Dates: `2023-01-02 10:00:00`, `2023/01/02 ...`, and old DJI `2017.08.19 13:02:57`.
 _RE_DATE = re.compile(
-    r"(\d{4})[-/](\d{2})[-/](\d{2})[ T](\d{2}):(\d{2}):(\d{2})"
+    r"(\d{4})[-/.](\d{2})[-/.](\d{2})[ T](\d{2}):(\d{2}):(\d{2})"
 )
 _RE_CUE_TIME = re.compile(r"(\d{2}):(\d{2}):(\d{2})[,.](\d{3})")
 _RE_BLOCK_SEP = re.compile(r"\n\s*\n")
@@ -127,7 +137,8 @@ def _parse_block(block: str, index: int) -> SrtFrame:
     kv = {k.lower(): v for k, v in _RE_KV.findall(payload)}
 
     frame.latitude = _to_float(kv.get("latitude"))
-    frame.longitude = _to_float(kv.get("longitude"))
+    # DJI firmware has shipped the misspelling `longtitude`.
+    frame.longitude = _to_float(kv.get("longitude", kv.get("longtitude")))
     frame.rel_alt = _to_float(kv.get("rel_alt"))
     frame.abs_alt = _to_float(kv.get("abs_alt"))
     if frame.rel_alt is None and "altitude" in kv:
@@ -142,10 +153,20 @@ def _parse_block(block: str, index: int) -> SrtFrame:
     if frame.latitude is None or frame.longitude is None:
         mp = _RE_GPS_PAREN.search(block)
         if mp:
-            frame.latitude = float(mp.group(1))
-            frame.longitude = float(mp.group(2))
+            a, b = float(mp.group(1)), float(mp.group(2))
+            # Documented order is (lon, lat). Only if that is impossible
+            # (|lat| > 90 or |lon| > 180) try the swapped (lat, lon) reading.
+            if abs(b) <= 90 and abs(a) <= 180:
+                frame.latitude, frame.longitude = b, a
+            elif abs(a) <= 90 and abs(b) <= 180:
+                frame.latitude, frame.longitude = a, b
+            if mp.group(3) is not None and mp.group(4):
+                if frame.abs_alt is None:
+                    frame.abs_alt = float(mp.group(3))
             if frame.abs_alt is None:
-                frame.abs_alt = float(mp.group(3))
+                mb = _RE_BAROMETER.search(block)
+                if mb:
+                    frame.abs_alt = float(mb.group(1))
 
     return frame
 

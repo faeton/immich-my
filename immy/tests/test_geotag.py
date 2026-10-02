@@ -160,3 +160,19 @@ def test_geotag_handles_gpx_with_default_namespace(tmp_path: Path):
     assert result.exit_code == 0, result.stdout
     tags = _xmp_tags(folder / "IMG_0001.xmp")
     assert float(tags["XMP:GPSLatitude"]) == pytest.approx(-20.2, abs=1e-4)
+
+
+def test_geotag_ignores_immy_generated_gpx(tmp_path: Path):
+    """immy's own track GPX (creator="immy", naive local time + fake Z) must
+    not be fed back into geotagging."""
+    folder = tmp_path / "gpx-trip"
+    folder.mkdir()
+    _stamp_jpg(folder / "IMG_0001.JPG", dt="2026:04:01 10:00:00")
+    gpx = folder / "DJI_0001.gpx"
+    _write_gpx(gpx, [("2026-04-01T06:00:30Z", -20.20, 57.20)])
+    gpx.write_text(gpx.read_text().replace('<gpx version="1.1"', '<gpx version="1.1" creator="immy"'))
+    (folder / "TRIP.md").write_text("---\ntimezone: Indian/Mauritius\n---\n")
+    result = runner.invoke(app, ["audit", str(folder), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+    xmp = folder / "IMG_0001.xmp"
+    assert not xmp.exists() or "XMP:GPSLatitude" not in _xmp_tags(xmp)

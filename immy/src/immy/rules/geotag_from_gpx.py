@@ -42,6 +42,19 @@ _GPX_NS = {"gpx": "http://www.topografix.com/GPX/1/1",
            "gpx10": "http://www.topografix.com/GPX/1/0"}
 
 
+def _is_immy_gpx(path: Path) -> bool:
+    """True for a GPX immy itself generated (`creator="immy"`, see `track.py`).
+
+    Those tracks carry the drone's naive local clock stamped with a fake `Z`,
+    so reading them back as UTC would mis-geotag; never consume our own output.
+    """
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError):
+        return False
+    return (root.get("creator") or "").strip().lower() == "immy"
+
+
 def _parse_gpx_time(raw: str) -> datetime | None:
     if not raw:
         return None
@@ -134,7 +147,7 @@ def _nearest(points: list[tuple[datetime, float, float]], target: datetime):
 
 
 def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
-    gpx_files = list(folder.rglob("*.gpx"))
+    gpx_files = [g for g in folder.rglob("*.gpx") if not _is_immy_gpx(g)]
     if not gpx_files:
         return []
     points: list[tuple[datetime, float, float]] = []

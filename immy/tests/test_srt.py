@@ -70,7 +70,7 @@ def test_parenthesised_gps_form(tmp_path: Path):
     txt = (
         "1\n00:00:00,000 --> 00:00:01,000\n"
         "FrameCnt : 1\n2023-01-02 10:00:00,000\n"
-        "GPS(-3.456000,12.789000,55.5) BAROMETER:55.5\n"
+        "GPS(12.789000,-3.456000,55) BAROMETER:55.5\n"
     )
     p = tmp_path / "old.SRT"
     p.write_text(txt)
@@ -88,3 +88,64 @@ def test_find_sibling(tmp_path: Path):
     assert srt.find_sibling(media) is None
     (tmp_path / "DJI_0001.SRT").write_text("x")
     assert srt.find_sibling(media) == tmp_path / "DJI_0001.SRT"
+
+
+def _one(tmp_path: Path, body: str):
+    p = tmp_path / "x.SRT"
+    p.write_text("1\n00:00:00,000 --> 00:00:01,000\n" + body)
+    return srt.parse_track(p)[0]
+
+
+def test_longtitude_misspelling(tmp_path: Path):
+    f = _one(tmp_path, (
+        "2021-06-20 10:11:12.123\n[iso: 100] [latitude: 41.123456] "
+        "[longtitude: 2.123456] [rel_alt: 1.3 abs_alt: -12.0]\n"))
+    assert (f.latitude, f.longitude, f.abs_alt) == (41.123456, 2.123456, -12.0)
+    assert f.has_fix()
+
+
+def test_old_dji_format_lon_lat_order_integer_and_dotted_date(tmp_path: Path):
+    f = _one(tmp_path, (
+        "HOME(149.0251,-20.2532) 2017.08.19 13:02:57\n"
+        "GPS(149.0251,-20.2533,16) BAROMETER:42.2\nISO:100\n"))
+    assert (f.latitude, f.longitude) == (-20.2533, 149.0251)
+    assert f.datetime == datetime(2017, 8, 19, 13, 2, 57)
+    assert f.abs_alt == 42.2  # 3rd field is a satellite count here
+
+
+def test_old_dji_integer_fields_and_meter_unit(tmp_path: Path):
+    f = _one(tmp_path, "2017.08.19 13:02:57\nGPS(8,47,15M)\n")
+    assert (f.latitude, f.longitude, f.abs_alt) == (47.0, 8.0, 15.0)
+
+
+def test_old_dji_swaps_when_lon_lat_impossible(tmp_path: Path):
+    f = _one(tmp_path, "GPS(-20.5,149.0,3)\n")
+    assert (f.latitude, f.longitude) == (-20.5, 149.0)
+
+
+def test_old_dji_impossible_both_ways_emits_nothing(tmp_path: Path):
+    f = _one(tmp_path, "GPS(200.5,149.0,3)\n")
+    assert not f.has_fix()
+
+
+def test_below_sea_level_altitude_roundtrips_negative(tmp_path: Path):
+    import subprocess
+
+    from immy import sidecar
+    from immy.exif import ExifRow
+    from immy.rules.dji_srt import _propose_gps
+
+    media = tmp_path / "DJI_0001.MP4"
+    media.write_bytes(b"")
+    (tmp_path / "DJI_0001.SRT").write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n2021-06-20 10:11:12.123\n"
+        "[latitude: 41.1] [longitude: 2.1] [rel_alt: 1.3 abs_alt: -12.0]\n"
+    )
+    (finding,) = _propose_gps([ExifRow(path=media, raw={})], tmp_path)
+    assert finding.patch["GPSAltitude"] == "12.00"
+    xmp = sidecar.write(media, finding.patch)
+    out = subprocess.run(
+        ["exiftool", "-n", "-s3", "-Composite:GPSAltitude", str(xmp)],
+        capture_output=True, text=True, check=True,
+    ).stdout.strip()
+    assert float(out) == -12.0

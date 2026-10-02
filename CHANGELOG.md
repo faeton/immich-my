@@ -4,6 +4,28 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — bloat/Insta360 detection, transcode temp name, SRT dialects, altitude sign, immy GPX
+
+### Fixed
+
+- **Bloat rule treated Insta360 exports as deliveries.** Equirectangular 2:1
+  clips >=5760 wide, anything under a path segment containing `360`
+  (`Incoming360`), and Insta360 filenames are now never bloat candidates.
+- **Transcode failed in ffmpeg.** The temp name `X.optimized.mp4.part` hid the
+  container; it is now `X.optimized.part.mp4`. The encoder falls back to
+  `libx265` when `hevc_videotoolbox` is not in `ffmpeg -encoders` (Linux/NAS);
+  the Mac path is unchanged.
+- **SRT parser.** Accepts DJI's `longtitude` misspelling and the old
+  `GPS(lon,lat,n[M])` form (lon first, integer fields, `BAROMETER:` altitude,
+  `2017.08.19` dates). If lon/lat is impossible as documented the swapped
+  reading is tried; if neither is valid no fix is emitted.
+- **Below-sea-level altitude** from SRT was written as `GPSAltitudeRef=1`, which
+  exiftool stores as 0 in XMP (read back positive). Now `abs(alt)` +
+  `Below Sea Level`.
+- **immy's own GPX was fed back into `geotag-from-gpx`** (naive local time with
+  a fake `Z`). immy GPX (`creator="immy"`) is skipped; GPX time encoding is
+  unchanged.
+
 ## 2026-10-02 — offline NAS drain, honest exit codes, marker provenance, `promote --verify`
 
 ### Fixed

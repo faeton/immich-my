@@ -199,3 +199,91 @@ def test_fmt_bytes():
 def test_fmt_bitrate():
     assert bloat_mod.fmt_bitrate(5_000_000) == "5.0 Mbps"
     assert bloat_mod.fmt_bitrate(500_000) == "500 kbps"
+
+
+# --- Task 9: Insta360 detection + transcode temp name / encoder -------------
+
+
+def _fat(path: Path, w=1920, h=1080) -> ExifRow:
+    return _row(path, **{
+        "QuickTime:CompressorID": "hvc1",
+        "QuickTime:ImageWidth": w, "QuickTime:ImageHeight": h,
+        "QuickTime:VideoFrameRate": 30,
+        "Composite:AvgBitrate": 120_000_000,
+        "File:FileSize": 3_000_000_000, "QuickTime:Duration": 200,
+    })
+
+
+def test_equirectangular_2to1_without_make_is_insta360(tmp_path: Path):
+    row = _fat(tmp_path / "reframed.mp4", 5760, 2880)
+    assert bloat_mod._candidate_from_row(row) is None
+    row = _fat(tmp_path / "big.mp4", 7680, 3840)
+    assert bloat_mod._candidate_from_row(row) is None
+
+
+def test_small_2to1_is_still_a_candidate(tmp_path: Path):
+    assert bloat_mod._candidate_from_row(_fat(tmp_path / "x.mp4", 3840, 1920)) is not None
+
+
+def test_360_folder_segment_is_insta360(tmp_path: Path):
+    for folder in ("Incoming360", "insta360-trip", "x360y"):
+        d = tmp_path / folder
+        assert bloat_mod._candidate_from_row(_fat(d / "clip.mp4")) is None
+
+
+def test_insta360_filename_pattern_is_insta360(tmp_path: Path):
+    row = _fat(tmp_path / "VID_20230102_101112_00_001.mp4")
+    assert bloat_mod._candidate_from_row(row) is None
+
+
+def test_plain_fat_clip_still_candidate(tmp_path: Path):
+    assert bloat_mod._candidate_from_row(_fat(tmp_path / "trip" / "clip.mp4")) is not None
+
+
+def _fake_run(calls):
+    import subprocess
+
+    def run(cmd, **kw):
+        calls.append(cmd)
+        if cmd[0] == "ffmpeg" and "-encoders" in cmd:
+            return subprocess.CompletedProcess(cmd, 0, stdout=" V..... libx265\n", stderr="")
+        if cmd[0] == "ffmpeg":
+            Path(cmd[-1]).write_bytes(b"x")
+        return subprocess.CompletedProcess(cmd, 0, stdout="", stderr="")
+    return run
+
+
+def test_transcode_temp_keeps_extension_last_and_falls_back_to_x265(tmp_path: Path, monkeypatch):
+    src = tmp_path / "clip.mp4"
+    src.write_bytes(b"s")
+    c = bloat_mod._candidate_from_row(_fat(src))
+    calls: list = []
+    monkeypatch.setattr(bloat_mod.subprocess, "run", _fake_run(calls))
+    monkeypatch.setattr(bloat_mod.shutil, "which", lambda n: "/usr/bin/ffmpeg")
+    monkeypatch.setattr(bloat_mod, "_verify", lambda a, b, tolerance=0.5: None)
+    bloat_mod._hevc_encoder.cache_clear()
+    out = bloat_mod.transcode_one(c)
+    enc = [x for x in calls if "-i" in x][0]
+    assert Path(enc[-1]).name == "clip.optimized.part.mp4"
+    assert enc[enc.index("-c:v") + 1] == "libx265"
+    assert out.name == "clip.optimized.mp4" and out.exists()
+    assert not (tmp_path / "clip.optimized.part.mp4").exists()
+    bloat_mod._hevc_encoder.cache_clear()
+
+
+def test_transcode_real_ffmpeg_part_name(tmp_path: Path):
+    import shutil
+    import subprocess
+    import pytest
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("ffmpeg missing")
+    enc = subprocess.run(["ffmpeg", "-hide_banner", "-encoders"], capture_output=True, text=True).stdout
+    if "libx265" not in enc and "hevc_videotoolbox" not in enc:
+        pytest.skip("no hevc encoder")
+    src = tmp_path / "clip.mp4"
+    subprocess.run(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", "testsrc=size=320x240:rate=10:duration=1",
+                    "-c:v", "libx264", str(src)], check=True)
+    c = bloat_mod._candidate_from_row(_fat(src, 320, 240))
+    assert c is not None
+    out = bloat_mod.transcode_one(c)
+    assert out.exists() and out.stat().st_size > 0
