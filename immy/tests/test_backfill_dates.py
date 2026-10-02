@@ -341,3 +341,12 @@ def test_apply_plan_sends_local_date_time_as_utc_tagged(tmp_path: Path) -> None:
     sent = [c.args[1] for c in cur.execute.call_args_list]
     ldts = [p["ldt"] for p in sent]
     assert all(v == datetime(2024, 2, 15, 10, 30, tzinfo=timezone.utc) for v in ldts)
+
+
+def test_resolve_capture_insta360_quicktime_is_local(tmp_path: Path) -> None:
+    insv = tmp_path / "VID_20240211_125116_00_052.insv"
+    insv.write_bytes(b"")
+    row = ExifRow(path=insv, raw={"QuickTime:CreateDate": "2024:02:11 12:51:08"})
+    dt, _, kind = bf.resolve_capture(insv, row)
+    assert dt == datetime(2024, 2, 11, 12, 51, 8)
+    assert kind == "local"

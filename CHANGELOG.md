@@ -13,9 +13,14 @@ continuously, so entries are dated rather than versioned.
   stored as if UTC, and `fileCreatedAt` / `dateTimeOriginal` as the true
   instant (checked against live rows: a Kyiv 15:20 shot is
   `localDateTime 15:20+00`, `dateTimeOriginal 12:20+00`). Ingest now
-  applies `EXIF:OffsetTimeOriginal`, inline XMP offsets and
-  `QuickTime:TimeZone`, treats `QuickTime:CreateDate` as UTC, and writes
-  the wall clock to `localDateTime` and the instant to the other two.
+  applies the offset that belongs to the chosen date (`OffsetTimeOriginal`
+  for EXIF, the inline offset for XMP, `QuickTime:TimeZone` for
+  QuickTime — a losing tag never lends its offset), prefers an Apple
+  `CreationDate` carrying an offset, and writes the wall clock to
+  `localDateTime` and the instant to the other two. `QuickTime:CreateDate`
+  is UTC except for makers in `QUICKTIME_LOCAL_CLOCK_MAKES` (Insta360,
+  verified on real `.insv`/GO 2 files to record local wall time; DJI and
+  GoPro checked and do write UTC).
   With no offset or zone known, the naive time is still taken as UTC for
   both. Offsets go to `asset_exif.timeZone` in Immich's own `UTC+2`
   spelling instead of a bare `+02:00`.
@@ -40,7 +45,10 @@ continuously, so entries are dated rather than versioned.
   by an hour in summer. It is now sent tagged as UTC.
 
 Assets already in the DB are not migrated: `immy backfill-dates --retime
-<trip>` (review the dry-run, then add `--apply`) recomputes their dates.
+<trip>` (review the dry-run, then add `--apply`) recomputes their dates,
+with limits: it reads only sibling `.xmp` sidecars (not `sidecars_root`
+on the NAS), and a clip/trip zone it finds (or none → NULL) replaces the
+file's own offset in `timeZone` and in the localDateTime it derives.
 
 ## 2026-10-02 — clock-drift: evidence-based deltas, never a median
 

@@ -241,3 +241,80 @@ def test_mac_read_folder_unchanged_for_sibling_sidecar(tmp_path: Path):
     _write_xmp(media.with_suffix(".xmp"), "2025:07:01 12:00:00+02:00")
     rows = {r.path: r for r in read_folder(trip)}
     assert rows[media].sidecar["XMP:DateTimeOriginal"] == "2025:07:01 12:00:00+02:00"
+
+
+# --- fix round 1: date + offset selected together; QuickTime clock by maker --
+
+
+def test_rejected_xmp_date_does_not_lend_its_offset(tmp_path: Path):
+    # EXIF wins (no offset); the losing embedded XMP date's +05:00 must not
+    # be applied to it.
+    asset, exif = _build(tmp_path, {
+        "EXIF:DateTimeOriginal": "2025:07:01 12:00:00",
+        "XMP:DateTimeOriginal": "2020:01:01 00:00:00+05:00",
+    })
+    assert exif.date_time_original == datetime(2025, 7, 1, 12, 0, tzinfo=UTC)
+    assert asset.local_date_time == datetime(2025, 7, 1, 12, 0, tzinfo=UTC)
+    assert exif.time_zone is None
+
+
+def test_quicktime_offset_does_not_leak_onto_exif_date(tmp_path: Path):
+    _, exif = _build(tmp_path, {
+        "EXIF:DateTimeOriginal": "2025:07:01 12:00:00",
+        "QuickTime:CreateDate": "2025:07:01 10:00:00",
+        "QuickTime:TimeZone": "+02:00",
+    })
+    assert exif.date_time_original == datetime(2025, 7, 1, 12, 0, tzinfo=UTC)
+    assert exif.time_zone is None
+
+
+def _build_media(tmp_path: Path, name: str, raw: dict):
+    trip = tmp_path / "trip"
+    trip.mkdir(exist_ok=True)
+    media = trip / name
+    media.write_bytes(b"x")
+    return process_mod.build_rows(media, trip, ExifRow(path=media, raw=raw), LIB)
+
+
+def test_insta360_create_date_is_local_wall_clock(tmp_path: Path):
+    # Live evidence: VID_20240211_125116_00_052.insv (Bolivia, UTC-4) has
+    # CreateDate 12:51:08 — the filename's local time, not UTC.
+    asset, exif = _build_media(tmp_path, "VID_20240211_125116_00_052.insv", {
+        "QuickTime:CreateDate": "2024:02:11 12:51:08",
+        "QuickTime:Make": "Insta360",
+    })
+    assert asset.local_date_time == datetime(2024, 2, 11, 12, 51, 8, tzinfo=UTC)
+    # No zone known → naive wall clock taken as UTC (unchanged behaviour).
+    assert exif.date_time_original == datetime(2024, 2, 11, 12, 51, 8, tzinfo=UTC)
+
+
+def test_insta360_go2_without_make_is_local_by_filename(tmp_path: Path):
+    asset, exif = _build_media(tmp_path, "PRO_VID_20221109_140156_00_015.mp4", {
+        "QuickTime:CreateDate": "2022:11:09 14:01:46",
+        "QuickTime:TimeZone": "+01:00",
+    })
+    assert asset.local_date_time == datetime(2022, 11, 9, 14, 1, 46, tzinfo=UTC)
+    assert exif.date_time_original == datetime(2022, 11, 9, 13, 1, 46, tzinfo=UTC)
+
+
+def test_unknown_maker_quicktime_stays_utc(tmp_path: Path):
+    asset, exif = _build_media(tmp_path, "GX010716.MP4", {
+        "QuickTime:CreateDate": "2026:03:06 06:23:16",
+        "QuickTime:TimeZone": 240,  # GoPro, exiftool -n: minutes
+        "QuickTime:Model": "HERO13 Black",
+    })
+    # GPSDateTime (UTC) of the real clip is 06:23:18 → CreateDate is UTC.
+    assert exif.date_time_original == datetime(2026, 3, 6, 6, 23, 16, tzinfo=UTC)
+    assert asset.local_date_time == datetime(2026, 3, 6, 10, 23, 16, tzinfo=UTC)
+    assert exif.time_zone == "UTC+4"
+
+
+def test_apple_creation_date_with_offset_beats_create_date(tmp_path: Path):
+    asset, exif = _build_media(tmp_path, "IMG_0001.MOV", {
+        "QuickTime:Make": "Apple",
+        "QuickTime:CreateDate": "2025:07:01 10:00:00",
+        "QuickTime:CreationDate": "2025:07:01 12:00:05+02:00",
+    })
+    assert exif.date_time_original == datetime(2025, 7, 1, 10, 0, 5, tzinfo=UTC)
+    assert asset.local_date_time == datetime(2025, 7, 1, 12, 0, 5, tzinfo=UTC)
+    assert exif.time_zone == "UTC+2"
