@@ -132,8 +132,14 @@ _QUERY_IMMICH_CLIP_MODEL = (
 
 def fetch_immich_clip_model(conn: psycopg.Connection) -> str:
     """Immich's configured CLIP model (read-only): `system_metadata`
-    `system-config` → machineLearning.clip.modelName, else Immich's default."""
-    row = conn.execute(_QUERY_IMMICH_CLIP_MODEL).fetchone()
+    `system-config` → machineLearning.clip.modelName, else Immich's default.
+
+    Runs in its own transaction block (a savepoint when one is already open):
+    callers treat a failure here as "can't verify → skip CLIP" and carry on,
+    so a failed read must not leave the connection ABORTED for every later
+    statement."""
+    with conn.transaction():
+        row = conn.execute(_QUERY_IMMICH_CLIP_MODEL).fetchone()
     name = row[0] if row else None
     return str(name) if name else IMMICH_DEFAULT_CLIP_MODEL
 

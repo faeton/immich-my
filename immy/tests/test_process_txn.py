@@ -498,3 +498,35 @@ def test_offline_failed_phase_not_journaled(tmp_path, ml_stubs, monkeypatch):
     assert not j.get(cs, "clip")
     entry = offline_mod._load_entry(offline_mod.offline_dir(trip) / f"{cs}.yml")
     assert entry["derivatives"], "journal claims derivatives the cache lacks"
+
+
+# --- CLIP-model read failure must not poison the connection ----------------
+
+
+def test_clip_model_read_failure_leaves_connection_usable(tmp_path, ml_stubs):
+    """Reading Immich's CLIP model fails (e.g. system_metadata unreadable).
+    CLIP is skipped, but the connection must not be left ABORTED — otherwise
+    every following INSERT (this trip and the next) fails."""
+    trip = _trip(tmp_path)
+    conn = FakePgConn(fail_on=("FROM system_metadata",))
+
+    results = process_mod.process_trip(
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True,
+        allow_mlx_clip=True)
+
+    assert results[0].clip_embedded is False
+    assert len(conn.committed_sql("INSERT INTO asset (")) == 1
+    assert conn.status != INERROR
+
+
+def test_fetch_immich_clip_model_failure_rolls_back_inside_open_txn():
+    """CLI path: the read runs on a connection that may already be inside a
+    transaction; a failure must roll back (to a savepoint) so it stays usable."""
+    from immy import pg as pg_mod
+
+    conn = FakePgConn(fail_on=("FROM system_metadata",))
+    conn.execute("SELECT 1 FROM asset_file")  # open a txn (INTRANS)
+    with pytest.raises(psycopg.Error):
+        pg_mod.fetch_immich_clip_model(conn)
+    assert conn.status != INERROR
+    conn.execute("SELECT 2 FROM asset_file")  # would raise if still aborted
