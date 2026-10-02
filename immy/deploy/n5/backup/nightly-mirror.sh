@@ -61,6 +61,9 @@ IMMY_STATE="${IMMY_STATE:-/mnt/flash/immy/state}"        # per-trip state (.immy
 IMMY_SIDECARS="${IMMY_SIDECARS:-/mnt/flash/immy/sidecars}"
 # Dedup manifest: a live SQLite DB (WAL) on tank (root dataset, root-owned).
 MANIFEST_DB="${MANIFEST_DB:-/mnt/tank/media/state/manifest.sqlite}"
+MANIFEST_MIN_ROWS="${MANIFEST_MIN_ROWS:-1000}"          # real manifest ~285k asset rows; refuse a near-empty one
+MIN_STATE_FILES="${MIN_STATE_FILES:-1}"                 # empty-source guard for immy state/sidecars rsync --delete
+ALLOW_EMPTY_SOURCES="${ALLOW_EMPTY_SOURCES:-0}"         # 1 = deliberately allow an empty source to empty vv's copy
 MANIFEST_STAGE="${MANIFEST_STAGE:-/mnt/tank/immich/backups/nightly/manifest-stage}"
 DUMP_DIR="${DUMP_DIR:-/mnt/tank/immich/backups/nightly}"  # faeton-owned; created if missing
 PG_CONTAINER="${PG_CONTAINER:-immich_postgres}"
@@ -133,7 +136,7 @@ log "preflight..."
 sudo zfs list -H "$ORIGINALS_DS" "$MEDIA_DS" "$FLASH_DS" >/dev/null \
   || { log "ERROR: datasets $ORIGINALS_DS / $MEDIA_DS / $FLASH_DS missing"; exit 1; }
 command -v sqlite3 >/dev/null || { log "ERROR: sqlite3 not installed (needed for manifest .backup)"; exit 1; }
-[ -f "$MANIFEST_DB" ] || { log "ERROR: manifest $MANIFEST_DB not found"; exit 1; }
+[ -s "$MANIFEST_DB" ] || { log "ERROR: manifest $MANIFEST_DB missing or zero bytes; refusing"; exit 1; }
 for d in "$IMMY_STATE" "$IMMY_SIDECARS"; do
   case "$d" in "$FLASH_MOUNT"/*) ;; *) log "ERROR: $d is not under FLASH_MOUNT=$FLASH_MOUNT"; exit 1;; esac
   [ -d "$d" ] || { log "ERROR: $d missing"; exit 1; }
@@ -206,10 +209,20 @@ sudo install -d -o "${OWNER%%:*}" -g "${OWNER##*:}" "$MANIFEST_STAGE"
 MANIFEST_COPY="$MANIFEST_STAGE/manifest.sqlite"
 rm -f "$MANIFEST_COPY" "$MANIFEST_COPY.tmp"
 log "sqlite3 .backup $MANIFEST_DB -> $MANIFEST_COPY ..."
-sudo sqlite3 "$MANIFEST_DB" ".backup '$MANIFEST_COPY.tmp'"
+# -readonly: never let this job (re)create or modify the source DB.
+sudo sqlite3 -readonly "$MANIFEST_DB" ".backup '$MANIFEST_COPY.tmp'"
 sudo chown "$OWNER" "$MANIFEST_COPY.tmp"
 [ "$(sqlite3 "$MANIFEST_COPY.tmp" 'PRAGMA integrity_check;')" = "ok" ] \
   || { log "ERROR: manifest backup failed integrity_check"; exit 1; }
+# An empty-but-valid DB passes integrity_check, so also require the expected
+# schema and a non-trivial row count before it may replace vv's good copy.
+for t in asset cluster; do
+  [ "$(sqlite3 -readonly "$MANIFEST_COPY.tmp" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='$t';")" = 1 ] \
+    || { log "ERROR: manifest backup lacks table '$t'; refusing"; rm -f "$MANIFEST_COPY.tmp"; exit 1; }
+done
+m_rows=$(sqlite3 -readonly "$MANIFEST_COPY.tmp" "SELECT count(*) FROM asset;")
+[ "$m_rows" -ge "$MANIFEST_MIN_ROWS" ] \
+  || { log "ERROR: manifest has only $m_rows asset rows (< $MANIFEST_MIN_ROWS); refusing"; rm -f "$MANIFEST_COPY.tmp"; exit 1; }
 mv -f "$MANIFEST_COPY.tmp" "$MANIFEST_COPY"
 log "manifest backup OK ($(stat -c %s "$MANIFEST_COPY") bytes)"
 
@@ -229,6 +242,30 @@ RSYNC_OPTS=(-aH --delete "--max-delete=$MAX_DELETE" --partial-dir=.rsync-partial
 ORIG_VIEW="$ORIGINALS/.zfs/snapshot/$SNAP"
 MEDIA_VIEW="$MEDIA/.zfs/snapshot/$SNAP"
 
+# Fail closed BEFORE any transfer: rsync --delete from an empty/unreadable
+# source would wipe vv's good copy (--max-delete only caps the count).
+count_files() { { find "$1" -type f -print 2>/dev/null || true; } | head -n "$2" | wc -l || true; }
+IMMY_SKIP=""
+for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
+  name="$(basename "$src")"
+  view="$FLASH_MOUNT/.zfs/snapshot/$SNAP/${src#"$FLASH_MOUNT"/}"
+  [ -d "$view" ] || { log "ERROR: snapshot view $view missing"; exit 1; }
+  n_view=$(count_files "$view" "$MIN_STATE_FILES")
+  n_live=$(count_files "$src" 1)
+  if [ "$n_view" -lt "$MIN_STATE_FILES" ]; then
+    if [ "$ALLOW_EMPTY_SOURCES" = 1 ]; then
+      log "WARN: immy/$name source empty; ALLOW_EMPTY_SOURCES=1 so mirroring anyway"
+    elif [ "$n_live" -gt 0 ]; then
+      log "ERROR: snapshot view of $src is empty but the live dir is not; refusing"; exit 1
+    elif [ -n "$($SSH_CMD "$REMOTE" "find '$VV_ROOT/immy/$name' -type f -print -quit 2>/dev/null")" ]; then
+      log "ERROR: $src is empty but vv:immy/$name holds files; refusing to empty it (set ALLOW_EMPTY_SOURCES=1 to override)"; exit 1
+    else
+      log "immy/$name is empty on both sides; nothing to mirror"
+      IMMY_SKIP="$IMMY_SKIP $name"
+    fi
+  fi
+done
+
 log "rsync originals -> vv ..."
 rsync "${RSYNC_OPTS[@]}" "$ORIG_VIEW/" "$REMOTE:$VV_ROOT/originals/"
 
@@ -245,8 +282,8 @@ done
 # inside these trees would be crash-consistent here (atomic snapshot incl. WAL).
 for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
   name="$(basename "$src")"
+  case " $IMMY_SKIP " in *" $name "*) continue;; esac
   view="$FLASH_MOUNT/.zfs/snapshot/$SNAP/${src#"$FLASH_MOUNT"/}"
-  [ -d "$view" ] || { log "ERROR: snapshot view $view missing"; exit 1; }
   dest="$VV_ROOT/immy/$name"
   if [ "$DRY_RUN" != 1 ]; then
     $SSH_CMD "$REMOTE" "mkdir -p '$dest'" || { log "ERROR: cannot create vv:$dest"; exit 1; }

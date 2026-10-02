@@ -13,7 +13,9 @@ offsite leg of 3-2-1. `nightly-mirror.sh` keeps vv a byte-level standby.
    Dump-before-files: a DB referencing missing files is worse than extra files.
    Also copies the dedup `manifest.sqlite` (live WAL DB, `/mnt/tank/media/state/`)
    into a faeton-owned staging dir with `sudo sqlite3 .backup`, then requires
-   `PRAGMA integrity_check` = `ok`. A live SQLite file is never copied raw.
+   `PRAGMA integrity_check` = `ok`. A live SQLite file is never copied raw. The source is opened `-readonly`, must be
+   non-empty, and the copy must have the `asset`/`cluster` tables and at least
+   `MANIFEST_MIN_ROWS` asset rows or the run aborts before anything reaches vv.
 3. **Snapshot + mirror files** — atomic ZFS snapshot, then rsync from the
    `.zfs/snapshot/<snap>/` view (immune to concurrent writes) → vv:
    `originals/` and `media/{library,profile,upload}/`.
@@ -92,6 +94,12 @@ on `flash` too, and `sqlite3` on PATH (preflight checks both). New vv dirs under
 create" instead (it never writes to vv). Install-time note: the installed copy at
 `/mnt/tank/scripts/immich-mirror/` is separate from this repo file — copy the
 script over and dry-run before trusting it.
+
+Fail-closed guards: before any `--delete` transfer of immy state/sidecars the
+snapshot view must contain at least `MIN_STATE_FILES` files; an empty view is
+refused if the live dir is non-empty or vv still holds files (override only with
+`ALLOW_EMPTY_SOURCES=1`). An empty source with an empty vv copy (sidecars today)
+is simply skipped.
 
 ## Config
 All knobs live in `mirror.env` (see `mirror.env.example`). Only `HC_URL` must be

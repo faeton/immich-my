@@ -382,3 +382,43 @@ def test_publish_replaces_atomically_and_failure_keeps_old(
         assert rd.execute("SELECT COUNT(*) FROM assets").fetchone()[0] == 5
     finally:
         rd.close()
+
+
+def test_temp_paths_are_unique_per_run(tmp_path: Path) -> None:
+    final = tmp_path / "snap.sqlite"
+    a, b = snap.temp_path(final), snap.temp_path(final)
+    assert a != b and a.parent == b.parent == final.parent
+
+
+# --- command-level: interrupted `immy snapshot` keeps the old file ---------
+
+
+class _BoomConn:
+    def cursor(self, *a, **k):
+        raise RuntimeError("pg connection dropped mid-fetch")
+
+    def close(self) -> None:
+        pass
+
+
+def test_cli_snapshot_failure_keeps_previous_snapshot(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    from typer.testing import CliRunner
+
+    from immy import cli
+    from immy.config import PgConfig
+
+    out = tmp_path / "snap.sqlite"
+    _complete_snapshot(out, n=3)
+    before = out.read_bytes()
+
+    cfg = type("C", (), {"pg": PgConfig("h", 1, "u", "p", "d")})()
+    monkeypatch.setattr(cli, "load_config", lambda _p: cfg)
+    monkeypatch.setattr(cli.pg_mod, "connect", lambda _c: _BoomConn())
+
+    result = CliRunner().invoke(cli.app, ["snapshot", "--out", str(out)])
+
+    assert result.exit_code != 0
+    assert out.read_bytes() == before  # old unlink-first code deleted it
+    assert [p.name for p in tmp_path.iterdir()] == ["snap.sqlite"]  # no temp left

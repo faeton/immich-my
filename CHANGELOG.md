@@ -26,6 +26,12 @@ continuously, so entries are dated rather than versioned.
   dir with an integrity check, never a raw copy) to vv `immy/`. Script change
   only: not run, and the installed copy under `/mnt/tank/scripts/` is unchanged.
   See `deploy/n5/backup/README.md`.
+- **Backup guards (review round 1).** The mirror fails closed before any
+  `--delete` transfer of state/sidecars when the snapshot view is empty (unless
+  `ALLOW_EMPTY_SOURCES=1`); the manifest source is opened `-readonly` and the
+  copy must be non-zero, have `asset`/`cluster` tables and >= `MANIFEST_MIN_ROWS`
+  rows. `immy snapshot` now uses a unique `mkstemp` temp file so overlapping
+  runs cannot clobber each other.
 
 ## 2026-10-02 — dedup: maker notes read, losers wait for their winner
 

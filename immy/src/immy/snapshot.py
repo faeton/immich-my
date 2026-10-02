@@ -22,6 +22,7 @@ from __future__ import annotations
 import base64
 import os
 import sqlite3
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -255,9 +256,17 @@ def create(path: Path) -> sqlite3.Connection:
 
 
 def temp_path(path: Path) -> Path:
-    """Where to build a snapshot destined for `path`. Same directory, so the
-    final `os.replace` is an atomic same-filesystem rename."""
-    return path.with_name(path.name + ".tmp")
+    """A unique temp file for building a snapshot destined for `path`.
+
+    Same directory, so the final `os.replace` is an atomic same-filesystem
+    rename; unique (mkstemp), so two concurrent `immy snapshot` runs never
+    share or unlink each other's partial file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, name = tempfile.mkstemp(
+        dir=path.parent, prefix=path.name + ".", suffix=".tmp",
+    )
+    os.close(fd)
+    return Path(name)
 
 
 def publish(tmp: Path, final: Path) -> None:
