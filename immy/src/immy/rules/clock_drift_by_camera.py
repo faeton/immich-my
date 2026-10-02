@@ -31,6 +31,14 @@ peak (the zero-offset peak included) by ≥ `DOMINANCE_MARGIN` and ≥
 under `MIN_DRIFT_SECONDS` it's no drift. Anything else is ambiguous → no
 proposal.
 
+Times are the instants ingest stores (`capture.capture_time`), not naive
+wall clocks: a DJI drone writes QuickTime CreateDate in UTC while a phone
+writes local time + offset, so comparing wall clocks invented a "drift" of
+the phone's UTC offset — and accepting it shifted the stored instant. The
+proposed sidecar value is rendered with its offset inline (the file's own
+zone, else the reference camera's) so ingest reads back exactly
+`instant + delta`.
+
 Sanity thresholds are deliberately conservative — cameras usually stay
 synced via GPS, phone sync, or manual set, so a real drift is either
 tens of minutes (time-zone mixup) or hours (manual slip). Noise below
@@ -46,12 +54,12 @@ not once per file.
 from __future__ import annotations
 
 from bisect import bisect_left
-from collections import defaultdict
-from datetime import datetime
+from collections import Counter, defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 from statistics import median
 
-from ..dates import resolve as resolve_date
+from ..capture import CaptureTime, _zone, capture_time, format_exif_datetime
 from ..exif import ExifRow, has_valid_gps as has_gps
 from .registry import Finding, Rule, register
 
@@ -167,33 +175,45 @@ def _fmt_delta(seconds: float) -> str:
     return f"{sign}{s}s"
 
 
+def _ref_zone(items: list[tuple[ExifRow, CaptureTime]]):
+    """The reference camera's own zone (most common), if its files carry one."""
+    zones = Counter(ct.time_zone for _, ct in items if ct.own_zone and ct.time_zone)
+    return _zone(zones.most_common(1)[0][0]) if zones else None
+
+
 def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
-    by_cam: dict[str, list[tuple[ExifRow, datetime]]] = defaultdict(list)
+    # Compare the INSTANTS ingest stores (`capture.capture_time`: sidecar
+    # first, offsets honoured, QuickTime CreateDate as UTC except local-clock
+    # makes) — never naive wall clocks: a UTC drone beside a phone in UTC+2
+    # is not a 2 h drift. Files with no capture tag (ingest uses mtime) are
+    # left out.
+    by_cam: dict[str, list[tuple[ExifRow, CaptureTime]]] = defaultdict(list)
     for r in rows:
-        authority = resolve_date(r)
-        if authority is None or authority.source == "mtime":
+        ct = capture_time(r)
+        if ct is None:
             continue
         cam = camera_key(r)
         if cam is None:
             continue
-        by_cam[cam].append((r, authority.dt))
+        by_cam[cam].append((r, ct))
 
     groups = {cam: items for cam, items in by_cam.items() if len(items) >= MIN_GROUP}
     if len(groups) < MIN_CAMERAS:
         return []
 
-    def gps_count(items: list[tuple[ExifRow, datetime]]) -> int:
+    def gps_count(items: list[tuple[ExifRow, CaptureTime]]) -> int:
         return sum(1 for r, _ in items if has_gps(r))
 
     ref_cam = max(groups, key=lambda c: (gps_count(groups[c]), len(groups[c])))
     ref_items = groups[ref_cam]
-    ref_times = [dt for _, dt in ref_items]
+    ref_times = [ct.instant for _, ct in ref_items]
+    ref_zone = _ref_zone(ref_items)
 
     out: list[Finding] = []
     for cam, items in groups.items():
         if cam == ref_cam:
             continue
-        estimate = _estimate_drift([dt for _, dt in items], ref_times)
+        estimate = _estimate_drift([ct.instant for _, ct in items], ref_times)
         if estimate is None:
             continue
         delta, pairs = estimate
@@ -206,14 +226,20 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
             f"events match); proposed: add "
             f"{_fmt_delta(delta)} to each DateTimeOriginal"
         )
-        for row, dt in items:
-            new_dt = datetime.fromtimestamp(dt.timestamp() + delta)
+        for row, ct in items:
+            # The sidecar value ingest will read back as `instant + delta`:
+            # in the file's own zone, else the reference camera's (so the
+            # wall clock reads right too), offset inline; with no zone known
+            # anywhere, bare numbers in the same wall-as-UTC space ingest
+            # used for this file.
+            zone = _zone(ct.time_zone) if ct.own_zone else ref_zone
+            stamp = format_exif_datetime(ct.instant + timedelta(seconds=delta), zone)
             out.append(Finding(
                 rule="clock-drift-by-camera",
                 confidence="medium",
                 path=row.path,
                 action="write_xmp",
-                patch={"DateTimeOriginal": new_dt.strftime("%Y:%m:%d %H:%M:%S")},
+                patch={"DateTimeOriginal": stamp},
                 reason=reason,
                 group=group_id,
             ))

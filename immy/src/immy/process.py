@@ -26,10 +26,9 @@ import re
 import time
 import uuid
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta, timezone, tzinfo
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
-from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 import yaml
@@ -48,6 +47,20 @@ from . import raw as raw_mod
 from . import sidecar as sidecar_mod
 from . import transcripts as transcripts_mod
 from . import video as video_mod
+from .capture import (  # noqa: F401  (re-exported: tests and backfill_dates use these names)
+    QUICKTIME_LOCAL_CLOCK_MAKES,
+    _best_datetime,
+    _capture,
+    _compute_instant,
+    _dated,
+    _immich_time_zone,
+    _offset_tag,
+    _parse_exif_datetime,
+    _parse_offset,
+    _quicktime_clock_is_local,
+    _zone,
+    capture_time,
+)
 from .derivatives import DerivativeFile
 from .exif import ExifRow, read_folder
 from .heartbeat import Heartbeat
@@ -90,216 +103,6 @@ def container_path_for(
 
 def asset_type_for(suffix: str) -> str:
     return "VIDEO" if suffix.lower() in VIDEO_EXTS else "IMAGE"
-
-
-def _parse_exif_datetime(raw: Any) -> datetime | None:
-    """Parse ExifTool-style `YYYY:MM:DD HH:MM:SS[±HH:MM]`. Returns tz-aware
-    datetime when a zone is present, else naive (caller anchors to UTC).
-
-    Rejects plausibly-valid-but-nonsensical dates: cameras sometimes emit
-    `0000:00:00 00:00:00` (a literal placeholder, not a real moment), and
-    a few write "1904:01:01" as the Mac epoch. We treat anything before
-    1970 or after 2100 as missing so `_best_datetime` keeps looking and
-    the filename-date rule can fire cleanly.
-    """
-    if not isinstance(raw, str) or len(raw) < 19:
-        return None
-    s = raw.strip()
-    tz = None
-    # Optional ±HH:MM suffix (ExifTool's OffsetTime).
-    if len(s) >= 25 and s[-6] in "+-" and s[-3] == ":":
-        sign = 1 if s[-6] == "+" else -1
-        try:
-            hours = int(s[-5:-3])
-            minutes = int(s[-2:])
-        except ValueError:
-            return None
-        tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
-        s = s[:-6]
-    try:
-        dt = datetime.strptime(s.strip(), "%Y:%m:%d %H:%M:%S")
-    except ValueError:
-        return None
-    if dt.year < 1970 or dt.year > 2100:
-        return None
-    return dt.replace(tzinfo=tz) if tz is not None else dt
-
-
-_OFFSET_RE = re.compile(r"^(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
-
-
-def _parse_offset(raw: Any) -> timezone | None:
-    """`+02:00` / `-0530` / `UTC+2` / `UTC+5:30` / `Z` / `UTC` → fixed tz.
-    Anything else (IANA names, garbage) → None."""
-    if not isinstance(raw, str):
-        return None
-    s = raw.strip()
-    if s.upper() in ("Z", "UTC", "GMT"):
-        return timezone.utc
-    m = _OFFSET_RE.match(s)
-    if m is None:
-        return None
-    hours, minutes = int(m.group(2)), int(m.group(3) or 0)
-    if hours > 14 or minutes > 59:
-        return None
-    sign = 1 if m.group(1) == "+" else -1
-    return timezone(sign * timedelta(hours=hours, minutes=minutes))
-
-
-def _zone(tz_name: str | None) -> tzinfo | None:
-    """A zone string as written to `asset_exif.timeZone` → tzinfo: an
-    offset (any `_parse_offset` form) or an IANA name. Unknown → None."""
-    if not tz_name:
-        return None
-    off = _parse_offset(tz_name)
-    if off is not None:
-        return off
-    try:
-        return ZoneInfo(tz_name)
-    except (ZoneInfoNotFoundError, ValueError):
-        return None
-
-
-def _immich_time_zone(off: timezone) -> str:
-    """Fixed offset → Immich's own `timeZone` spelling (`UTC`, `UTC+2`,
-    `UTC+5:30`, `UTC-3`) — what its metadata extraction writes, and what
-    the web UI (luxon) accepts as a zone; a bare `+02:00` it does not."""
-    total = int(off.utcoffset(None).total_seconds()) // 60
-    if total == 0:
-        return "UTC"
-    sign = "+" if total > 0 else "-"
-    h, m = divmod(abs(total), 60)
-    return f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
-
-
-# Makers whose `QuickTime:CreateDate` is the camera's LOCAL wall clock, not
-# UTC as the QuickTime spec says. Each entry is backed by real files
-# (CreateDate == the local time in the filename while the file mtime / GPS
-# is the true UTC instant) — see the AUDIT-2026-10 Task 5 report. DJI and
-# GoPro were checked and DO write UTC. Unknown makers stay UTC.
-QUICKTIME_LOCAL_CLOCK_MAKES = ("insta360", "arashi vision")
-
-
-def _quicktime_clock_is_local(row: ExifRow) -> bool:
-    make = _str(row.get("EXIF:Make", "QuickTime:Make"))
-    if make is not None and make.lower().startswith(QUICKTIME_LOCAL_CLOCK_MAKES):
-        return True
-    # Insta360 headers carry no Make (it lives in a vendor trailer exif.py
-    # only reads for .insv/.lrv/.insp); a GO 2 `.mp4` is known by its name.
-    return insta360_mod.classify(row.path) is not None
-
-
-def _offset_tag(raw: Any) -> timezone | None:
-    """An offset tag: `+02:00`-style text, or minutes as `-n` reports
-    `QuickTime:TimeZone` (GoPro: 240 == +04:00)."""
-    if isinstance(raw, (int, float)) and not isinstance(raw, bool):
-        minutes = int(raw)
-        if abs(minutes) > 14 * 60:
-            return None
-        return timezone(timedelta(minutes=minutes))
-    return _parse_offset(raw)
-
-
-def _dated(dt: datetime, offset_raw: Any) -> tuple[datetime, str | None]:
-    """A chosen date plus ITS OWN offset: inline if the value carries one,
-    else the offset tag that belongs to the same field."""
-    if dt.tzinfo is None:
-        off = _offset_tag(offset_raw)
-        if off is None:
-            return dt, None
-        dt = dt.replace(tzinfo=off)
-    return dt, _immich_time_zone(dt.tzinfo)
-
-
-def _capture(row: ExifRow) -> tuple[datetime, str | None] | None:
-    """Capture time and the `asset_exif.timeZone` that belongs to it,
-    selected together so a losing tag never lends its offset to the winner.
-
-    Order: SIDECAR `XMP:DateTimeOriginal` (immy's rule fixes / the user's
-    edits win over the file; a naive one keeps the camera's embedded
-    `OffsetTimeOriginal`, e.g. a clock-drift fix) → `EXIF:DateTimeOriginal`
-    (+ `OffsetTimeOriginal`) → embedded `XMP:DateTimeOriginal` (inline
-    offset only) → QuickTime: a `CreationDate` carrying an explicit offset
-    (Apple Keys), else `CreateDate` (+ `QuickTime:TimeZone`) — UTC per the
-    spec unless the maker is in `QUICKTIME_LOCAL_CLOCK_MAKES` →
-    `EXIF:CreateDate` (+ `OffsetTimeDigitized`).
-
-    The datetime is tz-aware whenever the absolute instant is known; naive
-    means wall clock, interpreted in the returned zone if there is one.
-    Offsets use Immich's `UTC±H[:MM]` spelling; IANA names pass through."""
-    embedded_offset = row.get("EXIF:OffsetTimeOriginal")
-    for dt, offset_raw in (
-        (_parse_exif_datetime(row.sidecar_get("XMP:DateTimeOriginal")), embedded_offset),
-        (_parse_exif_datetime(row.get("EXIF:DateTimeOriginal")), embedded_offset),
-        (_parse_exif_datetime(row.get("XMP:DateTimeOriginal")), None),
-    ):
-        if dt is not None:
-            return _dated(dt, offset_raw)
-
-    for key in ("QuickTime:CreationDate", "Keys:CreationDate"):
-        cd = _parse_exif_datetime(row.get(key))
-        if cd is not None and cd.tzinfo is not None:
-            return _dated(cd, None)
-
-    qt = _parse_exif_datetime(row.get("QuickTime:CreateDate"))
-    if qt is not None:
-        tz_raw = row.get("QuickTime:TimeZone")
-        off = _offset_tag(tz_raw)
-        tz_name = _immich_time_zone(off) if off is not None else _str(tz_raw)
-        if qt.tzinfo is None and not _quicktime_clock_is_local(row):
-            qt = qt.replace(tzinfo=timezone.utc)
-        return qt, tz_name
-
-    dt = _parse_exif_datetime(row.get("EXIF:CreateDate"))
-    if dt is not None:
-        return _dated(dt, row.get("EXIF:OffsetTimeDigitized"))
-    return None
-
-
-def _best_datetime(row: ExifRow) -> datetime | None:
-    """`_capture`'s datetime alone (tz-aware when the instant is known)."""
-    captured = _capture(row)
-    return captured[0] if captured is not None else None
-
-
-def _compute_instant(
-    dt: datetime, kind: str, tz_name: str | None,
-) -> tuple[datetime, datetime]:
-    """Return `(local_date_time, date_time_original_utc)`.
-
-    `local_date_time` is the naive wall-clock Immich sorts the timeline by
-    (store it as those numbers +00:00); `date_time_original_utc` is the
-    absolute instant.
-
-    - kind="utc": `dt` is an absolute instant (naive = UTC numbers).
-      localDateTime is that instant rendered in `tz_name`; with no zone, an
-      aware `dt` keeps its own wall clock, a naive one its UTC numbers.
-    - kind="local": `dt` is the wall clock the user saw. That IS
-      localDateTime; the absolute instant comes from interpreting it in
-      `tz_name` (or treating the wall numbers as UTC if no zone is known).
-
-    `tz_name` is an IANA name or a fixed offset (`+02:00`, `UTC+2`).
-    """
-    zone = _zone(tz_name)
-    if kind == "utc":
-        abs_utc = (
-            dt.astimezone(timezone.utc) if dt.tzinfo is not None
-            else dt.replace(tzinfo=timezone.utc)
-        )
-        if zone is not None:
-            local = abs_utc.astimezone(zone).replace(tzinfo=None)
-        elif dt.tzinfo is not None:
-            local = dt.replace(tzinfo=None)
-        else:
-            local = abs_utc.replace(tzinfo=None)
-        return local, abs_utc
-
-    local = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-    if zone is not None:
-        abs_utc = local.replace(tzinfo=zone).astimezone(timezone.utc)
-    else:
-        abs_utc = local.replace(tzinfo=timezone.utc)
-    return local, abs_utc
 
 
 def _best_gps(row: ExifRow) -> tuple[float | None, float | None]:
@@ -412,12 +215,12 @@ def build_rows(
     # UTC; `fileCreatedAt` / `dateTimeOriginal` are the true UTC instant.
     # No known offset/zone → the naive wall clock is taken as UTC for both.
     mtime_utc = _mtime_utc(media_file)
-    captured = _capture(exif_row)
-    best_dt, time_zone = captured if captured is not None else (None, None)
-    if best_dt is not None:
-        wall, file_created_at = _compute_instant(
-            best_dt, "utc" if best_dt.tzinfo is not None else "local", time_zone)
-        local_date_time = wall.replace(tzinfo=timezone.utc)
+    captured = capture_time(exif_row)  # the shared model (see capture.py)
+    best_dt = captured.instant if captured is not None else None
+    time_zone = captured.time_zone if captured is not None else None
+    if captured is not None:
+        file_created_at = captured.instant
+        local_date_time = captured.local.replace(tzinfo=timezone.utc)
     else:
         file_created_at = local_date_time = mtime_utc
 

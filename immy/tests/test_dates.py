@@ -53,3 +53,20 @@ def test_resolve_falls_through_to_next_exif_key_when_first_is_implausible(tmp_pa
     auth = dates.resolve(row)
     assert auth.source == "exif"
     assert auth.dt == datetime(2022, 3, 4, 8, 0, 0)
+
+
+def test_resolve_sidecar_beats_embedded_xmp_and_exif():
+    """Same precedence as ingest: a separate .xmp sidecar wins even when the
+    media embeds its own (stale) XMP:DateTimeOriginal."""
+    from datetime import datetime as _dt
+    from pathlib import Path as _P
+
+    from immy.dates import resolve
+    from immy.exif import ExifRow as _Row
+
+    row = _Row(_P("/t/a.jpg"), {
+        "EXIF:DateTimeOriginal": "2024:01:01 10:00:00",
+        "XMP:DateTimeOriginal": "2024:01:01 10:00:00",
+    }, sidecar={"XMP:DateTimeOriginal": "2024:01:01 07:00:00"})
+    auth = resolve(row)
+    assert auth.dt == _dt(2024, 1, 1, 7, 0, 0)

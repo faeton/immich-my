@@ -64,20 +64,29 @@ def _parse_exif_dt(s: object) -> datetime | None:
     return None
 
 
+# Same precedence as ingest (`capture._capture_sourced`): the separate .xmp
+# SIDECAR first — our deliberate override of baked-in tags (clock-drift
+# fixes, user edits) — then embedded EXIF, embedded XMP, QuickTime. Reading
+# the sidecar only through `raw` let an embedded XMP date hide it, so rules
+# re-proposed fixes for clocks already corrected.
 _EXIF_DATE_KEYS = (
-    # XMP sidecar wins when present — that's our deliberate override of
-    # baked-in EXIF (e.g. clock-drift correction, user edits).
-    "XMP:DateTimeOriginal",
     "EXIF:DateTimeOriginal",
+    "XMP:DateTimeOriginal",
     "QuickTime:CreateDate",
     "EXIF:CreateDate",
     "EXIF:ModifyDate",
 )
+_SIDECAR_KEY = "XMP:DateTimeOriginal"
 
 
 def resolve(row: ExifRow) -> DateAuthority | None:
-    for key in _EXIF_DATE_KEYS:
-        dt = _parse_exif_dt(row.raw.get(key))
+    """Wall-clock capture date (naive). Rules that compare capture INSTANTS
+    across clocks must use `capture.capture_time` instead — it applies
+    ingest's offset / QuickTime-UTC handling."""
+    candidates = [(row.sidecar_get(_SIDECAR_KEY), f"sidecar {_SIDECAR_KEY}")]
+    candidates += [(row.raw.get(key), key) for key in _EXIF_DATE_KEYS]
+    for value, key in candidates:
+        dt = _parse_exif_dt(value)
         if dt is not None and _is_plausible(dt):
             return DateAuthority(dt=dt, source="exif", raw=key)
 

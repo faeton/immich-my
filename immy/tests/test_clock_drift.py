@@ -246,3 +246,94 @@ def test_by_camera_coverage_counts_all_events_of_smaller_camera():
         rows.append(_row(f"bx{i}.jpg", datetime(2026, 4, 15, 8) + timedelta(minutes=37 * i), cam=SONY))
     findings = by_camera._propose(rows, FOLDER)
     assert not [f for f in findings if f.confidence in ("medium", "high")]
+
+
+# ------------------- final review B: compare the instants ingest stores ------
+#
+# Ingest treats QuickTime:CreateDate as UTC (except local-clock makes) and
+# honours OffsetTimeOriginal; a separate .xmp sidecar beats the embedded
+# tags. The drift rule used to compare naive wall clocks, so a UTC drone +
+# a phone in UTC+2 shooting the same moments looked like a clean "-2h"
+# drift, and accepting it shifted the stored instant.
+
+from datetime import timezone as _tz  # noqa: E402
+
+UTC2 = _tz(timedelta(hours=2))
+
+
+def _phone_off(name: str, local: datetime, offset: str = "+02:00") -> ExifRow:
+    r = _row(name, local, gps=True)
+    r.raw["EXIF:OffsetTimeOriginal"] = offset
+    return r
+
+
+def _qt_utc(name: str, utc: datetime, cam=DRONE) -> ExifRow:
+    return ExifRow(FOLDER / name, {
+        "QuickTime:CreateDate": utc.strftime("%Y:%m:%d %H:%M:%S"),
+        "QuickTime:Make": cam[0], "QuickTime:Model": cam[1],
+    })
+
+
+def _phone_trip_plus2() -> list[ExifRow]:
+    return [_phone_off(f"a{i}.jpg", t) for i, t in enumerate(_trip_events())]
+
+
+def _drone_trip_utc(slip: timedelta = timedelta(0)) -> list[ExifRow]:
+    rows = []
+    for i, t in enumerate(_trip_events()):
+        utc = t - timedelta(hours=2) + slip  # same moment as the phone's local t
+        for k in range(2):
+            rows.append(_qt_utc(f"d{i}_{k}.mp4", utc + timedelta(seconds=k)))
+    return rows
+
+
+def _ingested_instant(row: ExifRow, patch: dict) -> datetime:
+    from immy.capture import capture_time
+    patched = ExifRow(row.path, dict(row.raw),
+                      sidecar={"XMP:DateTimeOriginal": patch["DateTimeOriginal"]})
+    return capture_time(patched).instant
+
+
+def test_by_camera_utc_drone_vs_phone_in_plus2_is_not_drift():
+    assert by_camera._propose(_phone_trip_plus2() + _drone_trip_utc(), FOLDER) == []
+
+
+def test_by_camera_real_slip_on_utc_drone_found_and_patch_restores_instant():
+    drone = _drone_trip_utc(slip=timedelta(hours=3))
+    findings = by_camera._propose(_phone_trip_plus2() + drone, FOLDER)
+    assert len(findings) == len(drone)
+    rows = {r.path.name: r for r in drone}
+    for f in findings:
+        i, k = (int(x) for x in f.path.stem[1:].split("_"))
+        true = (_trip_events()[i] - timedelta(hours=2) + timedelta(seconds=k)).replace(tzinfo=_tz.utc)
+        assert _ingested_instant(rows[f.path.name], f.patch) == true
+        # Rendered in the reference camera's zone, offset inline.
+        assert f.patch["DateTimeOriginal"].endswith("+02:00")
+
+
+def test_by_camera_real_slip_with_offsets_found_and_patch_restores_instant():
+    sony = []
+    for i, t in enumerate(_trip_events()):
+        r = _row(f"b{i}.jpg", t + timedelta(hours=3), cam=SONY)
+        r.raw["EXIF:OffsetTimeOriginal"] = "+02:00"
+        sony.append(r)
+    findings = by_camera._propose(_phone_trip_plus2() + sony, FOLDER)
+    assert len(findings) == len(sony)
+    rows = {r.path.name: r for r in sony}
+    for f in findings:
+        i = int(f.path.stem[1:])
+        true = _trip_events()[i].replace(tzinfo=UTC2).astimezone(_tz.utc)
+        assert _ingested_instant(rows[f.path.name], f.patch) == true
+
+
+def test_by_camera_sidecar_correction_beats_embedded_xmp():
+    """A camera already corrected through its .xmp sidecar must not be
+    proposed again just because the media also embeds a stale XMP date."""
+    rows = _phone_trip()
+    for i, t in enumerate(_trip_events()):
+        wrong = (t + timedelta(hours=3)).strftime("%Y:%m:%d %H:%M:%S")
+        rows.append(ExifRow(FOLDER / f"b{i}.jpg", {
+            "EXIF:DateTimeOriginal": wrong, "XMP:DateTimeOriginal": wrong,
+            "EXIF:Make": SONY[0], "EXIF:Model": SONY[1],
+        }, sidecar={"XMP:DateTimeOriginal": t.strftime("%Y:%m:%d %H:%M:%S")}))
+    assert by_camera._propose(rows, FOLDER) == []
