@@ -26,7 +26,8 @@ continuously, so entries are dated rather than versioned.
   sidecar first, as ingest does.
 - **`backfill-dates`** reads sidecars through `sidecars_root` (NAS), puts a
   sidecar correction ahead of SRT/embedded dates, lets a file's own offset
-  beat `--timezone`/clip/trip zones, and `--retime` keeps the stored
+  beat the inferred clip/trip zones (an explicit `--timezone` still wins for
+  the display zone; the instant stays the file's), and `--retime` keeps the stored
   `timeZone` when none is known. The dead `-fast2` QuickTime re-read is gone.
 - **`dedup apply` holds losers of needs-review clusters** (unowned `auto`
   clusters where a burst / Live / edited guard now fires), counted in

@@ -64,7 +64,8 @@ def resolve_capture(
 
     Returns `(dt, source_label, kind, file_zone)` or None. `file_zone` is
     the zone the file itself records (offset tag / QuickTime TimeZone), or
-    None; when present it beats any trip/clip zone guess. `kind` says how
+    None; when present it beats any inferred trip/clip zone (an explicit
+    `--timezone` still wins). `kind` says how
     to interpret `dt`:
       - "utc"   — `dt` is an absolute instant (DJI SRT wall-clock is UTC; a
                   tz-aware embedded tag is absolute). localDateTime is then
@@ -246,10 +247,12 @@ def plan_folder(
             plan.already_dated += 1
             continue
 
-        # The file's own recorded zone (offset tag) beats every guess, as at
-        # ingest. Otherwise: --timezone, then the clip's own SRT-GPS zone,
-        # then the trip-wide guess.
-        clip_tz = file_tz or tz_override or _clip_timezone(media) or tz_name
+        # --timezone is explicit user input and wins for the whole run (the
+        # instant still comes from the file's own offset; only the zone it is
+        # shown in changes). Otherwise the file's own recorded zone beats
+        # every inferred guess, as at ingest: then the clip's own SRT-GPS
+        # zone, then the trip-wide guess.
+        clip_tz = tz_override or file_tz or _clip_timezone(media) or tz_name
         if existing_dto is not None:
             mode = "retime"
         elif exif_assetid is not None:

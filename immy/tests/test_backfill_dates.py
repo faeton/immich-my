@@ -405,3 +405,23 @@ def test_plan_folder_reads_sidecars_through_writable_paths(tmp_path: Path, monke
 
 def test_retime_keeps_existing_time_zone_when_none_is_known() -> None:
     assert 'COALESCE(%(tz)s, "timeZone")' in bf._RETIME_EXIF
+
+
+def test_plan_folder_explicit_timezone_beats_file_offset(tmp_path: Path, monkeypatch) -> None:
+    """--timezone forces the zone for the whole run (explicit user input
+    wins). The instant still comes from the file's own offset; only the
+    zone it is shown in changes: 18:00+09:00 → 09:00Z → 10:00 Lisbon."""
+    jpg = tmp_path / "IMG_0001.JPG"
+    jpg.write_bytes(b"x")
+    _patch_read_folder(monkeypatch, [ExifRow(path=jpg, raw={
+        "EXIF:DateTimeOriginal": "2024:05:01 18:00:00",
+        "EXIF:OffsetTimeOriginal": "+09:00",
+    })])
+    monkeypatch.setattr(bf, "_clip_timezone", lambda p: None)
+    conn, _ = _mock_conn(("a", "a", datetime(2024, 1, 1, tzinfo=timezone.utc)))
+
+    plan = bf.plan_folder(conn, LIB, tmp_path, tz_override="Europe/Lisbon", retime=True)
+    c = plan.candidates[0]
+    assert c.tz_name == "Europe/Lisbon"
+    assert c.date_time_original == datetime(2024, 5, 1, 9, 0, tzinfo=timezone.utc)
+    assert c.local_date_time == datetime(2024, 5, 1, 10, 0)
