@@ -21,6 +21,9 @@ o=$(count_files "$T/full" abc 2>/dev/null); check count-bad-max nz "" $? "$o"
 ( find() { return 1; }; o=$(count_files "$T/full" 1 2>/dev/null); check count-find-fails nz "" $? "$o" )
 ( find() { echo .; return 2; }; o=$(count_files "$T/full" 1 2>/dev/null); check count-find-partial-error nz "" $? "$o" )
 
+( head() { cat >/dev/null; return 1; }; o=$(count_files "$T/full" 1 2>/dev/null); check count-head-fails nz "" $? "$o" )
+( set -euo pipefail; head() { return 7; }; o=$(count_files "$T/empty" 1 2>/dev/null); check count-head-fails-strict nz "" $? "$o" ) || true
+
 SSH_CMD=ssh REMOTE=vv
 ( ssh() { return 255; }; o=$(remote_state /x 2>/dev/null); check ssh-255 nz "" $? "$o" )
 ( ssh() { echo garbage; return 0; }; o=$(remote_state /x 2>/dev/null); check ssh-garbage nz "" $? "$o" )
