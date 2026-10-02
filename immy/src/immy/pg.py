@@ -184,11 +184,13 @@ SAME_FACE_IOU = 0.5
 _Box = tuple[float, float, float, float]
 
 
+def _usable_size(width, height) -> bool:
+    return bool(width and height and width > 0 and height > 0)
+
+
 def _normalized_box(x1, y1, x2, y2, width, height) -> _Box:
-    """Bbox in 0..1 image units; pixel units when the size is unknown (0)."""
-    if width and height and width > 0 and height > 0:
-        return (x1 / width, y1 / height, x2 / width, y2 / height)
-    return (float(x1), float(y1), float(x2), float(y2))
+    """Bbox in 0..1 image units. Caller guarantees a usable size."""
+    return (x1 / width, y1 / height, x2 / width, y2 / height)
 
 
 def _box_iou(a: _Box, b: _Box) -> float:
@@ -216,7 +218,9 @@ def replace_asset_faces(
     deleted (CASCADE wipes their `face_search` too). Each face in `faces` is
     then inserted with its 512-dim ArcFace embedding — except one whose box
     overlaps a kept person-assigned face at IoU >= `SAME_FACE_IOU` (compared
-    in normalized coordinates), which is the same face re-detected. User-
+    in normalized coordinates; a kept row stored without a size uses this
+    detection's size, and an overlap that can't be measured at all counts
+    as a match), which is the same face re-detected. User-
     tagged faces (`sourceType='exif'`) are untouched. Idempotent —
     re-running `immy process` with `--with-faces` regenerates the rows.
 
@@ -227,14 +231,30 @@ def replace_asset_faces(
     written = 0
     with conn.cursor() as cur:
         cur.execute(_SELECT_ASSIGNED_FACE_BOXES, {"asset_id": asset_id})
-        assigned = [_normalized_box(*row) for row in cur.fetchall()]
+        # Kept boxes in 0..1 units. A row stored without a size (0) is
+        # placed in this detection's frame — same asset, so the best
+        # reference there is. `None` = overlap can't be measured at all.
+        detection_sized = _usable_size(image_width, image_height)
+        assigned: list[_Box | None] = []
+        for x1, y1, x2, y2, w, h in cur.fetchall():
+            if not _usable_size(w, h):
+                w, h = image_width, image_height
+            assigned.append(
+                _normalized_box(x1, y1, x2, y2, w, h)
+                if detection_sized and _usable_size(w, h) else None
+            )
         cur.execute(_DELETE_UNASSIGNED_ML_FACES, {"asset_id": asset_id})
         for face in faces:
             box = _normalized_box(
                 face["x1"], face["y1"], face["x2"], face["y2"],
                 image_width, image_height,
-            )
-            if any(_box_iou(box, kept) >= SAME_FACE_IOU for kept in assigned):
+            ) if detection_sized else None
+            # Unmeasurable overlap counts as the same face: never risk a
+            # duplicate beside a person's face.
+            if any(
+                box is None or kept is None or _box_iou(box, kept) >= SAME_FACE_IOU
+                for kept in assigned
+            ):
                 continue
             cur.execute(_INSERT_ASSET_FACE, {
                 "id": face["id"],

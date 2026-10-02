@@ -179,3 +179,33 @@ def test_replace_asset_faces_low_overlap_box_is_inserted():
         _new("neighbour", 150, 150, 250, 250),
     ])
     assert {r["id"] for r in table.rows} == {"named", "neighbour"}
+
+
+def test_replace_asset_faces_kept_face_without_dimensions_uses_detection_size():
+    """A kept person face stored with imageWidth/Height = 0 is placed in the
+    current detection's frame (same asset) — so an identical re-detection is
+    still recognised as the same face, not inserted beside it."""
+    from immy import pg as pg_mod
+
+    table = _FaceTable([_row("named", "person-1", 100, 100, 200, 200, w=0, h=0)])
+    written = pg_mod.replace_asset_faces(table, "a1", 1000, 1000, [
+        _new("dup", 100, 100, 200, 200),
+        _new("elsewhere", 600, 600, 700, 700),
+    ])
+    ids = {r["id"] for r in table.rows}
+    assert "dup" not in ids
+    assert {"named", "elsewhere"} <= ids
+    assert written == 1
+
+
+def test_replace_asset_faces_no_usable_dimensions_skips_new_boxes_near_kept():
+    """Neither the kept face nor the detection has a usable size: overlap
+    can't be measured, so err on not duplicating the person's face."""
+    from immy import pg as pg_mod
+
+    table = _FaceTable([_row("named", "person-1", 100, 100, 200, 200, w=0, h=0)])
+    written = pg_mod.replace_asset_faces(table, "a1", 0, 0, [
+        _new("dup", 100, 100, 200, 200),
+    ])
+    assert {r["id"] for r in table.rows} == {"named"}
+    assert written == 0
