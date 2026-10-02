@@ -162,6 +162,49 @@ def _first_float(row: ExifRow, *keys: str) -> float | None:
         return None
 
 
+# `-fast`, never `-fast2`: `-fast2` also skips maker notes, which is where
+# Apple keeps BurstUUID, ContentIdentifier and AdjustmentVersion — and on some
+# MOVs it loses the QuickTime tags too. Measured 2026-10 on real iPhone HEICs
+# in originals/2026/03: 0 of 164 ContentIdentifiers under `-fast2`, all 164
+# under `-fast`. Every manifest row fingerprinted before this has NULL
+# burst/live ids; `refresh_metadata` re-reads them.
+EXIFTOOL_ARGS = ["-G", "-n", "-fast", "-m"]
+
+
+def _exiftool_batch(paths: list[str]) -> dict[str, dict]:
+    """One exiftool pass over `paths` -> {SourceFile: tags}. A batch failure
+    falls back to one file at a time; a file exiftool cannot read is simply
+    absent from the result."""
+    import exiftool
+
+    with exiftool.ExifToolHelper(common_args=EXIFTOOL_ARGS, check_execute=False) as et:
+        try:
+            blobs = et.get_metadata(paths)
+        except Exception:
+            blobs = []
+            for target in paths:
+                try:
+                    blobs.extend(et.get_metadata([target]))
+                except Exception:
+                    pass
+    return {blob["SourceFile"]: blob for blob in blobs if "SourceFile" in blob}
+
+
+def apple_identity_fields(row: ExifRow) -> dict:
+    """The capture-identity columns the burst / Live-pair / edited guards in
+    `_decide_one` read. BurstUUID, ContentIdentifier (stills) and
+    AdjustmentVersion live in Apple maker notes, which `-fast2` never reads."""
+    edited = bool(
+        _EDITED_NAME_RE.search(row.path.stem)
+        or row.get("XMP:AdjustmentTimestamp", "MakerNotes:AdjustmentVersion")
+    )
+    return {
+        "burst_uuid": row.get("MakerNotes:BurstUUID"),
+        "live_cid": row.get("MakerNotes:ContentIdentifier", "QuickTime:ContentIdentifier"),
+        "edited": int(edited),
+    }
+
+
 def fingerprint_fields(row: ExifRow, source: str) -> dict:
     """Extract the manifest's fingerprint columns from one exiftool row.
 
@@ -200,11 +243,6 @@ def fingerprint_fields(row: ExifRow, source: str) -> dict:
                 if glat and glon and not (abs(glat) < 1e-3 and abs(glon) < 1e-3):
                     lat, lon = float(glat), float(glon)
 
-    edited = bool(
-        _EDITED_NAME_RE.search(path.stem)
-        or row.get("XMP:AdjustmentTimestamp", "MakerNotes:AdjustmentVersion")
-    )
-
     fields = {
         "media_type": media_type,
         "width": _first_int(
@@ -220,9 +258,7 @@ def fingerprint_fields(row: ExifRow, source: str) -> dict:
         "gps_lat": lat,
         "gps_lon": lon,
         "exif_fields": len(row.raw),
-        "burst_uuid": row.get("MakerNotes:BurstUUID"),
-        "live_cid": row.get("MakerNotes:ContentIdentifier", "QuickTime:ContentIdentifier"),
-        "edited": int(edited),
+        **apple_identity_fields(row),
     }
     if source == "photos":
         # Photos UUID + component from the batch's osxphotos report, and the
@@ -253,8 +289,6 @@ def fingerprint_pending(
     Returns (ok, failed); `ok` includes aliases. Pass `stats` to receive
     {"alias": n, "raced": n}. Commits per batch so a crash resumes at the
     batch boundary, not from zero."""
-    import exiftool
-
     from . import identity
 
     pending = manifest.pending_fingerprint(conn, source=source)
@@ -262,20 +296,7 @@ def fingerprint_pending(
 
     for start in range(0, len(pending), batch_size):
         batch = pending[start:start + batch_size]
-        paths = [p for _, p, _ in batch]
-        with exiftool.ExifToolHelper(
-            common_args=["-G", "-n", "-fast2", "-m"], check_execute=False,
-        ) as et:
-            try:
-                blobs = et.get_metadata(paths)
-            except Exception:
-                blobs = []
-                for target in paths:
-                    try:
-                        blobs.extend(et.get_metadata([target]))
-                    except Exception:
-                        pass
-        by_path = {blob["SourceFile"]: blob for blob in blobs if "SourceFile" in blob}
+        by_path = _exiftool_batch([p for _, p, _ in batch])
 
         for asset_id, path_text, asset_source in batch:
             path = Path(path_text)
@@ -336,6 +357,111 @@ def fingerprint_pending(
         if progress:
             progress(min(start + batch_size, len(pending)), len(pending))
     return ok, failed
+
+
+# Rows whose metadata was read at fingerprint time; `alias` rows never
+# cluster, so their ids decide nothing.
+_REFRESHABLE = (
+    manifest.FINGERPRINTED, manifest.CLUSTERED, manifest.DECIDED,
+    manifest.CANONICAL, manifest.PROMOTED, manifest.QUARANTINED,
+)
+
+
+def refresh_metadata(
+    conn: sqlite3.Connection, *, batch_size: int = 200, progress=None,
+) -> dict:
+    """Re-read `apple_identity_fields` for rows fingerprinted before the
+    `-fast2` fix, which recorded every BurstUUID / ContentIdentifier as NULL.
+
+    Fills only what is missing: a NULL burst_uuid / live_cid, an `edited`
+    that was 0. Never touches sizes, hashes, paths or the row's own status,
+    and never overwrites a known value — so a second run changes nothing.
+    The file is read where it lives now: `dest_path` once promoted or
+    quarantined, else `path`. A file at neither is counted `missing`.
+
+    A gained id can change a decision, so the clusters holding such rows
+    are re-opened — but nothing already applied is undone:
+      - `auto`, nothing moved yet  -> back to `pending`, its `decided`
+        members to `clustered`; `decide` takes it from there.
+      - `auto`, partly or fully applied -> moves stand; any member still
+        `decided` drops to `clustered` (promote-rest keeps it) instead of
+        being quarantined on the id-blind decision. Counted, not reopened.
+      - `pending`/`review` are re-decided by every `decide` run anyway, and
+        `kept_all` only ever comes from the burst guard, which a gained id
+        cannot loosen."""
+    marks = ",".join("?" * len(_REFRESHABLE))
+    rows = conn.execute(
+        "SELECT id, path, status, dest_path, burst_uuid, live_cid, edited FROM asset"
+        f" WHERE status IN ({marks}) AND (burst_uuid IS NULL OR live_cid IS NULL)"
+        " ORDER BY id",
+        _REFRESHABLE,
+    ).fetchall()
+    counts = {
+        "checked": len(rows), "updated": 0, "missing": 0, "unreadable": 0,
+        "clusters_reopened": 0, "applied_clusters_affected": 0,
+    }
+    gained: list[int] = []
+
+    for start in range(0, len(rows), batch_size):
+        located = []
+        for row in rows[start:start + batch_size]:
+            _, path_text, status, dest_path = row[:4]
+            moved = status in (manifest.PROMOTED, manifest.QUARANTINED) and dest_path
+            where = dest_path if moved else path_text
+            if os.path.isfile(where):
+                located.append((row, where))
+            else:
+                counts["missing"] += 1
+        by_path = _exiftool_batch([where for _, where in located]) if located else {}
+        for (asset_id, path_text, _, _, burst, live, edited), where in located:
+            raw = by_path.get(where)
+            if raw is None:
+                counts["unreadable"] += 1
+                continue
+            # The manifest's own path, not `where`: a collision-renamed dest
+            # (IMG_1__42.JPG) would hide an `-edited` stem.
+            fresh = apple_identity_fields(ExifRow(path=Path(path_text), raw=raw))
+            changes = {}
+            if burst is None and fresh["burst_uuid"]:
+                changes["burst_uuid"] = fresh["burst_uuid"]
+            if live is None and fresh["live_cid"]:
+                changes["live_cid"] = fresh["live_cid"]
+            if not edited and fresh["edited"]:
+                changes["edited"] = 1
+            if changes:
+                sets = ", ".join(f"{k}=?" for k in changes)
+                conn.execute(f"UPDATE asset SET {sets} WHERE id=?", [*changes.values(), asset_id])
+                counts["updated"] += 1
+                gained.append(asset_id)
+        conn.commit()
+        if progress:
+            progress(min(start + batch_size, len(rows)), len(rows))
+
+    affected = set()
+    for start in range(0, len(gained), 500):
+        chunk = gained[start:start + 500]
+        affected.update(conn.execute(
+            "SELECT DISTINCT c.id FROM cluster c JOIN membership m ON m.cluster_id = c.id"
+            f" WHERE c.decision = 'auto' AND m.asset_id IN ({','.join('?' * len(chunk))})",
+            chunk,
+        ).fetchall())
+    for (cluster_id,) in sorted(affected):
+        statuses = {s for (s,) in conn.execute(
+            "SELECT a.status FROM membership m JOIN asset a ON a.id = m.asset_id"
+            " WHERE m.cluster_id=?", (cluster_id,),
+        )}
+        conn.execute(
+            "UPDATE asset SET status=? WHERE status=? AND id IN"
+            " (SELECT asset_id FROM membership WHERE cluster_id=?)",
+            (manifest.CLUSTERED, manifest.DECIDED, cluster_id),
+        )
+        if statuses & {manifest.PROMOTED, manifest.QUARANTINED}:
+            counts["applied_clusters_affected"] += 1
+        else:
+            conn.execute("UPDATE cluster SET decision='pending' WHERE id=?", (cluster_id,))
+            counts["clusters_reopened"] += 1
+    conn.commit()
+    return counts
 
 
 # ---------------------------------------------------------- content identity
@@ -1553,6 +1679,48 @@ def promote_rest(
     return counts
 
 
+def _winner_not_in_library(
+    conn: sqlite3.Connection, winner_id: int | None, *, verify: bool,
+) -> str | None:
+    """None when a cluster's winner is safely in the library; otherwise why
+    not. The gate in front of every disposal of a loser.
+
+    In the library means `promoted` to a dest that is a real regular file,
+    or `canonical` (an `originals` row) whose path still is one. With
+    `verify` (apply, about to quarantine) a promoted winner must also have
+    its dest_path AND sha256 on record and the file must hash to it now; a
+    canonical winner is hashed when its sha256 is on record. Without it
+    (purge planning over the whole quarantine) presence is checked, and a
+    promoted row from before schema v4, which recorded no dest_path, stands
+    on its status — `promoted` was only ever written after a verified copy."""
+    row = conn.execute(
+        "SELECT status, source, path, dest_path, sha256 FROM asset WHERE id=?",
+        (winner_id,),
+    ).fetchone() if winner_id is not None else None
+    if row is None:
+        return f"winner {winner_id} is not in the manifest"
+    status, source, path_str, dest_path, sha = row
+    if status == manifest.PROMOTED:
+        if verify and not (dest_path and sha):
+            return f"winner {winner_id} is promoted without a recorded dest_path+sha256"
+        if not dest_path:
+            return None
+        target = Path(dest_path)
+    elif status == manifest.CANONICAL or (source == "originals" and status != manifest.ERROR):
+        target = Path(path_str)
+    else:
+        return f"winner {winner_id} is {status}, not in the library"
+    if not _distinct_regular(target, None):
+        return f"winner {winner_id} file is missing or not a regular file: {target}"
+    if verify and sha:
+        try:
+            if _sha256(target) != sha:
+                return f"winner {winner_id} file no longer matches its sha256: {target}"
+        except OSError as exc:
+            return f"winner {winner_id} file unreadable: {exc}"
+    return None
+
+
 def apply_decisions(
     conn: sqlite3.Connection,
     *,
@@ -1568,7 +1736,17 @@ def apply_decisions(
     `originals_root` (skipped if it's already a canonical/`originals`
     asset — it's already in Immich), quarantine every loser into
     `quarantine_root` (mirroring its staging path, never deleted here —
-    purging is a separate, later command).
+    purging is a separate, later step gated by `purge_candidates`).
+
+    Cluster by cluster, winner first. A loser is quarantined only once its
+    winner is in the library: promoted by this run, or found by
+    `_winner_not_in_library(verify=True)` — promoted with a recorded
+    dest_path whose bytes hash to the recorded sha256, or the canonical file
+    itself. Otherwise the loser stays `decided`, untouched, and is counted in
+    `losers_held` with the reason in `held_samples`; a later run retries it.
+    Diagnosed 2026-10: walking rows by asset id quarantined a lower-id loser
+    before its winner's move was even attempted, and a failed winner then
+    left the cluster's only surviving copy in quarantine.
 
     Idempotent and crash-safe: only `decided` assets belonging to `auto`
     clusters are selected, `_resolve_dest` recognizes a destination a prior
@@ -1578,16 +1756,17 @@ def apply_decisions(
     mid-copy, between rename and unlink, or between unlink and commit — is
     safe to resume, and status commits after every single asset (not
     batched) so the manifest is never more than one file out of sync with
-    disk.
+    disk. A dry run assumes a winner it would move gets there.
     """
     rows = conn.execute(
         """SELECT a.id, a.source, a.path, a.bytes, a.taken_at, a.taken_src,
-                  a.gps_lat, a.gps_lon, c.winner_asset_id, a.dest_path, a.sha256
+                  a.gps_lat, a.gps_lon, c.winner_asset_id, a.dest_path, a.sha256,
+                  c.id
            FROM asset a
            JOIN membership m ON m.asset_id = a.id
            JOIN cluster c ON c.id = m.cluster_id
            WHERE a.status = ? AND c.decision = 'auto'
-           ORDER BY a.id""",
+           ORDER BY c.id, a.id = c.winner_asset_id DESC, a.id""",
         (manifest.DECIDED,),
     ).fetchall()
     if limit is not None:
@@ -1596,15 +1775,28 @@ def apply_decisions(
     counts = {
         "promoted": 0, "quarantined": 0,
         "promoted_bytes": 0, "quarantined_bytes": 0,
-        "sidecars_written": 0, "errors": 0,
+        "sidecars_written": 0, "errors": 0, "losers_held": 0,
     }
     errors: list[str] = []
+    held: list[str] = []
+    # cluster id -> None (winner in the library) or the reason it is not.
+    winner_gate: dict[int, str | None] = {}
     total = len(rows)
 
     for i, (asset_id, source, path_str, nbytes, taken_at, taken_src, gps_lat, gps_lon,
-            winner_id, rec_dest, rec_sha) in enumerate(rows):
+            winner_id, rec_dest, rec_sha, cluster_id) in enumerate(rows):
         src = Path(path_str)
         is_winner = asset_id == winner_id
+        if not is_winner:
+            if cluster_id not in winner_gate:
+                winner_gate[cluster_id] = _winner_not_in_library(conn, winner_id, verify=True)
+            reason = winner_gate[cluster_id]
+            if reason is not None:
+                counts["losers_held"] += 1
+                held.append(f"{path_str}: {reason}")
+                if progress:
+                    progress(i + 1, total)
+                continue
         try:
             base_dest = (
                 _promote_dest(originals_root, path_str, taken_at) if is_winner
@@ -1626,6 +1818,9 @@ def apply_decisions(
                 )
                 conn.commit()
             if is_winner:
+                # `_move_asset` verified the copy by full sha256 and recorded
+                # it; nothing to re-prove for this run's losers.
+                winner_gate[cluster_id] = None
                 counts["promoted"] += 1
                 counts["promoted_bytes"] += nbytes or 0
             else:
@@ -1634,6 +1829,8 @@ def apply_decisions(
         except Exception as exc:  # noqa: BLE001 — one bad file must not kill the batch
             counts["errors"] += 1
             errors.append(f"{path_str}: {exc}")
+            if is_winner:
+                winner_gate[cluster_id] = f"winner {asset_id} failed to move: {exc}"
 
         if progress:
             progress(i + 1, total)
@@ -1644,7 +1841,45 @@ def apply_decisions(
         counts=counts, errors=errors,
     )
     counts["error_samples"] = errors[:20]
+    counts["held_samples"] = held[:20]
     return counts
+
+
+def purge_candidates(conn: sqlite3.Connection) -> tuple[list[int], list[tuple[int, str]]]:
+    """Split `quarantined` rows into (purgeable ids, [(id, reason refused)]).
+
+    Any purge of the quarantine must go through this. A cluster loser is
+    purgeable only while its winner is in the library
+    (`_winner_not_in_library`, presence-checked); an alias only while its
+    library twin (`alias_path`) is still a regular file; a row with neither
+    on record has no surviving copy anyone has vouched for and is refused.
+    Diagnosed 2026-10: the by-id apply walk could quarantine a loser whose
+    winner then failed to move — purging that loser would lose the shot."""
+    rows = conn.execute(
+        "SELECT a.id, a.alias_path, c.winner_asset_id FROM asset a"
+        " LEFT JOIN membership m ON m.asset_id = a.id"
+        " LEFT JOIN cluster c ON c.id = m.cluster_id"
+        " WHERE a.status = ? ORDER BY a.id",
+        (manifest.QUARANTINED,),
+    ).fetchall()
+    eligible: list[int] = []
+    refused: list[tuple[int, str]] = []
+    by_winner: dict[int, str | None] = {}
+    for asset_id, alias_path, winner_id in rows:
+        if winner_id is not None and winner_id != asset_id:
+            if winner_id not in by_winner:
+                by_winner[winner_id] = _winner_not_in_library(conn, winner_id, verify=False)
+            reason = by_winner[winner_id]
+        elif alias_path:
+            reason = (None if _distinct_regular(Path(alias_path), None)
+                      else f"library twin {alias_path} is gone")
+        else:
+            reason = "no winner or library twin on record"
+        if reason is None:
+            eligible.append(asset_id)
+        else:
+            refused.append((asset_id, reason))
+    return eligible, refused
 
 
 def _dispose_aliases(

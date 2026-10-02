@@ -1,7 +1,9 @@
 """Thin pyexiftool wrapper.
 
 One process per audit (pyexiftool keeps exiftool warm in -stay_open mode).
-Header-only reads (`-fast2`), numeric values (`-n`), one JSON blob per file.
+Header reads (`-fast`: no trailer scan, but maker notes included — `-fast2`
+skips Apple's BurstUUID/ContentIdentifier and some MOVs' QuickTime tags),
+numeric values (`-n`), one JSON blob per file.
 """
 
 from __future__ import annotations
@@ -137,7 +139,7 @@ def read_folder(
     targets = [str(f) for f in files] + [str(s) for s in sidecars_to_read.values()]
 
     with exiftool.ExifToolHelper(
-        common_args=["-G", "-n", "-fast2", "-m"],
+        common_args=["-G", "-n", "-fast", "-m"],
         check_execute=False,
     ) as et:
         try:

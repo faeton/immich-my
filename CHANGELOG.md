@@ -4,6 +4,39 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — dedup: maker notes read, losers wait for their winner
+
+### Fixed
+
+- **Burst and Live Photo ids were never recorded.** `dedup fingerprint`
+  and `exif.read_folder` ran exiftool with `-fast2`, which skips maker
+  notes — where Apple keeps `BurstUUID`, `ContentIdentifier` and
+  `AdjustmentVersion` — and loses the QuickTime tags of some MOVs. On
+  real iPhone HEICs in originals/2026/03, `-fast2` returned 0 of 164
+  ContentIdentifiers, `-fast` all 164; every row in n5's manifest has
+  NULL burst/live ids, so the burst and Live-pair guards in Stage D never
+  fired. Both now use `-fast` (slower, accepted). `immy dedup fingerprint
+  --refresh-meta` re-reads those ids (and `edited`) for rows already
+  fingerprinted: fills NULLs only, never sizes/hashes/status, idempotent,
+  reads promoted/quarantined rows at their `dest_path`. An `auto` cluster
+  that gains an id and has moved nothing is reopened (`pending`, members
+  back to `clustered`; re-run `dedup decide`); in one already applied the
+  moves stand and members still `decided` drop to `clustered`, so
+  promote-rest keeps them. Rows promoted before schema v4 recorded no
+  `dest_path` and are counted `missing`, not guessed.
+- **`dedup apply` could quarantine a loser whose winner never reached the
+  library.** Rows were walked by asset id, so a lower-id loser moved
+  before its winner was even tried, and a failed winner left the shot's
+  only copy in quarantine. Apply now goes cluster by cluster, winner
+  first, and quarantines a loser only when the winner was promoted by this
+  run, or is `promoted` with a recorded `dest_path` that still hashes to
+  its recorded sha256, or is the `canonical` library file. Otherwise the
+  loser stays `decided`, is counted as `losers held` with its reason, and
+  is retried on the next run. `engine.purge_candidates` is the gate for
+  any quarantine purge: it refuses a quarantined row whose winner is not
+  promoted/canonical with its file present (or an alias whose library twin
+  is gone).
+
 ## 2026-10-02 — capture time: wall-clock localDateTime, sidecars win
 
 ### Fixed

@@ -255,7 +255,7 @@ def _zero_head(path: Path) -> bool:
 
 def stub_reason(nbytes: int, raw: dict, path: Path | None = None) -> str | None:
     """A file present in a batch that is not the real asset. Errors only —
-    exiftool *warnings* are routine on real files. Header-level: `-fast2`
+    exiftool *warnings* are routine on real files. Header-level: `-fast`
     cannot prove a video is complete; that is transport accounting's job.
 
     The zero-filled case is concrete, not hypothetical: the icloudpd tree on

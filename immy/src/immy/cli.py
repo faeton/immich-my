@@ -3280,11 +3280,20 @@ def dedup_fingerprint(
     manifest_path: Path = _MANIFEST_OPT,
     source: str = typer.Option(None, "--source", help="Limit to one source."),
     batch_size: int = typer.Option(200, "--batch-size"),
+    refresh_meta: bool = typer.Option(
+        False, "--refresh-meta",
+        help="Instead of fingerprinting new arrivals, re-read burst / Live Photo / "
+        "edited ids for rows fingerprinted before maker notes were read "
+        "(fills only NULLs; re-opens unapplied auto clusters that gain one).",
+    ),
 ) -> None:
     """Extract metadata (exiftool batch) + pHash for every registered asset.
     Resumable: commits per batch, failed files land in status `error`."""
     from .dedup import engine as engine_mod
 
+    if refresh_meta:
+        _dedup_refresh_meta(engine_mod, manifest_path, batch_size)
+        return
     _, conn = _open_manifest(manifest_path)
     stats: dict = {}
     ok, failed = engine_mod.fingerprint_pending(
@@ -3296,6 +3305,37 @@ def dedup_fingerprint(
         f"[green]{ok} fingerprinted[/green], [{color}]{failed} failed[/{color}]"
         + (f", {stats['alias']} already in the library (alias)" if stats.get("alias") else "")
     )
+
+
+def _dedup_refresh_meta(engine_mod, manifest_path: Path, batch_size: int) -> None:
+    # It moves `decided` rows back to `clustered`, which `dedup apply` reads:
+    # hold the movers lock so it never runs under an apply in progress.
+    lock_path = manifest_path.with_suffix(MOVERS_LOCK_SUFFIX)
+    try:
+        lock_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        console.print(
+            f"[red]a file-moving run (dedup apply / promote-rest / triage apply) "
+            f"looks to be in progress[/red] (lock file exists: {lock_path}). "
+            f"If that's stale, delete it and retry."
+        )
+        raise typer.Exit(1)
+    try:
+        _, conn = _open_manifest(manifest_path)
+        result = engine_mod.refresh_metadata(
+            conn, batch_size=batch_size, progress=_dedup_progress,
+        )
+    finally:
+        os.close(lock_fd)
+        lock_path.unlink(missing_ok=True)
+    console.print(
+        f"[green]{result['updated']} updated[/green] of {result['checked']} checked · "
+        f"missing {result['missing']} · unreadable {result['unreadable']} · "
+        f"clusters reopened {result['clusters_reopened']} · "
+        f"applied clusters affected {result['applied_clusters_affected']}"
+    )
+    if result["clusters_reopened"]:
+        console.print("re-run `dedup decide` to re-decide the reopened clusters")
 
 
 @dedup_app.command("index-library")
@@ -3500,6 +3540,7 @@ def dedup_apply(
         f"{prefix}promote {result['promoted']} ({result['promoted_bytes'] / 1e9:.1f} GB) · "
         f"quarantine {result['quarantined']} ({result['quarantined_bytes'] / 1e9:.1f} GB) · "
         f"sidecars {result['sidecars_written']} · errors {result['errors']}"
+        + (f" · losers held {result['losers_held']}" if result.get("losers_held") else "")
         + (
             f" · aliases quarantined {result['aliases_quarantined']}"
             f" ({result['aliases_bytes'] / 1e9:.1f} GB)"
@@ -3509,6 +3550,8 @@ def dedup_apply(
     )
     for sample in result["error_samples"]:
         console.print(f"[red]error:[/red] {sample}")
+    for sample in result["held_samples"]:
+        console.print(f"[yellow]held:[/yellow] {sample}")
 
 
 @dedup_app.command("review-server")
