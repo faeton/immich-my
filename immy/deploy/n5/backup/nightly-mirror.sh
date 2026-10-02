@@ -31,6 +31,8 @@ set -euo pipefail
 # --- config -----------------------------------------------------------------
 # mirror.env (next to this script, or $MIRROR_ENV) overrides any default below.
 SELF_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=guards-lib.sh
+. "$SELF_DIR/guards-lib.sh"   # count_files / remote_state (fail-closed helpers)
 MIRROR_ENV="${MIRROR_ENV:-$SELF_DIR/mirror.env}"
 # A DRY_RUN passed on the command line / environment is the safety toggle and
 # MUST win over whatever mirror.env says — capture it before sourcing.
@@ -244,22 +246,27 @@ MEDIA_VIEW="$MEDIA/.zfs/snapshot/$SNAP"
 
 # Fail closed BEFORE any transfer: rsync --delete from an empty/unreadable
 # source would wipe vv's good copy (--max-delete only caps the count).
-count_files() { { find "$1" -type f -print 2>/dev/null || true; } | head -n "$2" | wc -l || true; }
 IMMY_SKIP=""
 for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
   name="$(basename "$src")"
   view="$FLASH_MOUNT/.zfs/snapshot/$SNAP/${src#"$FLASH_MOUNT"/}"
   [ -d "$view" ] || { log "ERROR: snapshot view $view missing"; exit 1; }
-  n_view=$(count_files "$view" "$MIN_STATE_FILES")
-  n_live=$(count_files "$src" 1)
+  # Any counting failure aborts the run: never interpreted as "0 files".
+  n_view=$(count_files "$view" "$MIN_STATE_FILES") \
+    || { log "ERROR: cannot count files in $view; aborting (fail closed)"; exit 1; }
+  n_live=$(count_files "$src" 1) \
+    || { log "ERROR: cannot count files in $src; aborting (fail closed)"; exit 1; }
   if [ "$n_view" -lt "$MIN_STATE_FILES" ]; then
     if [ "$ALLOW_EMPTY_SOURCES" = 1 ]; then
       log "WARN: immy/$name source empty; ALLOW_EMPTY_SOURCES=1 so mirroring anyway"
     elif [ "$n_live" -gt 0 ]; then
       log "ERROR: snapshot view of $src is empty but the live dir is not; refusing"; exit 1
-    elif [ -n "$($SSH_CMD "$REMOTE" "find '$VV_ROOT/immy/$name' -type f -print -quit 2>/dev/null")" ]; then
-      log "ERROR: $src is empty but vv:immy/$name holds files; refusing to empty it (set ALLOW_EMPTY_SOURCES=1 to override)"; exit 1
     else
+      v_state=$(remote_state "$VV_ROOT/immy/$name") \
+        || { log "ERROR: cannot determine vv:immy/$name state; aborting (fail closed)"; exit 1; }
+      if [ "$v_state" = YES ]; then
+        log "ERROR: $src is empty but vv:immy/$name holds files; refusing to empty it (set ALLOW_EMPTY_SOURCES=1 to override)"; exit 1
+      fi
       log "immy/$name is empty on both sides; nothing to mirror"
       IMMY_SKIP="$IMMY_SKIP $name"
     fi

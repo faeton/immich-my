@@ -101,6 +101,11 @@ refused if the live dir is non-empty or vv still holds files (override only with
 `ALLOW_EMPTY_SOURCES=1`). An empty source with an empty vv copy (sidecars today)
 is simply skipped.
 
+Counting is fail-closed too: `guards-lib.sh` (sourced by the script — copy it
+next to `nightly-mirror.sh` on install) returns non-zero with no output on any
+find/ssh error, and the script aborts instead of reading that as "empty".
+`bash tests/test-guards.sh` exercises this with stubbed `ssh`/`find`.
+
 ## Config
 All knobs live in `mirror.env` (see `mirror.env.example`). Only `HC_URL` must be
 set; everything else defaults to the as-built n5 layout.
