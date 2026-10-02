@@ -4,6 +4,28 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — clock-drift: evidence-based deltas, never a median
+
+### Fixed
+
+- **`clock-drift` collapsed multi-day trips onto one instant.** It flagged
+  every file >24 h from the folder median and patched each to that single
+  median timestamp, so a 10-day single-phone trip had 8/10 files flagged
+  and `--yes-medium` rewrote them all to the same moment. The rule now
+  splits the folder into sessions (no gap >3 h) and flags only files whose
+  session is >24 h from every other session, isn't the trip's biggest
+  session, and holds ≤25 % of the files. Its proposal is a delta (a
+  whole-year or whole-hour shift that uniquely lands the file in a
+  session), never a constant; deltas >26 h are uncorroborated and stay
+  LOW (never auto-applied), and with no clean shift it emits a LOW note
+  with no patch.
+- **`clock-drift-by-camera` inferred drift from medians.** Comparing
+  per-camera median times told a drone flown only on day 9 of a 10-day
+  trip that it was "+83h" off. Drift is now estimated only from
+  temporally overlapping sessions (raw times ±1 h): the median of
+  nearest-neighbour deltas to the reference camera, used only when ≥3
+  pairs agree within 5 min. No overlap → no proposal.
+
 ## 2026-10-02 — face→person links, promote path scope, trash status
 
 ### Fixed

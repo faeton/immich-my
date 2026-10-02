@@ -53,6 +53,19 @@ def clock_drift_fixture(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+def clock_hour_off_fixture(clock_drift_fixture: Path) -> Path:
+    """clock-drift-simple with DSC_0004 restamped 25 h after the 10:00-10:10
+    session: a whole-hour offset (-25 h) lands it inside the session, so
+    `clock-drift` proposes a MEDIUM delta. (Only the tmp copy is touched.)"""
+    subprocess.run([
+        "exiftool", "-overwrite_original",
+        "-EXIF:DateTimeOriginal=2026:04:02 11:05:00",
+        str(clock_drift_fixture / "DSC_0004.JPG"),
+    ], check=True, capture_output=True)
+    return clock_drift_fixture
+
+
+@pytest.fixture
 def tag_suggest_fixture(tmp_path: Path) -> Path:
     target = tmp_path / "tag-suggest-missing"
     shutil.copytree(FIXTURES / "tag-suggest-missing", target)
@@ -327,64 +340,74 @@ def test_trip_timezone_noop_when_no_date(tmp_path: Path):
 
 
 def test_clock_drift_flags_outlier_but_read_only_does_not_write(clock_drift_fixture: Path):
+    # DSC_0004 is 4 days after the only other session at an unrelated time:
+    # flagged (LOW note, shown in the table), but no patch to review.
     result = runner.invoke(app, ["audit", str(clock_drift_fixture), "--auto"])
     assert result.exit_code == 0, result.stdout
-    assert "MEDIUM findings: 1 pending review" in result.stdout
     assert "clock-drift" in result.stdout
+    assert "MEDIUM findings" not in result.stdout
     assert not (clock_drift_fixture / "DSC_0004.xmp").exists()
 
 
-def test_clock_drift_yes_medium_writes_median_and_reaudit_clean(clock_drift_fixture: Path):
+def test_clock_drift_yes_medium_never_snaps_outlier_to_median(clock_drift_fixture: Path):
+    # Regression: the old rule patched DSC_0004 to the folder median
+    # (2026:04:01 10:07:30) and --yes-medium applied it.
     result = runner.invoke(
         app, ["audit", str(clock_drift_fixture), "--write", "--auto", "--yes-medium"],
     )
     assert result.exit_code == 0, result.stdout
     xmp = clock_drift_fixture / "DSC_0004.xmp"
-    assert xmp.is_file()
-    tags = _xmp_tags(xmp)
-    # Median of 10:00, 10:05, 10:10, 12:00(+4d) on 4 samples is the avg of
-    # the middle two sorted timestamps: (10:05 + 10:10)/2 = 10:07:30 on apr 1.
-    assert tags["XMP:DateTimeOriginal"] == "2026:04:01 10:07:30"
+    if xmp.exists():
+        assert "XMP:DateTimeOriginal" not in _xmp_tags(xmp)
 
-    # Re-audit is a no-op: MEDIUM finding disappears (XMP override now puts
-    # DSC_0004 within 24h of the new median).
+
+def test_clock_drift_yes_medium_applies_delta_and_reaudit_clean(clock_hour_off_fixture: Path):
+    folder = clock_hour_off_fixture
+    result = runner.invoke(
+        app, ["audit", str(folder), "--write", "--auto", "--yes-medium"],
+    )
+    assert result.exit_code == 0, result.stdout
+    tags = _xmp_tags(folder / "DSC_0004.xmp")
+    # 2026:04:02 11:05:00 - 25h — a delta, not the folder median.
+    assert tags["XMP:DateTimeOriginal"] == "2026:04:01 10:05:00"
+
+    # Re-audit is a no-op: the XMP override puts DSC_0004 inside the session.
     result2 = runner.invoke(
-        app, ["audit", str(clock_drift_fixture), "--write", "--auto", "--yes-medium"],
+        app, ["audit", str(folder), "--write", "--auto", "--yes-medium"],
     )
     assert result2.exit_code == 0
     assert "MEDIUM findings" not in result2.stdout
     assert "review clock-drift" not in result2.stdout
 
 
-def test_clock_drift_interactive_y_applies_n_skips(clock_drift_fixture: Path):
+def test_clock_drift_interactive_y_applies_n_skips(clock_hour_off_fixture: Path):
     # LOW coords + tz prompts fire first; send empty to skip both, then "y"
     # to accept the single MEDIUM clock-drift finding.
     result = runner.invoke(
-        app, ["audit", str(clock_drift_fixture), "--write"],
+        app, ["audit", str(clock_hour_off_fixture), "--write"],
         input="\n\ny\n",
     )
     assert result.exit_code == 0, result.stdout
     assert "apply? [y/N]" in result.stdout
-    assert (clock_drift_fixture / "DSC_0004.xmp").is_file()
+    assert (clock_hour_off_fixture / "DSC_0004.xmp").is_file()
 
 
-def test_clock_drift_interactive_n_leaves_pending(tmp_path: Path):
-    target = tmp_path / "clock-drift-simple"
-    shutil.copytree(FIXTURES / "clock-drift-simple", target)
+def test_clock_drift_interactive_n_leaves_pending(clock_hour_off_fixture: Path):
     result = runner.invoke(
-        app, ["audit", str(target), "--write"],
+        app, ["audit", str(clock_hour_off_fixture), "--write"],
         input="\n\nn\n",
     )
     assert result.exit_code == 0, result.stdout
-    assert not (target / "DSC_0004.xmp").exists()
+    assert "apply? [y/N]" in result.stdout
+    assert not (clock_hour_off_fixture / "DSC_0004.xmp").exists()
 
 
-def test_clock_drift_skipped_without_yes_medium_in_auto(clock_drift_fixture: Path):
+def test_clock_drift_skipped_without_yes_medium_in_auto(clock_hour_off_fixture: Path):
     # --auto without --yes-medium: report but do not apply.
-    result = runner.invoke(app, ["audit", str(clock_drift_fixture), "--write", "--auto"])
+    result = runner.invoke(app, ["audit", str(clock_hour_off_fixture), "--write", "--auto"])
     assert result.exit_code == 0, result.stdout
     assert "MEDIUM findings: 1 pending review" in result.stdout
-    assert not (clock_drift_fixture / "DSC_0004.xmp").exists()
+    assert not (clock_hour_off_fixture / "DSC_0004.xmp").exists()
 
 
 def test_clock_drift_skipped_below_min_samples(trip_anchor_fixture: Path):
@@ -668,10 +691,11 @@ def _build_two_camera_folder(
     root: Path, *,
     cam_a: tuple[str, str] = ("NIKON", "Z50_2"),
     cam_b: tuple[str, str] = ("SONY", "ILCE-7M4"),
-    offset_seconds: int = 3 * 3600,
+    offset_seconds: int = 20 * 60,
     count: int = 4,
 ) -> Path:
-    """Stamp `count` JPGs per camera with matching EXIF. Camera B's dates
+    """Stamp `count` JPGs per camera with matching EXIF: both bodies shoot
+    the same moments, hourly, in one overlapping session. Camera B's dates
     are shifted by `offset_seconds` (camera B is "behind" when positive)."""
     target = root / "two-cam"
     target.mkdir()
@@ -691,7 +715,7 @@ def _build_two_camera_folder(
         ], check=True, capture_output=True)
 
     for i in range(count):
-        ts = base_dt + timedelta(minutes=5 * i)
+        ts = base_dt + timedelta(hours=i)
         stamp(target / f"A_{i:04d}.JPG", cam_a[0], cam_a[1], ts)
         ts_b = ts - timedelta(seconds=offset_seconds)
         stamp(target / f"B_{i:04d}.JPG", cam_b[0], cam_b[1], ts_b)
@@ -710,15 +734,17 @@ def test_clock_drift_by_camera_flags_offset_group(tmp_path: Path):
 
 
 def test_clock_drift_by_camera_yes_medium_applies_delta(tmp_path: Path):
-    folder = _build_two_camera_folder(tmp_path, offset_seconds=3 * 3600)
+    folder = _build_two_camera_folder(tmp_path, offset_seconds=20 * 60)
     result = runner.invoke(
         app, ["audit", str(folder), "--write", "--auto", "--yes-medium"],
     )
     assert result.exit_code == 0, result.stdout
-    # A_ files untouched (they're the reference); B_ files shifted +3h.
-    # B_0000 original was 07:00:00 → should now read 10:00:00.
+    # A_ files untouched (they're the reference); B_ files shifted +20m,
+    # each keeping its own spacing. B_0000 09:40 → 10:00, B_0003 12:40 → 13:00.
     tags = _xmp_tags(folder / "B_0000.xmp")
     assert tags["XMP:DateTimeOriginal"] == "2026:04:01 10:00:00"
+    tags = _xmp_tags(folder / "B_0003.xmp")
+    assert tags["XMP:DateTimeOriginal"] == "2026:04:01 13:00:00"
     # A_0000 gets no XMP sidecar from this rule.
     assert not (folder / "A_0000.xmp").exists()
 
@@ -744,6 +770,15 @@ def test_clock_drift_by_camera_skips_noise(tmp_path: Path):
     assert "clock-drift-by-camera" not in result.stdout
 
 
+def test_clock_drift_by_camera_skips_non_overlapping_cameras(tmp_path: Path):
+    # 5 h apart, sessions never overlap in raw time — could just be two
+    # bodies shooting at different times, so no drift is inferred.
+    folder = _build_two_camera_folder(tmp_path, offset_seconds=5 * 3600)
+    result = runner.invoke(app, ["audit", str(folder), "--auto"])
+    assert result.exit_code == 0
+    assert "clock-drift-by-camera" not in result.stdout
+
+
 def test_clock_drift_by_camera_skips_sanity_max(tmp_path: Path):
     # 30 day offset — above MAX_DRIFT_SECONDS (14 days).
     folder = _build_two_camera_folder(tmp_path, offset_seconds=30 * 86400)
@@ -752,12 +787,10 @@ def test_clock_drift_by_camera_skips_sanity_max(tmp_path: Path):
     assert "clock-drift-by-camera" not in result.stdout
 
 
-def test_clock_drift_single_camera_unaffected(tmp_path: Path):
-    # Single-camera folder with one outlier still goes through folder-median
-    # clock-drift (shipped 2a.2), not clock-drift-by-camera.
-    src = FIXTURES / "clock-drift-simple"
-    folder = tmp_path / "clock-single"
-    shutil.copytree(src, folder)
+def test_clock_drift_single_camera_unaffected(clock_hour_off_fixture: Path):
+    # Single-camera folder with one outlier goes through `clock-drift`,
+    # not clock-drift-by-camera.
+    folder = clock_hour_off_fixture
     result = runner.invoke(app, ["audit", str(folder), "--auto"])
     assert result.exit_code == 0
     assert "review clock-drift:" in result.stdout
