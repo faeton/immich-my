@@ -1487,7 +1487,7 @@ def _run_one_trip(
         from .exif import read_folder as _read
         from . import dji as _dji
         from . import raw as _raw
-        rows = _read(folder)
+        rows = _read(folder, paths=paths)
         # Match process_trip's filter: all DJI `.LRF` proxies are
         # dropped (paired ones are consumed as ffmpeg input for their
         # master; orphans are stray low-res proxies) — never ingested as

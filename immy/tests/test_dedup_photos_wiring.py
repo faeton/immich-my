@@ -63,3 +63,61 @@ def test_json_date_rescue_is_not_google_only(tmp_path, monkeypatch):
 
     assert result["sidecars_written"] == 1
     assert written == [tmp_path / "originals" / "2024" / "06" / "IMG_0001.HEIC"]
+
+
+def _promote_one(tmp_path, monkeypatch, source: str) -> dict:
+    patches: list[dict] = []
+    monkeypatch.setattr(engine.sidecar, "write", lambda dest, patch: patches.append(patch))
+    conn = manifest.open_manifest(tmp_path / "m.sqlite")
+    src = tmp_path / "staging" / "IMG_0001.JPG"
+    src.parent.mkdir(parents=True)
+    src.write_bytes(b"x" * 64)
+    conn.execute(
+        "INSERT INTO asset (id, source, path, status, bytes, taken_at, taken_src, media_type)"
+        " VALUES (1, ?, ?, ?, 64, '2024-06-15T10:00:00', 'json', 'image')",
+        (source, str(src), manifest.FINGERPRINTED),
+    )
+    conn.commit()
+    engine.promote_rest(conn, originals_root=tmp_path / "originals", dry_run=False)
+    assert len(patches) == 1
+    return patches[0]
+
+
+def test_takeout_json_date_is_written_as_explicit_utc(tmp_path, monkeypatch):
+    """Google's photoTakenTime is a UTC epoch. Written naive, Immich would
+    read it as local wall clock and shift the photo by the UTC offset."""
+    patch = _promote_one(tmp_path, monkeypatch, "google")
+    assert patch["DateTimeOriginal"] == "2024:06:15 10:00:00+00:00"
+
+
+def test_photos_json_date_stays_wall_clock(tmp_path, monkeypatch):
+    # Photos companion dates are local wall clock — no UTC offset forced.
+    patch = _promote_one(tmp_path, monkeypatch, "photos")
+    assert patch["DateTimeOriginal"] == "2024:06:15 10:00:00"
+
+
+def test_takeout_photo_taken_time_is_utc(tmp_path, monkeypatch):
+    import json
+    from immy.exif import ExifRow
+    img = tmp_path / "IMG_0001.jpg"
+    img.write_bytes(b"x")
+    (tmp_path / "IMG_0001.jpg.json").write_text(json.dumps(
+        {"photoTakenTime": {"timestamp": "1719223200"}}))  # 2024-06-24T10:00:00Z
+    fields = engine.fingerprint_fields(ExifRow(path=img, raw={}), "google")
+    assert fields["taken_src"] == "json"
+    assert fields["taken_at"] == "2024-06-24T10:00:00"
+
+
+def test_rescue_sidecar_keeps_gps_hemisphere(tmp_path):
+    """XMP GPSLatitude/Longitude carry the sign; exiftool ignores a separate
+    XMP GPS*Ref, so writing abs() values put Los Angeles in China."""
+    import subprocess
+    dest = tmp_path / "IMG_0001.JPG"
+    dest.write_bytes(b"x")
+    assert engine._rescue_sidecar(dest, None, 34.05, -118.25)
+    out = subprocess.run(
+        ["exiftool", "-n", "-s3", "-XMP:GPSLatitude", "-XMP:GPSLongitude",
+         str(dest.with_suffix(".xmp"))],
+        capture_output=True, text=True, check=True,
+    ).stdout.split()
+    assert [float(v) for v in out] == [34.05, -118.25]

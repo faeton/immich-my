@@ -312,3 +312,32 @@ def test_apply_plan_rolls_back_on_error(tmp_path: Path) -> None:
     with pytest.raises(RuntimeError):
         bf.apply_plan(conn, plan)
     conn.rollback.assert_called_once()
+
+
+# --- Task 5: zone parsing + Lisbon-session safety ------------------------
+
+
+def test_compute_instant_accepts_fixed_offset_zone() -> None:
+    ldt, dto = bf._compute_instant(datetime(2025, 7, 1, 12, 0), "local", "UTC+2")
+    assert ldt == datetime(2025, 7, 1, 12, 0)
+    assert dto == datetime(2025, 7, 1, 10, 0, tzinfo=timezone.utc)
+
+
+def test_compute_instant_aware_source_without_zone_keeps_own_wall() -> None:
+    from datetime import timedelta
+    aware = datetime(2025, 7, 1, 12, 0, tzinfo=timezone(timedelta(hours=2)))
+    ldt, dto = bf._compute_instant(aware, "utc", None)
+    assert ldt == datetime(2025, 7, 1, 12, 0)
+    assert dto == datetime(2025, 7, 1, 10, 0, tzinfo=timezone.utc)
+
+
+def test_apply_plan_sends_local_date_time_as_utc_tagged(tmp_path: Path) -> None:
+    # Immich's DB session TimeZone is not UTC (live: Europe/Lisbon); a naive
+    # param would be read as Lisbon time and shift localDateTime.
+    conn, cur = _mock_conn(None, rowcount=1)
+    plan = bf.FolderPlan(folder=tmp_path, tz_name="UTC", tz_reason="x")
+    plan.candidates = [_candidate("update")]
+    bf.apply_plan(conn, plan)
+    sent = [c.args[1] for c in cur.execute.call_args_list]
+    ldts = [p["ldt"] for p in sent]
+    assert all(v == datetime(2024, 2, 15, 10, 30, tzinfo=timezone.utc) for v in ldts)

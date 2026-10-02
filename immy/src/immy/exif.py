@@ -6,13 +6,16 @@ Header-only reads (`-fast2`), numeric values (`-n`), one JSON blob per file.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Iterable
+from typing import TYPE_CHECKING, Any, Iterable
 
 import exiftool
 
 from .state import AUDIT_DIR
+
+if TYPE_CHECKING:
+    from .paths import WritablePaths
 
 
 MEDIA_EXTS = {
@@ -27,11 +30,22 @@ MEDIA_EXTS = {
 class ExifRow:
     path: Path
     raw: dict[str, Any]
+    # Tags read from the separate `.xmp` SIDECAR file (immy's rule fixes or
+    # the user's edits), kept apart from the media's own embedded tags so
+    # ingest can let them win. Sidecar `XMP:*` keys are also merged into
+    # `raw` (when the media doesn't embed the same key) for the audit rules.
+    sidecar: dict[str, Any] = field(default_factory=dict)
 
     def get(self, *keys: str) -> Any:
         for k in keys:
             if k in self.raw:
                 return self.raw[k]
+        return None
+
+    def sidecar_get(self, *keys: str) -> Any:
+        for k in keys:
+            if k in self.sidecar:
+                return self.sidecar[k]
         return None
 
 
@@ -96,7 +110,14 @@ def _persist_camera_cache(cache_path: Path, data: dict) -> None:
         pass
 
 
-def read_folder(folder: Path) -> list[ExifRow]:
+def read_folder(
+    folder: Path, *, paths: "WritablePaths | None" = None,
+) -> list[ExifRow]:
+    """Read every media file under `folder` (plus its `.xmp` sidecar).
+
+    The sidecar is `paths.xmp_path(media)` when `paths` is given — on the
+    NAS that resolves under `sidecars_root`, where immy writes them — else
+    the sibling `media.with_suffix('.xmp')` (the Mac layout, unchanged)."""
     import sys
     import time
     t_total = time.monotonic()
@@ -109,7 +130,7 @@ def read_folder(folder: Path) -> list[ExifRow]:
     # earlier passes of the same audit.
     sidecars_to_read: dict[Path, Path] = {}
     for f in files:
-        side = f.with_suffix(".xmp")
+        side = paths.xmp_path(f) if paths is not None else f.with_suffix(".xmp")
         if side.is_file():
             sidecars_to_read[f] = side
 
@@ -246,12 +267,15 @@ def read_folder(folder: Path) -> list[ExifRow]:
     for f in files:
         raw = dict(by_path.get(f, {"SourceFile": str(f)}))
         side = sidecars_to_read.get(f)
+        sidecar_tags: dict[str, Any] = {}
         if side is not None:
             sblob = by_path.get(side, {})
             for k, v in sblob.items():
-                if k.startswith("XMP:") and k not in raw:
-                    raw[k] = v
-        rows.append(ExifRow(path=f, raw=raw))
+                if k.startswith("XMP:"):
+                    sidecar_tags[k] = v
+                    if k not in raw:
+                        raw[k] = v
+        rows.append(ExifRow(path=f, raw=raw, sidecar=sidecar_tags))
     sys.stderr.write(
         f"  read {len(rows)} file(s) in {time.monotonic() - t_total:.1f}s\n"
     )

@@ -22,12 +22,14 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import psycopg
 import yaml
@@ -108,7 +110,6 @@ def _parse_exif_datetime(raw: Any) -> datetime | None:
             minutes = int(s[-2:])
         except ValueError:
             return None
-        from datetime import timedelta
         tz = timezone(sign * timedelta(hours=hours, minutes=minutes))
         s = s[:-6]
     try:
@@ -120,18 +121,162 @@ def _parse_exif_datetime(raw: Any) -> datetime | None:
     return dt.replace(tzinfo=tz) if tz is not None else dt
 
 
+_OFFSET_RE = re.compile(r"^(?:UTC|GMT)?\s*([+-])(\d{1,2})(?::?(\d{2}))?$", re.IGNORECASE)
+
+
+def _parse_offset(raw: Any) -> timezone | None:
+    """`+02:00` / `-0530` / `UTC+2` / `UTC+5:30` / `Z` / `UTC` → fixed tz.
+    Anything else (IANA names, garbage) → None."""
+    if not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if s.upper() in ("Z", "UTC", "GMT"):
+        return timezone.utc
+    m = _OFFSET_RE.match(s)
+    if m is None:
+        return None
+    hours, minutes = int(m.group(2)), int(m.group(3) or 0)
+    if hours > 14 or minutes > 59:
+        return None
+    sign = 1 if m.group(1) == "+" else -1
+    return timezone(sign * timedelta(hours=hours, minutes=minutes))
+
+
+def _zone(tz_name: str | None) -> tzinfo | None:
+    """A zone string as written to `asset_exif.timeZone` → tzinfo: an
+    offset (any `_parse_offset` form) or an IANA name. Unknown → None."""
+    if not tz_name:
+        return None
+    off = _parse_offset(tz_name)
+    if off is not None:
+        return off
+    try:
+        return ZoneInfo(tz_name)
+    except (ZoneInfoNotFoundError, ValueError):
+        return None
+
+
+def _immich_time_zone(off: timezone) -> str:
+    """Fixed offset → Immich's own `timeZone` spelling (`UTC`, `UTC+2`,
+    `UTC+5:30`, `UTC-3`) — what its metadata extraction writes, and what
+    the web UI (luxon) accepts as a zone; a bare `+02:00` it does not."""
+    total = int(off.utcoffset(None).total_seconds()) // 60
+    if total == 0:
+        return "UTC"
+    sign = "+" if total > 0 else "-"
+    h, m = divmod(abs(total), 60)
+    return f"UTC{sign}{h}" + (f":{m:02d}" if m else "")
+
+
+def _with_offset(dt: datetime | None, offset_raw: Any) -> datetime | None:
+    """Attach a separate OffsetTime* tag to a naive EXIF datetime."""
+    if dt is None or dt.tzinfo is not None:
+        return dt
+    off = _parse_offset(offset_raw)
+    return dt.replace(tzinfo=off) if off is not None else dt
+
+
 def _best_datetime(row: ExifRow) -> datetime | None:
-    for k in (
-        "EXIF:DateTimeOriginal",
-        "XMP:DateTimeOriginal",
-        "QuickTime:CreateDate",
-        "EXIF:CreateDate",
-    ):
-        v = row.get(k)
-        parsed = _parse_exif_datetime(v)
-        if parsed is not None:
-            return parsed
+    """Capture time, tz-aware whenever the absolute instant is known.
+
+    Order: SIDECAR `XMP:DateTimeOriginal` (immy's rule fixes / the user's
+    edits win over the file) → `EXIF:DateTimeOriginal` (+ its
+    `OffsetTimeOriginal`) → embedded `XMP:DateTimeOriginal` (inline offset)
+    → `QuickTime:CreateDate` (UTC per the QuickTime spec) → `EXIF:CreateDate`
+    (+ `OffsetTimeDigitized`). A naive sidecar date (e.g. a clock-drift fix)
+    keeps the camera's embedded offset. Naive return = wall clock with no
+    known offset."""
+    embedded_offset = row.get("EXIF:OffsetTimeOriginal")
+    sidecar = _with_offset(
+        _parse_exif_datetime(row.sidecar_get("XMP:DateTimeOriginal")), embedded_offset)
+    if sidecar is not None:
+        return sidecar
+    exif = _with_offset(
+        _parse_exif_datetime(row.get("EXIF:DateTimeOriginal")), embedded_offset)
+    if exif is not None:
+        return exif
+    xmp = _parse_exif_datetime(row.get("XMP:DateTimeOriginal"))
+    if xmp is not None:
+        return xmp
+    qt = _parse_exif_datetime(row.get("QuickTime:CreateDate"))
+    if qt is not None:
+        return qt if qt.tzinfo is not None else qt.replace(tzinfo=timezone.utc)
+    return _with_offset(
+        _parse_exif_datetime(row.get("EXIF:CreateDate")),
+        row.get("EXIF:OffsetTimeDigitized"))
+
+
+def _capture_time_zone(row: ExifRow) -> str | None:
+    """Value for `asset_exif.timeZone`. Sidecar date offset first, then the
+    embedded `OffsetTimeOriginal` / `QuickTime:TimeZone`, then an embedded
+    XMP date's inline offset. Offsets use Immich's `UTC±H[:MM]` spelling;
+    IANA names pass through."""
+    sidecar_dt = _parse_exif_datetime(row.sidecar_get("XMP:DateTimeOriginal"))
+    if sidecar_dt is not None and sidecar_dt.tzinfo is not None:
+        return _immich_time_zone(sidecar_dt.tzinfo)
+    for raw in (row.get("EXIF:OffsetTimeOriginal"), row.get("QuickTime:TimeZone")):
+        s = _str(raw)
+        if s is None:
+            continue
+        off = _parse_offset(s)
+        return _immich_time_zone(off) if off is not None else s
+    xmp_dt = _parse_exif_datetime(row.get("XMP:DateTimeOriginal"))
+    if xmp_dt is not None and xmp_dt.tzinfo is not None:
+        return _immich_time_zone(xmp_dt.tzinfo)
     return None
+
+
+def _compute_instant(
+    dt: datetime, kind: str, tz_name: str | None,
+) -> tuple[datetime, datetime]:
+    """Return `(local_date_time, date_time_original_utc)`.
+
+    `local_date_time` is the naive wall-clock Immich sorts the timeline by
+    (store it as those numbers +00:00); `date_time_original_utc` is the
+    absolute instant.
+
+    - kind="utc": `dt` is an absolute instant (naive = UTC numbers).
+      localDateTime is that instant rendered in `tz_name`; with no zone, an
+      aware `dt` keeps its own wall clock, a naive one its UTC numbers.
+    - kind="local": `dt` is the wall clock the user saw. That IS
+      localDateTime; the absolute instant comes from interpreting it in
+      `tz_name` (or treating the wall numbers as UTC if no zone is known).
+
+    `tz_name` is an IANA name or a fixed offset (`+02:00`, `UTC+2`).
+    """
+    zone = _zone(tz_name)
+    if kind == "utc":
+        abs_utc = (
+            dt.astimezone(timezone.utc) if dt.tzinfo is not None
+            else dt.replace(tzinfo=timezone.utc)
+        )
+        if zone is not None:
+            local = abs_utc.astimezone(zone).replace(tzinfo=None)
+        elif dt.tzinfo is not None:
+            local = dt.replace(tzinfo=None)
+        else:
+            local = abs_utc.replace(tzinfo=None)
+        return local, abs_utc
+
+    local = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
+    if zone is not None:
+        abs_utc = local.replace(tzinfo=zone).astimezone(timezone.utc)
+    else:
+        abs_utc = local.replace(tzinfo=timezone.utc)
+    return local, abs_utc
+
+
+def _best_gps(row: ExifRow) -> tuple[float | None, float | None]:
+    """Sidecar `XMP:GPSLatitude/Longitude` (an immy fix or user edit) wins
+    as a pair over the embedded Composite → EXIF → XMP chain."""
+    lat = _float(row.sidecar_get("XMP:GPSLatitude"))
+    lon = _float(row.sidecar_get("XMP:GPSLongitude"))
+    if lat is not None and lon is not None:
+        return lat, lon
+    return (
+        _float(row.get("Composite:GPSLatitude", "EXIF:GPSLatitude", "XMP:GPSLatitude")),
+        _float(row.get("Composite:GPSLongitude", "EXIF:GPSLongitude", "XMP:GPSLongitude")),
+    )
 
 
 def _mtime_utc(path: Path) -> datetime:
@@ -227,10 +372,18 @@ def build_rows(
     basename = media_file.name
     asset_type = asset_type_for(media_file.suffix)
 
+    # Immich 3.0.2: `localDateTime` is the capture wall clock stored as if
+    # UTC; `fileCreatedAt` / `dateTimeOriginal` are the true UTC instant.
+    # No known offset/zone → the naive wall clock is taken as UTC for both.
     mtime_utc = _mtime_utc(media_file)
     best_dt = _best_datetime(exif_row)
-    file_created_at = _to_utc(best_dt) if best_dt is not None else mtime_utc
-    local_date_time = file_created_at
+    time_zone = _capture_time_zone(exif_row)
+    if best_dt is not None:
+        wall, file_created_at = _compute_instant(
+            best_dt, "utc" if best_dt.tzinfo is not None else "local", time_zone)
+        local_date_time = wall.replace(tzinfo=timezone.utc)
+    else:
+        file_created_at = local_date_time = mtime_utc
 
     duration: int | None = None
     if asset_type == "VIDEO":
@@ -276,6 +429,7 @@ def build_rows(
         make = "Insta360"
         if model is None and exif_row.path.suffix.lower() == ".mp4":
             model = "Insta360 GO 2"
+    latitude, longitude = _best_gps(exif_row)
     exif = AssetExifRow(
         asset_id=asset_id,
         description="",
@@ -292,20 +446,16 @@ def build_rows(
             "QuickTime:ImageHeight", "File:ImageHeight",
         )),
         file_size_in_byte=file_size,
-        date_time_original=_to_utc(best_dt) if best_dt is not None else None,
+        date_time_original=file_created_at if best_dt is not None else None,
         modify_date=_to_utc(mod_dt_parsed) if mod_dt_parsed is not None else None,
         f_number=_float(exif_row.get("EXIF:FNumber")),
         focal_length=_float(exif_row.get("EXIF:FocalLength")),
         iso=_int(exif_row.get("EXIF:ISO")),
         exposure_time=_str(exif_row.get("EXIF:ExposureTime")),
         fps=_float(exif_row.get("QuickTime:VideoFrameRate")),
-        latitude=_float(exif_row.get(
-            "Composite:GPSLatitude", "EXIF:GPSLatitude", "XMP:GPSLatitude",
-        )),
-        longitude=_float(exif_row.get(
-            "Composite:GPSLongitude", "EXIF:GPSLongitude", "XMP:GPSLongitude",
-        )),
-        time_zone=_str(exif_row.get("EXIF:OffsetTimeOriginal", "QuickTime:TimeZone")),
+        latitude=latitude,
+        longitude=longitude,
+        time_zone=time_zone,
     )
     return asset, exif
 
@@ -569,7 +719,13 @@ def process_trip(
     (Immich's own worker or a prior run owns that row). CLIP dim is verified
     once up-front against `smart_search.embedding` typmod.
     """
-    rows = read_folder(trip_folder)
+    # Resolve writable targets once. Unset roots → `<trip>/.audit` + sidecars
+    # beside the media (Mac path, byte-identical). NAS passes a WritablePaths
+    # rooted off the read-only originals so nothing is written under them —
+    # and the sidecars written there are read back from there.
+    if paths is None:
+        paths = resolve_writable_paths(trip_folder)
+    rows = read_folder(trip_folder, paths=paths)
 
     # DJI drones write every clip as a paired `.MP4` master + `.LRF`
     # low-res proxy sharing a stem. The LRF is never a library asset:
@@ -612,11 +768,6 @@ def process_trip(
     # ON CONFLICT path returns inserted=False on resume. Without it the
     # enrichers would skip a half-finished asset because they currently
     # gate on `inserted`.
-    # Resolve writable targets once. Unset roots → `<trip>/.audit` + sidecars
-    # beside the media (Mac path, byte-identical). NAS passes a WritablePaths
-    # rooted off the read-only originals so nothing is written under them.
-    if paths is None:
-        paths = resolve_writable_paths(trip_folder)
     if journal is None:
         journal = Journal.load_path(paths.journal_path)
     INGEST_VERSION = "v1"

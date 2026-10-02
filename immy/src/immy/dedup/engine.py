@@ -41,7 +41,7 @@ import shutil
 import sqlite3
 import stat as stat_mod
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from itertools import combinations
 from pathlib import Path
 
@@ -189,7 +189,10 @@ def fingerprint_fields(row: ExifRow, source: str) -> dict:
             if taken_src in (None, "filename", "mtime"):
                 ts = (sidecar.get("photoTakenTime") or {}).get("timestamp")
                 if ts:
-                    taken_at = datetime.utcfromtimestamp(int(ts)).isoformat()
+                    # UTC epoch, kept naive-UTC in the manifest;
+                    # `_rescue_sidecar` writes it out with +00:00.
+                    taken_at = datetime.fromtimestamp(
+                        int(ts), tz=timezone.utc).replace(tzinfo=None).isoformat()
                     taken_src = "json"
             if lat is None:
                 geo = sidecar.get("geoData") or {}
@@ -1434,7 +1437,10 @@ def _move_asset(
     return dest
 
 
-def _rescue_sidecar(dest: Path, taken_at: str | None, gps_lat: float | None, gps_lon: float | None) -> bool:
+def _rescue_sidecar(
+    dest: Path, taken_at: str | None, gps_lat: float | None, gps_lon: float | None,
+    *, taken_is_utc: bool = False,
+) -> bool:
     """Google Takeout strips or mangles EXIF; `fingerprint_fields` already
     rescued the real date/GPS from the `*.json` companion into the manifest
     (taken_src='json') — write it back out as an XMP sidecar next to the
@@ -1443,18 +1449,30 @@ def _rescue_sidecar(dest: Path, taken_at: str | None, gps_lat: float | None, gps
 
     Gated on `taken_src == 'json'` alone, not on source: any adapter whose
     companion JSON corrects the date (Photos exports included) needs the
-    same write-back, or the correction lives only in the manifest."""
+    same write-back, or the correction lives only in the manifest.
+
+    `taken_is_utc`: Google's `photoTakenTime` is a UTC epoch, stored naive in
+    the manifest. Written without an offset it would be read as local wall
+    clock and shift by the UTC offset, so it goes out with an explicit
+    `+00:00` (XMP carries the offset inline in DateTimeOriginal — there is
+    no XMP OffsetTimeOriginal). No zone is guessed: Immich shows the true
+    instant. Photos companion dates are local wall clock and stay naive."""
     patch: dict[str, object] = {}
     if taken_at:
         try:
             dt = datetime.fromisoformat(taken_at)
-            patch["DateTimeOriginal"] = dt.strftime("%Y:%m:%d %H:%M:%S")
+            stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
+            if taken_is_utc and dt.tzinfo is None:
+                stamp += "+00:00"
+            patch["DateTimeOriginal"] = stamp
         except ValueError:
             pass
     if gps_lat is not None and gps_lon is not None:
-        patch["GPSLatitude"] = abs(gps_lat)
+        # Signed: XMP GPSLatitude/Longitude carry the hemisphere and
+        # exiftool ignores a separate XMP GPS*Ref (abs() put LA in China).
+        patch["GPSLatitude"] = gps_lat
         patch["GPSLatitudeRef"] = "N" if gps_lat >= 0 else "S"
-        patch["GPSLongitude"] = abs(gps_lon)
+        patch["GPSLongitude"] = gps_lon
         patch["GPSLongitudeRef"] = "E" if gps_lon >= 0 else "W"
     if not patch:
         return False
@@ -1513,7 +1531,8 @@ def promote_rest(
                     library_root=originals_root, dest_root=originals_root,
                 )
                 if taken_src == "json":
-                    if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
+                    if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon,
+                                       taken_is_utc=source == "google"):
                         counts["sidecars_written"] += 1
                 conn.execute(
                     "UPDATE asset SET status=? WHERE id=?",
@@ -1598,7 +1617,8 @@ def apply_decisions(
                     dest_root=originals_root if is_winner else quarantine_root,
                 )
                 if is_winner and taken_src == "json":
-                    if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon):
+                    if _rescue_sidecar(dest, taken_at, gps_lat, gps_lon,
+                                       taken_is_utc=source == "google"):
                         counts["sidecars_written"] += 1
                 conn.execute(
                     "UPDATE asset SET status=? WHERE id=?",

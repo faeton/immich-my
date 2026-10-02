@@ -4,6 +4,44 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — capture time: wall-clock localDateTime, sidecars win
+
+### Fixed
+
+- **`immy process` stored `localDateTime` as the UTC instant and ignored
+  offsets.** Immich 3.0.2 keeps `localDateTime` as the capture wall clock
+  stored as if UTC, and `fileCreatedAt` / `dateTimeOriginal` as the true
+  instant (checked against live rows: a Kyiv 15:20 shot is
+  `localDateTime 15:20+00`, `dateTimeOriginal 12:20+00`). Ingest now
+  applies `EXIF:OffsetTimeOriginal`, inline XMP offsets and
+  `QuickTime:TimeZone`, treats `QuickTime:CreateDate` as UTC, and writes
+  the wall clock to `localDateTime` and the instant to the other two.
+  With no offset or zone known, the naive time is still taken as UTC for
+  both. Offsets go to `asset_exif.timeZone` in Immich's own `UTC+2`
+  spelling instead of a bare `+02:00`.
+- **Sidecar fixes lost to embedded tags.** A date, GPS fix or offset in a
+  separate `.xmp` sidecar (immy's audit rules or the user) now beats the
+  file's embedded EXIF/Composite values at ingest. XMP embedded in the
+  file is not elevated over embedded EXIF. `exif.read_folder` keeps the
+  sidecar's tags apart (`ExifRow.sidecar`) so this precedence doesn't rely
+  on the `XMP:` group alone.
+- **NAS sidecars were never read.** `read_folder` only looked for the
+  sibling `<stem>.xmp`; with `sidecars_root` set, `immy process` now reads
+  sidecars from `WritablePaths.xmp_path` (where it writes them). The Mac
+  layout is unchanged.
+- **Takeout date rescue shifted by the UTC offset.** Google's
+  `photoTakenTime` is a UTC epoch but was written to the XMP sidecar as a
+  naive `DateTimeOriginal`; it now carries an explicit `+00:00`. The same
+  write-back stored `abs()` GPS with a separate `GPS*Ref`, which exiftool
+  ignores for XMP — western/southern fixes landed in the wrong hemisphere;
+  coordinates are now written signed.
+- **`backfill-dates` wrote `localDateTime` as a naive timestamp**, which
+  Postgres read in the Immich DB session zone (Europe/Lisbon), shifting it
+  by an hour in summer. It is now sent tagged as UTC.
+
+Assets already in the DB are not migrated: `immy backfill-dates --retime
+<trip>` (review the dry-run, then add `--apply`) recomputes their dates.
+
 ## 2026-10-02 — clock-drift: evidence-based deltas, never a median
 
 ### Fixed

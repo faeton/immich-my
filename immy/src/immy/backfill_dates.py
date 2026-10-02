@@ -34,7 +34,9 @@ from zoneinfo import ZoneInfo
 from .exif import ExifRow, read_folder
 from .filenames import parse_date as parse_filename_date
 from .pg import LibraryInfo
-from .process import _best_datetime, _parse_exif_datetime, container_path_for
+from .process import (
+    _best_datetime, _compute_instant, _parse_exif_datetime, container_path_for,
+)
 from .srt import find_sibling, parse as parse_srt
 from .rules.trip_timezone_guess import _tz_finder, guess_timezone
 
@@ -110,40 +112,6 @@ def resolve_capture(media_path: Path, row: ExifRow) -> tuple[datetime, str, str]
         return qt, "QuickTime CreateDate", "utc"
 
     return None
-
-
-def _compute_instant(
-    dt: datetime, kind: str, tz_name: str | None,
-) -> tuple[datetime, datetime]:
-    """Return `(local_date_time, date_time_original_utc)`.
-
-    `local_date_time` is the naive wall-clock Immich sorts the timeline by;
-    `date_time_original_utc` is the absolute instant for the metadata panel.
-
-    - kind="utc": `dt` is an absolute instant. The absolute time is known;
-      localDateTime is that instant rendered in the trip zone (or left at the
-      UTC wall numbers if no zone is known — the caller warns).
-    - kind="local": `dt` is the wall clock the user saw. That IS
-      localDateTime; the absolute instant comes from interpreting it in the
-      trip zone (or treating the wall numbers as UTC if no zone is known).
-    """
-    if kind == "utc":
-        abs_utc = (
-            dt.astimezone(timezone.utc) if dt.tzinfo is not None
-            else dt.replace(tzinfo=timezone.utc)
-        )
-        if tz_name is not None:
-            local = abs_utc.astimezone(ZoneInfo(tz_name)).replace(tzinfo=None)
-        else:
-            local = abs_utc.replace(tzinfo=None)
-        return local, abs_utc
-
-    local = dt.replace(tzinfo=None) if dt.tzinfo is not None else dt
-    if tz_name is not None:
-        abs_utc = local.replace(tzinfo=ZoneInfo(tz_name)).astimezone(timezone.utc)
-    else:
-        abs_utc = local.replace(tzinfo=timezone.utc)
-    return local, abs_utc
 
 
 # --- timezone for the trip ------------------------------------------------
@@ -364,7 +332,10 @@ def apply_plan(conn, plan: FolderPlan) -> int:
                     "aid": c.asset_id,
                     "dto": c.date_time_original,
                     "tz": c.tz_name,
-                    "ldt": c.local_date_time,
+                    # localDateTime is the wall clock stored as if UTC. Tag it
+                    # so Postgres doesn't read a naive value in the session
+                    # TimeZone (Immich's DB runs Europe/Lisbon, not UTC).
+                    "ldt": c.local_date_time.replace(tzinfo=timezone.utc),
                     "size": c.file_size,
                 }
                 if c.mode == "update":
