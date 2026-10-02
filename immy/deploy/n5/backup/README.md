@@ -99,7 +99,18 @@ Fail-closed guards: before any `--delete` transfer of immy state/sidecars the
 snapshot view must contain at least `MIN_STATE_FILES` files; an empty view is
 refused if the live dir is non-empty or vv still holds files (override only with
 `ALLOW_EMPTY_SOURCES=1`). An empty source with an empty vv copy (sidecars today)
-is simply skipped.
+is simply skipped. The guard counts with the same excludes the rsync uses
+(`mirror_exclude_dirs` in `guards-lib.sh`), so it counts exactly what will be
+transferred.
+
+Excludes are per tree: `.rsync-partial/` everywhere; `.audit/` from the
+**originals** tree only. All of immy's per-trip state (journals, markers,
+offline caches, derivatives) lives under `state/<trip>/.audit/`, so the state
+tree is mirrored with `.audit/` included (an earlier version excluded it
+globally and shipped nothing). The first live run after this change copies the
+whole state tree (~9 GB); routine churn there (offline caches pruned after
+sync) counts against `MAX_DELETE`, and rsync exits non-zero (run fails loudly)
+if a night's deletions exceed it.
 
 Counting is fail-closed too: `guards-lib.sh` (sourced by the script — copy it
 next to `nightly-mirror.sh` on install) returns non-zero with no output on any

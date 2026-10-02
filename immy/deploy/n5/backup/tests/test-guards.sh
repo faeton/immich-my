@@ -24,6 +24,27 @@ o=$(count_files "$T/full" abc 2>/dev/null); check count-bad-max nz "" $? "$o"
 ( head() { cat >/dev/null; return 1; }; o=$(count_files "$T/full" 1 2>/dev/null); check count-head-fails nz "" $? "$o" )
 ( set -euo pipefail; head() { return 7; }; o=$(count_files "$T/empty" 1 2>/dev/null); check count-head-fails-strict nz "" $? "$o" ) || true
 
+# Exclude-aware counting: the guard must count what rsync will transfer.
+mkdir -p "$T/partial/.rsync-partial" "$T/state/trip/.audit/offline"
+touch "$T/partial/.rsync-partial/x" "$T/state/trip/.audit/journal.yml" "$T/state/trip/.audit/offline/a.yml"
+o=$(count_files "$T/partial" 5 .rsync-partial); check count-excluded-only 0 0 $? "$o"
+o=$(count_files "$T/full" 5 .rsync-partial); check count-with-unused-exclude 0 2 $? "$o"
+# shellcheck disable=SC2046
+o=$(count_files "$T/state" 5 $(mirror_exclude_dirs state)); check count-state-audit-included 0 2 $? "$o"
+# shellcheck disable=SC2046
+o=$(count_files "$T/state" 5 $(mirror_exclude_dirs originals)); check count-originals-audit-excluded 0 0 $? "$o"
+
+# Per-tree rsync excludes: immy state lives under <trip>/.audit/, so only the
+# originals tree may exclude .audit (it would otherwise ship nothing to vv).
+o=$(mirror_exclude_dirs state | tr '\n' ' '); check excl-state 0 ".rsync-partial " $? "$o"
+o=$(mirror_exclude_dirs media | tr '\n' ' '); check excl-media 0 ".rsync-partial " $? "$o"
+o=$(mirror_exclude_dirs originals | tr '\n' ' '); check excl-originals 0 ".rsync-partial .audit " $? "$o"
+o=$(mirror_exclude_dirs bogus 2>/dev/null); check excl-unknown nz "" $? "$o"
+# nightly-mirror.sh must not hard-code a global .audit exclude any more.
+if grep -nE "exclude=?'?\.audit" "$HERE/../nightly-mirror.sh" >/dev/null; then
+  echo "FAIL mirror-no-global-audit-exclude"; echo x >> "$FAILF"
+else echo "ok   mirror-no-global-audit-exclude"; fi
+
 SSH_CMD=ssh REMOTE=vv
 ( ssh() { return 255; }; o=$(remote_state /x 2>/dev/null); check ssh-255 nz "" $? "$o" )
 ( ssh() { echo garbage; return 0; }; o=$(remote_state /x 2>/dev/null); check ssh-garbage nz "" $? "$o" )

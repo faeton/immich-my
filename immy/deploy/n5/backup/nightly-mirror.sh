@@ -235,9 +235,23 @@ sudo zfs snapshot "$MEDIA_DS@$SNAP"
 sudo zfs snapshot "$FLASH_DS@$SNAP"
 
 RSYNC_OPTS=(-aH --delete "--max-delete=$MAX_DELETE" --partial-dir=.rsync-partial
-            --stats --human-readable -e "$SSH_CMD"
-            --exclude='.audit/' --exclude='.audit/***' --exclude='.rsync-partial/')
+            --stats --human-readable -e "$SSH_CMD")
 [ "$DRY_RUN" = 1 ] && RSYNC_OPTS+=(--dry-run)
+# Per-tree excludes come from guards-lib's mirror_exclude_dirs, which the
+# empty-source guard below also counts with. `.audit/` is excluded from the
+# ORIGINALS tree only: all of immy's per-trip state (journals, markers, offline
+# caches) lives under <state_root>/<trip>/.audit/ and must reach vv.
+EXCL_ORIGINALS=(); EXCL_MEDIA=(); EXCL_STATE=()
+while IFS= read -r d; do EXCL_ORIGINALS+=("$d"); done < <(mirror_exclude_dirs originals)
+while IFS= read -r d; do EXCL_MEDIA+=("$d"); done < <(mirror_exclude_dirs media)
+while IFS= read -r d; do EXCL_STATE+=("$d"); done < <(mirror_exclude_dirs state)
+[ ${#EXCL_ORIGINALS[@]} -gt 0 ] && [ ${#EXCL_STATE[@]} -gt 0 ] && [ ${#EXCL_MEDIA[@]} -gt 0 ] \
+  || { log "ERROR: could not build rsync exclude lists"; exit 1; }
+rsync_excludes() { local d; for d in "$@"; do printf -- '--exclude=%s/\n' "$d"; done; }
+ORIG_RSYNC_OPTS=("${RSYNC_OPTS[@]}"); MEDIA_RSYNC_OPTS=("${RSYNC_OPTS[@]}"); STATE_RSYNC_OPTS=("${RSYNC_OPTS[@]}")
+while IFS= read -r a; do ORIG_RSYNC_OPTS+=("$a"); done < <(rsync_excludes "${EXCL_ORIGINALS[@]}")
+while IFS= read -r a; do MEDIA_RSYNC_OPTS+=("$a"); done < <(rsync_excludes "${EXCL_MEDIA[@]}")
+while IFS= read -r a; do STATE_RSYNC_OPTS+=("$a"); done < <(rsync_excludes "${EXCL_STATE[@]}")
 # NOTE: deliberately NO --numeric-ids — pushing as ${SSH_USER}@vv (non-root) makes
 # files land owned by vv's own faeton, which is exactly the perm story vv wants.
 
@@ -252,9 +266,10 @@ for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
   view="$FLASH_MOUNT/.zfs/snapshot/$SNAP/${src#"$FLASH_MOUNT"/}"
   [ -d "$view" ] || { log "ERROR: snapshot view $view missing"; exit 1; }
   # Any counting failure aborts the run: never interpreted as "0 files".
-  n_view=$(count_files "$view" "$MIN_STATE_FILES") \
+  # Count with the state rsync's own excludes: exactly what will be transferred.
+  n_view=$(count_files "$view" "$MIN_STATE_FILES" "${EXCL_STATE[@]}") \
     || { log "ERROR: cannot count files in $view; aborting (fail closed)"; exit 1; }
-  n_live=$(count_files "$src" 1) \
+  n_live=$(count_files "$src" 1 "${EXCL_STATE[@]}") \
     || { log "ERROR: cannot count files in $src; aborting (fail closed)"; exit 1; }
   if [ "$n_view" -lt "$MIN_STATE_FILES" ]; then
     if [ "$ALLOW_EMPTY_SOURCES" = 1 ]; then
@@ -274,14 +289,14 @@ for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
 done
 
 log "rsync originals -> vv ..."
-rsync "${RSYNC_OPTS[@]}" "$ORIG_VIEW/" "$REMOTE:$VV_ROOT/originals/"
+rsync "${ORIG_RSYNC_OPTS[@]}" "$ORIG_VIEW/" "$REMOTE:$VV_ROOT/originals/"
 
 # library = uploaded-asset originals (irreplaceable). profile + upload are small.
 # encoded-video/ + thumbs/ + media/backups/ are intentionally NOT mirrored.
 for sub in library profile upload; do
   if [ -d "$MEDIA_VIEW/$sub" ]; then
     log "rsync media/$sub -> vv ..."
-    rsync "${RSYNC_OPTS[@]}" "$MEDIA_VIEW/$sub/" "$REMOTE:$VV_ROOT/media/$sub/"
+    rsync "${MEDIA_RSYNC_OPTS[@]}" "$MEDIA_VIEW/$sub/" "$REMOTE:$VV_ROOT/media/$sub/"
   fi
 done
 
@@ -299,7 +314,7 @@ for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
     continue
   fi
   log "rsync immy/$name -> vv ..."
-  rsync "${RSYNC_OPTS[@]}" "$view/" "$REMOTE:$dest/"
+  rsync "${STATE_RSYNC_OPTS[@]}" "$view/" "$REMOTE:$dest/"
 done
 
 # === 4. push dump + recipe to vv (AFTER files) ==============================
