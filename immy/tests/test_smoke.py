@@ -742,6 +742,17 @@ def test_clock_drift_by_camera_yes_medium_applies_delta(tmp_path: Path):
     assert not (folder / "A_0000.xmp").exists()
 
 
+def test_clock_drift_by_camera_skipped_without_yes_medium_in_auto(tmp_path: Path):
+    # --write --auto without --yes-medium: report the MEDIUM finding, never apply it.
+    folder = _build_two_camera_folder(tmp_path)
+    result = runner.invoke(app, ["audit", str(folder), "--write", "--auto"])
+    assert result.exit_code == 0, result.stdout
+    assert "MEDIUM findings: 4 pending review" in result.stdout
+    assert "review clock-drift-by-camera: 4 file(s)" in result.stdout
+    for i in range(4):
+        assert not (folder / f"B_{i:04d}.xmp").exists()
+
+
 def test_clock_drift_by_camera_batch_prompt_is_single(tmp_path: Path):
     folder = _build_two_camera_folder(tmp_path, count=5)
     # 5 Sony files would produce 5 findings; they should collapse to ONE

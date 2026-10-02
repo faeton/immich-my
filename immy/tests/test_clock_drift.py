@@ -230,3 +230,19 @@ def test_split_sessions_breaks_on_gaps_over_three_hours():
     times = [t0, t0 + timedelta(hours=3), t0 + timedelta(hours=6, seconds=1)]
     sessions = by_camera.split_sessions(times)
     assert sessions == [[times[0], times[1]], [times[2]]]
+
+
+def test_by_camera_coverage_counts_all_events_of_smaller_camera():
+    # 103 events per camera; only three line up (at +3h), every other event
+    # is days away from anything on the other body. 3/103 is a coincidence,
+    # not a clock offset — no MEDIUM bulk rewrite of the whole camera.
+    rows = []
+    for i, m in enumerate((0, 41, 97)):
+        t = datetime(2026, 4, 1, 9) + timedelta(minutes=m)
+        rows.append(_row(f"a{i}.jpg", t, gps=True))
+        rows.append(_row(f"b{i}.jpg", t + timedelta(hours=3), cam=SONY))
+    for i in range(100):
+        rows.append(_row(f"ax{i}.jpg", datetime(2026, 4, 5, 8) + timedelta(minutes=37 * i), gps=True))
+        rows.append(_row(f"bx{i}.jpg", datetime(2026, 4, 15, 8) + timedelta(minutes=37 * i), cam=SONY))
+    findings = by_camera._propose(rows, FOLDER)
+    assert not [f for f in findings if f.confidence in ("medium", "high")]

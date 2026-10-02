@@ -25,7 +25,7 @@ scored by one-to-one event matches within `MATCH_TOLERANCE_SECONDS`
 (each reference event used at most once). Candidates sharing an hour
 form one peak. The best peak is accepted only when it has ≥
 `MIN_MATCHED_EVENTS` matches covering ≥ `MIN_COVERAGE` of the smaller
-camera's events in the overlapping window, and dominates the runner-up
+camera's total events, and dominates the runner-up
 peak (the zero-offset peak included) by ≥ `DOMINANCE_MARGIN` and ≥
 `DOMINANCE_RATIO`×. The offset is refined by the median matched delta;
 under `MIN_DRIFT_SECONDS` it's no drift. Anything else is ambiguous → no
@@ -67,7 +67,7 @@ SKEW_SECONDS = 5 * 60              # ...each plus a skew of up to ±5 min
 SKEW_STEP_SECONDS = 30
 MATCH_TOLERANCE_SECONDS = 2 * 60   # shifted events this close to a ref event match
 MIN_MATCHED_EVENTS = 3             # independent matched events needed
-MIN_COVERAGE = 0.3                 # of the smaller camera's events in the overlap
+MIN_COVERAGE = 0.3                 # of the smaller camera's total events
 DOMINANCE_MARGIN = 2               # best peak ≥ runner-up + 2 ...
 DOMINANCE_RATIO = 2                # ... and ≥ 2 × runner-up
 # Cap for deltas not backed by evidence from another clock (single-camera
@@ -127,16 +127,6 @@ def _match(cam: list[float], ref: list[float], offset: float) -> list[float]:
     return residuals
 
 
-def _coverage_base(cam: list[float], ref: list[float], offset: float) -> int:
-    """Event count of the smaller camera inside the window where both
-    cameras (camera shifted by `offset`) have events."""
-    lo = max(cam[0] + offset, ref[0]) - MATCH_TOLERANCE_SECONDS
-    hi = min(cam[-1] + offset, ref[-1]) + MATCH_TOLERANCE_SECONDS
-    n_cam = sum(1 for c in cam if lo <= c + offset <= hi)
-    n_ref = sum(1 for r in ref if lo <= r <= hi)
-    return min(n_cam, n_ref)
-
-
 def _estimate_drift(
     cam_times: list[datetime], ref_times: list[datetime],
 ) -> tuple[float, int] | None:
@@ -158,8 +148,9 @@ def _estimate_drift(
         return None
     if best < runner_up + DOMINANCE_MARGIN or best < DOMINANCE_RATIO * runner_up:
         return None
-    base = _coverage_base(cam, ref, offset)
-    if base == 0 or best < MIN_COVERAGE * base:
+    # Coverage is of the smaller camera's *whole* event count: three matches
+    # out of 103 events is a coincidence, not a clock offset.
+    if best < MIN_COVERAGE * min(len(cam), len(ref)):
         return None
     return offset + median(_match(cam, ref, offset)), best
 
