@@ -4,6 +4,7 @@ command shape, status parsing, body-over-stdin, and error mirroring without
 ever touching the network (subprocess.run is faked)."""
 from __future__ import annotations
 
+import json
 import subprocess
 import types
 
@@ -38,12 +39,13 @@ def test_ssh_used_when_host_set(monkeypatch):
     assert cmd[0] == "ssh" and "n5" in cmd
     assert "BatchMode=yes" in cmd
     remote = cmd[-1]
-    assert remote.startswith("curl ")
+    assert remote.startswith("sh -c ") and " curl " in remote
     assert "http://127.0.0.1:2283/api/jobs" in remote
     assert "-X GET" in remote
     # key travels on stdin as a curl config, never in any argv.
     assert "-K -" in remote
     assert cap["input"] == b'header = "x-api-key: KEY"\n'
+    assert "KEY" not in remote
     assert "Content-Type" not in remote
 
 
@@ -58,7 +60,7 @@ def test_ssh_post_pipes_body_over_stdin(monkeypatch):
     # JSON + key go over stdin (one curl config), never into any argv.
     assert cap["input"] == (
         b'header = "x-api-key: KEY"\n'
-        b'data-binary = "{\\"command\\": \\"start\\", \\"force\\": true}"\n'
+        b'{"command": "start", "force": true}'
     )
     assert "force" not in remote
 
@@ -122,3 +124,49 @@ def test_no_ssh_host_keeps_urllib_path(monkeypatch):
                         lambda req, timeout=None: _Resp())
     c = ImmichClient(url="http://x", api_key="k")  # no ssh_host
     assert c._request("GET", "/api/jobs") == {}
+
+
+def test_ssh_real_curl_roundtrip_large_body(monkeypatch):
+    """Run the remote command through a real sh + curl against a local HTTP
+    server: key escaping, and a >10 MB body (curl's config-line limit)."""
+    import shutil
+    import threading
+    from http.server import BaseHTTPRequestHandler, HTTPServer
+
+    if not shutil.which("curl") or not shutil.which("sh"):
+        pytest.skip("curl/sh unavailable")
+    seen = {}
+
+    class H(BaseHTTPRequestHandler):
+        def do_POST(self):
+            seen["key"] = self.headers["x-api-key"]
+            seen["body"] = self.rfile.read(int(self.headers["Content-Length"]))
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{"ok": 1}')
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), H)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    real_run = subprocess.run
+    argvs = []
+
+    def fake(cmd, **kw):  # run the "remote" command locally instead of ssh
+        argvs.append(cmd)
+        return real_run(["sh", "-c", cmd[-1]], **kw)
+
+    monkeypatch.setattr(subprocess, "run", fake)
+    key = 'a"b\\c$x`y'
+    c = ImmichClient(url=f"http://127.0.0.1:{srv.server_port}", api_key=key,
+                     ssh_host="n5", timeout=60)
+    body = {"blob": "\\\"é\n" * 3_000_000}  # >10 MB of JSON
+    try:
+        assert c._request("POST", "/x", body=body) == {"ok": 1}
+    finally:
+        srv.shutdown()
+    assert seen["key"] == key
+    assert json.loads(seen["body"]) == body
+    assert len(seen["body"]) > 10_000_000
+    assert key not in " ".join(argvs[0])

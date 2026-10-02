@@ -106,8 +106,8 @@ class ImmichClient:
         Immich API is localhost-bound and not reachable from the laptop (no
         port-forwarding, TLS handshake fails on the tailscale IP).
 
-        The API key and request body are piped to curl over stdin as a `-K -`
-        config (see below) so neither appears in any argv and JSON never has to
+        The API key and request body are piped to the remote shell over stdin
+        (see below) so neither appears in any argv and JSON never has to
         survive remote-shell quoting; the remote argv is otherwise
         `shlex.quote`d into one command string (ssh joins args with bare spaces,
         so pre-quoting is mandatory). A trailing `-w '\\n%{http_code}'` carries
@@ -122,16 +122,23 @@ class ImmichClient:
             "-w", "\n%{http_code}",
         ]
         if data is not None:
-            curl += ["-H", "Content-Type: application/json"]
+            curl += ["-H", "Content-Type: application/json",
+                     "--data-binary", "@/dev/fd/3"]
         curl.append(url)
-        remote = " ".join(shlex.quote(a) for a in curl)
-        # stdin = a curl config (`-K -`): the API key must not appear in the
-        # local ssh argv or the remote curl argv (both visible in `ps`). curl
-        # reads stdin once, so the body rides in the same config.
+        # stdin = ONE curl-config line (the escaped key header) + "\n" + the raw
+        # body. The remote shell `read`s exactly that line (byte-wise on a pipe,
+        # so the body is not consumed), keeps the original stdin as fd 3 for the
+        # body, and feeds the config line to `curl -K -` via a heredoc. The key
+        # is only ever shell-variable/heredoc data: no argv, local or remote.
+        # The body streams (no curl config-line size limit, ≥8.2: 10 MB).
+        script = (
+            "IFS= read -r cfg; "
+            + " ".join(shlex.quote(a) for a in curl)
+            + " 3<&0 <<EOF\n$cfg\nEOF"
+        )
+        remote = "sh -c " + shlex.quote(script)
         config = f'header = "x-api-key: {_curl_config_quote(self.api_key)}"\n'
-        if data is not None:
-            config += f'data-binary = "{_curl_config_quote(data.decode())}"\n'
-        stdin = config.encode()
+        stdin = config.encode() + (data or b"")
         ssh = [
             "ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10",
             self.ssh_host, remote,
