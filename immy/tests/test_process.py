@@ -329,15 +329,6 @@ def test_write_marker_drops_expected_yaml(tmp_path: Path):
     assert payload["assets"][0]["id"] == "id-1"
 
 
-def test_is_processed_false_without_marker(tmp_path: Path):
-    assert process_mod.is_processed(tmp_path) is False
-
-
-def test_is_processed_true_with_marker(tmp_path: Path):
-    process_mod.write_marker(tmp_path, [])
-    assert process_mod.is_processed(tmp_path) is True
-
-
 # --- Y.3 CLIP wiring -----------------------------------------------------
 
 

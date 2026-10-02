@@ -2135,10 +2135,6 @@ def marker_path(trip_folder: Path) -> Path:
     return trip_folder / AUDIT_DIR / Y_MARKER_FILENAME
 
 
-def is_processed(trip_folder: Path) -> bool:
-    return marker_path(trip_folder).is_file()
-
-
 def ingestable_media(trip_folder: Path) -> list[Path]:
     """Media files `process_trip` ingests as assets, by path only (no
     exiftool): every DJI `.LRF` proxy and every camera JPEG preview paired
@@ -2196,7 +2192,7 @@ __all__ = [
     "AssetRow", "AssetExifRow", "ProcessResult",
     "build_rows", "path_checksum", "container_path_for", "asset_type_for",
     "insert_asset", "process_trip", "write_marker", "read_marker",
-    "is_processed", "is_trip_fully_cached", "marker_path", "Y_MARKER_FILENAME",
+    "is_trip_fully_cached", "marker_path", "Y_MARKER_FILENAME",
     "ingestable_media", "marker_steps", "marker_db_identity",
     "MARKER_DB_IDENTITY_KEYS",
     "marker_provenance", "provenance_matches", "INGEST_VERSION",
