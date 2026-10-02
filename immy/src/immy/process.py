@@ -61,6 +61,10 @@ from .state import AUDIT_DIR, Y_MARKER_FILENAME
 # Y_MARKER_FILENAME now lives in state.py (imported above) so leaf modules
 # can reference it without importing process.py.
 
+# Version of the asset+exif insert itself (journal "ingest" step).
+INGEST_VERSION = "v1"
+
+
 VIDEO_EXTS = {
     ".mp4", ".mov", ".m4v", ".avi", ".mkv", ".mts", ".m2ts",
     ".insv", ".lrv",
@@ -802,7 +806,6 @@ def process_trip(
     # gate on `inserted`.
     if journal is None:
         journal = Journal.load_path(paths.journal_path)
-    INGEST_VERSION = "v1"
     DERIV_VERSION = journal_mod.DERIVATIVES_VERSION
     CLIP_VERSION = journal_mod.clip_version(clip_model, clip_backend)
     FACES_VERSION = journal_mod.faces_version(faces_model)
@@ -1882,8 +1885,76 @@ def _process_faces(
     return len(rows)
 
 
+# --- Marker provenance -----------------------------------------------------
+#
+# A marker only proves "processed" for the DB, mode and enrichers it was
+# written with. `immy process` records them; the cached-skip and `promote`
+# compare them against the current run, so a trip processed against another
+# DB/library, offline, or with an older model is not mistaken for done.
+
+
+def marker_steps(
+    *,
+    compute_derivatives: bool = False,
+    compute_clip: bool = False,
+    compute_faces: bool = False,
+    compute_transcripts: bool = False,
+    compute_captions: bool = False,
+    clip_model: str = clip_mod.DEFAULT_MODEL,
+    clip_backend: str = "mlx",
+    faces_model: str = faces_mod.DEFAULT_MODEL,
+    transcript_model: str = transcripts_mod.DEFAULT_MODEL,
+    captioner_config: captions_mod.CaptionerConfig | None = None,
+) -> dict[str, str]:
+    """`{step: version}` for every enabled step — the same version strings
+    `process_trip` journals under, so a model bump reads as a mismatch."""
+    steps = {"ingest": INGEST_VERSION}
+    if compute_derivatives:
+        steps["derivatives"] = journal_mod.DERIVATIVES_VERSION
+    if compute_clip:
+        steps["clip"] = journal_mod.clip_version(clip_model, clip_backend)
+    if compute_faces:
+        steps["faces"] = journal_mod.faces_version(faces_model)
+    if compute_transcripts:
+        steps["transcript"] = journal_mod.transcript_version(transcript_model)
+    if compute_captions and captioner_config is not None:
+        steps["caption"] = journal_mod.caption_version(captioner_config.model)
+    return steps
+
+
+def marker_db_identity(pg: Any, library_id: str | None) -> dict:
+    """`{host, port, database, library_id}` of the Immich DB a run targets.
+    `pg` is a `PgConfig` (or None — offline without a `pg:` block)."""
+    return {
+        "host": getattr(pg, "host", None),
+        "port": getattr(pg, "port", None),
+        "database": getattr(pg, "database", None),
+        "library_id": library_id,
+    }
+
+
+def marker_provenance(*, db: dict, offline: bool, steps: dict[str, str]) -> dict:
+    return {"db": db, "mode": "offline" if offline else "online", "steps": steps}
+
+
+def provenance_matches(marker_data: dict, expected: dict) -> bool:
+    """Same DB, same mode, and every expected step recorded at the same
+    version (extra recorded steps are fine — a captioned trip is still done
+    for a run without captions). A marker without provenance (written before
+    it existed) never matches."""
+    if marker_data.get("db") != expected["db"]:
+        return False
+    if marker_data.get("mode") != expected["mode"]:
+        return False
+    recorded = marker_data.get("steps")
+    if not isinstance(recorded, dict):
+        return False
+    return all(recorded.get(k) == v for k, v in expected["steps"].items())
+
+
 def write_marker(
     trip_folder: Path, results: list[ProcessResult], *, marker: Path | None = None,
+    provenance: dict | None = None,
 ) -> Path:
     """Drop `.audit/y_processed.yml` so `immy promote` knows to skip the
     library-scan POST (the rows are already there) and to pick up any
@@ -1934,8 +2005,10 @@ def write_marker(
         "faces_detected": sum(r.faces_detected for r in results),
         "transcripts_written": sum(1 for r in results if r.transcript),
         "captions_written": sum(1 for r in results if r.caption),
-        "assets": assets,
     }
+    if provenance is not None:
+        payload.update(provenance)  # db / mode / steps
+    payload["assets"] = assets
     marker.write_text(yaml.safe_dump(payload, sort_keys=False))
     return marker
 
@@ -1957,8 +2030,20 @@ def is_processed(trip_folder: Path) -> bool:
     return marker_path(trip_folder).is_file()
 
 
+def ingestable_media(trip_folder: Path) -> list[Path]:
+    """Media files `process_trip` ingests as assets, by path only (no
+    exiftool): every DJI `.LRF` proxy and every camera JPEG preview paired
+    with a RAW are dropped — the same filter `process_trip` applies."""
+    from .exif import iter_media as _iter_media
+
+    files = [f for f in _iter_media(trip_folder) if not dji_mod.is_proxy(f)]
+    raw_index = raw_mod.build_raw_index(files)
+    return [f for f in files if not raw_mod.is_paired_preview(f, raw_index)]
+
+
 def is_trip_fully_cached(
     trip_folder: Path, *, marker: Path | None = None,
+    provenance: dict | None = None,
 ) -> tuple[bool, int]:
     """True when `.audit/y_processed.yml` exists, the count of ingestable
     media files matches the marker, and no source file has been modified
@@ -1971,13 +2056,14 @@ def is_trip_fully_cached(
     because they're never ingested as standalone assets, so the marker
     doesn't list them — this must match `process_trip`'s ingest filter.
 
+    `provenance` (db / mode / steps of the current run) must match what
+    the marker recorded (`provenance_matches`) — a trip processed against
+    another DB, in the other mode, or with an older enricher version is not
+    cached. A legacy marker without provenance never matches.
+
     Trusts the marker. If a file is hand-edited without bumping mtime, a
     re-run will skip it; pass `--force` (or delete the marker) to redo.
     """
-    from .exif import iter_media as _iter_media
-    from . import dji as _dji
-    from . import raw as _raw
-
     marker_data = read_marker(trip_folder, marker=marker)
     if not marker_data:
         return False, 0
@@ -1985,10 +2071,9 @@ def is_trip_fully_cached(
     if not isinstance(processed_at, (int, float)):
         return False, 0
     expected = marker_data.get("assets") or []
-    files = list(_iter_media(trip_folder))
-    files = [f for f in files if not _dji.is_proxy(f)]
-    raw_index = _raw.build_raw_index(files)
-    files = [f for f in files if not _raw.is_paired_preview(f, raw_index)]
+    files = ingestable_media(trip_folder)
+    if provenance is not None and not provenance_matches(marker_data, provenance):
+        return False, len(files)
     if len(files) != len(expected):
         return False, len(files)
     try:
@@ -2003,4 +2088,6 @@ __all__ = [
     "build_rows", "path_checksum", "container_path_for", "asset_type_for",
     "insert_asset", "process_trip", "write_marker", "read_marker",
     "is_processed", "is_trip_fully_cached", "marker_path", "Y_MARKER_FILENAME",
+    "ingestable_media", "marker_steps", "marker_db_identity",
+    "marker_provenance", "provenance_matches", "INGEST_VERSION",
 ]

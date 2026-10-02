@@ -851,6 +851,11 @@ def test_promote_skips_scan_when_marker_present(config_full, tmp_path, monkeypat
     fake = FakeClient()
     monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
     monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: None)
+    # config_full points pg at 127.0.0.1:15432; never let the album step
+    # reach a real Postgres from a unit test.
+    monkeypatch.setattr(
+        promote_mod, "_sync_album",
+        lambda *a, **kw: {"name": "dji-srt-pair", "status": "skipped"})
 
     result = runner.invoke(app, ["promote", str(target)])
     assert result.exit_code == 0, result.stdout
@@ -1058,3 +1063,149 @@ def test_cli_aborts_before_writing_on_live_schema_mismatch(
     fake_conn.cursor.assert_not_called()
     fake_conn.commit.assert_not_called()
     assert not (target / ".audit" / "y_processed.yml").exists()
+
+
+# --- Task 8: shared batch connection, Ctrl-C exit code, marker provenance --
+
+
+def _closable_fake_conn():
+    """MagicMock conn that behaves like psycopg after close(): `closed`
+    flips True and any further cursor() raises."""
+    conn = MagicMock()
+    conn.closed = False
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+
+    def _cursor(*a, **kw):
+        if conn.closed:
+            raise RuntimeError("the connection is closed")
+        return cur
+
+    def _close():
+        conn.closed = True
+
+    conn.cursor.side_effect = _cursor
+    conn.close.side_effect = _close
+    return conn
+
+
+def _two_trips(tmp_path: Path) -> list[Path]:
+    trips = []
+    for name in ("trip-a", "trip-b"):
+        t = tmp_path / name
+        shutil.copytree(FIXTURES / "dji-srt-pair", t)
+        trips.append(t)
+    return trips
+
+
+def test_process_batch_keeps_shared_conn_open_across_trips(
+    no_schema_guard, config_full, tmp_path, monkeypatch,
+):
+    """`process` opens ONE connection for the whole batch. The per-trip
+    sink must not close it, or every trip after the first hits a closed
+    connection. The batch closes it exactly once at the end."""
+    trips = _two_trips(tmp_path)
+    conn = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda c, lid: LIB)
+
+    result = runner.invoke(
+        app, ["process", *map(str, trips), "--no-derivatives"])
+    assert result.exit_code == 0, result.stdout
+    assert "2 ok" in result.stdout
+    for t in trips:
+        assert (t / ".audit" / "y_processed.yml").is_file()
+    assert conn.close.call_count == 1
+
+
+def test_process_batch_ctrl_c_exits_130(no_schema_guard, config_full, tmp_path, monkeypatch):
+    trips = _two_trips(tmp_path)
+    conn = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda c, lid: LIB)
+
+    def _interrupt(*a, **kw):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr("immy.cli._run_one_trip", _interrupt)
+    result = runner.invoke(app, ["process", *map(str, trips)])
+    assert result.exit_code == 130, result.stdout
+    assert "interrupted" in result.stdout
+
+
+def _prov(**over):
+    p = {
+        "db": {"host": "127.0.0.1", "port": 15432, "database": "immich",
+               "library_id": "lib-1"},
+        "mode": "online",
+        "steps": {"ingest": "v1", "derivatives": "v1"},
+    }
+    p.update(over)
+    return p
+
+
+def _cached_trip(tmp_path: Path, provenance: dict | None) -> tuple[Path, Path]:
+    trip = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", trip)
+    marker = process_mod.write_marker(trip, [process_mod.ProcessResult(
+        asset_id="id-1", container_path="/x/DJI_0001.JPG", inserted=True,
+    )], provenance=provenance)
+    return trip, marker
+
+
+def test_write_marker_records_provenance(tmp_path: Path):
+    _, marker = _cached_trip(tmp_path, _prov())
+    payload = yaml.safe_load(marker.read_text())
+    assert payload["db"] == _prov()["db"]
+    assert payload["mode"] == "online"
+    assert payload["steps"] == {"ingest": "v1", "derivatives": "v1"}
+
+
+def test_fully_cached_requires_matching_provenance(tmp_path: Path):
+    trip, marker = _cached_trip(tmp_path, _prov())
+    assert process_mod.is_trip_fully_cached(trip, provenance=_prov())[0] is True
+    # A subset of the recorded steps (same versions) is still cached.
+    assert process_mod.is_trip_fully_cached(
+        trip, provenance=_prov(steps={"ingest": "v1"}))[0] is True
+
+    other_db = _prov(db={**_prov()["db"], "library_id": "lib-2"})
+    assert process_mod.is_trip_fully_cached(trip, provenance=other_db)[0] is False
+    assert process_mod.is_trip_fully_cached(
+        trip, provenance=_prov(mode="offline"))[0] is False
+    newer_clip = _prov(steps={"ingest": "v1", "clip": "clip:x"})
+    assert process_mod.is_trip_fully_cached(trip, provenance=newer_clip)[0] is False
+    bumped = _prov(steps={"ingest": "v1", "derivatives": "v2"})
+    assert process_mod.is_trip_fully_cached(trip, provenance=bumped)[0] is False
+
+
+def test_fully_cached_treats_legacy_marker_as_stale(tmp_path: Path):
+    """Markers written before provenance existed carry no db/mode/steps —
+    they can't prove which DB they were made against, so not cached."""
+    trip, _ = _cached_trip(tmp_path, None)
+    assert process_mod.is_trip_fully_cached(trip, provenance=_prov())[0] is False
+
+
+def test_process_cli_marker_carries_provenance_and_skips_rerun(
+    no_schema_guard, config_full, tmp_path, monkeypatch,
+):
+    trip = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", trip)
+    conn = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda c, lid: LIB)
+
+    r1 = runner.invoke(app, ["process", str(trip), "--no-derivatives"])
+    assert r1.exit_code == 0, r1.stdout
+    payload = yaml.safe_load((trip / ".audit" / "y_processed.yml").read_text())
+    assert payload["db"] == {"host": "127.0.0.1", "port": 15432,
+                             "database": "immich", "library_id": "lib-1"}
+    assert payload["mode"] == "online"
+    assert payload["steps"] == {"ingest": "v1"}
+
+    conn2 = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn2)
+    r2 = runner.invoke(app, ["process", str(trip), "--no-derivatives"])
+    assert r2.exit_code == 0, r2.stdout
+    assert "unchanged since marker" in r2.stdout

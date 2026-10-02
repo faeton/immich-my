@@ -4,6 +4,51 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — offline NAS drain, honest exit codes, marker provenance, `promote --verify`
+
+### Fixed
+
+- **Offline cache on the NAS was never drained.** `process --offline` spools
+  to `WritablePaths.offline_dir` (under `state_root` on the NAS), but
+  `iter_entries` / `sync_trip` / `_replay_entry` hard-wired
+  `<trip>/.audit/offline`, so `sync-offline` and promote's drain found nothing
+  (and replay read CLIP/faces files from the wrong root). They now take
+  `offline_root`; `sync-offline` and `promote` resolve it from config. The Mac
+  path (no `state_root`) is unchanged.
+- **Multi-trip online `process` batches failed after the first trip.** The
+  batch opens one Postgres connection, but each trip's `PgSink.close()` closed
+  it. `PgSink` no longer closes a connection it does not own; the batch closes
+  it once at the end.
+- **Exit codes.** `process` exits 130 on Ctrl-C (was 0). `promote` exits 1 when
+  any step failed (offline-cache sync, library scan, derivatives push, Insta360
+  stack, album sync, thumbnail repair, tags, re-embed queueing), after running
+  every step that can still run; output text is unchanged apart from a new
+  "thumbnail repair failed" line. `repair-thumbs` exits 1 when a trip errors
+  (including partial derivative-generation failures, a missing folder, or a DB
+  error, which no longer aborts the remaining trips).
+
+### Changed
+
+- **`y_processed.yml` records provenance**: `db: {host, port, database,
+  library_id}`, `mode: online|offline` and `steps: {name: version}` for the
+  enabled enrichers (journal version strings). The cached-trip skip in
+  `process` requires the same DB and mode and every requested step at the same
+  version. **Markers written before this change carry no provenance, so the
+  first `process` run after upgrading re-scans every trip once** (the journal
+  keeps it cheap: finished work is skipped). `promote` treats a marker whose
+  `db` differs from the current config as "not processed for this DB": it
+  warns and takes the library-scan path instead of skipping it. Markers without
+  a `db` block are still trusted by `promote`.
+
+### Added
+
+- **`immy promote --verify <trip>`** — read-only check: the trip's Immich album
+  (members under this trip's path; `--into-album` picks the album) vs the local
+  media files `process` ingests, plus local files Immich holds as visible
+  assets, minus Live-photo motion halves Immich keeps `visibility='hidden'`
+  (Immich 3.0.2 never puts hidden assets in albums). Prints both counts; on
+  mismatch lists up to 20 missing names and exits 1. No rsync, scan or writes.
+
 ## 2026-10-02 — atomic snapshot, backups cover immy state
 
 ### Fixed

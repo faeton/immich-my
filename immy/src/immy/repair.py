@@ -73,7 +73,7 @@ class TripRepair:
     missing_source: int = 0  # broken in DB but file not on the Mac
     generated: int = 0       # assets we staged derivatives for
     rows_upserted: int = 0
-    status: str = "ok"       # ok | skipped | error
+    status: str = "ok"       # ok | skipped | error (any asset failed)
     detail: str = ""
 
 
@@ -234,5 +234,8 @@ def repair_trip(
         conn.close()
 
     if errors:
+        # The rows that did regenerate are upserted above; the trip still
+        # failed for the rest, so report it (repair-thumbs exits 1).
+        result.status = "error"
         result.detail = f"{len(errors)} gen error(s): " + "; ".join(errors[:2])
     return result

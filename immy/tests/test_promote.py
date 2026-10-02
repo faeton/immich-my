@@ -272,7 +272,8 @@ def test_promote_drains_offline_cache_when_pending(
 ):
     """If `.audit/offline/<cs>.yml` entries exist, promote must try to
     sync them before the scan. When pg is unreachable, failure is soft
-    (surfaced in summary) so the rsync step still runs."""
+    (surfaced in summary) so the rsync step still runs — but the promote
+    exits 1 so a script sees the cache did not drain."""
     from immy import offline as offline_mod
     from immy import process as process_mod
     from immy.pg import LibraryInfo
@@ -293,7 +294,8 @@ def test_promote_drains_offline_cache_when_pending(
     monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
 
     result = runner.invoke(app, ["promote", str(dji_ready)])
-    assert result.exit_code == 0, result.stdout
+    assert result.exit_code == 1, result.stdout
+    assert (config_file[1] / "dji-srt-pair" / "DJI_0001.JPG").is_file()
     # Rich wraps long lines, so check for the tokens individually rather
     # than a composite phrase.
     flat = result.stdout.replace("\n", " ").replace("  ", " ")
@@ -935,3 +937,228 @@ def test_like_prefix_matches_only_the_literal_prefix():
     assert not hit("/o/2024X06 50%\\x/a.jpg")     # `_` is not a wildcard
     assert not hit("/o/2024_06 50abc\\x/a.jpg")   # `%` is not a wildcard
     assert not hit("/o/2024_06 50%\\x-other/a.jpg")
+
+
+# --- Task 8: exit codes, marker provenance, NAS offline root, --verify -----
+
+
+def test_promote_exits_1_when_scan_fails(config_file, dji_ready, monkeypatch):
+    class ScanFails(FakeClient):
+        def scan_library(self, library_id):
+            raise immich_mod.ImmichError("502 bad gateway")
+
+    fake = ScanFails()
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 1, result.stdout
+    assert "scan failed" in result.stdout
+
+
+def test_promote_exits_1_when_album_sync_fails(no_schema_guard, config_file, dji_ready, monkeypatch):
+    """A step error after the scan still lets the rest finish, then exits 1."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+
+    class AlbumFails(FakeClient):
+        def find_album_by_name(self, name):
+            raise immich_mod.ImmichError("albums: 500")
+
+    fake = AlbumFails(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 1, result.stdout
+    assert "album" in result.stdout and "albums: 500" in result.stdout
+    assert fake.scans == ["lib-1"]
+
+
+def test_promote_exits_1_when_tagging_fails(no_schema_guard, config_file, dji_ready, monkeypatch):
+    _enable_fake_album_pg(config_file, monkeypatch)
+
+    class TagFails(FakeClient):
+        def upsert_tags(self, names):
+            raise immich_mod.ImmichError("tags: 500")
+
+    fake = TagFails(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+    result = runner.invoke(app, ["promote", str(dji_ready), "--tag", "x"])
+    assert result.exit_code == 1, result.stdout
+    assert "tags failed" in result.stdout
+    assert fake.albums_created  # album step still completed
+
+
+def _write_marker_with_db(folder: Path, db: dict | None) -> None:
+    from immy import process as process_mod
+    prov = None if db is None else process_mod.marker_provenance(
+        db=db, offline=False, steps={"ingest": "v1"})
+    process_mod.write_marker(folder, [process_mod.ProcessResult(
+        asset_id="id-1", container_path="/x/a.jpg", inserted=True,
+    )], provenance=prov)
+
+
+_THIS_DB = {"host": "127.0.0.1", "port": 15432, "database": "immich",
+            "library_id": "lib-1"}
+
+
+def test_promote_marker_for_other_db_is_not_processed(
+    no_schema_guard, config_file, dji_ready, monkeypatch,
+):
+    """A marker written against another DB/library proves nothing for this
+    one: promote warns and takes the scan path instead of skipping it."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+    _write_marker_with_db(dji_ready, {**_THIS_DB, "library_id": "lib-OTHER"})
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert fake.scans == ["lib-1"]
+    flat = " ".join(result.stdout.split())
+    assert "different database" in flat, flat
+
+
+def test_promote_marker_for_this_db_skips_scan(
+    no_schema_guard, config_file, dji_ready, monkeypatch,
+):
+    _enable_fake_album_pg(config_file, monkeypatch)
+    _write_marker_with_db(dji_ready, _THIS_DB)
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert fake.scans == []
+    assert "scan skipped" in result.stdout
+
+
+def test_promote_drain_reads_nas_offline_root(tmp_path: Path):
+    """With state_root configured, `process --offline` spooled under
+    state_root — promote's drain must look there, not under the trip."""
+    from immy import offline as offline_mod
+    from immy import process as process_mod
+    from immy.paths import resolve_writable_paths
+
+    originals = tmp_path / "originals"
+    trip = originals / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", trip)
+    state = tmp_path / "state"
+    paths = resolve_writable_paths(trip, originals_root=originals, state_root=state)
+    lib = LibraryInfo(id="lib-1", owner_id="owner-1", container_root="/x")
+    sink = offline_mod.OfflineSink(trip, lib, offline_root=paths.offline_dir)
+    process_mod.process_trip(trip, None, lib, sink=sink, paths=paths)
+
+    cfg = Config(
+        originals_root=originals, immich=None, pg=None, media=None, ml=None,
+        notes_filename=None, source=None, state_root=state,
+    )
+    summary = promote_mod._drain_offline_cache(trip, cfg, dry_run=True)
+    assert summary is not None and summary["pending"] == 1
+
+
+def _verify_pg(config_file, monkeypatch, *, assets, members):
+    """Fake read-only pg for --verify: `assets` = [(originalPath,
+    visibility)] under the trip; `members` = album member originalPaths."""
+    cfg_path, _ = config_file
+    data = yaml.safe_load(cfg_path.read_text()) or {}
+    data["pg"] = {"host": "127.0.0.1", "port": 15432,
+                  "user": "postgres", "password": "x", "database": "immich"}
+    cfg_path.write_text(yaml.safe_dump(data))
+    executed: list[str] = []
+    conn = MagicMock()
+    conn.closed = False
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    state = {}
+
+    def _execute(sql, p=None):
+        executed.append(" ".join(sql.split()))
+        state["last"] = sql
+
+    def _fetchall():
+        if "album_asset" in state["last"]:
+            return [(m,) for m in members]
+        return list(assets)
+
+    cur.execute.side_effect = _execute
+    cur.fetchall.side_effect = _fetchall
+    conn.cursor.return_value = cur
+    monkeypatch.setattr(promote_mod.pg_mod, "connect", lambda cfg: conn)
+    monkeypatch.setattr(
+        promote_mod.pg_mod, "fetch_library_info",
+        lambda c, lib_id: LibraryInfo(
+            id=lib_id, owner_id="o", container_root="/mnt/external/originals"),
+    )
+    return conn, executed
+
+
+_ROOT = "/mnt/external/originals/dji-srt-pair/"
+_ALBUM = [{"id": "alb-1", "albumName": "dji-srt-pair"}]
+
+
+def test_promote_verify_ok(config_file, dji_ready, monkeypatch):
+    _, originals = config_file
+    conn, executed = _verify_pg(
+        config_file, monkeypatch,
+        assets=[(_ROOT + "DJI_0001.JPG", "timeline")],
+        members=[_ROOT + "DJI_0001.JPG"],
+    )
+    fake = FakeClient(existing_albums=_ALBUM)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+
+    result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
+    assert result.exit_code == 0, result.stdout
+    flat = " ".join(result.stdout.split())
+    assert "album 1" in flat and "local 1" in flat, flat
+    # Read-only: no rsync, no writes, no API mutations.
+    assert not (originals / "dji-srt-pair").exists()
+    assert not any(s.split()[0] in ("UPDATE", "INSERT", "DELETE") for s in executed)
+    conn.commit.assert_not_called()
+    assert fake.scans == [] and fake.albums_created == [] and fake.album_assets == []
+
+
+def test_promote_verify_mismatch_lists_missing_and_exits_1(config_file, dji_ready, monkeypatch):
+    (dji_ready / "DJI_0002.JPG").write_bytes((dji_ready / "DJI_0001.JPG").read_bytes())
+    _verify_pg(
+        config_file, monkeypatch,
+        assets=[(_ROOT + "DJI_0001.JPG", "timeline")],
+        members=[_ROOT + "DJI_0001.JPG"],
+    )
+    fake = FakeClient(existing_albums=_ALBUM)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+
+    result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
+    assert result.exit_code == 1, result.stdout
+    flat = " ".join(result.stdout.split())
+    assert "album 1" in flat and "local 2" in flat, flat
+    assert "DJI_0002.JPG" in flat
+
+
+def test_promote_verify_excludes_hidden_live_photo_halves(config_file, dji_ready, monkeypatch):
+    """Immich hides Live-photo motion halves (visibility='hidden') and never
+    puts them in albums — they must not count as missing."""
+    (dji_ready / "IMG_0001.MOV").write_bytes(b"\0" * 16)
+    _verify_pg(
+        config_file, monkeypatch,
+        assets=[(_ROOT + "DJI_0001.JPG", "timeline"),
+                (_ROOT + "IMG_0001.MOV", "hidden")],
+        members=[_ROOT + "DJI_0001.JPG"],
+    )
+    fake = FakeClient(existing_albums=_ALBUM)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+
+    result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
+    assert result.exit_code == 0, result.stdout
+
+
+def test_promote_verify_missing_album_exits_1(config_file, dji_ready, monkeypatch):
+    _verify_pg(config_file, monkeypatch,
+               assets=[(_ROOT + "DJI_0001.JPG", "timeline")], members=[])
+    fake = FakeClient(existing_albums=[])
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+
+    result = runner.invoke(app, ["promote", str(dji_ready), "--verify"])
+    assert result.exit_code == 1, result.stdout
+    assert "DJI_0001.JPG" in result.stdout

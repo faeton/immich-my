@@ -417,8 +417,10 @@ class PgSink:
         self.conn.rollback()
 
     def close(self) -> None:
-        if not self.conn.closed:
-            self.conn.close()
+        # The connection is the caller's: `immy process` opens ONE for the
+        # whole batch and hands it to a fresh sink per trip, then closes it
+        # once at the end. Closing it here broke every trip after the first.
+        pass
 
 
 # --- OfflineSink ----------------------------------------------------------
@@ -754,8 +756,13 @@ class OfflineSink:
 # --- Sync (offline → DB) --------------------------------------------------
 
 
-def iter_entries(trip_folder: Path) -> Iterator[tuple[Path, dict]]:
-    root = offline_dir(trip_folder)
+def iter_entries(
+    trip_folder: Path, *, offline_root: Path | None = None,
+) -> Iterator[tuple[Path, dict]]:
+    """Yield `(yml_path, entry)` for every cached asset. `offline_root`
+    is where `process --offline` spooled them (`WritablePaths.offline_dir`
+    — under state_root on the NAS); unset → `<trip>/.audit/offline/`."""
+    root = offline_root if offline_root is not None else offline_dir(trip_folder)
     if not root.is_dir():
         return
     for yml in sorted(root.glob("*.yml")):
@@ -792,6 +799,7 @@ def sync_trip(
     *,
     library: LibraryInfo | None = None,
     progress: Any = None,
+    offline_root: Path | None = None,
 ) -> dict:
     """Replay every unsynced `.audit/offline/*.yml` entry into Postgres.
 
@@ -799,6 +807,9 @@ def sync_trip(
     used to substitute placeholder `owner_id`/`library_id` values that
     the offline path stamped into cached entries when the DB was down
     and only `container_root` could be recovered from existing markers.
+
+    `offline_root` overrides the cache location (NAS: `paths.offline_dir`
+    under state_root); unset → `<trip>/.audit/offline/`.
 
     Returns a summary dict suitable for display. Each entry is processed
     in its own transaction — a DB-level failure on one asset rolls back
@@ -811,7 +822,7 @@ def sync_trip(
     synced = 0
     skipped = 0
     failed = 0
-    entries = list(iter_entries(trip_folder))
+    entries = list(iter_entries(trip_folder, offline_root=offline_root))
     _emit(f"sync-offline: {len(entries)} entry(ies) to consider")
 
     for idx, (yml_path, data) in enumerate(entries, start=1):
@@ -821,7 +832,10 @@ def sync_trip(
         rel = yml_path.name
         _emit(f"[{idx}/{len(entries)}] {rel}")
         try:
-            _replay_entry(conn, trip_folder, data, library=library)
+            _replay_entry(
+                conn, trip_folder, data,
+                library=library, offline_root=offline_root,
+            )
             # Commit BEFORE stamping the YAML synced. If the commit fails the
             # exception path rolls back and the entry stays unsynced for the
             # next run; replay is idempotent (ON CONFLICT), so a crash between
@@ -866,6 +880,7 @@ def _replay_entry(
     data: dict,
     *,
     library: LibraryInfo | None = None,
+    offline_root: Path | None = None,
 ) -> None:
     """Replay one cached asset into Postgres. All writes idempotent via
     the same ON CONFLICT / LIKE-guarded UPDATE pattern the online path
@@ -940,7 +955,8 @@ def _replay_entry(
                 "file_stem": fname.rsplit(".", 1)[0] if fname else None,
             })
 
-    offline_root = offline_dir(trip_folder)
+    if offline_root is None:
+        offline_root = offline_dir(trip_folder)
     clip = data.get("clip")
     if clip:
         clip_path = offline_root / clip["path"]

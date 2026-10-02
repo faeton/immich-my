@@ -28,14 +28,18 @@ from . import offline as offline_mod
 from . import pg as pg_mod
 from . import schema_contract
 from .config import Config
-from .derivatives import DERIVATIVES_DIR
 from .exif import read_folder
 from .immich import ImmichClient, ImmichError, wait_for_asset
 from .notes import notes_body, resolve as resolve_notes
-from .process import is_processed as y_is_processed, read_marker as y_read_marker
+from .paths import WritablePaths, resolve_writable_paths
+from .process import (
+    ingestable_media,
+    marker_db_identity,
+    read_marker as y_read_marker,
+)
 from .rules import evaluate, dedup_by_field
 from .heartbeat import Heartbeat
-from .state import AUDIT_DIR, State, log_event, patch_hash
+from .state import State, log_event, patch_hash
 
 
 RSYNC_EXCLUDES = (
@@ -376,6 +380,41 @@ def _stack_pair(client: ImmichClient, pair: InstaPair, folder_name: str) -> tupl
     return ("stacked", f"{pair.lrv.name} primary, {pair.insv.name} child")
 
 
+def _trip_paths(folder: Path, config: Config) -> WritablePaths:
+    """Where `immy process` wrote this trip's state. Without `state_root`
+    (the Mac) that is `<trip>/.audit/...`, byte-identical to before."""
+    return resolve_writable_paths(
+        folder,
+        originals_root=config.originals_root,
+        state_root=config.state_root,
+        sidecars_root=config.sidecars_root,
+    )
+
+
+def _marker_for_current_db(
+    marker_path: Path, config: Config,
+) -> tuple[dict | None, str | None]:
+    """Return `(marker, warning)`. A marker whose recorded DB identity
+    (host/port/database/library_id) differs from the current config proves
+    nothing about THIS database — treat the trip as not processed and say
+    why. A legacy marker without a `db` block is trusted as before."""
+    if not marker_path.is_file():
+        return None, None
+    marker = y_read_marker(marker_path.parent, marker=marker_path)
+    recorded = marker.get("db") if marker else None
+    if not isinstance(recorded, dict) or config.pg is None or config.immich is None:
+        return marker, None
+    current = marker_db_identity(config.pg, config.immich.library_id)
+    if recorded == current:
+        return marker, None
+    return None, (
+        "y_processed.yml was written against a different database "
+        f"({recorded.get('host')}:{recorded.get('port')}/"
+        f"{recorded.get('database')} library {recorded.get('library_id')}); "
+        "treating the trip as not processed here"
+    )
+
+
 def execute(
     plan: Plan,
     config: Config,
@@ -417,7 +456,9 @@ def execute(
     # moment to flush the cache — otherwise a later library scan would
     # see files on disk with no DB rows and ingest them as blank assets.
     hb.write(step="offline cache drain")
-    offline_summary = _drain_offline_cache(plan.folder, config, dry_run=dry_run)
+    paths = _trip_paths(plan.folder, config)
+    offline_summary = _drain_offline_cache(
+        plan.folder, config, dry_run=dry_run, paths=paths)
     if offline_summary is not None:
         summary["offline_sync"] = offline_summary
 
@@ -439,11 +480,16 @@ def execute(
         return summary
 
     # Phase Y.1: if `immy process` already inserted rows for this trip, the
-    # scan POST is pure wasted work — skip it. The marker is our signal.
-    if y_is_processed(plan.folder):
+    # scan POST is pure wasted work — skip it. The marker is our signal —
+    # but only when it was written against THIS database.
+    marker, marker_warning = _marker_for_current_db(paths.marker_path, config)
+    if marker_warning:
+        summary["marker_warning"] = marker_warning
+    if marker is not None:
         summary["scan_skipped_reason"] = "y_processed"
         hb.write(step="rsync derivatives")
-        derivatives_summary = _push_derivatives(plan, config)
+        derivatives_summary = _push_derivatives(
+            plan, config, marker=marker, paths=paths)
         if derivatives_summary is not None:
             summary["derivatives"] = derivatives_summary
     else:
@@ -506,6 +552,100 @@ def _trigger_reembed(client: ImmichClient, mode: str) -> dict:
     return out
 
 
+# --- `promote --verify` (read-only) --------------------------------------
+
+
+@dataclass
+class VerifyResult:
+    album: str
+    album_found: bool
+    album_count: int        # album members under this trip's path
+    expected_count: int     # local media files Immich should show
+    missing: list[str]      # expected but not in the album (trip-relative)
+    extra: list[str]        # in the album but not expected
+
+    @property
+    def ok(self) -> bool:
+        return self.album_count == self.expected_count and not self.missing
+
+
+_VERIFY_TRIP_ASSETS_SQL = (
+    'SELECT "originalPath", visibility FROM asset '
+    'WHERE "originalPath" LIKE %s ' "ESCAPE '\\' "
+    'AND "libraryId" = %s '
+    'AND "deletedAt" IS NULL'
+)
+
+_VERIFY_ALBUM_MEMBERS_SQL = (
+    'SELECT a."originalPath" FROM album_asset aa '
+    'JOIN asset a ON a.id = aa."assetId" '
+    'WHERE aa."albumId" = %s '
+    'AND a."originalPath" LIKE %s ' "ESCAPE '\\' "
+    'AND a."libraryId" = %s '
+    'AND a."deletedAt" IS NULL'
+)
+
+
+def verify_trip(
+    folder: Path, config: Config, client: ImmichClient,
+    *, into_album: str | None = None,
+) -> VerifyResult:
+    """Compare the trip's Immich album with the local media files. Read-only:
+    one album lookup over the API (the same `find_album_by_name` promote
+    uses) and SELECTs over a connection that never commits.
+
+    Expected = the files `process` ingests (`ingestable_media`), plus any
+    other local file Immich holds as a visible asset under the trip path
+    (e.g. a scan-ingested RAW-paired JPEG), minus files Immich keeps
+    `visibility='hidden'` — Live-photo motion halves, which Immich never
+    shows in albums. Album count = album members under this trip's path
+    (an `--into-album` merge target also holds other trips' assets).
+    Raises on DB/API errors; the caller reports them."""
+    if config.pg is None or config.immich is None:
+        raise RuntimeError("verify needs pg: and immich: in immy config")
+    album_name = into_album or folder.name
+    local = {p.relative_to(folder).as_posix() for p in ingestable_media(folder)}
+
+    album = client.find_album_by_name(album_name)
+    album_id = album.get("id") if album else None
+
+    conn = pg_mod.connect(config.pg)
+    try:
+        conn.read_only = True
+        library = pg_mod.fetch_library_info(conn, config.immich.library_id)
+        prefix = f"{library.container_root.rstrip('/')}/{folder.name}/"
+        like = pg_mod.like_prefix(prefix)
+        with conn.cursor() as cur:
+            cur.execute(_VERIFY_TRIP_ASSETS_SQL, (like, config.immich.library_id))
+            db_rows = [(str(r[0]), str(r[1])) for r in cur.fetchall()]
+            members: list[str] = []
+            if album_id is not None:
+                cur.execute(
+                    _VERIFY_ALBUM_MEMBERS_SQL,
+                    (album_id, like, config.immich.library_id),
+                )
+                members = [str(r[0]) for r in cur.fetchall()]
+    finally:
+        conn.rollback()
+        conn.close()
+
+    def _rel(original_path: str) -> str:
+        return original_path[len(prefix):]
+
+    hidden = {_rel(p) for p, vis in db_rows if vis == "hidden"}
+    visible = {_rel(p) for p, vis in db_rows if vis != "hidden"}
+    expected = (local | {r for r in visible if (folder / r).is_file()}) - hidden
+    in_album = {_rel(p) for p in members}
+    return VerifyResult(
+        album=album_name,
+        album_found=album_id is not None,
+        album_count=len(in_album),
+        expected_count=len(expected),
+        missing=sorted(expected - in_album),
+        extra=sorted(in_album - expected),
+    )
+
+
 # --- Offline cache drain -------------------------------------------------
 
 
@@ -526,6 +666,7 @@ def _connect_checked(config: Config):
 
 def _drain_offline_cache(
     folder: Path, config: Config, *, dry_run: bool,
+    paths: WritablePaths | None = None,
 ) -> dict | None:
     """Flush any `.audit/offline/*.yml` entries produced by `process
     --offline` into Postgres. Runs before scan/stack/album so the DB is
@@ -537,7 +678,8 @@ def _drain_offline_cache(
     refusing to rsync because a few sync entries failed would block
     the path we actually need, NAS file upload.
     """
-    entries = list(offline_mod.iter_entries(folder))
+    offline_root = (paths or _trip_paths(folder, config)).offline_dir
+    entries = list(offline_mod.iter_entries(folder, offline_root=offline_root))
     if not entries:
         return None
     pending = sum(1 for _, e in entries if not e.get("synced"))
@@ -582,7 +724,8 @@ def _drain_offline_cache(
     offline_mod.cache_library_info(library)
 
     try:
-        result = offline_mod.sync_trip(folder, conn, library=library)
+        result = offline_mod.sync_trip(
+            folder, conn, library=library, offline_root=offline_root)
     finally:
         if not conn.closed:
             conn.close()
@@ -647,14 +790,20 @@ def _rsync_derivatives(src_root: Path, host_root: str) -> subprocess.CompletedPr
     return _run_streaming(args)
 
 
-def _push_derivatives(plan: Plan, config: Config) -> dict | None:
+def _push_derivatives(
+    plan: Plan, config: Config, *,
+    marker: dict | None = None, paths: WritablePaths | None = None,
+) -> dict | None:
     """Rsync `.audit/derivatives/` into NAS media root + INSERT `asset_file`
     rows for every staged derivative the marker records.
 
+    `marker` / `paths` default to the trip's own marker and state layout.
     Returns a summary dict, or None when nothing to do. Never raises —
     failures are caught and surfaced via the returned `status`.
     """
-    marker = y_read_marker(plan.folder)
+    paths = paths or _trip_paths(plan.folder, config)
+    if marker is None:
+        marker = y_read_marker(plan.folder, marker=paths.marker_path)
     if not marker:
         return None
     if config.media is None or config.pg is None:
@@ -664,7 +813,7 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
             "rows_written": 0,
         }
 
-    staged_root = plan.folder / AUDIT_DIR / DERIVATIVES_DIR
+    staged_root = paths.derivatives_dir
     file_specs: list[dict] = []
     for asset in marker.get("assets") or []:
         derivs = asset.get("derivatives") or []

@@ -529,3 +529,89 @@ def test_replay_normalises_legacy_duration_string(tmp_path: Path):
     update = next(c for c in calls if "SET duration" in c.args[0])
     assert update.args[1]["duration"] == 12_500
 
+
+
+# --- NAS layout: offline cache lives under state_root, not the :ro trip ---
+
+
+def _nas_paths(tmp_path: Path, target: Path):
+    from immy.paths import resolve_writable_paths
+    return resolve_writable_paths(
+        target, originals_root=target.parent,
+        state_root=tmp_path / "state", sidecars_root=tmp_path / "sidecars",
+    )
+
+
+def _replay_conn():
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("replayed-uuid",)
+    conn.cursor.return_value = cur
+    return conn, cur
+
+
+def test_sync_trip_drains_cache_under_nas_offline_root(tmp_path: Path, monkeypatch):
+    """On the NAS `process --offline` writes the cache to
+    `paths.offline_dir` (under state_root). `iter_entries` / `sync_trip` /
+    `_replay_entry` must read that same root — including the CLIP `.npy`
+    the entry points at — instead of the hard-wired `<trip>/.audit/offline`
+    (which is empty there, so the drain silently found nothing)."""
+    target = tmp_path / "originals" / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    paths = _nas_paths(tmp_path, target)
+    sink = offline_mod.OfflineSink(
+        target, LIB, offline_root=paths.offline_dir, clip_dim=4)
+    results = process_mod.process_trip(target, None, LIB, sink=sink, paths=paths)
+    sink.upsert_clip(results[0].asset_id, [0.1, 0.2, 0.3, 0.4], "[...]")
+    assert not (target / ".audit" / "offline").exists()
+
+    entries = list(offline_mod.iter_entries(target, offline_root=paths.offline_dir))
+    assert len(entries) == 1
+
+    upserts = []
+    monkeypatch.setattr(offline_mod.pg_mod, "upsert_smart_search",
+                        lambda conn, aid, lit: upserts.append(aid))
+    conn, _ = _replay_conn()
+    summary = offline_mod.sync_trip(
+        target, conn, library=LIB, offline_root=paths.offline_dir)
+    assert summary == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
+    assert upserts == ["replayed-uuid"]
+    data = yaml.safe_load(entries[0][0].read_text())
+    assert data["synced"] is True
+
+
+def test_sync_offline_cli_reads_state_root_cache(tmp_path: Path, monkeypatch):
+    """`immy sync-offline` with a NAS config (state_root) must find the
+    entries `process --offline` cached under state_root."""
+    from typer.testing import CliRunner
+    from immy.cli import app
+
+    originals = tmp_path / "originals"
+    target = originals / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    paths = _nas_paths(tmp_path, target)
+    sink = offline_mod.OfflineSink(target, LIB, offline_root=paths.offline_dir)
+    process_mod.process_trip(target, None, LIB, sink=sink, paths=paths)
+
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(yaml.safe_dump({
+        "originals_root": str(originals),
+        "state_root": str(tmp_path / "state"),
+        "sidecars_root": str(tmp_path / "sidecars"),
+        "immich": {"url": "http://fake", "api_key": "k", "library_id": "lib-abc"},
+        "pg": {"host": "h", "port": 5432, "user": "u", "password": "p",
+               "database": "immich"},
+    }))
+    monkeypatch.setenv("IMMY_CONFIG", str(cfg))
+    conn, _ = _replay_conn()
+    conn.closed = False
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda c: conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda c, lid: LIB)
+    monkeypatch.setattr("immy.schema_contract.assert_live_schema", lambda c: None)
+
+    result = CliRunner().invoke(app, ["sync-offline", str(target)])
+    assert result.exit_code == 0, result.stdout
+    assert "nothing to sync" not in result.stdout
+    assert "synced=1" in result.stdout

@@ -580,12 +580,17 @@ def _promote_impl(
     reembed: str = "none",
     into_album: str | None = None,
     tags: list[str] | None = None,
+    verify: bool = False,
 ) -> None:
     """Rsync + Immich library-scan + Insta360 stack calls.
 
-    Shared body for the `promote` / `push` / `pub` aliases.
+    Shared body for the `promote` / `push` / `pub` aliases. Exits 1 when any
+    step failed (after every step that can still run has run), 130 on Ctrl-C.
     """
     config = load_config(config_path)
+    if verify:
+        _promote_verify(folder, config, into_album=into_album)
+        return
     if config.originals_root is None:
         console.print(
             "[red]no originals_root configured[/red] — set `originals_root:` in "
@@ -636,12 +641,14 @@ def _promote_impl(
         console.print("\n[yellow]interrupted[/yellow] — rsync stopped; scan/stack/album skipped.")
         raise typer.Exit(code=130)
 
+    step_failed = False
     prefix = "[yellow]dry-run[/yellow] " if dry_run else ""
     changed = len(summary["rsync_changes"])
     console.print(f"{prefix}rsync: {changed} change(s) to {summary['target']}")
     off = summary.get("offline_sync")
     if off:
         if "error" in off:
+            step_failed = True
             console.print(
                 f"[yellow]offline-sync:[/yellow] {off['pending']} pending; "
                 f"[red]{off['error']}[/red]"
@@ -655,19 +662,24 @@ def _promote_impl(
                 f"[dim]offline-sync: {off['total']} entry(ies), all synced[/dim]"
             )
         else:
+            step_failed = step_failed or off["failed"] > 0
             colour = "green" if off["failed"] == 0 else "yellow"
             console.print(
                 f"[{colour}]offline-sync:[/{colour}] synced {off['synced']} of "
                 f"{off['pending']} pending"
                 + (f", [red]{off['failed']} failed[/red]" if off["failed"] else "")
             )
+    if summary.get("marker_warning"):
+        console.print(f"[yellow]warning:[/yellow] {summary['marker_warning']}")
     if "scan_error" in summary:
+        step_failed = True
         console.print(f"[red]scan failed:[/red] {summary['scan_error']}")
     elif summary["scan_triggered"]:
         console.print("[green]✓[/green] library scan triggered")
     elif summary.get("scan_skipped_reason") == "y_processed":
         console.print("[dim]scan skipped: y_processed.yml present[/dim]")
         derivs = summary.get("derivatives") or {}
+        step_failed = step_failed or derivs.get("status") == "error"
         if derivs:
             colour = {
                 "pushed": "green", "empty": "dim",
@@ -678,11 +690,13 @@ def _promote_impl(
                 f"{derivs['detail']}"
             )
     for status, detail in summary["stacks"]:
+        step_failed = step_failed or status == "error"
         colour = {
             "stacked": "green", "planned": "yellow", "skipped": "dim", "error": "red",
         }.get(status, "")
         console.print(f"  [{colour}]{status}[/{colour}] {detail}")
     album = summary.get("album") or {}
+    step_failed = step_failed or album.get("status") == "error"
     if album and album.get("status") != "skipped":
         colour = {
             "created": "green", "updated": "green", "error": "red",
@@ -702,9 +716,14 @@ def _promote_impl(
             "path are trashed (online soft-deletes, left as-is). "
             "Pass [bold]--resurrect-deleted[/bold] to include them."
         )
+    if album and album.get("thumbs_repair_error"):
+        step_failed = True
+        console.print(
+            f"[red]thumbnail repair failed:[/red] {album['thumbs_repair_error']}")
     tagsum = album.get("tags") if album else None
     if tagsum:
         if "error" in tagsum:
+            step_failed = True
             console.print(f"[red]tags failed:[/red] {tagsum['error']}")
         else:
             applied = tagsum.get("applied", {})
@@ -721,9 +740,47 @@ def _promote_impl(
             )
         for q in ("smartSearch", "faceDetection"):
             if str(reembed.get(q, "")).startswith("error"):
+                step_failed = True
                 console.print(f"[red]re-embed {q} failed:[/red] {reembed[q]}")
         if "check_error" in reembed:
             console.print(f"[yellow]re-embed check skipped:[/yellow] {reembed['check_error']}")
+    if step_failed:
+        raise typer.Exit(code=1)
+
+
+_VERIFY_MAX_EXAMPLES = 20
+
+
+def _promote_verify(folder: Path, config, *, into_album: str | None) -> None:
+    """`promote --verify`: album asset count vs local media files. Read-only
+    — no rsync, no scan, no DB writes. Exit 1 on mismatch."""
+    if config.pg is None or config.immich is None:
+        console.print("[red]--verify needs pg: and immich: blocks in immy config.[/red]")
+        raise typer.Exit(code=2)
+    client = ImmichClient(
+        url=config.immich.url,
+        api_key=config.immich.api_key,
+        ssh_host=config.immich.ssh_host,
+    )
+    try:
+        res = promote_mod.verify_trip(folder, config, client, into_album=into_album)
+    except Exception as e:  # noqa: BLE001 — DB/API unreachable
+        console.print(f"[red]verify failed:[/red] {e}")
+        raise typer.Exit(code=2)
+    album_note = "" if res.album_found else " [red](album not found)[/red]"
+    console.print(
+        f"[bold]verify[/bold] {folder.name} → album {res.album}{album_note}\n"
+        f"  album {res.album_count} asset(s), local {res.expected_count} file(s)"
+    )
+    if res.ok:
+        console.print("[green]✓[/green] album matches the local trip")
+        return
+    console.print(f"[red]mismatch[/red] — {len(res.missing)} local file(s) not in the album")
+    for name in res.missing[:_VERIFY_MAX_EXAMPLES]:
+        console.print(f"  missing: {name}", markup=False, highlight=False)
+    if len(res.missing) > _VERIFY_MAX_EXAMPLES:
+        console.print(f"  [dim]… and {len(res.missing) - _VERIFY_MAX_EXAMPLES} more[/dim]")
+    raise typer.Exit(code=1)
 
 
 def _promote(
@@ -735,6 +792,7 @@ def _promote(
     reembed: str = typer.Option("none", "--reembed", help="After scan, trigger Immich CLIP+faces jobs (immy-inserted assets are NOT auto-queued). 'missing'=new assets only; 'all'=reprocess whole library (one-time stale-index cleanup); 'none'=off (default). LIBRARY-WIDE — in a batch, pass it once on the last trip, not per-trip."),
     into_album: str = typer.Option(None, "--into-album", help="Add this trip's assets to an EXISTING album of this name instead of one named after the folder (the merge case — e.g. promote ivan-photoshoot INTO anya-beach-photoshop). The target album's description is left untouched."),
     tag: list[str] = typer.Option(None, "--tag", help="Tag this trip's assets with this flat tag name (repeatable). Used to mark merged/edited files, e.g. --tag post-edited --tag with-anya. Idempotent."),
+    verify: bool = typer.Option(False, "--verify", help="Read-only check instead of a promote: compare the Immich album's asset count (for this trip's path) with the local media files; list up to 20 missing names and exit 1 on mismatch. Never writes."),
 ) -> None:
     """Rsync trip into originals + trigger Immich scan + stack Insta360 pairs."""
     if reembed not in ("none", "missing", "all"):
@@ -742,7 +800,7 @@ def _promote(
     _promote_impl(
         folder, dry_run=dry_run, force=force, config_path=config_path,
         resurrect_deleted=resurrect_deleted, reembed=reembed,
-        into_album=into_album, tags=tag or None,
+        into_album=into_album, tags=tag or None, verify=verify,
     )
 
 
@@ -1435,8 +1493,12 @@ def _run_one_trip(
     state_root: Path | None = None,
     sidecars_root: Path | None = None,
     force: bool = False,
+    provenance: dict | None = None,
 ) -> bool:
     """Run the full pipeline for one trip folder. Returns True on success.
+
+    `provenance` (db / mode / steps, see `process.marker_provenance`) is
+    recorded in the marker and must match it for the cached-trip skip.
 
     Per-trip sink + commit boundary: a failure (or KeyboardInterrupt) in
     one trip rolls back only that trip's writes, so sibling trips already
@@ -1460,7 +1522,7 @@ def _run_one_trip(
     # batch when most trips are already done. Pass --force to override.
     if not dry_run and not force:
         cached, count = process_mod.is_trip_fully_cached(
-            folder, marker=paths.marker_path)
+            folder, marker=paths.marker_path, provenance=provenance)
         if cached:
             console.print(
                 f"\n[dim][cached][/dim] {folder.name}: "
@@ -1561,7 +1623,8 @@ def _run_one_trip(
     face_count = sum(r.faces_detected for r in results)
     transcript_count = sum(1 for r in results if r.transcript)
     caption_count = sum(1 for r in results if r.caption)
-    process_mod.write_marker(folder, results, marker=paths.marker_path)
+    process_mod.write_marker(
+        folder, results, marker=paths.marker_path, provenance=provenance)
     tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
     tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
     tail += f", [cyan]{face_count} face(s)[/cyan]" if face_count else ""
@@ -1794,6 +1857,23 @@ def process(
             f"  phases: {', '.join(phases) if phases else '[dim](EXIF + insert only)[/dim]'}"
         )
 
+    # What this run's markers record and what a cached marker must match.
+    provenance = process_mod.marker_provenance(
+        db=process_mod.marker_db_identity(config.pg, config.immich.library_id),
+        offline=offline,
+        steps=process_mod.marker_steps(
+            compute_derivatives=compute,
+            compute_clip=compute_clip,
+            compute_faces=compute_faces,
+            compute_transcripts=with_transcripts,
+            compute_captions=with_captions,
+            clip_model=clip_model,
+            clip_backend=clip_backend,
+            transcript_model=transcript_model,
+            captioner_config=captioner_config,
+        ),
+    )
+
     ok = 0
     failed = 0
     interrupted = False
@@ -1840,6 +1920,7 @@ def process(
                 state_root=config.state_root,
                 sidecars_root=config.sidecars_root,
                 force=force,
+                provenance=provenance,
             )
             if success:
                 ok += 1
@@ -1865,7 +1946,9 @@ def process(
             + (f", [yellow]{len(folders) - ok - failed} skipped (interrupted)[/yellow]"
                if interrupted else "")
         )
-    if failed and not interrupted:
+    if interrupted:
+        raise typer.Exit(code=130)
+    if failed:
         raise typer.Exit(code=1)
 
 
@@ -1892,11 +1975,19 @@ def sync_offline(
         )
         raise typer.Exit(code=2)
 
-    entries = list(offline_mod.iter_entries(folder))
+    # Same resolver `process --offline` used: NAS → state_root/<trip>/.audit
+    # /offline; Mac (no roots) → `<trip>/.audit/offline`, unchanged.
+    offline_root = process_mod.resolve_writable_paths(
+        folder,
+        originals_root=config.originals_root,
+        state_root=config.state_root,
+        sidecars_root=config.sidecars_root,
+    ).offline_dir
+    entries = list(offline_mod.iter_entries(folder, offline_root=offline_root))
     if not entries:
         console.print(
-            f"[dim]no offline entries under {folder}/.audit/"
-            f"{offline_mod.OFFLINE_DIR_NAME}/ — nothing to sync.[/dim]"
+            f"[dim]no offline entries under {offline_root}/"
+            " — nothing to sync.[/dim]"
         )
         return
 
@@ -1938,6 +2029,7 @@ def sync_offline(
     try:
         summary = offline_mod.sync_trip(
             folder, conn, library=library, progress=_progress,
+            offline_root=offline_root,
         )
     finally:
         if not conn.closed:
@@ -2417,13 +2509,17 @@ def repair_thumbs(
     totals = {"broken": 0, "generated": 0, "rows": 0, "no_src": 0, "failed": 0}
     for folder in folders:
         if not folder.is_dir():
+            totals["failed"] += 1
             console.print(f"[red]not a folder:[/red] {folder}")
             continue
         console.print(f"[bold]repair-thumbs[/bold] {folder.name} …")
-        res = repair_mod.repair_trip(
-            folder, config, parallel=parallel, dry_run=dry_run,
-            progress=lambda done, total: None,
-        )
+        try:
+            res = repair_mod.repair_trip(
+                folder, config, parallel=parallel, dry_run=dry_run,
+                progress=lambda done, total: None,
+            )
+        except Exception as e:  # noqa: BLE001 — one trip's DB/IO failure must not stop the rest
+            res = repair_mod.TripRepair(trip=folder.name, status="error", detail=str(e))
         totals["broken"] += res.broken
         totals["generated"] += res.generated
         totals["rows"] += res.rows_upserted
@@ -2447,6 +2543,8 @@ def repair_thumbs(
         f"{totals['rows']} row(s) upserted, {totals['no_src']} no source, "
         f"[red]{totals['failed']} trip(s) failed[/red]"
     )
+    if totals["failed"]:
+        raise typer.Exit(code=1)
 
 
 @app.command("snapshot")
