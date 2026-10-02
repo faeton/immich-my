@@ -10,8 +10,8 @@ telemetry fields. Three field dialects appear in the wild:
   Note `rel_alt`/`abs_alt` share a single bracket, and the older firmware
   emits `[altitude: 120.0]` instead (treated as a relative height).
 - Older (parenthesised): `GPS(..)` in two coordinate orders (lat-first with an `M`
-  third field; lon-first beside `HOME(..)`), see `_resolve_paren_order`;
-  ambiguous orders yield no fix, and no altitude is taken. Dotted dates
+  third field, else decided per file from labelled coords / range), see
+  `_resolve_file_order`; ambiguous orders yield no fix, and no altitude is taken. Dotted dates
   (`2017.8.5`) are accepted. Newer firmware
   also misspells `[longtitude: ..]`.
 
@@ -126,36 +126,53 @@ def _in_range(lat: float, lon: float) -> bool:
     return abs(lat) <= 90 and abs(lon) <= 180
 
 
-def _resolve_paren_order(
-    a: float, b: float, has_unit: bool, home, frame: "SrtFrame",
-) -> tuple[float, float] | None:
-    """(lat, lon) for `GPS(a,b,..)`, or None when the order can't be justified.
+LAT_FIRST, LON_FIRST = "lat-first", "lon-first"
 
-    Priority: dialect signature (`M`-suffixed third field -> lat-first; a
-    `HOME(lon,lat)` line -> lon-first), then agreement within ~1 degree with a
-    lone labelled latitude/longitude from the same cue, then range: exactly one
-    in-range reading is used, both in range is ambiguous -> no fix.
+
+def _resolve_file_order(
+    parens: list[tuple[float, float, bool]],
+    labelled: list[tuple[float, float]],
+    homes: list[tuple[float, float]],
+) -> str | None:
+    """Coordinate order of every `GPS(a,b,..)` in a file, decided ONCE per file.
+
+    1. Any `M`-suffixed third field -> lat-first (Matrice style).
+    2. Else agreement within ~1 degree with in-file evidence: every labelled
+       (latitude, longitude) pair plus each `HOME(..)` read both ways (HOME is
+       evidence only through this check, never a dialect signature).
+    3. Else exactly one order that is in range for every GPS cue.
+    4. Else None: emit no fix from the GPS() cues.
     """
-    lat_first, lon_first = (a, b), (b, a)
-    ok = [c for c in (lat_first, lon_first) if _in_range(*c)]
-    if not ok:
+    if not parens:
         return None
-    if has_unit:
-        return lat_first if _in_range(*lat_first) else None
-    if home is not None:
-        return lon_first if _in_range(*lon_first) else None
-    if len(ok) == 1:
-        return ok[0]
-    if frame.latitude is not None:
-        agree = [c for c in ok if abs(c[0] - frame.latitude) <= 1.0]
-    elif frame.longitude is not None:
-        agree = [c for c in ok if abs(c[1] - frame.longitude) <= 1.0]
-    else:
-        return None
-    return agree[0] if len(agree) == 1 else None
+    if any(unit for _, _, unit in parens):
+        return LAT_FIRST
+
+    def point(order: str, a: float, b: float) -> tuple[float, float]:
+        return (a, b) if order == LAT_FIRST else (b, a)
+
+    evidence = list(labelled)
+    for h1, h2 in homes:
+        evidence += [(h1, h2), (h2, h1)]
+    orders = (LAT_FIRST, LON_FIRST)
+    if evidence:
+        agree = [
+            o for o in orders
+            if any(
+                abs(point(o, a, b)[0] - la) <= 1.0 and abs(point(o, a, b)[1] - lo) <= 1.0
+                for a, b, _ in parens for la, lo in evidence
+            )
+        ]
+        if len(agree) == 1:
+            return agree[0]
+    valid = [
+        o for o in orders
+        if all(_in_range(*point(o, a, b)) for a, b, _ in parens)
+    ]
+    return valid[0] if len(valid) == 1 else None
 
 
-def _parse_block(block: str, index: int) -> SrtFrame:
+def _parse_block(block: str, index: int, order: str | None = None) -> SrtFrame:
     frame = SrtFrame(index=index, t_offset_s=_cue_offset(block))
 
     m = _RE_DATE.search(block)
@@ -191,25 +208,36 @@ def _parse_block(block: str, index: int) -> SrtFrame:
     # Parenthesised fallback when no bracketed coords were present.
     if frame.latitude is None or frame.longitude is None:
         mp = _RE_GPS_PAREN.search(block)
-        if mp:
-            pair = _resolve_paren_order(
-                float(mp.group(1)), float(mp.group(2)), bool(mp.group(4)),
-                _RE_HOME.search(block), frame,
-            )
-            if pair is not None:
-                frame.latitude, frame.longitude = pair
+        if mp and order is not None:
+            a, b = float(mp.group(1)), float(mp.group(2))
+            lat, lon = (a, b) if order == LAT_FIRST else (b, a)
+            if _in_range(lat, lon):
+                frame.latitude, frame.longitude = lat, lon
 
     return frame
 
 
 def iter_frames(text: str) -> Iterator[SrtFrame]:
     """Yield one `SrtFrame` per non-empty cue block, in file order."""
-    idx = 0
-    for block in _RE_BLOCK_SEP.split(text.strip()):
-        if not block.strip():
+    blocks = [b for b in _RE_BLOCK_SEP.split(text.strip()) if b.strip()]
+    # Pass 1: file-wide evidence for the `GPS(a,b)` order (see _resolve_file_order).
+    parens: list[tuple[float, float, bool]] = []
+    labelled: list[tuple[float, float]] = []
+    homes: list[tuple[float, float]] = []
+    for i, block in enumerate(blocks, 1):
+        f = _parse_block(block, i)
+        if f.latitude is not None and f.longitude is not None:
+            labelled.append((f.latitude, f.longitude))
             continue
-        idx += 1
-        yield _parse_block(block, idx)
+        mp = _RE_GPS_PAREN.search(block)
+        if mp:
+            parens.append((float(mp.group(1)), float(mp.group(2)), bool(mp.group(4))))
+        mh = _RE_HOME.search(block)
+        if mh:
+            homes.append((float(mh.group(1)), float(mh.group(2))))
+    order = _resolve_file_order(parens, labelled, homes)
+    for i, block in enumerate(blocks, 1):
+        yield _parse_block(block, i, order)
 
 
 def parse_track(srt_path: Path) -> list[SrtFrame]:

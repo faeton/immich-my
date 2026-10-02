@@ -129,9 +129,46 @@ def test_old_format_is_lon_first_with_dotted_unpadded_date(tmp_path: Path):
     assert f.abs_alt is None and f.rel_alt is None
 
 
-def test_old_format_lon_first_when_both_in_range(tmp_path: Path):
+def test_home_alone_is_not_a_dialect_signature(tmp_path: Path):
+    # HOME read both ways agrees with either order; both in range -> no fix.
     f = _one(tmp_path, "HOME(8.54,47.37) 2017.8.5 14:11:51\nGPS(8.54,47.37,12)\n")
-    assert (f.latitude, f.longitude) == (47.37, 8.54)
+    assert not f.has_fix()
+
+
+def test_lat_first_unitless_file_with_home_resolves_by_range(tmp_path: Path):
+    # lat-first coords (36.6, 120.1): the lon-first reading has lat 120 -> impossible.
+    f = _one(tmp_path, "HOME(36.6,120.1) 2017.8.5 14:11:51\nGPS(36.6001,120.1001,12)\n")
+    assert (f.latitude, f.longitude) == (36.6001, 120.1001)
+
+
+def test_order_is_decided_per_file_with_labelled_evidence_in_other_cue(tmp_path: Path):
+    p = tmp_path / "x.SRT"
+    p.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n[latitude: 47.37] [longitude: 8.54]\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nGPS(8.5401,47.3701,12)\n"
+    )
+    fr = srt.parse_track(p)
+    assert [(f.latitude, f.longitude, f.has_fix()) for f in fr] == [
+        (47.37, 8.54, True), (47.3701, 8.5401, True)]
+
+
+def test_labelled_evidence_picks_lat_first_too(tmp_path: Path):
+    p = tmp_path / "x.SRT"
+    p.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\n[latitude: 8.54] [longitude: 47.37]\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nGPS(8.5401,47.3701,12)\n"
+    )
+    assert [(f.latitude, f.longitude) for f in srt.parse_track(p)][1] == (8.5401, 47.3701)
+
+
+def test_per_file_order_is_constrained_by_every_cue(tmp_path: Path):
+    p = tmp_path / "x.SRT"
+    p.write_text(
+        "1\n00:00:00,000 --> 00:00:01,000\nGPS(8.5,47.3,1)\n\n"
+        "2\n00:00:01,000 --> 00:00:02,000\nGPS(149.0,-20.2,1)\n"
+    )
+    # Cue 2 is only valid lon-first, so the whole file is lon-first.
+    assert [(f.latitude, f.longitude) for f in srt.parse_track(p)] == [(47.3, 8.5), (-20.2, 149.0)]
 
 
 def test_unlabelled_both_in_range_emits_nothing(tmp_path: Path):
@@ -141,11 +178,6 @@ def test_unlabelled_both_in_range_emits_nothing(tmp_path: Path):
 def test_unlabelled_single_valid_order_is_used(tmp_path: Path):
     f = _one(tmp_path, "GPS(-20.5,149.0,3)\n")
     assert (f.latitude, f.longitude) == (-20.5, 149.0)
-
-
-def test_unlabelled_resolved_by_lone_labelled_coordinate(tmp_path: Path):
-    f = _one(tmp_path, "[latitude: 47.4]\nGPS(8.54,47.37,12)\n")
-    assert (f.latitude, f.longitude) == (47.37, 8.54)
 
 
 def test_impossible_both_ways_emits_nothing(tmp_path: Path):

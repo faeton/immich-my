@@ -16,10 +16,11 @@ continuously, so entries are dated rather than versioned.
   `libx265` when `hevc_videotoolbox` is not in `ffmpeg -encoders` (Linux/NAS);
   the Mac path is unchanged.
 - **SRT parser.** Accepts DJI's `longtitude` misspelling and the old
-  `GPS(..)` form in both published orders: lat-first when the third field has
-  an `M` unit (Matrice style), lon-first beside `HOME(..)` (old Phantom/Mavic
-  Pro); otherwise a lone labelled coordinate in the cue, or the single in-range
-  reading, decides; ambiguous -> no fix. No altitude is taken from `GPS()` or
+  `GPS(..)` form in both published orders, decided once per file: an `M`-suffixed
+  third field means lat-first (Matrice style); else agreement (~1 degree) with
+  labelled lat/lon pairs or `HOME(..)` points elsewhere in the file; else the
+  single order in range for every GPS cue; else no fix. HOME alone is not a
+  dialect signature. No altitude is taken from `GPS()` or
   `BAROMETER` (vertical reference unverified). Dates like `2017.8.5` parse.
 - **Below-sea-level altitude** from SRT was written as `GPSAltitudeRef=1`, which
   exiftool stores as 0 in XMP (read back positive). Now `abs(alt)` +
