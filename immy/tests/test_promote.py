@@ -744,3 +744,35 @@ def test_promote_skips_album_when_no_immich_creds(tmp_path, dji_ready, monkeypat
     assert "no immich creds" in result.stdout
     # No album line in output (status "skipped" hidden by CLI).
     assert "album " not in result.stdout
+
+
+def test_promote_aborts_before_rsync_on_live_schema_mismatch(
+    tmp_path, dji_ready, monkeypatch,
+):
+    from unittest.mock import MagicMock
+
+    from immy import schema_contract
+
+    originals = tmp_path / "originals-guard"
+    originals.mkdir()
+    cfg = tmp_path / "config-pg.yml"
+    cfg.write_text(yaml.safe_dump({
+        "originals_root": str(originals),
+        "immich": {"url": "http://fake", "api_key": "k", "library_id": "lib-1"},
+        "pg": {"host": "db", "port": 5432, "user": "u", "password": "p", "database": "immich"},
+    }))
+    monkeypatch.setenv("IMMY_CONFIG", str(cfg))
+    fake_conn = MagicMock()
+    monkeypatch.setattr("immy.pg.connect", lambda cfg: fake_conn)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: FakeClient())
+
+    def mismatch(conn):
+        raise schema_contract.SchemaMismatch("asset: table missing\nRefusing to write.")
+    monkeypatch.setattr(schema_contract, "assert_live_schema", mismatch)
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+
+    assert result.exit_code == 2, result.stdout
+    assert "Refusing to write" in result.stdout
+    assert not any(originals.iterdir())  # nothing rsynced
+    fake_conn.cursor.assert_not_called()

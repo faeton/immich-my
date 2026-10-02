@@ -43,6 +43,7 @@ import psycopg
 import yaml
 
 from . import pg as pg_mod
+from . import video as video_mod
 from .pg import LibraryInfo
 from .state import AUDIT_DIR, Y_MARKER_FILENAME
 
@@ -150,7 +151,7 @@ class Sink(Protocol):
     def clip_recorded(self, asset_id: str) -> bool: ...
     def faces_recorded(self, asset_id: str) -> bool: ...
     def update_asset_dims(self, asset_id: str, width: int, height: int) -> None: ...
-    def update_asset_duration(self, asset_id: str, duration: str) -> None: ...
+    def update_asset_duration(self, asset_id: str, duration: int) -> None: ...
     def get_description(self, asset_id: str) -> str | None: ...
     def update_description_if_empty(
         self, asset_id: str, text: str, file_name: str | None = None) -> None: ...
@@ -171,17 +172,17 @@ class Sink(Protocol):
 
 
 # The SQL used to live in process.py; moved here so the Sink owns all
-# DB-facing statements and process_trip stays transport-agnostic. Text
-# is unchanged so the replay path produces byte-identical rows.
+# DB-facing statements and process_trip stays transport-agnostic. The
+# replay path uses the same text, so it produces identical rows.
 
 _INSERT_ASSET = """
 INSERT INTO asset (
-  id, "deviceAssetId", "ownerId", "deviceId", type,
+  id, "ownerId", type,
   "originalPath", "originalFileName", checksum, "checksumAlgorithm",
   "fileCreatedAt", "fileModifiedAt", "localDateTime",
   duration, "libraryId", "isExternal"
 ) VALUES (
-  %(id)s, %(device_asset_id)s, %(owner_id)s, %(device_id)s, %(asset_type)s,
+  %(id)s, %(owner_id)s, %(asset_type)s,
   %(original_path)s, %(original_file_name)s, %(checksum)s, 'sha1-path',
   %(file_created_at)s, %(file_modified_at)s, %(local_date_time)s,
   %(duration)s, %(library_id)s, true
@@ -308,7 +309,7 @@ class PgSink:
                 "id": asset_id, "width": width, "height": height,
             })
 
-    def update_asset_duration(self, asset_id: str, duration: str) -> None:
+    def update_asset_duration(self, asset_id: str, duration: int) -> None:
         with self.conn.cursor() as cur:
             cur.execute(_UPDATE_ASSET_DURATION, {
                 "id": asset_id, "duration": duration,
@@ -569,7 +570,7 @@ class OfflineSink:
         entry["asset"]["height"] = height
         self._flush(hex_key)
 
-    def update_asset_duration(self, asset_id: str, duration: str) -> None:
+    def update_asset_duration(self, asset_id: str, duration: int) -> None:
         hex_key, entry = self._entry_for(asset_id)
         entry["asset"]["duration"] = duration
         self._flush(hex_key)
@@ -846,6 +847,9 @@ def _replay_entry(
     asset_params["checksum"] = bytes.fromhex(asset_raw["checksum"])
     for key in ("file_created_at", "file_modified_at", "local_date_time"):
         asset_params[key] = _deserialise_datetime(asset_params.get(key))
+    # Entries cached before Immich 3.x hold `HH:MM:SS.sss`; the column is
+    # int4 milliseconds now.
+    asset_params["duration"] = video_mod.normalize_duration_ms(asset_params.get("duration"))
     # Placeholder substitution: offline mode without a cached library
     # stamped `__offline_placeholder__` for owner_id / library_id. Fill
     # them from the live `library` we fetched at sync time.

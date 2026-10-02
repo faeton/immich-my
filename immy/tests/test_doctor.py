@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 
-from immy import doctor
+from immy import doctor, schema_contract
 from immy.config import Config, ImmichConfig, MediaConfig, MLConfig, PgConfig
 from immy.immich import ImmichError
 
@@ -95,15 +96,23 @@ class _FakeCursor:
         return self.rows[0] if self.rows else None
 
 
-class _FakePg:
-    """Answers the handful of queries doctor issues."""
+def _snapshot_tables():
+    return copy.deepcopy(schema_contract.load_snapshot()["tables"])
 
-    def __init__(self, columns, dim="vector(512)"):
-        self.columns, self.dim, self.closed = columns, dim, False
+
+class _FakePg:
+    """Answers the handful of queries doctor issues. `tables` is shaped like
+    the schema snapshot (table → column → attrs)."""
+
+    def __init__(self, tables, dim="vector(512)"):
+        self.tables, self.dim, self.closed = tables, dim, False
 
     def execute(self, sql, params=()):
         if "information_schema.columns" in sql:
-            return _FakeCursor([(c,) for c in self.columns.get(params[0], ())])
+            return _FakeCursor([
+                (name, c["udt_name"], "YES" if c["is_nullable"] else "NO", c["column_default"])
+                for name, c in self.tables.get(params[0], {}).items()
+            ])
         if "smart_search" in sql:
             return _FakeCursor([(self.dim,)])
         raise AssertionError(sql)
@@ -120,20 +129,27 @@ def _pg_cfg(model="ViT-B-32__openai"):
 
 
 def test_postgres_schema_and_clip_dim_ok():
-    fake = _FakePg(dict(doctor.DIRECT_WRITE_COLUMNS))
-    got = _statuses(doctor.check_postgres(_pg_cfg(), connect=lambda cfg: fake))
+    fake = _FakePg(_snapshot_tables())
+    checks = doctor.check_postgres(_pg_cfg(), connect=lambda cfg: fake)
+    got = _statuses(checks)
     assert set(got.values()) == {doctor.OK}
+    # Every table immy writes is covered, not a hand-picked subset.
+    assert {n.removeprefix("table ") for n in got if n.startswith("table ")} \
+        == set(schema_contract.WRITE_COLUMNS)
     assert fake.closed
 
 
 def test_postgres_renamed_column_and_wrong_dim_fail():
-    columns = dict(doctor.DIRECT_WRITE_COLUMNS)
-    columns["asset"] = tuple(c for c in columns["asset"] if c != "localDateTime")
-    fake = _FakePg(columns, dim="vector(768)")
-    got = _statuses(doctor.check_postgres(_pg_cfg(), connect=lambda cfg: fake))
-    assert got["table asset"] == doctor.FAIL
-    assert got["clip dim"] == doctor.FAIL
-    assert got["table asset_exif"] == doctor.OK
+    tables = _snapshot_tables()
+    del tables["asset"]["localDateTime"]
+    tables["asset"]["duration"]["udt_name"] = "varchar"
+    fake = _FakePg(tables, dim="vector(768)")
+    checks = {c.name: c for c in doctor.check_postgres(_pg_cfg(), connect=lambda cfg: fake)}
+    assert checks["table asset"].status == doctor.FAIL
+    assert "localDateTime" in checks["table asset"].detail
+    assert "duration is varchar" in checks["table asset"].detail
+    assert checks["clip dim"].status == doctor.FAIL
+    assert checks["table asset_exif"].status == doctor.OK
 
 
 def test_postgres_unreachable_fails_without_raising():

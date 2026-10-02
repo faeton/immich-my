@@ -9,6 +9,15 @@
 > Source reading date: 2026-04-19. Anything flagged **GAP** was not pinned down
 > and needs verification against a live install before we rely on it.
 
+> **Immich 3.0.2 (2026-10).** The live install is now 3.0.2. The tables immy
+> writes are pinned in `immy/src/immy/data/immich_schema.json` (regenerate with
+> `immy/scripts/regen_immich_schema.py`); `tests/test_schema_contract.py` checks
+> every INSERT/UPDATE in the source against it, and `process` / `promote` /
+> `sync-offline` refuse to write if the live columns drift (`immy doctor` shows
+> the same check). Differences from the 2.7.5 tables below that matter to us:
+> `asset."deviceAssetId"` and `asset."deviceId"` are **gone**, and
+> `asset.duration` is **`integer` milliseconds** (was a `HH:MM:SS.sss` varchar).
+
 ## Abstract — Path Forward
 
 - **External-library asset rows are cheap to forge.** `checksum = sha1("path:" + absPath)`, `originalPath = absolute path as-seen-by-server`, `isExternal = true`, `libraryId` set, `checksumAlgorithm = 'sha1-path'`. No file-content hashing required, and uniqueness is `(ownerId, libraryId, checksum)`, so the path-hash IS the dedupe key. See §1, §2.
@@ -46,15 +55,15 @@ Source: `server/src/schema/tables/asset.table.ts` (see
 | Column                | Type                       | NOT NULL | Default    | For our row                           |
 |-----------------------|----------------------------|----------|------------|---------------------------------------|
 | `id`                  | uuid (generated)           | ✓        | gen_uuid   | generate client-side (v4)             |
-| `deviceAssetId`       | string                     | ✓        | —          | `basename(path).replaceAll(/\s+/, '')` |
+| ~~`deviceAssetId`~~   | string                     | ✓        | —          | **dropped in 3.x** — don't write |
 | `ownerId`             | uuid (FK users)            | ✓        | —          | primary user UUID                      |
-| `deviceId`            | string                     | ✓        | —          | `'Library Import'`                    |
+| ~~`deviceId`~~        | string                     | ✓        | —          | **dropped in 3.x** — don't write |
 | `type`                | `asset_type_enum`          | ✓        | —          | `'IMAGE'` or `'VIDEO'`                 |
 | `originalPath`        | string                     | ✓        | —          | `/mnt/external/originals/trip/DSC_4182.JPG` (normalized) |
 | `fileCreatedAt`       | timestamptz                | ✓        | —          | `stat.mtime` initially, overwritten by EXIF dateTimeOriginal |
 | `fileModifiedAt`      | timestamptz                | ✓        | —          | `stat.mtime`                           |
 | `isFavorite`          | bool                       | ✓        | false      | false                                  |
-| `duration`            | varchar                    | —        | —          | `null` for images, `"HH:MM:SS.sss"` for videos |
+| `duration`            | integer (3.x; varchar in 2.x) | —     | —          | `null` for images, milliseconds for videos (3.x) |
 | `checksum`            | bytea                      | ✓        | —          | SHA1 of `"path:" + originalPath` — **20 bytes, not hex/base64** |
 | `checksumAlgorithm`   | `asset_checksum_algorithm_enum` | ✓  | —          | `'sha1-path'` for external, `'sha1'` for upload |
 | `livePhotoVideoId`    | uuid (FK asset SET NULL)   | —        | —          | null                                   |
@@ -810,7 +819,6 @@ BEGIN;
 -- REQUIRED (1 row)
 INSERT INTO asset (
   id, ownerId, libraryId,
-  deviceAssetId, deviceId,
   type, originalPath, originalFileName,
   checksum, checksumAlgorithm,
   fileCreatedAt, fileModifiedAt, localDateTime,
@@ -821,8 +829,6 @@ INSERT INTO asset (
   $id,
   $ownerId,
   $libraryId,
-  replace($basename, ' ', ''),
-  'Library Import',
   'IMAGE',
   $originalPath,
   $basename,
@@ -898,7 +904,7 @@ write <MEDIA>/thumbs/<userId>/<id[0:2]>/<id[2:4]>/<id>_thumbnail.webp   -- 250px
 - **`checksum` must be binary 20 bytes**, not hex string. `bytea`-over-wire in most Postgres drivers is `\x<hex>` or direct Buffer in Bun/Node.
 - **`asset_file` unique is `(assetId, type, isEdited)`** — two previews with different `isEdited` are allowed. For pure ingest we always use `isEdited=false`.
 - **HEIC / RAW / WEBP sources:** Set `type='IMAGE'` — the thumbnail pipeline handles the decode. If we transcode the fullsize ourselves, also add an `asset_file(type='fullsize', format=JPEG, isEdited=false)` row.
-- **Video-specific:** set `asset.type='VIDEO'`, populate `asset.duration` (the `ffprobe` format.duration formatted as `"HH:MM:SS.sss"`). Preview is a single-frame JPEG extracted via ffmpeg.
+- **Video-specific:** set `asset.type='VIDEO'`, populate `asset.duration` (the `ffprobe` format.duration as integer milliseconds in 3.x; a `"HH:MM:SS.sss"` string in 2.x). Preview is a single-frame JPEG extracted via ffmpeg.
 - **Live photos:** pair `.HEIC` + `.MOV` via matching `livePhotoCID` in EXIF; after inserting both, set `asset.livePhotoVideoId = <video_id>` on the image and `asset.visibility = 'hidden'` on the video. The `linkLivePhotos` logic is in `metadata.service.ts`; easier to replicate its query than rebuild the heuristic.
 - **Thumbhash encoding:** the thumbhash npm library emits a `Uint8Array` of length typically 18-25 bytes; `asset.thumbhash` is `bytea`. See the `thumbhash` npm package or Bun port; must match decoder the UI uses (`thumbhash-utils`).
 

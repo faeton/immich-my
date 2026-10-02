@@ -496,3 +496,36 @@ def test_cache_library_info_roundtrip(tmp_path: Path, monkeypatch):
     offline_mod.cache_library_info(LIB)
     loaded = offline_mod.load_cached_library()
     assert loaded == LIB
+
+
+def test_replay_normalises_legacy_duration_string(tmp_path: Path):
+    """Entries cached before the Immich 3.x fix carry `duration` as an
+    `HH:MM:SS.sss` string (and the dropped device columns). Replay must
+    write integer milliseconds — int4 rejects the string."""
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    sink = offline_mod.OfflineSink(target, LIB)
+    process_mod.process_trip(target, None, LIB, sink=sink)
+    entry_path = next((target / ".audit" / "offline").glob("*.yml"))
+    data = yaml.safe_load(entry_path.read_text())
+    data["asset"]["duration"] = "00:00:12.500"
+    data["asset"]["device_asset_id"] = "DJI_0001.JPG"
+    data["asset"]["device_id"] = "Library Import"
+    entry_path.write_text(yaml.safe_dump(data, sort_keys=False))
+
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("replayed-uuid",)
+    conn.cursor.return_value = cur
+
+    summary = offline_mod.sync_trip(target, conn, library=LIB)
+    assert summary["failed"] == 0
+
+    calls = cur.execute.call_args_list
+    insert = next(c for c in calls if "INSERT INTO asset (" in c.args[0])
+    assert insert.args[1]["duration"] == 12_500
+    update = next(c for c in calls if "SET duration" in c.args[0])
+    assert update.args[1]["duration"] == 12_500
+

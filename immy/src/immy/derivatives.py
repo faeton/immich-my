@@ -143,13 +143,14 @@ class DerivativeResult:
     `duration` is non-None only for videos; surfaced so `process.py`
     can overwrite an EXIF-derived `asset.duration` with the ffprobe
     value when they disagree (ffprobe wins — it reads the container
-    directly instead of guessing from QuickTime tags).
+    directly instead of guessing from QuickTime tags). Integer
+    milliseconds — Immich 3.x's `asset.duration` is int4.
     """
 
     files: list[DerivativeFile]
     width: int | None
     height: int | None
-    duration: str | None = None
+    duration: int | None = None
 
 
 def _bucket(asset_id: str) -> tuple[str, str]:
@@ -319,7 +320,7 @@ def _video_stills_and_transcode(
     *, transcode: bool,
     derivative_source: Path | None = None,
     preproc_vf: str | None = None,
-) -> tuple[list[DerivativeFile], int, int, str | None]:
+) -> tuple[list[DerivativeFile], int, int, int | None]:
     """VIDEO branch: ffprobe → poster → two stills via pyvips (+ optional
     transcode). Returns (files, width, height, duration).
 
@@ -337,8 +338,8 @@ def _video_stills_and_transcode(
     we don't insert an `asset_file` row for it.
     """
     info = video_mod.probe(source_media)
-    duration_str = (
-        video_mod.format_duration(info.duration_s)
+    duration = (
+        video_mod.duration_ms(info.duration_s)
         if info.duration_s is not None else None
     )
 
@@ -388,7 +389,7 @@ def _video_stills_and_transcode(
             is_transparent=False,
         ))
 
-    return files, info.width, info.height, duration_str
+    return files, info.width, info.height, duration
 
 
 def _link_or_copy(src: Path, dst: Path) -> None:
@@ -409,8 +410,8 @@ def _mirror_video_derivatives(
     base: Path,
 ) -> DerivativeResult:
     info = video_mod.probe(source_media)
-    duration_str = (
-        video_mod.format_duration(info.duration_s)
+    duration = (
+        video_mod.duration_ms(info.duration_s)
         if info.duration_s is not None else None
     )
     files: list[DerivativeFile] = []
@@ -425,7 +426,7 @@ def _mirror_video_derivatives(
         ))
     return DerivativeResult(
         files=files, width=info.width, height=info.height,
-        duration=duration_str,
+        duration=duration,
     )
 
 

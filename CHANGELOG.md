@@ -4,6 +4,34 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — Immich 3.0.2 schema contract
+
+### Fixed
+
+- **`process` / `sync-offline` INSERTs failed on Immich 3.0.2.** The `asset`
+  INSERT wrote `"deviceAssetId"` and `"deviceId"`, both dropped in 3.x; every
+  new asset errored. Removed from the INSERT and from `AssetRow`.
+- **`asset.duration` is `int4` milliseconds in 3.x**, but immy wrote
+  `"HH:MM:SS.sss"` strings (initial INSERT, ffprobe UPDATE, offline replay).
+  It now writes integer ms everywhere (`video.duration_ms`); offline-cache
+  entries written before this fix are normalised on replay
+  (`video.normalize_duration_ms`).
+
+### Added
+
+- **Schema contract.** `immy/src/immy/data/immich_schema.json` snapshots every
+  table immy writes as 3.0.2 ships it (from information_schema;
+  regenerate with `immy/scripts/regen_immich_schema.py`).
+  `tests/test_schema_contract.py` extracts every INSERT/UPDATE from the source
+  and checks each column exists, that each INSERT supplies every NOT NULL
+  column without a default, and that `schema_contract.WRITE_COLUMNS` is exactly
+  what the source writes.
+- **Pre-write guard.** `process`, `promote` and `sync-offline` check the live
+  columns against that contract (missing, retyped, or newly required) and exit
+  2 with the list before writing anything. `doctor` now reports the same check
+  for all seven write tables (it used to check a hand-written subset).
+- `docs/IMMICH-INGEST.md` notes the 3.0.2 differences.
+
 ## 2026-09-23 — manifest identity (schema v4), `photos` adapter, doctor/status/prune
 
 Phase 2 of the Photos Bridge plan (`todo/PHASE2-IDENTITY-DESIGN.md`, rev 3 after

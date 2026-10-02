@@ -45,6 +45,7 @@ from . import pg as pg_mod
 from . import raw as raw_mod
 from . import sidecar as sidecar_mod
 from . import transcripts as transcripts_mod
+from . import video as video_mod
 from .derivatives import DerivativeFile
 from .exif import ExifRow, MEDIA_EXTS, read_folder
 from .heartbeat import Heartbeat
@@ -170,10 +171,8 @@ def _str(raw: Any) -> str | None:
 @dataclass
 class AssetRow:
     id: str
-    device_asset_id: str
     owner_id: str
     library_id: str
-    device_id: str
     asset_type: str  # 'IMAGE' | 'VIDEO'
     original_path: str
     original_file_name: str
@@ -181,7 +180,7 @@ class AssetRow:
     file_created_at: datetime
     file_modified_at: datetime
     local_date_time: datetime
-    duration: str | None
+    duration: int | None  # milliseconds — Immich 3.x `asset.duration` is int4
     # Populated after derivative gen (Y.2). Written via UPDATE, not the
     # initial INSERT, because we don't decode the image until derivatives
     # run. Immich's viewer reads these for intrinsic fullscreen dims.
@@ -233,20 +232,16 @@ def build_rows(
     file_created_at = _to_utc(best_dt) if best_dt is not None else mtime_utc
     local_date_time = file_created_at
 
-    duration: str | None = None
+    duration: int | None = None
     if asset_type == "VIDEO":
         d = _float(exif_row.get("QuickTime:Duration", "Composite:Duration"))
         if d is not None and d > 0:
-            h, rem = divmod(d, 3600)
-            m, s = divmod(rem, 60)
-            duration = f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+            duration = video_mod.duration_ms(d)
 
     asset = AssetRow(
         id=asset_id,
-        device_asset_id=basename.replace(" ", ""),
         owner_id=library.owner_id,
         library_id=library.id,
-        device_id="Library Import",
         asset_type=asset_type,
         original_path=cpath,
         original_file_name=basename,
@@ -319,12 +314,12 @@ def build_rows(
 
 _INSERT_ASSET = """
 INSERT INTO asset (
-  id, "deviceAssetId", "ownerId", "deviceId", type,
+  id, "ownerId", type,
   "originalPath", "originalFileName", checksum, "checksumAlgorithm",
   "fileCreatedAt", "fileModifiedAt", "localDateTime",
   duration, "libraryId", "isExternal"
 ) VALUES (
-  %(id)s, %(device_asset_id)s, %(owner_id)s, %(device_id)s, %(asset_type)s,
+  %(id)s, %(owner_id)s, %(asset_type)s,
   %(original_path)s, %(original_file_name)s, %(checksum)s, 'sha1-path',
   %(file_created_at)s, %(file_modified_at)s, %(local_date_time)s,
   %(duration)s, %(library_id)s, true
@@ -427,9 +422,9 @@ def update_exif_description(
 
 
 def update_asset_duration(
-    conn: psycopg.Connection, asset_id: str, duration: str,
+    conn: psycopg.Connection, asset_id: str, duration: int,
 ) -> None:
-    """Overwrite `asset.duration` with the ffprobe value.
+    """Overwrite `asset.duration` (integer ms) with the ffprobe value.
 
     The initial INSERT guesses duration from `QuickTime:Duration` when
     ExifTool surfaces it, but some containers (.mts, .avi, repaired

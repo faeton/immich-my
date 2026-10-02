@@ -34,22 +34,6 @@ CLIP_DIMS = {
     "nllb-clip-base-siglip__v1": 768,
 }
 
-# Columns `process` writes directly (Phase Y). An Immich upgrade that renames
-# one turns every insert into an error mid-run; better to find out here.
-DIRECT_WRITE_COLUMNS = {
-    "asset": (
-        "ownerId", "libraryId", "deviceAssetId", "deviceId", "originalPath",
-        "originalFileName", "fileCreatedAt", "fileModifiedAt", "localDateTime",
-        "isExternal", "checksumAlgorithm",
-    ),
-    "asset_exif": (
-        "assetId", "dateTimeOriginal", "modifyDate", "timeZone",
-        "exifImageWidth", "exifImageHeight", "fileSizeInByte",
-        "fNumber", "focalLength", "exposureTime", "lensModel",
-    ),
-    "smart_search": ("assetId", "embedding"),
-}
-
 BINARIES = ("exiftool", "ffmpeg", "ffprobe")
 
 
@@ -179,20 +163,17 @@ def check_postgres(config: Config, connect=None) -> list[Check]:
 
 
 def _check_columns(conn) -> list[Check]:
+    """Every table/column immy writes directly, against the live DB — the
+    same contract `process` / `promote` enforce before writing
+    (`schema_contract.WRITE_COLUMNS`)."""
+    from . import schema_contract
+
     checks = []
-    for table, wanted in DIRECT_WRITE_COLUMNS.items():
-        rows = conn.execute(
-            "SELECT column_name FROM information_schema.columns WHERE table_name = %s",
-            (table,),
-        ).fetchall()
-        have = {r[0] for r in rows}
-        if not have:
-            checks.append(Check(f"table {table}", FAIL, "missing"))
-            continue
-        missing = [c for c in wanted if c not in have]
+    for table, problems in schema_contract.live_schema_problems(conn).items():
+        wanted = len(schema_contract.WRITE_COLUMNS[table])
         checks.append(
-            Check(f"table {table}", FAIL, f"missing columns: {', '.join(missing)}") if missing
-            else Check(f"table {table}", OK, f"{len(wanted)} direct-write columns present")
+            Check(f"table {table}", FAIL, "; ".join(problems)) if problems
+            else Check(f"table {table}", OK, f"{wanted} direct-write columns present")
         )
     return checks
 

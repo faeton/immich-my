@@ -107,11 +107,9 @@ def test_build_rows_dji_fixture_populates_exif(tmp_path: Path):
 
     assert asset.owner_id == "owner-1"
     assert asset.library_id == "lib-1"
-    assert asset.device_id == "Library Import"
     assert asset.asset_type == "IMAGE"
     assert asset.original_path == f"/mnt/external/originals/{target.name}/DJI_0001.JPG"
     assert asset.original_file_name == "DJI_0001.JPG"
-    assert asset.device_asset_id == "DJI_0001.JPG"
     assert len(asset.checksum) == 20
     assert asset.checksum == hashlib.sha1(
         f"path:{asset.original_path}".encode()
@@ -130,15 +128,33 @@ def test_build_rows_dji_fixture_populates_exif(tmp_path: Path):
     assert exif.exif_image_height == 1
 
 
-def test_build_rows_deviceassetid_strips_spaces(tmp_path: Path):
+def test_build_rows_keeps_original_file_name(tmp_path: Path):
     trip = tmp_path / "t"
     trip.mkdir()
     f = trip / "GP Temp Download.jpg"
     f.write_bytes(b"x")
     rows = read_folder(trip)
     asset, _ = process_mod.build_rows(f, trip, rows[0], LIB)
-    assert asset.device_asset_id == "GPTempDownload.jpg"
     assert asset.original_file_name == "GP Temp Download.jpg"
+
+
+def test_asset_row_has_no_columns_immich_3_dropped(tmp_path: Path):
+    # Immich 3.0.2 has no asset."deviceAssetId" / "deviceId"; inserting
+    # them fails every row.
+    fields = set(process_mod.AssetRow.__dataclass_fields__)
+    assert not fields & {"device_asset_id", "device_id"}
+
+
+def test_build_rows_video_duration_is_integer_ms(tmp_path: Path):
+    from immy.exif import ExifRow
+
+    trip = tmp_path / "t"
+    trip.mkdir()
+    f = trip / "clip.mp4"
+    f.write_bytes(b"x")
+    row = ExifRow(path=f, raw={"QuickTime:Duration": 12.5})
+    asset, _ = process_mod.build_rows(f, trip, row, LIB)
+    assert asset.duration == 12_500
 
 
 def test_build_rows_uuid_is_unique(tmp_path: Path):
@@ -996,3 +1012,32 @@ def test_caption_fill_missing_falls_through_on_empty_prior(tmp_path: Path, monke
 
     assert called["n"] == 1  # blank prior → re-captioned, not kept
     assert results[0].caption["text"] == "NEW"
+
+
+def _schema_mismatch(conn):
+    from immy import schema_contract
+    raise schema_contract.SchemaMismatch("asset: missing columns: duration\nRefusing to write.")
+
+
+@pytest.mark.parametrize("argv", [["process"], ["sync-offline"]])
+def test_cli_aborts_before_writing_on_live_schema_mismatch(
+    argv, config_full, tmp_path, monkeypatch,
+):
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    if argv == ["sync-offline"]:  # needs a pending entry to get as far as pg
+        from immy import offline as offline_mod
+        sink = offline_mod.OfflineSink(target, LIB)
+        process_mod.process_trip(target, None, LIB, sink=sink)
+    fake_conn = MagicMock()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: fake_conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda conn, lib_id: LIB)
+    monkeypatch.setattr("immy.schema_contract.assert_live_schema", _schema_mismatch)
+
+    result = runner.invoke(app, [*argv, str(target)])
+
+    assert result.exit_code == 2, result.stdout
+    assert "Refusing to write" in result.stdout
+    fake_conn.cursor.assert_not_called()
+    fake_conn.commit.assert_not_called()
+    assert not (target / ".audit" / "y_processed.yml").exists()

@@ -1,0 +1,627 @@
+{
+  "immich_version": "3.0.2",
+  "latest_migration": "1782414436633-AddPluginMethodAllowedHosts",
+  "generated_by": "immy/scripts/regen_immich_schema.py",
+  "tables": {
+    "asset": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "ownerId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "type": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "originalPath": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "fileCreatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "fileModifiedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "isFavorite": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "duration": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "checksum": {
+        "data_type": "bytea",
+        "udt_name": "bytea",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "livePhotoVideoId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "originalFileName": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "thumbhash": {
+        "data_type": "bytea",
+        "udt_name": "bytea",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "isOffline": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "libraryId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "isExternal": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "deletedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "localDateTime": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "stackId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "duplicateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "status": {
+        "data_type": "USER-DEFINED",
+        "udt_name": "assets_status_enum",
+        "is_nullable": false,
+        "column_default": "'active'::assets_status_enum"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      },
+      "visibility": {
+        "data_type": "USER-DEFINED",
+        "udt_name": "asset_visibility_enum",
+        "is_nullable": false,
+        "column_default": "'timeline'::asset_visibility_enum"
+      },
+      "width": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "height": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "isEdited": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "checksumAlgorithm": {
+        "data_type": "USER-DEFINED",
+        "udt_name": "asset_checksum_algorithm_enum",
+        "is_nullable": false,
+        "column_default": null
+      }
+    },
+    "asset_exif": {
+      "assetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "make": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "model": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "exifImageWidth": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "exifImageHeight": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "fileSizeInByte": {
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "orientation": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "dateTimeOriginal": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "modifyDate": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "lensModel": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "fNumber": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "focalLength": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "iso": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "latitude": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "longitude": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "city": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "state": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "country": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "description": {
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": false,
+        "column_default": "''::text"
+      },
+      "fps": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "exposureTime": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "livePhotoCID": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "timeZone": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "projectionType": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "profileDescription": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "colorspace": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "bitsPerSample": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "autoStackId": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "rating": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "clock_timestamp()"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      },
+      "lockedProperties": {
+        "data_type": "ARRAY",
+        "udt_name": "_varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "tags": {
+        "data_type": "ARRAY",
+        "udt_name": "_varchar",
+        "is_nullable": true,
+        "column_default": null
+      }
+    },
+    "asset_face": {
+      "assetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "personId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "imageWidth": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "imageHeight": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "boundingBoxX1": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "boundingBoxY1": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "boundingBoxX2": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "boundingBoxY2": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "sourceType": {
+        "data_type": "USER-DEFINED",
+        "udt_name": "sourcetype",
+        "is_nullable": false,
+        "column_default": "'machine-learning'::sourcetype"
+      },
+      "deletedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      },
+      "isVisible": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "true"
+      }
+    },
+    "asset_file": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "assetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "type": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "path": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      },
+      "isEdited": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "isProgressive": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "isTransparent": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      }
+    },
+    "face_search": {
+      "faceId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "embedding": {
+        "data_type": "USER-DEFINED",
+        "udt_name": "vector",
+        "is_nullable": false,
+        "column_default": null
+      }
+    },
+    "person": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "ownerId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "name": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "''::character varying"
+      },
+      "thumbnailPath": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "''::character varying"
+      },
+      "isHidden": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "birthDate": {
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "faceAssetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "isFavorite": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "color": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      }
+    },
+    "smart_search": {
+      "assetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "embedding": {
+        "data_type": "USER-DEFINED",
+        "udt_name": "vector",
+        "is_nullable": false,
+        "column_default": null
+      }
+    }
+  }
+}

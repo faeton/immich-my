@@ -59,6 +59,7 @@ offline_mod = _LazyModule("offline")
 process_mod = _LazyModule("process")
 promote_mod = _LazyModule("promote")
 pg_mod = _LazyModule("pg")
+schema_contract_mod = _LazyModule("schema_contract")
 similar_mod = _LazyModule("similar")
 snapshot_mod = _LazyModule("snapshot")
 srt_mod = _LazyModule("srt")
@@ -544,6 +545,32 @@ def audit(
                 console.print(f"  {k}: {v}")
 
 
+def _require_live_schema(conn) -> None:
+    """Abort (exit 2) before any direct DB write if the live Immich schema
+    has drifted from what immy writes — see `schema_contract`."""
+    try:
+        schema_contract_mod.assert_live_schema(conn)
+    except schema_contract_mod.SchemaMismatch as e:
+        console.print(str(e), style="red", markup=False, highlight=False)
+        conn.close()
+        raise typer.Exit(code=2)
+
+
+def _promote_schema_preflight(config) -> None:
+    """`promote` writes `asset_file` rows, offline-cache replays and asset
+    un-trash UPDATEs, each over its own connection that degrades softly when
+    Postgres is down. Check the schema once, up front, before any rsync. An
+    unreachable DB is left to those steps to report."""
+    if config.pg is None or config.immich is None:
+        return
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception:  # noqa: BLE001 — the write steps surface connectivity
+        return
+    _require_live_schema(conn)
+    conn.close()
+
+
 def _promote_impl(
     folder: Path,
     dry_run: bool,
@@ -585,6 +612,9 @@ def _promote_impl(
             "Run `immy audit --write` first, or pass --force."
         )
         raise typer.Exit(code=1)
+
+    if not dry_run:
+        _promote_schema_preflight(config)
 
     client: ImmichClient | None = None
     if config.immich is not None and not dry_run:
@@ -1640,6 +1670,7 @@ def process(
                 "with [bold]--offline[/bold] to cache work locally; sync later."
             )
             raise typer.Exit(code=2)
+        _require_live_schema(conn)
         try:
             shared_library = pg_mod.fetch_library_info(conn, config.immich.library_id)
         except LookupError as e:
@@ -1889,6 +1920,7 @@ def sync_offline(
     except Exception as e:
         console.print(f"[red]pg connect failed:[/red] {e}")
         raise typer.Exit(code=2)
+    _require_live_schema(conn)
 
     try:
         library = pg_mod.fetch_library_info(conn, config.immich.library_id)

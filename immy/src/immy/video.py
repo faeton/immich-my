@@ -30,6 +30,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 
 POSTER_SEEK_CAP_SEC = 5.0  # don't seek deeper than this for the poster
@@ -154,15 +155,33 @@ def probe(path: Path) -> VideoInfo:
     )
 
 
-def format_duration(seconds: float) -> str:
-    """Render ffprobe seconds as Immich's `HH:MM:SS.sss` string — the
-    format `asset.duration` expects. We zero-pad all three fields so
-    ORDER BY on the text column sorts correctly."""
-    if seconds < 0:
-        seconds = 0.0
-    h, rem = divmod(seconds, 3600)
-    m, s = divmod(rem, 60)
-    return f"{int(h):02d}:{int(m):02d}:{s:06.3f}"
+def duration_ms(seconds: float) -> int:
+    """ffprobe seconds → Immich's `asset.duration`: integer milliseconds
+    (int4 since Immich 3.x; it was an `HH:MM:SS.sss` varchar before)."""
+    return max(0, round(seconds * 1000))
+
+
+def normalize_duration_ms(raw: Any) -> int | None:
+    """Coerce a stored duration to integer milliseconds.
+
+    Offline-cache entries written before the Immich 3.x fix hold the old
+    `H:MM:SS(.fff)` string; newer ones hold an int. Anything unparseable
+    becomes None (the column is nullable and Immich's metadata extraction
+    fills it) rather than failing the whole asset's replay."""
+    if raw is None or isinstance(raw, bool):
+        return None
+    if isinstance(raw, (int, float)):
+        return max(0, round(raw))
+    text = str(raw).strip()
+    if not text:
+        return None
+    try:
+        if ":" not in text:
+            return max(0, round(float(text)))
+        h, m, s = text.split(":")
+        return duration_ms(int(h) * 3600 + int(m) * 60 + float(s))
+    except ValueError:
+        return None
 
 
 def needs_transcode(info: VideoInfo) -> bool:
@@ -265,7 +284,7 @@ def transcode(src: Path, dst: Path, *, preproc_vf: str | None = None) -> None:
 
 __all__ = [
     "VideoInfo", "VideoProbeError", "VideoTranscodeError",
-    "probe", "format_duration", "needs_transcode",
+    "probe", "duration_ms", "normalize_duration_ms", "needs_transcode",
     "extract_poster", "transcode",
     "POSTER_SEEK_CAP_SEC", "TRANSCODE_TARGET_HEIGHT",
 ]
