@@ -446,7 +446,7 @@ def test_process_trip_with_clip_upserts_smart_search(tmp_path: Path, monkeypatch
 
     results = process_mod.process_trip(
         target, conn, LIB,
-        compute_derivatives=True, compute_clip=True,
+        compute_derivatives=True, compute_clip=True, allow_mlx_clip=True,
     )
 
     assert len(results) == 1
@@ -490,7 +490,7 @@ def test_process_trip_clip_requires_derivatives(tmp_path: Path):
     with pytest.raises(ValueError, match="compute_derivatives"):
         process_mod.process_trip(
             target, conn, LIB,
-            compute_derivatives=False, compute_clip=True,
+            compute_derivatives=False, compute_clip=True, allow_mlx_clip=True,
         )
 
 
@@ -519,7 +519,7 @@ def test_process_trip_clip_dim_mismatch_soft_skips_by_default(tmp_path: Path, mo
 
     results = process_mod.process_trip(
         target, conn, LIB,
-        compute_derivatives=True, compute_clip=True,
+        compute_derivatives=True, compute_clip=True, allow_mlx_clip=True,
     )
     assert results[0].clip_embedded is False  # soft skip
     # upsert never ran
@@ -552,7 +552,7 @@ def test_process_trip_clip_dim_mismatch_raises_when_requested(tmp_path: Path, mo
     with pytest.raises(RuntimeError, match="CLIP dim mismatch"):
         process_mod.process_trip(
             target, conn, LIB,
-            compute_derivatives=True, compute_clip=True,
+            compute_derivatives=True, compute_clip=True, allow_mlx_clip=True,
             on_clip_error="raise",
         )
 

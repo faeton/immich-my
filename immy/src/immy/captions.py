@@ -39,6 +39,7 @@ non-`AI:`-prefixed descriptions are never clobbered — user text wins.
 from __future__ import annotations
 
 import base64
+import email.utils
 import hashlib
 import json
 import os
@@ -47,6 +48,7 @@ import re
 import time
 import urllib.error
 import urllib.request
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -244,14 +246,33 @@ BACKOFF_CAP_S = 30.0
 RETRY_AFTER_CAP_S = 120.0
 
 
-def _retry_delay(attempt: int, retry_after: str | None) -> float:
-    """Seconds to wait before retry number `attempt` (1-based): honour a
-    numeric `Retry-After`, else exponential backoff with full-ish jitter."""
-    if retry_after:
-        try:
-            return max(0.0, min(float(retry_after), RETRY_AFTER_CAP_S))
-        except ValueError:
-            pass
+def _parse_retry_after(value: str | None) -> float | None:
+    """Seconds a `Retry-After` header asks for (delta-seconds or HTTP-date),
+    or None when absent/unparseable."""
+    if not value:
+        return None
+    value = value.strip()
+    try:
+        return max(0.0, float(value))
+    except ValueError:
+        pass
+    try:
+        when = email.utils.parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _retry_delay(attempt: int, retry_after: str | None) -> float | None:
+    """Seconds to wait before retry number `attempt` (1-based). A server
+    `Retry-After` is honoured exactly (never retry earlier); if it asks for
+    more than RETRY_AFTER_CAP_S, returns None = give up. Otherwise
+    exponential backoff with jitter."""
+    asked = _parse_retry_after(retry_after)
+    if asked is not None:
+        return None if asked > RETRY_AFTER_CAP_S else asked
     base = min(BACKOFF_CAP_S, BACKOFF_BASE_S * (2 ** (attempt - 1)))
     return base * (0.5 + random.random() / 2)
 
@@ -314,7 +335,12 @@ def _post_json(
             if attempt == MAX_ATTEMPTS:
                 raise CaptionError(
                     f"{e} (after {MAX_ATTEMPTS} attempts)") from e
-            (sleep or _sleep)(_retry_delay(attempt, e.retry_after))
+            delay = _retry_delay(attempt, e.retry_after)
+            if delay is None:
+                raise CaptionError(
+                    f"{e} (Retry-After {e.retry_after!r} exceeds "
+                    f"{RETRY_AFTER_CAP_S:.0f}s; not retrying)") from e
+            (sleep or _sleep)(delay)
     raise AssertionError("unreachable")  # pragma: no cover
 
 

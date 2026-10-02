@@ -244,7 +244,7 @@ def test_clip_sql_failure_is_contained_and_not_journaled(tmp_path, ml_stubs):
     conn = FakePgConn(fail_on=("INSERT INTO smart_search",))
 
     results = process_mod.process_trip(
-        trip, conn, LIB, compute_derivatives=True, compute_clip=True)
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
 
     assert results[0].clip_embedded is False
     inserted = conn.committed_sql("INSERT INTO asset (")
@@ -285,7 +285,7 @@ def test_commit_failure_leaves_no_journal_marks(tmp_path, ml_stubs):
 
     with pytest.raises(Exception) as ei:
         process_mod.process_trip(
-            trip, conn, LIB, compute_derivatives=True, compute_clip=True)
+            trip, conn, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
     assert "DJI_0001.JPG" in str(ei.value)
 
     j = Journal.load(trip)
@@ -332,7 +332,7 @@ def test_journal_marks_promoted_after_successful_commit(tmp_path, ml_stubs):
     trip = _trip(tmp_path)
     conn = FakePgConn()
     process_mod.process_trip(
-        trip, conn, LIB, compute_derivatives=True, compute_clip=True)
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
     cs = _cs(trip).hex()
     j = Journal.load(trip)
     assert j.is_done(cs, "ingest", "v1")
@@ -354,7 +354,7 @@ def test_db_asset_id_wins_over_stale_journal_id(tmp_path, ml_stubs):
     msgs: list[str] = []
 
     results = process_mod.process_trip(
-        trip, conn, LIB, compute_derivatives=True, compute_clip=True,
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True,
         progress=msgs.append)
 
     assert results[0].asset_id == "db-row-id"
@@ -393,13 +393,13 @@ def test_reinserted_row_does_not_trust_cached_phases(tmp_path, ml_stubs):
     trip = _trip(tmp_path)
     conn = FakePgConn()
     process_mod.process_trip(
-        trip, conn, LIB, compute_derivatives=True, compute_clip=True)
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
     assert ml_stubs == {"derivatives": 1, "clip": 1}
 
     # Same journal + staged files, but the DB lost the row.
     conn2 = FakePgConn()
     results = process_mod.process_trip(
-        trip, conn2, LIB, compute_derivatives=True, compute_clip=True)
+        trip, conn2, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
 
     assert results[0].inserted is True
     assert ml_stubs == {"derivatives": 2, "clip": 2}
@@ -410,11 +410,11 @@ def test_existing_row_keeps_cached_phases(tmp_path, ml_stubs):
     trip = _trip(tmp_path)
     conn = FakePgConn()
     process_mod.process_trip(
-        trip, conn, LIB, compute_derivatives=True, compute_clip=True)
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
 
     conn2 = FakePgConn(existing=dict(conn.rows))
     results = process_mod.process_trip(
-        trip, conn2, LIB, compute_derivatives=True, compute_clip=True)
+        trip, conn2, LIB, compute_derivatives=True, compute_clip=True, allow_mlx_clip=True)
     assert results[0].inserted is False
     assert results[0].clip_embedded is True
     assert ml_stubs == {"derivatives": 1, "clip": 1}
@@ -490,7 +490,7 @@ def test_offline_failed_phase_not_journaled(tmp_path, ml_stubs, monkeypatch):
 
     process_mod.process_trip(
         trip, None, LIB, sink=sink, compute_derivatives=True,
-        compute_clip=True)
+        compute_clip=True, allow_mlx_clip=True)
 
     cs = _cs(trip).hex()
     j = Journal.load(trip)

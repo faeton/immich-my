@@ -717,7 +717,7 @@ def process_trip(
     clip_model: str = clip_mod.DEFAULT_MODEL,
     clip_backend: str = "mlx",
     clip_endpoint: str | None = None,
-    allow_mlx_clip: bool = True,  # library default permissive; the CLI passes the user's choice (default False)
+    allow_mlx_clip: bool = False,
     faces_model: str = faces_mod.DEFAULT_MODEL,
     transcript_model: str = transcripts_mod.DEFAULT_MODEL,
     transcript_prompt: str | None = None,
@@ -807,6 +807,11 @@ def process_trip(
             )
         except Exception as e:  # noqa: BLE001 — can't verify → don't write
             _guard = f"could not read Immich's CLIP model ({e}); refusing smart_search writes"
+        if not _guard:
+            _set_prov = getattr(sink, "set_clip_provenance", None)
+            if _set_prov is not None:
+                _set_prov(model=clip_model, backend=clip_backend,
+                          allow_mlx=allow_mlx_clip)
         if _guard:
             if progress is not None:
                 progress(f"  CLIP disabled: {_guard}")
@@ -1357,13 +1362,26 @@ def process_trip(
                 or (asset.asset_type == "VIDEO" and caption_preview is not None)
             )
         )
+        prior_caption = (
+            sink.caption_info(asset.id)
+            if caption_eligible
+            else None
+        )
         # A prompt/max_tokens/extra_body change since the cached caption was
         # made forces a re-caption of just this asset, like `--recaption`.
         _prompt_changed = (
             caption_eligible and not recaption
-            and caption_prompt_changed(
-                journal.get(cs_hex, "caption"),
-                captioner_config.model, CAPTION_PROMPT_HASH)
+            and (
+                caption_prompt_changed(
+                    journal.get(cs_hex, "caption"),
+                    captioner_config.model, CAPTION_PROMPT_HASH)
+                # offline cache carries the hash in its meta, journal or not
+                or bool(
+                    prior_caption
+                    and prior_caption.get("prompt_hash")
+                    and prior_caption["prompt_hash"] != CAPTION_PROMPT_HASH
+                )
+            )
         )
         force_caption = recaption or _prompt_changed
         # Caption journal-skip path — strongest signal, used in addition
@@ -1393,13 +1411,9 @@ def process_trip(
         # whose YAML already carries `caption.model == current_model` —
         # this is how a Ctrl-C'd overnight Gemma run resumes in place
         # instead of re-captioning thousands of images at 9.5 s each.
-        prior_caption = (
-            sink.caption_info(asset.id)
-            if caption_eligible
-            else None
-        )
         if (
             prior_caption
+            and not force_caption
             and captioner_config is not None
             and prior_caption.get("model") == captioner_config.model
         ):

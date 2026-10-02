@@ -564,6 +564,7 @@ def test_sync_trip_drains_cache_under_nas_offline_root(tmp_path: Path, monkeypat
     sink = offline_mod.OfflineSink(
         target, LIB, offline_root=paths.offline_dir, clip_dim=4)
     results = process_mod.process_trip(target, None, LIB, sink=sink, paths=paths)
+    sink.set_clip_provenance(model="ViT-B-32__openai", backend="onnx", allow_mlx=False)
     sink.upsert_clip(results[0].asset_id, [0.1, 0.2, 0.3, 0.4], "[...]")
     assert not (target / ".audit" / "offline").exists()
 
@@ -573,10 +574,13 @@ def test_sync_trip_drains_cache_under_nas_offline_root(tmp_path: Path, monkeypat
     upserts = []
     monkeypatch.setattr(offline_mod.pg_mod, "upsert_smart_search",
                         lambda conn, aid, lit: upserts.append(aid))
+    monkeypatch.setattr(offline_mod.pg_mod, "fetch_immich_clip_model",
+                        lambda c: "ViT-B-32__openai")
     conn, _ = _replay_conn()
     summary = offline_mod.sync_trip(
         target, conn, library=LIB, offline_root=paths.offline_dir)
-    assert summary == {"total": 1, "synced": 1, "skipped": 0, "failed": 0}
+    assert summary == {"total": 1, "synced": 1, "skipped": 0, "failed": 0,
+                       "clip_refused": 0}
     assert upserts == ["replayed-uuid"]
     data = yaml.safe_load(entries[0][0].read_text())
     assert data["synced"] is True

@@ -164,7 +164,8 @@ def test_caption_prompt_changed_rules():
     assert not f({"version": "caption:other@bbbbbbbb"}, "m", "aaaaaaaa")  # model bump
 
 
-def _caption_run(tmp_path, monkeypatch, entry_version, entry_meta_extra, cfg):
+def _caption_run(tmp_path, monkeypatch, entry_version, entry_meta_extra, cfg,
+                 db_description="AI: old text"):
     from immy import exif as exif_mod
     from immy import offline as offline_mod
     from immy.derivatives import DerivativeFile, DerivativeResult
@@ -196,7 +197,7 @@ def _caption_run(tmp_path, monkeypatch, entry_version, entry_meta_extra, cfg):
         return MagicMock(text="fresh caption text", model=config.model,
                          prompt_tokens=1, completion_tokens=2)
     monkeypatch.setattr("immy.process.captions_mod.caption", _fake)
-    monkeypatch.setattr(offline_mod.PgSink, "get_description", lambda self, a: "AI: old text")
+    monkeypatch.setattr(offline_mod.PgSink, "get_description", lambda self, a: db_description)
     rows = exif_mod.read_folder(target)
     asset, _ = process_mod.build_rows(rows[0].path, target, rows[0], LIB)
     cs = asset.checksum.hex()
@@ -220,7 +221,9 @@ def test_prompt_change_recaptions_even_with_ai_description(tmp_path, monkeypatch
 
 
 def test_legacy_entry_without_hash_is_not_recaptioned(tmp_path, monkeypatch):
-    n, res = _caption_run(tmp_path, monkeypatch, "caption:g", {}, CFG)
+    # no DB AI-prefix fallback: only the journal can explain "not recaptioned"
+    n, res = _caption_run(tmp_path, monkeypatch, "caption:g", {}, CFG,
+                          db_description=None)
     assert n == 0
     assert res.caption["text"] == "old text"
 
@@ -318,3 +321,155 @@ def test_config_allow_mlx_clip_parsed(tmp_path):
     p = tmp_path / "c.yml"
     p.write_text("ml:\n  allow_mlx_clip: true\n", encoding="utf-8")
     assert config.load(p).ml.allow_mlx_clip is True
+
+
+def test_process_trip_omitting_allow_mlx_clip_refuses_mlx(tmp_path, monkeypatch):
+    from immy.derivatives import DerivativeFile, DerivativeResult
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("uuid-x",)
+    conn.cursor.return_value = cur
+    preview = tmp_path / "p.jpeg"
+    preview.write_bytes(b"fake")
+    monkeypatch.setattr("immy.process.pg_mod.fetch_smart_search_dim", lambda c: 4)
+    monkeypatch.setattr("immy.offline.pg_mod.fetch_immich_clip_model",
+                        lambda c: "ViT-B-32__openai")
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: DerivativeResult(files=[DerivativeFile(
+            kind="preview", staged_path=preview, relative_path="t/p.jpeg",
+            is_progressive=True, is_transparent=False)], width=1, height=1))
+    monkeypatch.setattr("immy.process.clip_mod.embed", lambda *a, **k: [0.1, 0.2, 0.3, 0.4])
+    res = process_mod.process_trip(target, conn, LIB, compute_derivatives=True,
+                                   compute_clip=True)  # backend defaults to mlx
+    assert res[0].clip_embedded is False
+    assert not any("INSERT INTO smart_search" in c.args[0] for c in cur.execute.call_args_list)
+
+
+# --- Retry-After ---------------------------------------------------------
+
+
+def test_retry_after_http_date_honoured():
+    from email.utils import format_datetime
+    from datetime import datetime, timedelta, timezone
+    when = format_datetime(datetime.now(timezone.utc) + timedelta(seconds=40), usegmt=True)
+    sleeps: list[float] = []
+    _post([_http_error(503, {"Retry-After": when}), _Resp(b"{}")], sleeps)
+    assert len(sleeps) == 1 and 35 <= sleeps[0] <= 40
+
+
+def test_retry_after_over_cap_fails_without_sleeping():
+    sleeps: list[float] = []
+    with patch("immy.captions.urllib.request.urlopen",
+               side_effect=[_http_error(429, {"Retry-After": "600"}), _Resp(b"{}")]) as m:
+        with pytest.raises(captions.CaptionError, match="exceeds"):
+            captions._post_json("http://x", {}, api_key=None, timeout_s=1,
+                                sleep=sleeps.append)
+    assert m.call_count == 1 and sleeps == []
+
+
+def test_retry_after_between_backoff_and_cap_not_shortened():
+    sleeps: list[float] = []
+    _post([_http_error(429, {"Retry-After": "90"}), _Resp(b"{}")], sleeps)
+    assert sleeps == [90.0]
+
+
+# --- offline caption cache + deferred CLIP replay ------------------------
+
+
+def test_offline_prior_caption_with_other_hash_is_regenerated(tmp_path, monkeypatch):
+    from immy import offline as offline_mod
+    from immy.derivatives import DerivativeFile, DerivativeResult
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    preview = tmp_path / "p.jpeg"
+    preview.write_bytes(b"fake")
+    monkeypatch.setattr(
+        "immy.process.derivatives_mod.compute_for_asset",
+        lambda **kw: DerivativeResult(files=[DerivativeFile(
+            kind="preview", staged_path=preview, relative_path="t/p.jpeg",
+            is_progressive=True, is_transparent=False)], width=1, height=1))
+    calls = {"n": 0}
+
+    def _fake(media, *, config, preview=None, context=None):
+        calls["n"] += 1
+        return MagicMock(text="brand new caption text", model=config.model,
+                         prompt_tokens=1, completion_tokens=1)
+    monkeypatch.setattr("immy.process.captions_mod.caption", _fake)
+    root = tmp_path / "off"
+    sink = offline_mod.OfflineSink(target, LIB, offline_root=root, clip_dim=4)
+    kw = dict(compute_derivatives=True, compute_captions=True, sink=sink)
+    process_mod.process_trip(target, None, LIB, captioner_config=CFG, **kw)
+    assert calls["n"] == 1
+    # same prompt: offline cache reused
+    process_mod.process_trip(target, None, LIB, captioner_config=CFG, **kw)
+    assert calls["n"] == 1
+    # prompt changed: regenerated and stored under the new hash
+    cfg2 = captions.CaptionerConfig(endpoint="http://x", model="g", prompt="other", max_tokens=64)
+    process_mod.process_trip(target, None, LIB, captioner_config=cfg2, **kw)
+    assert calls["n"] == 2
+    entry = next(iter(offline_mod.iter_entries(target, offline_root=root)))[1]
+    assert entry["caption"]["prompt_hash"] == captions.prompt_hash(cfg2)
+
+
+def _sync_with_clip(tmp_path, monkeypatch, provenance, immich_model):
+    import numpy as np
+    from immy import offline as offline_mod
+    target = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", target)
+    root = tmp_path / "off"
+    sink = offline_mod.OfflineSink(target, LIB, offline_root=root, clip_dim=4)
+    res = process_mod.process_trip(target, None, LIB, sink=sink)
+    if provenance is not None:
+        sink.set_clip_provenance(**provenance)
+    sink.upsert_clip(res[0].asset_id, [0.1, 0.2, 0.3, 0.4], "[...]")
+    upserts: list[str] = []
+    monkeypatch.setattr(offline_mod.pg_mod, "upsert_smart_search",
+                        lambda c, a, l: upserts.append(a))
+    monkeypatch.setattr(offline_mod.pg_mod, "fetch_immich_clip_model", lambda c: immich_model)
+    conn = MagicMock()
+    cur = MagicMock()
+    cur.__enter__.return_value = cur
+    cur.__exit__.return_value = False
+    cur.fetchone.return_value = ("replayed-uuid",)
+    conn.cursor.return_value = cur
+    summary = offline_mod.sync_trip(target, conn, library=LIB, offline_root=root)
+    return summary, upserts
+
+
+OK_PROV = dict(model="ViT-B-32__openai", backend="onnx", allow_mlx=False)
+
+
+def test_sync_writes_clip_when_provenance_matches(tmp_path, monkeypatch):
+    summary, ups = _sync_with_clip(tmp_path, monkeypatch, OK_PROV, "ViT-B-32__openai")
+    assert ups == ["replayed-uuid"] and summary["clip_refused"] == 0
+
+
+def test_sync_refuses_equal_dim_model_mismatch(tmp_path, monkeypatch):
+    # ViT-B-16 is also 512-dim: dimension alone can't catch this.
+    summary, ups = _sync_with_clip(tmp_path, monkeypatch,
+                                   {**OK_PROV, "model": "ViT-B-16__openai"},
+                                   "ViT-B-32__openai")
+    assert ups == [] and summary["clip_refused"] == 1 and summary["synced"] == 1
+
+
+def test_sync_refuses_legacy_payload_without_provenance(tmp_path, monkeypatch):
+    summary, ups = _sync_with_clip(tmp_path, monkeypatch, None, "ViT-B-32__openai")
+    assert ups == [] and summary["clip_refused"] == 1 and summary["synced"] == 1
+
+
+def test_sync_refuses_mlx_not_allowed_but_accepts_allowed(tmp_path, monkeypatch):
+    s, ups = _sync_with_clip(tmp_path, monkeypatch,
+                             {**OK_PROV, "backend": "mlx"}, "ViT-B-32__openai")
+    assert ups == [] and s["clip_refused"] == 1
+
+
+def test_sync_accepts_mlx_when_allowed_at_generation(tmp_path, monkeypatch):
+    s, ups = _sync_with_clip(tmp_path, monkeypatch,
+                             {**OK_PROV, "backend": "mlx", "allow_mlx": True},
+                             "ViT-B-32__openai")
+    assert ups == ["replayed-uuid"] and s["clip_refused"] == 0

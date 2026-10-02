@@ -2087,6 +2087,12 @@ def sync_offline(
         f"synced={summary['synced']}, skipped={summary['skipped']}, "
         f"failed={summary['failed']} of {summary['total']}"
     )
+    if summary.get("clip_refused"):
+        console.print(
+            f"[yellow]CLIP vectors withheld for {summary['clip_refused']} "
+            "asset(s)[/yellow] (model mismatch / mlx not allowed / no provenance); "
+            "rows otherwise synced."
+        )
     if summary["failed"]:
         raise typer.Exit(code=1)
 

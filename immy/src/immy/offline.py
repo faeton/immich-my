@@ -666,6 +666,13 @@ class OfflineSink:
     def immich_clip_model(self) -> str | None:
         return None  # no DB offline; the sync step is where Immich is reachable
 
+    def set_clip_provenance(self, *, model: str, backend: str, allow_mlx: bool) -> None:
+        """Stamp what produced the vectors upsert_clip records, so sync can
+        re-run the CLIP guard against Immich's model at replay time."""
+        self._clip_provenance = {
+            "model": model, "backend": backend, "allow_mlx": bool(allow_mlx),
+        }
+
     def upsert_clip(
         self, asset_id: str, embedding: list[float], literal: str,
     ) -> None:
@@ -675,6 +682,7 @@ class OfflineSink:
         entry["clip"] = {
             "dim": len(embedding),
             "path": emb_path.relative_to(self.root).as_posix(),
+            **getattr(self, "_clip_provenance", {}),
         }
         self._mark_dirty(entry)
         self._flush(hex_key)
@@ -840,6 +848,8 @@ def sync_trip(
     synced = 0
     skipped = 0
     failed = 0
+    clip_refused = 0
+    immich_model = pg_mod.fetch_immich_clip_model(conn)
     entries = list(iter_entries(trip_folder, offline_root=offline_root))
     _emit(f"sync-offline: {len(entries)} entry(ies) to consider")
 
@@ -850,10 +860,14 @@ def sync_trip(
         rel = yml_path.name
         _emit(f"[{idx}/{len(entries)}] {rel}")
         try:
-            _replay_entry(
+            refused = _replay_entry(
                 conn, trip_folder, data,
                 library=library, offline_root=offline_root,
+                immich_clip_model=immich_model,
             )
+            if refused:
+                clip_refused += 1
+                _emit(f"    CLIP not written: {refused}")
             # Commit BEFORE stamping the YAML synced. If the commit fails the
             # exception path rolls back and the entry stays unsynced for the
             # next run; replay is idempotent (ON CONFLICT), so a crash between
@@ -886,7 +900,21 @@ def sync_trip(
         "synced": synced,
         "skipped": skipped,
         "failed": failed,
+        "clip_refused": clip_refused,
     }
+
+
+def _clip_replay_refusal(clip: dict, immich_model: str | None) -> str | None:
+    """Same guard as the online path, applied to a recorded payload. Legacy
+    payloads (no model/backend provenance) can't be vouched for → refused."""
+    model, backend = clip.get("model"), clip.get("backend")
+    if not model or not backend:
+        return "recorded without model/backend provenance (legacy payload)"
+    if backend == "mlx" and not clip.get("allow_mlx"):
+        return "mlx vectors were not explicitly allowed when generated"
+    if immich_model is not None and model != immich_model:
+        return f"recorded model {model!r} != Immich's configured {immich_model!r}"
+    return None
 
 
 _OFFLINE_PLACEHOLDER = "__offline_placeholder__"
@@ -899,8 +927,10 @@ def _replay_entry(
     *,
     library: LibraryInfo | None = None,
     offline_root: Path | None = None,
-) -> None:
-    """Replay one cached asset into Postgres. All writes idempotent via
+    immich_clip_model: str | None = None,
+) -> str | None:
+    """Replay one cached asset into Postgres. Returns a reason string when
+    the CLIP vector was withheld by the guard, else None. All writes idempotent via
     the same ON CONFLICT / LIKE-guarded UPDATE pattern the online path
     uses, so a partial success → retry → completion sequence is safe."""
     asset_raw = data["asset"]
@@ -976,10 +1006,13 @@ def _replay_entry(
     if offline_root is None:
         offline_root = offline_dir(trip_folder)
     clip = data.get("clip")
+    clip_refusal = None
     if clip:
-        clip_path = offline_root / clip["path"]
-        _, literal = _pgvector_literal_from_npy(clip_path)
-        pg_mod.upsert_smart_search(conn, asset_id, literal)
+        clip_refusal = _clip_replay_refusal(clip, immich_clip_model)
+        if clip_refusal is None:
+            clip_path = offline_root / clip["path"]
+            _, literal = _pgvector_literal_from_npy(clip_path)
+            pg_mod.upsert_smart_search(conn, asset_id, literal)
 
     faces = data.get("faces")
     if faces and faces.get("count"):
@@ -1001,6 +1034,7 @@ def _replay_entry(
             pg_mod.replace_asset_faces(
                 conn, asset_id, faces["width"], faces["height"], rows,
             )
+    return clip_refusal
 
 
 __all__ = [

@@ -34,6 +34,13 @@ continuously, so entries are dated rather than versioned.
   to Immich's vectors) is refused unless `--allow-mlx-clip` or
   `ml.allow_mlx_clip: true` is given. The default backend is unchanged, so a
   Mac run on `mlx` now needs the flag or config key to keep writing CLIP.
+  `process_trip` itself also defaults to refusing mlx. Offline caches record
+  model/backend with each CLIP vector; `immy sync` re-applies the guard and
+  withholds (and counts) vectors that mismatch, were mlx without consent, or
+  predate provenance (legacy payloads), while syncing the rest of the row.
+- **Retry-After** accepts HTTP-dates, is never shortened, and a request over
+  120 s fails the caption instead of retrying early. An offline caption cached
+  under a different prompt hash is regenerated.
 
 ## 2026-10-02 — bloat/Insta360 detection, transcode temp name, SRT dialects, altitude sign, immy GPX
 
