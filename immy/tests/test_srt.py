@@ -70,7 +70,7 @@ def test_parenthesised_gps_form(tmp_path: Path):
     txt = (
         "1\n00:00:00,000 --> 00:00:01,000\n"
         "FrameCnt : 1\n2023-01-02 10:00:00,000\n"
-        "GPS(12.789000,-3.456000,55) BAROMETER:55.5\n"
+        "GPS(-3.456000,12.789000,55.5M) BAROMETER:55.5\n"
     )
     p = tmp_path / "old.SRT"
     p.write_text(txt)
@@ -78,7 +78,7 @@ def test_parenthesised_gps_form(tmp_path: Path):
     assert len(frames) == 1
     assert frames[0].latitude == -3.456000
     assert frames[0].longitude == 12.789000
-    assert frames[0].abs_alt == 55.5
+    assert frames[0].abs_alt is None  # unit-suffixed field not a verified MSL altitude
     assert frames[0].has_fix()
 
 
@@ -104,28 +104,52 @@ def test_longtitude_misspelling(tmp_path: Path):
     assert f.has_fix()
 
 
-def test_old_dji_format_lon_lat_order_integer_and_dotted_date(tmp_path: Path):
-    f = _one(tmp_path, (
-        "HOME(149.0251,-20.2532) 2017.08.19 13:02:57\n"
-        "GPS(149.0251,-20.2533,16) BAROMETER:42.2\nISO:100\n"))
+# Provenance: excerpts of JuanIrache/DJI_SRT_Parser samples (MIT, (c) 2018 Juan Irache).
+MATRICE_300 = (  # samples/matrice_300.srt -- lat-first, `M` unit
+    "2022.06.21 16:06:17\nGPS(36.6146,-6.1120,0.0M) BAROMETER:0.3M\n"
+)
+OLD_FORMAT = (  # samples/old_format.SRT -- lon-first beside HOME()
+    "HOME(149.0251,-20.2532) 2017.8.5 14:11:51\n"
+    "GPS(149.0251,-20.2533,16) Hb:1.9 Hs:1.9\nISO:100 TV:60 EV: 0 IR:F2.8\n"
+)
+
+
+def test_matrice_300_is_lat_first_both_readings_in_range(tmp_path: Path):
+    # (36.6, -6.1) also parses as lon=36.6/lat=-6.1: the M-unit dialect decides.
+    f = _one(tmp_path, MATRICE_300)
+    assert (f.latitude, f.longitude) == (36.6146, -6.1120)
+    assert f.datetime == datetime(2022, 6, 21, 16, 6, 17)
+    assert f.abs_alt is None and f.rel_alt is None
+
+
+def test_old_format_is_lon_first_with_dotted_unpadded_date(tmp_path: Path):
+    f = _one(tmp_path, OLD_FORMAT)
     assert (f.latitude, f.longitude) == (-20.2533, 149.0251)
-    assert f.datetime == datetime(2017, 8, 19, 13, 2, 57)
-    assert f.abs_alt == 42.2  # 3rd field is a satellite count here
+    assert f.datetime == datetime(2017, 8, 5, 14, 11, 51)
+    assert f.abs_alt is None and f.rel_alt is None
 
 
-def test_old_dji_integer_fields_and_meter_unit(tmp_path: Path):
-    f = _one(tmp_path, "2017.08.19 13:02:57\nGPS(8,47,15M)\n")
-    assert (f.latitude, f.longitude, f.abs_alt) == (47.0, 8.0, 15.0)
+def test_old_format_lon_first_when_both_in_range(tmp_path: Path):
+    f = _one(tmp_path, "HOME(8.54,47.37) 2017.8.5 14:11:51\nGPS(8.54,47.37,12)\n")
+    assert (f.latitude, f.longitude) == (47.37, 8.54)
 
 
-def test_old_dji_swaps_when_lon_lat_impossible(tmp_path: Path):
+def test_unlabelled_both_in_range_emits_nothing(tmp_path: Path):
+    assert not _one(tmp_path, "GPS(12.789,-3.456,55)\n").has_fix()
+
+
+def test_unlabelled_single_valid_order_is_used(tmp_path: Path):
     f = _one(tmp_path, "GPS(-20.5,149.0,3)\n")
     assert (f.latitude, f.longitude) == (-20.5, 149.0)
 
 
-def test_old_dji_impossible_both_ways_emits_nothing(tmp_path: Path):
-    f = _one(tmp_path, "GPS(200.5,149.0,3)\n")
-    assert not f.has_fix()
+def test_unlabelled_resolved_by_lone_labelled_coordinate(tmp_path: Path):
+    f = _one(tmp_path, "[latitude: 47.4]\nGPS(8.54,47.37,12)\n")
+    assert (f.latitude, f.longitude) == (47.37, 8.54)
+
+
+def test_impossible_both_ways_emits_nothing(tmp_path: Path):
+    assert not _one(tmp_path, "GPS(200.5,149.0,3)\n").has_fix()
 
 
 def test_below_sea_level_altitude_roundtrips_negative(tmp_path: Path):

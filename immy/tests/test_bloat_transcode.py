@@ -287,3 +287,15 @@ def test_transcode_real_ffmpeg_part_name(tmp_path: Path):
     assert c is not None
     out = bloat_mod.transcode_one(c)
     assert out.exists() and out.stat().st_size > 0
+
+
+def test_videotoolbox_preferred_when_both_encoders_advertised(monkeypatch):
+    import subprocess
+    out = " V..... hevc_videotoolbox\n V..... libx265\n"
+    monkeypatch.setattr(
+        bloat_mod.subprocess, "run",
+        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 0, stdout=out, stderr=""),
+    )
+    bloat_mod._hevc_encoder.cache_clear()
+    assert bloat_mod._hevc_encoder() == "hevc_videotoolbox"
+    bloat_mod._hevc_encoder.cache_clear()
