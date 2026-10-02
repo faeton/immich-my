@@ -4,6 +4,62 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — final-review fixes (backup state, drift dates, dedup holds, markers)
+
+### Fixed
+
+- **Backup: immy state was never mirrored.** `nightly-mirror.sh` excluded
+  `.audit/` for every rsync, but all per-trip state lives under
+  `state/<trip>/.audit/`, so vv got nothing; the empty-source guard counted the
+  excluded files and passed. Excludes are now per tree (`mirror_exclude_dirs`
+  in `guards-lib.sh`): `.audit/` for originals only, `.rsync-partial/`
+  everywhere, and the guard counts with the same list. The first live run
+  copies the whole state tree (~9 GB).
+- **`clock-drift-by-camera` compared the wrong clocks.** It read naive wall
+  clocks while ingest stores instants (QuickTime CreateDate = UTC except
+  Insta360, offsets honoured, sidecar first). A UTC drone beside a phone in
+  UTC+2 looked like a -2 h drift, and the MEDIUM patch then shifted the
+  stored instant. Capture-time resolution now lives in `capture.py`
+  (`capture_time`), used by ingest, the drift rule and `backfill-dates`; the
+  rule's patch carries its offset inline so ingest reads back exactly the
+  corrected instant. `dates.resolve` (other rules) reads the separate `.xmp`
+  sidecar first, as ingest does.
+- **`backfill-dates`** reads sidecars through `sidecars_root` (NAS), puts a
+  sidecar correction ahead of SRT/embedded dates, lets a file's own offset
+  beat `--timezone`/clip/trip zones, and `--retime` keeps the stored
+  `timeZone` when none is known. The dead `-fast2` QuickTime re-read is gone.
+- **`dedup apply` holds losers of needs-review clusters** (unowned `auto`
+  clusters where a burst / Live / edited guard now fires), counted in
+  `losers_held` with the reason.
+- **Dedup recovery never accepts a destination by size alone.** A legacy
+  `decided` winner whose source is gone and which has no recorded sha256 is
+  no longer "found" at a same-size library file (that recorded a stranger's
+  hash and released the losers); the move fails loudly and its losers are
+  held.
+- **Markers no longer claim unfinished work.** A step that failed for any
+  asset (caption retries exhausted, an enricher savepoint rolled back) is left
+  out of `y_processed.yml`, so the next run re-walks the trip and retries it
+  instead of printing `[cached]`. `--recaption` bypasses the cached-trip skip
+  without `--force`.
+- **Withheld offline CLIP vectors can be rewritten.** When `sync-offline`
+  (or promote's drain) withholds a CLIP payload, it clears that asset's `clip`
+  journal entry and drops `clip` from the marker, so a normal `immy process`
+  recomputes it; `process --force` also recomputes CLIP despite the journal.
+- **A failed read of Immich's CLIP model no longer aborts the connection**
+  (it runs in its own transaction block / savepoint).
+
+### Changed
+
+- **Marker DB identity is `(database, library_id)`.** host/port are still
+  recorded but only informational: the same DB seen from the Mac
+  (`<n5>:15432`) and the container (`database:5432`) no longer forces a rescan
+  or a promote library-scan.
+- `process.is_processed` (no production caller) removed.
+- Docs: `ARCHITECTURE.md` storage layout follows `deploy/n5/compose.yaml`;
+  `TESTING.md` Y.1/Y.3 hardware smokes are marked as DS923+ (historical).
+- Tests: an autouse guard makes any socket connect to 5432/15432/2283 and any
+  real `psycopg.connect` fail the test (one test reached the live port).
+
 ## 2026-10-02 — docs drift + ruff baseline
 
 ### Changed
