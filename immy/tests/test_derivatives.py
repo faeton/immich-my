@@ -456,7 +456,7 @@ def _marker_with_derivs(trip: Path, asset_id: str = "id-1") -> None:
         p.write_bytes(b"x")
 
 
-def test_push_derivatives_rsyncs_and_inserts(tmp_path: Path, monkeypatch):
+def test_push_derivatives_rsyncs_and_inserts(no_schema_guard, tmp_path: Path, monkeypatch):
     trip = tmp_path / "trip"
     trip.mkdir()
     _marker_with_derivs(trip, asset_id="id-1")

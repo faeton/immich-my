@@ -514,6 +514,7 @@ def _enable_fake_album_pg(config_file: tuple[Path, Path], monkeypatch) -> MagicM
 
 
 def test_promote_creates_album_with_description_from_notes(
+    no_schema_guard,
     config_file, dji_ready, monkeypatch
 ):
     _, originals = config_file
@@ -537,7 +538,7 @@ def test_promote_creates_album_with_description_from_notes(
     assert created["asset_ids"]  # at least one asset attached
 
 
-def test_promote_updates_existing_album(config_file, dji_ready, monkeypatch):
+def test_promote_updates_existing_album(no_schema_guard, config_file, dji_ready, monkeypatch):
     _, originals = config_file
     _enable_fake_album_pg(config_file, monkeypatch)
     notes = dji_ready / "README.md"
@@ -610,7 +611,7 @@ def _sql_recording_pg(config_file, monkeypatch, *, trashed_skipped=0):
     return executed
 
 
-def test_default_promote_untrashes_offline_autotrash(config_file, dji_ready, monkeypatch):
+def test_default_promote_untrashes_offline_autotrash(no_schema_guard, config_file, dji_ready, monkeypatch):
     """DEFAULT (no --resurrect-deleted): the un-trash UPDATE clears BOTH
     isOffline and deletedAt, gated on isOffline=true (the offline-auto-trash
     signature) — so the never-promoted backlog lands without the flag, while
@@ -630,7 +631,7 @@ def test_default_promote_untrashes_offline_autotrash(config_file, dji_ready, mon
     assert '"deletedAt" IS NOT NULL' not in u   # NOT the resurrect-all form
 
 
-def test_resurrect_deleted_untrashes_everything(config_file, dji_ready, monkeypatch):
+def test_resurrect_deleted_untrashes_everything(no_schema_guard, config_file, dji_ready, monkeypatch):
     """--resurrect-deleted broadens the UPDATE to also include online
     soft-deletes (deletedAt IS NOT NULL)."""
     executed = _sql_recording_pg(config_file, monkeypatch)
@@ -644,7 +645,7 @@ def test_resurrect_deleted_untrashes_everything(config_file, dji_ready, monkeypa
     assert '"deletedAt" IS NOT NULL' in u  # online soft-deletes included
 
 
-def test_promote_warns_on_trashed_skipped(config_file, dji_ready, monkeypatch):
+def test_promote_warns_on_trashed_skipped(no_schema_guard, config_file, dji_ready, monkeypatch):
     """Residual online-trashed assets are surfaced, never silent."""
     _sql_recording_pg(config_file, monkeypatch, trashed_skipped=4)
     fake = FakeClient(indexed=_indexed_set(dji_ready))
@@ -656,7 +657,7 @@ def test_promote_warns_on_trashed_skipped(config_file, dji_ready, monkeypatch):
     assert "4 asset(s)" in result.stdout and "--resurrect-deleted" in result.stdout
 
 
-def test_promote_into_album_merges_into_existing(config_file, dji_ready, monkeypatch):
+def test_promote_into_album_merges_into_existing(no_schema_guard, config_file, dji_ready, monkeypatch):
     """`--into-album X` adds THIS trip's assets (resolved from its own path) to
     the existing album X, creates no folder-named album, and does NOT clobber
     X's description with the source trip's notes."""
@@ -685,7 +686,7 @@ def test_promote_into_album_merges_into_existing(config_file, dji_ready, monkeyp
     assert target_id == "album-anya" and ids          # the existing album
 
 
-def test_promote_applies_tags(config_file, dji_ready, monkeypatch):
+def test_promote_applies_tags(no_schema_guard, config_file, dji_ready, monkeypatch):
     """`--tag a --tag b` upserts both tags and attaches each to the trip's
     assets."""
     _enable_fake_album_pg(config_file, monkeypatch)
@@ -705,7 +706,7 @@ def test_promote_applies_tags(config_file, dji_ready, monkeypatch):
         assert ids  # asset ids attached to each tag
 
 
-def test_promote_no_tags_leaves_tag_surface_untouched(config_file, dji_ready, monkeypatch):
+def test_promote_no_tags_leaves_tag_surface_untouched(no_schema_guard, config_file, dji_ready, monkeypatch):
     """No --tag → no tag API calls (byte-identical to the pre-feature path)."""
     _enable_fake_album_pg(config_file, monkeypatch)
     fake = FakeClient(indexed=_indexed_set(dji_ready))
@@ -719,6 +720,7 @@ def test_promote_no_tags_leaves_tag_surface_untouched(config_file, dji_ready, mo
 
 
 def test_promote_repairs_thumbnails_for_brought_online_assets(
+    no_schema_guard,
     config_file, dji_ready, monkeypatch
 ):
     """Assets registered while offline keep broken thumbs after the files
@@ -776,3 +778,77 @@ def test_promote_aborts_before_rsync_on_live_schema_mismatch(
     assert "Refusing to write" in result.stdout
     assert not any(originals.iterdir())  # nothing rsynced
     fake_conn.cursor.assert_not_called()
+
+
+def test_promote_validates_schema_on_later_connections_when_preflight_cannot_connect(
+    tmp_path, dji_ready, monkeypatch,
+):
+    """Preflight can't reach Postgres (tailnet flapping); a later step's own
+    connection succeeds — against an incompatible schema. That step must
+    validate before writing, not replay assets unchecked."""
+    import copy
+    from unittest.mock import MagicMock
+
+    from immy import offline as offline_mod
+    from immy import process as process_mod
+    from immy import schema_contract
+    from immy.pg import LibraryInfo
+
+    originals = tmp_path / "originals-flap"
+    originals.mkdir()
+    cfg = tmp_path / "config-pg.yml"
+    cfg.write_text(yaml.safe_dump({
+        "originals_root": str(originals),
+        "immich": {"url": "http://fake", "api_key": "k", "library_id": "lib-1"},
+        "pg": {"host": "db", "port": 5432, "user": "u", "password": "p", "database": "immich"},
+    }))
+    monkeypatch.setenv("IMMY_CONFIG", str(cfg))
+    lib = LibraryInfo(id="lib-1", owner_id="owner-1", container_root="/x")
+    process_mod.process_trip(dji_ready, None, lib, sink=offline_mod.OfflineSink(dji_ready, lib))
+
+    tables = copy.deepcopy(schema_contract.load_snapshot()["tables"])
+    del tables["asset"]["localDateTime"]  # incompatible live schema
+
+    class _Rows:
+        def __init__(self, rows):
+            self.rows = rows
+
+        def fetchall(self):
+            return self.rows
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+    conns = []
+
+    def connect(cfg):
+        if not conns:
+            conns.append(None)
+            raise OSError("tailnet down")  # the preflight's attempt
+        conn = MagicMock()
+        conn.closed = False
+
+        def execute(sql, params=()):
+            if "FROM library" in sql:
+                return _Rows([("owner-1", ["/x"])])
+            assert "information_schema.columns" in sql, sql
+            return _Rows([
+                (n, c["udt_name"], "YES" if c["is_nullable"] else "NO", c["column_default"])
+                for n, c in tables.get(params[0], {}).items()
+            ])
+        conn.execute.side_effect = execute
+        conns.append(conn)
+        return conn
+
+    monkeypatch.setattr("immy.pg.connect", connect)
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: FakeClient())
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+
+    flat = result.stdout.replace("\n", " ")
+    later = [c for c in conns if c is not None]
+    assert later, "a later step should have connected"
+    for c in later:
+        c.cursor.assert_not_called()   # no INSERT/UPDATE issued
+        c.commit.assert_not_called()
+    assert "localDateTime" in flat, flat

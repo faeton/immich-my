@@ -52,5 +52,4 @@ testpaths = ["tests"]
 addopts = "-n auto"
 markers = [
     "integration: hits the network / a real model or server (skips when unavailable)",
-    "real_schema_guard: run with the real live-schema guard (conftest stubs it otherwise)",
 ]

@@ -26,6 +26,7 @@ import signal
 
 from . import offline as offline_mod
 from . import pg as pg_mod
+from . import schema_contract
 from .config import Config
 from .derivatives import DERIVATIVES_DIR
 from .exif import read_folder
@@ -508,6 +509,21 @@ def _trigger_reembed(client: ImmichClient, mode: str) -> dict:
 # --- Offline cache drain -------------------------------------------------
 
 
+def _connect_checked(config: Config):
+    """Open the Postgres connection a write step uses, after checking the
+    live schema against `schema_contract`. Each promote step connects on
+    its own and the CLI preflight may not have reached the DB (tailnet down
+    then back), so every write connection checks for itself. Raises
+    `SchemaMismatch` (connection closed) when the schema has drifted."""
+    conn = pg_mod.connect(config.pg)
+    try:
+        schema_contract.assert_live_schema(conn)
+    except BaseException:
+        conn.close()
+        raise
+    return conn
+
+
 def _drain_offline_cache(
     folder: Path, config: Config, *, dry_run: bool,
 ) -> dict | None:
@@ -542,7 +558,12 @@ def _drain_offline_cache(
         }
 
     try:
-        conn = pg_mod.connect(config.pg)
+        conn = _connect_checked(config)
+    except schema_contract.SchemaMismatch as e:
+        return {
+            "total": len(entries), "pending": pending,
+            "synced": 0, "failed": 0, "error": str(e),
+        }
     except Exception as e:
         return {
             "total": len(entries), "pending": pending,
@@ -675,7 +696,9 @@ def _push_derivatives(plan: Plan, config: Config) -> dict | None:
         }
 
     try:
-        conn = pg_mod.connect(config.pg)
+        conn = _connect_checked(config)
+    except schema_contract.SchemaMismatch as e:
+        return {"status": "error", "detail": str(e), "rows_written": 0}
     except Exception as e:
         return {
             "status": "error",
@@ -769,7 +792,10 @@ def _sync_album(
         return summary
 
     try:
-        conn = pg_mod.connect(config.pg)
+        conn = _connect_checked(config)
+    except schema_contract.SchemaMismatch as e:
+        summary.update(status="error", detail=str(e))
+        return summary
     except Exception as e:
         summary.update(status="error", detail=f"pg connect failed: {e}")
         return summary

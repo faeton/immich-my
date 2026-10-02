@@ -28,7 +28,9 @@ continuously, so entries are dated rather than versioned.
   what the source writes.
 - **Pre-write guard.** `process`, `promote` and `sync-offline` check the live
   columns against that contract (missing, retyped, or newly required) and exit
-  2 with the list before writing anything. `doctor` now reports the same check
+  2 with the list before writing anything; `promote` also re-checks on each of
+  its write connections, so a preflight that couldn't reach the DB never lets a
+  later step write unchecked. `doctor` now reports the same check
   for all seven write tables (it used to check a hand-written subset).
 - `docs/IMMICH-INGEST.md` notes the 3.0.2 differences.
 

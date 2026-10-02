@@ -57,6 +57,56 @@ def _joined_text(node: ast.JoinedStr, names: dict[str, str]) -> str:
     return "".join(parts)
 
 
+def _piece_text(node: ast.AST, names: dict[str, str]) -> str | None:
+    """Text of a string piece used in SQL assembly, or None if unresolvable."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in names:
+        return names[node.id]
+    if isinstance(node, ast.JoinedStr):
+        return _joined_text(node, names)
+    return None
+
+
+def _assembled_sql(tree: ast.Module, names: dict[str, str], rel: str):
+    """SQL built incrementally inside a function — `sql = "UPDATE ..."` then
+    `sql += FRAGMENT` (srtgeo's GPS lock). Every append is folded in, as if
+    each conditional branch were taken, so all columns the statement can
+    write are seen. Yields (text, lineno, ids of the pieces consumed).
+    An append the extractor can't resolve fails loudly instead of letting
+    a column slip past the contract."""
+    for fn in ast.walk(tree):
+        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        buffers: dict[str, list] = {}  # name -> [text, lineno, piece ids, appended?]
+        nodes = sorted(
+            (n for n in ast.walk(fn) if isinstance(n, (ast.Assign, ast.AugAssign))),
+            key=lambda n: (n.lineno, n.col_offset),
+        )
+        for n in nodes:
+            if (isinstance(n, ast.Assign) and len(n.targets) == 1
+                    and isinstance(n.targets[0], ast.Name)):
+                text = _piece_text(n.value, names)
+                if text is not None and _STATEMENT.search(text):
+                    buffers[n.targets[0].id] = [text, n.lineno, {id(n.value)}, False]
+            elif (isinstance(n, ast.AugAssign) and isinstance(n.op, ast.Add)
+                    and isinstance(n.target, ast.Name) and n.target.id in buffers):
+                buf = buffers[n.target.id]
+                text = _piece_text(n.value, names)
+                if text is None:
+                    raise AssertionError(
+                        f"{rel}:{n.lineno}: unsupported SQL assembly "
+                        f"`{n.target.id} += {ast.unparse(n.value)}` — use a "
+                        "string literal or a module-level constant"
+                    )
+                buf[0] += text
+                buf[2].add(id(n.value))
+                buf[3] = True
+        for text, lineno, ids, appended in buffers.values():
+            if appended:
+                yield text, lineno, ids
+
+
 def _split_top_level(text: str) -> list[str]:
     parts, depth, cur = [], 0, []
     for ch in text:
@@ -157,20 +207,24 @@ def extract_pg_writes(src: Path = SRC) -> list[dict]:
             id(v) for n in ast.walk(tree) if isinstance(n, ast.JoinedStr) for v in n.values
         }
         names = _module_strings(tree)
+        texts: list[tuple[str, int]] = []
+        if rel.split("/")[0] not in _SQLITE_PACKAGES:
+            for text, lineno, ids in _assembled_sql(tree, names, rel):
+                texts.append((text, lineno))
+                skip |= ids  # the pieces are scanned as the whole statement
         for node in ast.walk(tree):
             if id(node) in skip:
                 continue
             if isinstance(node, ast.Constant) and isinstance(node.value, str):
-                text = node.value
+                texts.append((node.value, node.lineno))
             elif isinstance(node, ast.JoinedStr):
-                text = _joined_text(node, names)
-            else:
-                continue
+                texts.append((_joined_text(node, names), node.lineno))
+        for text, lineno in texts:
             for m in _STATEMENT.finditer(text):
                 stmt = parse_statement(text, m.start())
                 if stmt is None or _is_local_sqlite(rel, text, stmt["table"]):
                     continue
-                stmt["file"] = f"{rel}:{node.lineno}"
+                stmt["file"] = f"{rel}:{lineno}"
                 out.append(stmt)
     return out
 
@@ -255,6 +309,24 @@ def test_parser_reads_update_set_with_nested_commas():
     assert s["columns"] == ["description", "lockedProperties"]
 
 
+def test_extractor_folds_incremental_sql_assembly():
+    # srtgeo builds its GPS UPDATE with `sql += _LOCK_GPS_FRAGMENT`.
+    gps = [s for s in WRITES if s["file"].startswith("srtgeo.py")
+           and "latitude" in (s["columns"] or [])]
+    assert len(gps) == 1
+    assert gps[0]["columns"] == ["latitude", "longitude", "lockedProperties"]
+
+
+def test_extractor_fails_on_unresolvable_sql_assembly():
+    tree = ast.parse(
+        "def f(extra):\n"
+        "    sql = 'UPDATE asset SET width = %(w)s'\n"
+        "    sql += extra\n"
+    )
+    with pytest.raises(AssertionError, match="unsupported SQL assembly"):
+        list(_assembled_sql(tree, {}, "x.py"))
+
+
 def test_snapshot_flags_dropped_device_columns():
     # The 3.0.2 regression this contract exists for.
     assert "deviceAssetId" not in SNAPSHOT["asset"]
@@ -291,13 +363,11 @@ def _live_copy():
 
 
 
-@pytest.mark.real_schema_guard
 def test_live_guard_passes_on_snapshot_schema():
     assert all(not p for p in schema_contract.live_schema_problems(_FakeLivePg(_live_copy())).values())
     schema_contract.assert_live_schema(_FakeLivePg(_live_copy()))
 
 
-@pytest.mark.real_schema_guard
 def test_live_guard_rejects_missing_retyped_and_newly_required_columns():
     live = _live_copy()
     del live["asset_file"]["isProgressive"]
@@ -316,7 +386,6 @@ def test_live_guard_rejects_missing_retyped_and_newly_required_columns():
         schema_contract.assert_live_schema(_FakeLivePg(live))
 
 
-@pytest.mark.real_schema_guard
 def test_live_guard_ignores_new_required_columns_on_update_only_tables():
     live = _live_copy()
     live["person"]["mood"] = {"udt_name": "text", "is_nullable": False, "column_default": None}

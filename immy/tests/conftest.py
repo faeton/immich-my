@@ -22,15 +22,13 @@ def _isolate_library_cache(tmp_path_factory, monkeypatch):
     monkeypatch.setattr(offline_mod, "LIBRARY_CACHE_PATH", isolated)
 
 
-@pytest.fixture(autouse=True)
-def _stub_live_schema_guard(request, monkeypatch):
-    """The CLI's pre-write schema guard (`schema_contract.assert_live_schema`)
-    queries information_schema; the suite's MagicMock connections can't
-    answer it. Stub it out except in tests marked `real_schema_guard`, and
-    tests that monkeypatch it themselves still win (their patch lands
-    after this one)."""
-    if request.node.get_closest_marker("real_schema_guard"):
-        return
+
+@pytest.fixture
+def no_schema_guard(monkeypatch):
+    """Opt-in for tests whose fake (MagicMock) Postgres connection can't
+    answer the pre-write guard's information_schema query. Everything else
+    runs the real guard — a new CLI test gets production behaviour unless it
+    asks for this."""
     from immy import schema_contract
 
     monkeypatch.setattr(schema_contract, "assert_live_schema", lambda conn: None)

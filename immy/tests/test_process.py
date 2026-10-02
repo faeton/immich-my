@@ -752,7 +752,7 @@ def config_full(tmp_path: Path, monkeypatch) -> Path:
     return cfg
 
 
-def test_process_cli_dry_run_no_pg_connect(config_full, tmp_path, monkeypatch):
+def test_process_cli_dry_run_no_pg_connect(no_schema_guard, config_full, tmp_path, monkeypatch):
     target = tmp_path / "dji-srt-pair"
     shutil.copytree(FIXTURES / "dji-srt-pair", target)
 
@@ -775,7 +775,7 @@ def test_process_cli_dry_run_no_pg_connect(config_full, tmp_path, monkeypatch):
     assert not (target / ".audit" / "y_processed.yml").exists()
 
 
-def test_process_cli_inserts_and_drops_marker(config_full, tmp_path, monkeypatch):
+def test_process_cli_inserts_and_drops_marker(no_schema_guard, config_full, tmp_path, monkeypatch):
     target = tmp_path / "dji-srt-pair"
     shutil.copytree(FIXTURES / "dji-srt-pair", target)
 
