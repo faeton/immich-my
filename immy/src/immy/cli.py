@@ -1539,8 +1539,9 @@ def _run_one_trip(
     # file has been touched since, don't fork exiftool over thousands of
     # files just to re-confirm everything is cached. One stat() per file vs.
     # an exiftool spawn — saves ~all the wall-clock on a "scan all trips"
-    # batch when most trips are already done. Pass --force to override.
-    if not dry_run and not force:
+    # batch when most trips are already done. Pass --force to override;
+    # --recaption is an explicit redo and bypasses it too.
+    if not dry_run and not force and not recaption:
         cached, count = process_mod.is_trip_fully_cached(
             folder, marker=paths.marker_path, provenance=provenance)
         if cached:
@@ -1644,8 +1645,20 @@ def _run_one_trip(
     face_count = sum(r.faces_detected for r in results)
     transcript_count = sum(1 for r in results if r.transcript)
     caption_count = sum(1 for r in results if r.caption)
+    # Record only the steps that completed for every asset: a failed step
+    # left in the marker would make the next unchanged run skip the trip.
+    marker_prov = (
+        None if provenance is None
+        else process_mod.provenance_for_completed(provenance, results)
+    )
     process_mod.write_marker(
-        folder, results, marker=paths.marker_path, provenance=provenance)
+        folder, results, marker=paths.marker_path, provenance=marker_prov)
+    unfinished = sorted({s for r in results for s in r.incomplete_steps})
+    if unfinished:
+        console.print(
+            f"[yellow]{folder.name}: unfinished step(s) {', '.join(unfinished)}"
+            "[/yellow] — not recorded as done; the next run retries them"
+        )
     tail = f", [cyan]{derivs} derivative file(s) staged[/cyan]" if derivs else ""
     tail += f", [cyan]{clipped} CLIP embedding(s)[/cyan]" if clipped else ""
     tail += f", [cyan]{face_count} face(s)[/cyan]" if face_count else ""

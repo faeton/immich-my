@@ -1225,3 +1225,55 @@ def test_process_cli_marker_carries_provenance_and_skips_rerun(
     r2 = runner.invoke(app, ["process", str(trip), "--no-derivatives"])
     assert r2.exit_code == 0, r2.stdout
     assert "unchanged since marker" in r2.stdout
+
+
+def test_process_cli_failed_enricher_does_not_mark_trip_cached(
+    no_schema_guard, config_full, tmp_path, monkeypatch,
+):
+    """Final review F: a step that failed for some asset must not be recorded
+    in the marker, or the next unchanged run skips the trip as [cached] and
+    the work is never retried."""
+    cfg = yaml.safe_load(config_full.read_text())
+    cfg["media"] = {"host_root": str(tmp_path / "media"), "container_root": "/data"}
+    config_full.write_text(yaml.safe_dump(cfg))
+    trip = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", trip)
+    conn = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda c, lid: LIB)
+
+    def _boom(**kw):
+        raise RuntimeError("pyvips exploded (test)")
+    monkeypatch.setattr("immy.process.derivatives_mod.compute_for_asset", _boom)
+
+    r1 = runner.invoke(app, ["process", str(trip), "--no-clip", "--no-faces"])
+    assert r1.exit_code == 0, r1.stdout
+    payload = yaml.safe_load((trip / ".audit" / "y_processed.yml").read_text())
+    assert "derivatives" not in payload["steps"], payload["steps"]
+    assert payload["steps"]["ingest"] == "v1"
+
+    conn2 = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn2)
+    r2 = runner.invoke(app, ["process", str(trip), "--no-clip", "--no-faces"])
+    assert r2.exit_code == 0, r2.stdout
+    assert "unchanged since marker" not in r2.stdout
+
+
+def test_process_cli_recaption_bypasses_cached_skip(
+    no_schema_guard, config_full, tmp_path, monkeypatch,
+):
+    """`--recaption` is an explicit redo: it must not be swallowed by the
+    [cached] skip of an unchanged, fully-processed trip (no --force needed)."""
+    trip = tmp_path / "dji-srt-pair"
+    shutil.copytree(FIXTURES / "dji-srt-pair", trip)
+    conn = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn)
+    monkeypatch.setattr("immy.cli.pg_mod.fetch_library_info", lambda c, lid: LIB)
+    r1 = runner.invoke(app, ["process", str(trip), "--no-derivatives"])
+    assert r1.exit_code == 0, r1.stdout
+
+    conn2 = _closable_fake_conn()
+    monkeypatch.setattr("immy.cli.pg_mod.connect", lambda cfg: conn2)
+    r2 = runner.invoke(app, ["process", str(trip), "--no-derivatives", "--recaption"])
+    assert r2.exit_code == 0, r2.stdout
+    assert "unchanged since marker" not in r2.stdout

@@ -530,3 +530,58 @@ def test_fetch_immich_clip_model_failure_rolls_back_inside_open_txn():
         pg_mod.fetch_immich_clip_model(conn)
     assert conn.status != INERROR
     conn.execute("SELECT 2 FROM asset_file")  # would raise if still aborted
+
+
+# --- final review F: failed steps must be reported, not marked complete ------
+
+
+def _failing_caption(*a, **kw):
+    from immy import captions as captions_mod
+    raise captions_mod.CaptionError("retries exhausted (test)")
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_failed_caption_is_reported_as_incomplete(tmp_path, ml_stubs, monkeypatch, workers):
+    from immy import captions as captions_mod
+    trip = _trip(tmp_path)
+    conn = FakePgConn()
+    monkeypatch.setattr("immy.process.captions_mod.caption", _failing_caption)
+    cfg = captions_mod.CaptionerConfig(model="m1", endpoint="http://example.invalid/v1")
+
+    results = process_mod.process_trip(
+        trip, conn, LIB, compute_derivatives=True, compute_captions=True,
+        captioner_config=cfg, caption_workers=workers)
+
+    assert results[0].caption is None
+    assert "caption" in results[0].incomplete_steps
+
+
+def test_rolled_back_enricher_is_reported_as_incomplete(tmp_path, ml_stubs):
+    trip = _trip(tmp_path)
+    conn = FakePgConn(fail_on=("INSERT INTO smart_search",))
+
+    results = process_mod.process_trip(
+        trip, conn, LIB, compute_derivatives=True, compute_clip=True,
+        allow_mlx_clip=True)
+
+    assert results[0].incomplete_steps == {"clip"}
+
+
+def test_successful_run_reports_nothing_incomplete(tmp_path, ml_stubs):
+    trip = _trip(tmp_path)
+    results = process_mod.process_trip(
+        trip, FakePgConn(), LIB, compute_derivatives=True, compute_clip=True,
+        allow_mlx_clip=True)
+    assert results[0].incomplete_steps == set()
+
+
+def test_completed_steps_drop_any_step_an_asset_left_unfinished():
+    prov = process_mod.marker_provenance(
+        db={"database": "immich", "library_id": "lib-1"}, offline=False,
+        steps={"ingest": "v1", "derivatives": "d1", "caption": "c1"})
+    ok = process_mod.ProcessResult(asset_id="a", container_path="/a", inserted=True)
+    bad = process_mod.ProcessResult(asset_id="b", container_path="/b", inserted=True,
+                                    incomplete_steps={"caption"})
+    out = process_mod.provenance_for_completed(prov, [ok, bad])
+    assert out["steps"] == {"ingest": "v1", "derivatives": "d1"}
+    assert prov["steps"]["caption"] == "c1"  # input untouched

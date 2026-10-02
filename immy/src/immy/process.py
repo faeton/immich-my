@@ -25,7 +25,7 @@ import os
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone, tzinfo
 from pathlib import Path
 from typing import Any, Callable
@@ -675,6 +675,10 @@ class ProcessResult:
     faces_detected: int = 0  # count of asset_face rows written this run
     transcript: dict | None = None  # {"path": str, "language": str} or None
     caption: dict | None = None  # {"text": str, "model": str, "prompt_tokens", "completion_tokens"}
+    # Enricher steps (journal worker names) attempted for this asset that
+    # FAILED this run — rolled-back savepoint, exhausted caption retries.
+    # The marker must not claim them (`provenance_for_completed`).
+    incomplete_steps: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -794,6 +798,9 @@ def process_trip(
         sink = offline_mod.PgSink(conn)
 
     expected_dim: int | None = None
+    # Steps this run could not perform for ANY asset (stamped on every
+    # result at the end, so the marker doesn't claim them).
+    trip_incomplete: set[str] = set()
     if compute_clip:
         if not compute_derivatives:
             raise ValueError("compute_clip requires compute_derivatives=True")
@@ -816,6 +823,7 @@ def process_trip(
             if progress is not None:
                 progress(f"  CLIP disabled: {_guard}")
             compute_clip = False
+            trip_incomplete.add("clip")
 
     # Journal anchors per-phase resumability across crashes / Ctrl-C.
     # On every successful asset insert we drop an "ingest" entry; that
@@ -919,6 +927,7 @@ def process_trip(
     for idx, exif_row in enumerate(rows, start=1):
         timings: dict[str, float] = {}
         asset_t0 = time.monotonic()
+        asset_incomplete: set[str] = set()
         if commit_per_asset:
             journal.stage()
 
@@ -1227,6 +1236,7 @@ def process_trip(
                 if on_derivative_error == "raise":
                     raise
                 derivs = None
+                asset_incomplete.add("derivatives")
         # CLIP: skip if journal says done at the current model version.
         if (
             compute_clip and we_own and asset.asset_type == "IMAGE"
@@ -1269,6 +1279,7 @@ def process_trip(
                     if on_clip_error == "raise":
                         raise
                     clip_embedded = False
+                    asset_incomplete.add("clip")
         faces_detected = 0
         # Faces: journal-skip path. We don't store the face count in
         # journal meta because asset_face is the truth; on cached skip
@@ -1306,6 +1317,7 @@ def process_trip(
                     if on_faces_error == "raise":
                         raise
                     faces_detected = 0
+                    asset_incomplete.add("faces")
         transcript_info: dict | None = None
         # Transcripts run regardless of `inserted` — they're idempotent via
         # the on-disk `<stem>.<lang>.srt` sidecar, so a second `immy process
@@ -1344,6 +1356,7 @@ def process_trip(
                 if on_transcript_error == "raise":
                     raise
                 transcript_info = None
+                asset_incomplete.add("transcript")
         caption_info: dict | None = None
         # The VLM captions a single still image. For an IMAGE that's the
         # asset's own preview JPEG; for a VIDEO we caption the poster `preview`
@@ -1550,6 +1563,7 @@ def process_trip(
                 reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
                 _emit(f"    {exif_row.path.name} | caption… FAILED: {reason}")
                 caption_info = None
+                asset_incomplete.add("caption")
         results.append(ProcessResult(
             asset_id=asset.id,
             container_path=asset.original_path,
@@ -1563,6 +1577,7 @@ def process_trip(
                 else None
             ),
             caption=caption_info,
+            incomplete_steps=asset_incomplete,
         ))
 
         # One-liner summary per asset: phase timings + what actually
@@ -1657,6 +1672,7 @@ def process_trip(
                     _emit(f"    caption… (VLM @ {captioner_config.model})")
                     reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
                     _emit(f"    {job.media.name} | caption… FAILED: {reason}")
+                    results[job.result_idx].incomplete_steps.add("caption")
                     continue
                 if not info:
                     # Poster vanished after the sequential-pass guard — no
@@ -1691,6 +1707,7 @@ def process_trip(
                         raise
                     reason = str(e).replace("\n", " ")[:200] or e.__class__.__name__
                     _emit(f"    {job.media.name} | caption… FAILED: {reason}")
+                    results[job.result_idx].incomplete_steps.add("caption")
                     continue
                 journal.mark_done(
                     job.cs_hex, "caption", CAPTION_VERSION, meta=info,
@@ -1714,6 +1731,9 @@ def process_trip(
     # leave the last-known state on disk — `updated_at` tells watchers
     # the run died, and the file pinpoints which asset was in flight.
     hb.clear()
+    if trip_incomplete:
+        for r in results:
+            r.incomplete_steps |= trip_incomplete
     return results
 
 
@@ -2061,6 +2081,21 @@ def provenance_matches(marker_data: dict, expected: dict) -> bool:
     return all(recorded.get(k) == v for k, v in expected["steps"].items())
 
 
+def provenance_for_completed(
+    provenance: dict, results: list[ProcessResult],
+) -> dict:
+    """`provenance` with every step some asset left unfinished this run
+    removed — what the marker may honestly claim. A step missing from the
+    marker makes the next run's `provenance_matches` fail, so the trip is
+    re-walked (journal-cached work is skipped) and the failed step retried,
+    instead of the whole trip being skipped as `[cached]`."""
+    failed: set[str] = set()
+    for r in results:
+        failed |= r.incomplete_steps
+    steps = {k: v for k, v in provenance.get("steps", {}).items() if k not in failed}
+    return {**provenance, "steps": steps}
+
+
 def write_marker(
     trip_folder: Path, results: list[ProcessResult], *, marker: Path | None = None,
     provenance: dict | None = None,
@@ -2194,6 +2229,6 @@ __all__ = [
     "insert_asset", "process_trip", "write_marker", "read_marker",
     "is_trip_fully_cached", "marker_path", "Y_MARKER_FILENAME",
     "ingestable_media", "marker_steps", "marker_db_identity",
-    "MARKER_DB_IDENTITY_KEYS",
+    "MARKER_DB_IDENTITY_KEYS", "provenance_for_completed",
     "marker_provenance", "provenance_matches", "INGEST_VERSION",
 ]
