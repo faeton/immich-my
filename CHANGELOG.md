@@ -16,15 +16,20 @@ continuously, so entries are dated rather than versioned.
   session is >24 h from every other session, isn't the trip's biggest
   session, and holds ≤25 % of the files. Its proposal is a delta (a
   whole-year or whole-hour shift that uniquely lands the file in a
-  session), never a constant; deltas >26 h are uncorroborated and stay
-  LOW (never auto-applied), and with no clean shift it emits a LOW note
-  with no patch.
+  session), never a constant. One clock can't corroborate its own shift
+  (a genuine next-day photo 25 h later "lands" too), so every finding is
+  LOW — reported, never auto-applied — and with no clean shift it is a
+  LOW note with no patch.
 - **`clock-drift-by-camera` inferred drift from medians.** Comparing
   per-camera median times told a drone flown only on day 9 of a 10-day
-  trip that it was "+83h" off. Drift is now estimated only from
-  temporally overlapping sessions (raw times ±1 h): the median of
-  nearest-neighbour deltas to the reference camera, used only when ≥3
-  pairs agree within 5 min. No overlap → no proposal.
+  trip that it was "+83h" off. Drift is now found by offset search:
+  bursts (≤60 s) collapse to independent events, candidates are whole
+  hours ±14 h plus ±5 min skew, each scored by one-to-one event matches
+  within 2 min. The best hour-peak needs ≥3 matched events, ≥30 %
+  coverage of the smaller camera's overlapping events, and must beat the
+  runner-up (zero offset included) by ≥2 and ≥2×; the offset is refined
+  by the median matched delta. A +3h time-zone slip is found; one
+  correctly timed drone burst is not drift; ambiguous → no proposal.
 
 ## 2026-10-02 — face→person links, promote path scope, trash status
 

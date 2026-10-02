@@ -18,10 +18,12 @@ from its own median on 8 days out of 10.
 The proposal is a *delta*, never a constant: when shifting the file by a
 whole number of years (same time of day, joining a session) or by a
 whole number of hours (landing inside a session) gives exactly one
-candidate, the patch is `original + delta`. A delta over
-`MAX_UNCORROBORATED_SECONDS` is a guess nothing corroborates, so it stays
-LOW (never auto-applied by `--yes-medium`). With no clean candidate the
-finding is a LOW note with no patch.
+candidate, the patch is `original + delta` (hour shifts capped at
+`MAX_UNCORROBORATED_SECONDS`). A single clock can't corroborate its own
+shift — a unique landing offset is still a guess (a genuine next-day
+shot 25 h later "lands" too) — so every finding is LOW: shown in the
+report, never auto-applied by `--yes-medium`. With no clean candidate
+the finding is a LOW note with no patch.
 
 Multi-camera folders are left to `clock-drift-by-camera`.
 
@@ -151,7 +153,7 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
         new_dt = authority.dt + timedelta(seconds=delta)
         out.append(Finding(
             rule="clock-drift",
-            confidence="medium" if abs(delta) <= MAX_UNCORROBORATED_SECONDS else "low",
+            confidence="low",
             path=row.path,
             action="write_xmp",
             patch={"DateTimeOriginal": new_dt.strftime("%Y:%m:%d %H:%M:%S")},
@@ -160,4 +162,4 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
     return out
 
 
-register(Rule(name="clock-drift", confidence="medium", propose=_propose))
+register(Rule(name="clock-drift", confidence="low", propose=_propose))

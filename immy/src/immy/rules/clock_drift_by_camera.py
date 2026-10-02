@@ -16,16 +16,20 @@ satellite-synced; tie-break on group size), and proposes a per-camera
 *delta*. Each off-camera file gets `DateTimeOriginal = original + delta`,
 preserving the intra-camera sequence.
 
-Drift is only inferred from temporally overlapping evidence. Each
-camera's files are split into sessions (runs with no gap >
-`SESSION_GAP_SECONDS`); a camera session is compared only with reference
-sessions it overlaps in *raw* time (± `OVERLAP_TOLERANCE_SECONDS`). For
-every file in such a session we take the delta to its nearest reference
-neighbour; the median of those deltas is the drift estimate, and it
-needs ≥ `MIN_PAIRS` pairs that agree with it (within
-`AGREE_TOLERANCE_SECONDS`) to count. No overlap → no proposal: comparing
-per-camera medians told a drone flown only on day 9 of a 10-day trip
-that it was "+83h" off.
+Drift is found by offset search, never by comparing medians (that told
+a drone flown only on day 9 of a 10-day trip it was "+83h"). Each
+camera's bursts are collapsed into independent events (shots within
+`EVENT_GAP_SECONDS`). Candidate offsets are whole hours (±`MAX_HOURS`)
+plus a small skew (±`SKEW_SECONDS`, step `SKEW_STEP_SECONDS`); each is
+scored by one-to-one event matches within `MATCH_TOLERANCE_SECONDS`
+(each reference event used at most once). Candidates sharing an hour
+form one peak. The best peak is accepted only when it has ≥
+`MIN_MATCHED_EVENTS` matches covering ≥ `MIN_COVERAGE` of the smaller
+camera's events in the overlapping window, and dominates the runner-up
+peak (the zero-offset peak included) by ≥ `DOMINANCE_MARGIN` and ≥
+`DOMINANCE_RATIO`×. The offset is refined by the median matched delta;
+under `MIN_DRIFT_SECONDS` it's no drift. Anything else is ambiguous → no
+proposal.
 
 Sanity thresholds are deliberately conservative — cameras usually stay
 synced via GPS, phone sync, or manual set, so a real drift is either
@@ -41,6 +45,7 @@ not once per file.
 
 from __future__ import annotations
 
+from bisect import bisect_left
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
@@ -56,11 +61,17 @@ MIN_CAMERAS = 2                    # rule only makes sense with ≥2 groups
 MIN_DRIFT_SECONDS = 5 * 60         # below this is sync noise
 MAX_DRIFT_SECONDS = 14 * 86400     # above this: different trip / date typo
 SESSION_GAP_SECONDS = 3 * 3600     # a gap longer than this starts a new session
-OVERLAP_TOLERANCE_SECONDS = 3600   # raw-time slack when testing session overlap
-MIN_PAIRS = 3                      # nearest-neighbour pairs needed to infer drift
-AGREE_TOLERANCE_SECONDS = 5 * 60   # a pair "agrees" when within this of the median
-# A delta not backed by overlapping evidence from another clock is a guess;
-# above this it never gets MEDIUM/HIGH (so `--yes-medium` can't apply it).
+EVENT_GAP_SECONDS = 60             # shots this close are one burst = one event
+MAX_HOURS = 14                     # whole-hour offsets searched: -14h..+14h
+SKEW_SECONDS = 5 * 60              # ...each plus a skew of up to ±5 min
+SKEW_STEP_SECONDS = 30
+MATCH_TOLERANCE_SECONDS = 2 * 60   # shifted events this close to a ref event match
+MIN_MATCHED_EVENTS = 3             # independent matched events needed
+MIN_COVERAGE = 0.3                 # of the smaller camera's events in the overlap
+DOMINANCE_MARGIN = 2               # best peak ≥ runner-up + 2 ...
+DOMINANCE_RATIO = 2                # ... and ≥ 2 × runner-up
+# Cap for deltas not backed by evidence from another clock (single-camera
+# `clock-drift` guesses); such guesses are never MEDIUM/HIGH.
 MAX_UNCORROBORATED_SECONDS = 26 * 3600
 
 
@@ -84,36 +95,73 @@ def split_sessions(times: list[datetime]) -> list[list[datetime]]:
     return sessions
 
 
-def _overlaps(a: list[datetime], b: list[datetime]) -> bool:
-    slack = OVERLAP_TOLERANCE_SECONDS
-    return (
-        a[0].timestamp() <= b[-1].timestamp() + slack
-        and b[0].timestamp() <= a[-1].timestamp() + slack
-    )
+def _events(times: list[datetime]) -> list[float]:
+    """Collapse bursts (consecutive shots ≤ EVENT_GAP_SECONDS apart) into
+    independent events; returns each event's first-shot timestamp, sorted."""
+    out: list[float] = []
+    last = None
+    for ts in sorted(t.timestamp() for t in times):
+        if last is None or ts - last > EVENT_GAP_SECONDS:
+            out.append(ts)
+        last = ts
+    return out
+
+
+def _match(cam: list[float], ref: list[float], offset: float) -> list[float]:
+    """One-to-one matches of `cam` events shifted by `offset` onto `ref`
+    events within MATCH_TOLERANCE_SECONDS (each ref event used once,
+    nearest free one wins). Returns each match's residual (ref - shifted)."""
+    used: set[int] = set()
+    residuals: list[float] = []
+    for c in cam:
+        x = c + offset
+        i = bisect_left(ref, x - MATCH_TOLERANCE_SECONDS)
+        best = None
+        while i < len(ref) and ref[i] <= x + MATCH_TOLERANCE_SECONDS:
+            if i not in used and (best is None or abs(ref[i] - x) < abs(ref[best] - x)):
+                best = i
+            i += 1
+        if best is not None:
+            used.add(best)
+            residuals.append(ref[best] - x)
+    return residuals
+
+
+def _coverage_base(cam: list[float], ref: list[float], offset: float) -> int:
+    """Event count of the smaller camera inside the window where both
+    cameras (camera shifted by `offset`) have events."""
+    lo = max(cam[0] + offset, ref[0]) - MATCH_TOLERANCE_SECONDS
+    hi = min(cam[-1] + offset, ref[-1]) + MATCH_TOLERANCE_SECONDS
+    n_cam = sum(1 for c in cam if lo <= c + offset <= hi)
+    n_ref = sum(1 for r in ref if lo <= r <= hi)
+    return min(n_cam, n_ref)
 
 
 def _estimate_drift(
     cam_times: list[datetime], ref_times: list[datetime],
 ) -> tuple[float, int] | None:
-    """(delta seconds to add to the camera, agreeing pair count), or None
-    when the camera's sessions don't overlap the reference's in enough
-    places, or the nearest-neighbour deltas don't agree on one offset."""
-    ref_sessions = split_sessions(ref_times)
-    deltas: list[float] = []
-    for session in split_sessions(cam_times):
-        ref_near = [t.timestamp() for rs in ref_sessions if _overlaps(session, rs) for t in rs]
-        if not ref_near:
-            continue
-        for t in session:
-            ts = t.timestamp()
-            deltas.append(min(ref_near, key=lambda r: abs(r - ts)) - ts)
-    if len(deltas) < MIN_PAIRS:
+    """(delta seconds to add to the camera, matched event count), or None
+    when there's no drift or no unambiguous offset."""
+    cam, ref = _events(cam_times), _events(ref_times)
+    skews = range(-SKEW_SECONDS, SKEW_SECONDS + 1, SKEW_STEP_SECONDS)
+    # Peak per whole hour: its best-scoring candidate offset.
+    peaks: dict[int, tuple[int, float]] = {}
+    for h in range(-MAX_HOURS, MAX_HOURS + 1):
+        for eps in skews:
+            offset = h * 3600.0 + eps
+            score = len(_match(cam, ref, offset))
+            if h not in peaks or score > peaks[h][0]:
+                peaks[h] = (score, offset)
+    ranked = sorted(peaks.values(), key=lambda p: p[0], reverse=True)
+    (best, offset), runner_up = ranked[0], ranked[1][0]
+    if best < MIN_MATCHED_EVENTS:
         return None
-    delta = median(deltas)
-    agreeing = sum(1 for d in deltas if abs(d - delta) <= AGREE_TOLERANCE_SECONDS)
-    if agreeing < MIN_PAIRS or agreeing * 2 < len(deltas):
+    if best < runner_up + DOMINANCE_MARGIN or best < DOMINANCE_RATIO * runner_up:
         return None
-    return delta, agreeing
+    base = _coverage_base(cam, ref, offset)
+    if base == 0 or best < MIN_COVERAGE * base:
+        return None
+    return offset + median(_match(cam, ref, offset)), best
 
 
 def _fmt_delta(seconds: float) -> str:
@@ -163,8 +211,8 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
         group_id = f"clock-drift-camera:{cam}"
         reason = (
             f"{cam} ({len(items)} files) is {_fmt_delta(-delta)} vs "
-            f"{ref_cam} ({len(ref_items)} ref files; {pairs} overlapping "
-            f"shot pairs agree); proposed: add "
+            f"{ref_cam} ({len(ref_items)} ref files; {pairs} independent "
+            f"events match); proposed: add "
             f"{_fmt_delta(delta)} to each DateTimeOriginal"
         )
         for row, dt in items:

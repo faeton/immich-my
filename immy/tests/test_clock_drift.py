@@ -82,13 +82,15 @@ def test_single_camera_year_off_outlier_gets_year_delta_low_confidence():
     assert _patched(f) == datetime(2026, 4, 1, 10, 7)
 
 
-def test_single_camera_whole_hour_offset_landing_in_session_is_medium():
-    # 25 h after the session: shifting -25 h lands at 10:05, inside it.
+def test_single_camera_next_day_shot_is_never_medium():
+    # Six photos Apr 1 10:00-10:25 + one genuine Apr 2 11:05 photo. Shifting
+    # -25 h "lands" it at 10:05, but a unique landing offset from one clock is
+    # not corroboration: LOW (shown, never auto-applied by --yes-medium).
     rows = _session() + [_row("odd.jpg", datetime(2026, 4, 2, 11, 5))]
     findings = clock_drift._propose(rows, FOLDER)
     assert len(findings) == 1
     f = findings[0]
-    assert f.confidence == "medium"
+    assert f.confidence == "low"
     assert f.action == "write_xmp"
     assert _patched(f) == datetime(2026, 4, 1, 10, 5)
 
@@ -136,49 +138,83 @@ def test_by_camera_drone_flown_one_day_gets_no_median_delta():
     assert by_camera._propose(rows, FOLDER) == []
 
 
-def test_by_camera_no_temporal_overlap_means_no_proposal():
-    # Two 15-minute bursts 3 h apart: indistinguishable from shooting at
-    # different times, so no drift is inferred.
-    rows = []
-    for i in range(4):
-        rows.append(_row(f"a{i}.jpg", datetime(2026, 4, 1, 10, 5 * i), gps=True))
-        rows.append(_row(f"b{i}.jpg", datetime(2026, 4, 1, 7, 5 * i), cam=SONY))
+def test_by_camera_correctly_timed_burst_is_not_drift():
+    # Phone noon shots days 1-10 + three correctly timed drone shots on day 9
+    # at 11:40:00-02: one burst = one event, one reference shot — not three
+    # supporting pairs, and certainly not a bulk correction.
+    rows = _phone_ten_days() + [
+        _row(f"d{i}.mp4", datetime(2025, 7, 9, 11, 40, i), cam=DRONE) for i in range(3)
+    ]
     assert by_camera._propose(rows, FOLDER) == []
 
 
-def _concurrent(offset: timedelta, n: int = 5) -> list[ExifRow]:
-    """Phone (GPS, reference) shoots hourly; the Sony shoots the same
-    moments but its clock reads `offset` early."""
+def _trip_events() -> list[datetime]:
+    """Irregular shooting moments over three days (fixed, not periodic)."""
+    minutes = [0, 23, 71, 118, 160, 247, 301, 389, 452, 530, 611, 655]
+    return [
+        datetime(2026, 4, day, 8) + timedelta(minutes=m + 7 * day)
+        for day in (1, 2, 3) for m in minutes
+    ]
+
+
+def _slipped(offset: timedelta, cam=SONY, prefix="b") -> list[ExifRow]:
+    """The camera shoots every trip event (a 2-shot burst each) with its
+    clock reading `offset` ahead."""
     rows = []
-    for i in range(n):
-        t = datetime(2026, 4, 1, 10 + i, 3 * i)
-        rows.append(_row(f"a{i}.jpg", t, gps=True))
-        rows.append(_row(f"b{i}.jpg", t - offset, cam=SONY))
+    for i, t in enumerate(_trip_events()):
+        for k in range(2):
+            rows.append(_row(f"{prefix}{i}_{k}.jpg", t + offset + timedelta(seconds=k), cam=cam))
     return rows
 
 
-def test_by_camera_overlapping_sessions_yield_nn_delta_preserving_spacing():
-    rows = _concurrent(timedelta(minutes=20))
+def _phone_trip() -> list[ExifRow]:
+    return [_row(f"a{i}.jpg", t, gps=True) for i, t in enumerate(_trip_events())]
+
+
+def test_by_camera_timezone_slip_plus_3h_is_found():
+    rows = _phone_trip() + _slipped(timedelta(hours=3))
     findings = by_camera._propose(rows, FOLDER)
-    assert {f.path.name for f in findings} == {f"b{i}.jpg" for i in range(5)}
-    assert all(f.rule == "clock-drift-by-camera" for f in findings)
-    assert all(f.confidence == "medium" for f in findings)
+    assert len(findings) == 2 * len(_trip_events())
+    assert all(f.rule == "clock-drift-by-camera" and f.confidence == "medium" for f in findings)
     assert len({f.group for f in findings}) == 1
+    # Each file shifted by -3h00m: spacing preserved, never a constant.
     by_name = {f.path.name: f for f in findings}
-    for i in range(5):
-        assert _patched(by_name[f"b{i}.jpg"]) == datetime(2026, 4, 1, 10 + i, 3 * i)
+    for i, t in enumerate(_trip_events()):
+        assert _patched(by_name[f"b{i}_0.jpg"]) == t
+        assert _patched(by_name[f"b{i}_1.jpg"]) == t + timedelta(seconds=1)
 
 
-def test_by_camera_needs_three_pairs():
-    rows = [r for r in _concurrent(timedelta(minutes=20), n=5)
-            if r.path.name not in ("b2.jpg", "b3.jpg", "b4.jpg")]
-    # Pad the Sony group back to MIN_GROUP with a shot on another day that
-    # overlaps nothing — still only 2 nearest-neighbour pairs of evidence.
-    rows.append(_row("b9.jpg", datetime(2026, 4, 3, 10), cam=SONY))
+def test_by_camera_finds_each_slipped_camera_independently():
+    rows = (_phone_trip() + _slipped(timedelta(hours=3))
+            + _slipped(-timedelta(hours=7, minutes=2), cam=DRONE, prefix="d"))
+    by_name = {f.path.name: f for f in by_camera._propose(rows, FOLDER)}
+    for i, t in enumerate(_trip_events()):
+        assert _patched(by_name[f"b{i}_0.jpg"]) == t
+        assert _patched(by_name[f"d{i}_0.jpg"]) == t
+
+
+def test_by_camera_synced_cameras_get_no_proposal():
+    assert by_camera._propose(_phone_trip() + _slipped(timedelta(0)), FOLDER) == []
+    # Sub-5-minute skew is sync noise.
+    assert by_camera._propose(_phone_trip() + _slipped(timedelta(minutes=2)), FOLDER) == []
+
+
+def test_by_camera_periodic_shooting_is_ambiguous():
+    # Hourly shots on both bodies: +4h/+5h/+6h all line up nearly as well,
+    # no peak dominates → no proposal.
+    rows = [_row(f"a{i}.jpg", datetime(2026, 4, 1, 10 + i), gps=True) for i in range(4)]
+    rows += [_row(f"b{i}.jpg", datetime(2026, 4, 1, 5 + i), cam=SONY) for i in range(4)]
     assert by_camera._propose(rows, FOLDER) == []
 
 
-def test_by_camera_inconsistent_nn_deltas_are_not_evidence():
+def test_by_camera_needs_three_matched_events():
+    rows = _phone_trip() + [
+        r for r in _slipped(timedelta(hours=3)) if r.path.name.split("_")[0] in ("b0", "b5")
+    ]
+    assert by_camera._propose(rows, FOLDER) == []
+
+
+def test_by_camera_inconsistent_deltas_are_not_evidence():
     # Overlapping sessions but the deltas disagree (cameras simply shot at
     # different moments) — no consistent offset, no proposal.
     rows = [_row(f"a{i}.jpg", datetime(2026, 4, 1, 10 + 2 * i), gps=True) for i in range(4)]
