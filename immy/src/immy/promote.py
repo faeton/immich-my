@@ -34,6 +34,7 @@ from .notes import notes_body, resolve as resolve_notes
 from .paths import WritablePaths, resolve_writable_paths
 from .process import (
     ingestable_media,
+    MARKER_DB_IDENTITY_KEYS,
     marker_db_identity,
     read_marker as y_read_marker,
 )
@@ -395,11 +396,13 @@ def _marker_for_current_db(
     marker_path: Path, config: Config,
 ) -> tuple[dict | None, str | None]:
     """Return `(marker, warning)`. A marker whose recorded DB identity
-    (host/port/database/library_id) differs from the current config proves
-    nothing about THIS database — treat the trip as not processed and say
-    why. Every field known on BOTH sides is compared, so a config without
-    `pg:` still rejects a marker for another `library_id`. A legacy marker
-    without a `db` block is trusted as before."""
+    (database/library_id — `MARKER_DB_IDENTITY_KEYS`; host/port are only
+    informational, the same DB has a different address from the Mac and from
+    the container) differs from the current config proves nothing about THIS
+    database — treat the trip as not processed and say why. Every identity
+    field known on BOTH sides is compared, so a config without `pg:` still
+    rejects a marker for another `library_id`. A legacy marker without a `db`
+    block is trusted as before."""
     if not marker_path.is_file():
         return None, None
     marker = y_read_marker(marker_path.parent, marker=marker_path)
@@ -409,8 +412,9 @@ def _marker_for_current_db(
     current = marker_db_identity(
         config.pg, config.immich.library_id if config.immich else None)
     if all(
-        recorded.get(k) is None or v is None or recorded.get(k) == v
-        for k, v in current.items()
+        recorded.get(k) is None or current.get(k) is None
+        or recorded.get(k) == current.get(k)
+        for k in MARKER_DB_IDENTITY_KEYS
     ):
         return marker, None
     return None, (

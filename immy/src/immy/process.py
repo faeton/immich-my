@@ -2019,9 +2019,17 @@ def marker_steps(
     return steps
 
 
+# What makes two markers "the same Immich DB". host/port are recorded too but
+# are informational only: the same DB is `<n5>:15432` from the Mac and
+# `database:5432` from inside the container.
+MARKER_DB_IDENTITY_KEYS = ("database", "library_id")
+
+
 def marker_db_identity(pg: Any, library_id: str | None) -> dict:
     """`{host, port, database, library_id}` of the Immich DB a run targets.
-    `pg` is a `PgConfig` (or None — offline without a `pg:` block)."""
+    `pg` is a `PgConfig` (or None — offline without a `pg:` block). Only
+    `MARKER_DB_IDENTITY_KEYS` take part in matching; host/port are recorded
+    for the operator's information."""
     return {
         "host": getattr(pg, "host", None),
         "port": getattr(pg, "port", None),
@@ -2038,8 +2046,12 @@ def provenance_matches(marker_data: dict, expected: dict) -> bool:
     """Same DB, same mode, and every expected step recorded at the same
     version (extra recorded steps are fine — a captioned trip is still done
     for a run without captions). A marker without provenance (written before
-    it existed) never matches."""
-    if marker_data.get("db") != expected["db"]:
+    it existed) never matches. DB identity is `MARKER_DB_IDENTITY_KEYS`."""
+    recorded_db = marker_data.get("db")
+    if not isinstance(recorded_db, dict):
+        return False
+    if any(recorded_db.get(k) != expected["db"].get(k)
+           for k in MARKER_DB_IDENTITY_KEYS):
         return False
     if marker_data.get("mode") != expected["mode"]:
         return False
@@ -2186,5 +2198,6 @@ __all__ = [
     "insert_asset", "process_trip", "write_marker", "read_marker",
     "is_processed", "is_trip_fully_cached", "marker_path", "Y_MARKER_FILENAME",
     "ingestable_media", "marker_steps", "marker_db_identity",
+    "MARKER_DB_IDENTITY_KEYS",
     "marker_provenance", "provenance_matches", "INGEST_VERSION",
 ]

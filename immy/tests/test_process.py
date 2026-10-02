@@ -1193,6 +1193,18 @@ def test_fully_cached_requires_matching_provenance(tmp_path: Path):
     assert process_mod.is_trip_fully_cached(trip, provenance=bumped)[0] is False
 
 
+def test_fully_cached_db_identity_is_database_and_library_not_host(tmp_path: Path):
+    """The same DB seen from the Mac (n5:15432) and from inside the container
+    (database:5432) is one DB: identity = (database, library_id); host/port
+    are recorded for information only."""
+    trip, _ = _cached_trip(tmp_path, _prov())
+    container_view = _prov(db={"host": "database", "port": 5432,
+                               "database": "immich", "library_id": "lib-1"})
+    assert process_mod.is_trip_fully_cached(trip, provenance=container_view)[0] is True
+    other_dbname = _prov(db={**_prov()["db"], "database": "immich_test"})
+    assert process_mod.is_trip_fully_cached(trip, provenance=other_dbname)[0] is False
+
+
 def test_fully_cached_treats_legacy_marker_as_stale(tmp_path: Path):
     """Markers written before provenance existed carry no db/mode/steps —
     they can't prove which DB they were made against, so not cached."""

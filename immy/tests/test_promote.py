@@ -1032,6 +1032,23 @@ def test_promote_marker_for_this_db_skips_scan(
     assert "scan skipped" in result.stdout
 
 
+def test_promote_marker_same_db_via_other_host_port_skips_scan(
+    no_schema_guard, config_file, dji_ready, monkeypatch,
+):
+    """Marker written inside the container (database:5432) and promote run
+    from the Mac (127.0.0.1:15432): same (database, library_id) → same DB."""
+    _enable_fake_album_pg(config_file, monkeypatch)
+    _write_marker_with_db(dji_ready, {**_THIS_DB, "host": "database", "port": 5432})
+    fake = FakeClient(indexed=_indexed_set(dji_ready))
+    monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
+    monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
+
+    result = runner.invoke(app, ["promote", str(dji_ready)])
+    assert result.exit_code == 0, result.stdout
+    assert fake.scans == []
+    assert "different database" not in " ".join(result.stdout.split())
+
+
 def test_promote_drain_reads_nas_offline_root(tmp_path: Path):
     """With state_root configured, `process --offline` spooled under
     state_root — promote's drain must look there, not under the trip."""
