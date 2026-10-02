@@ -168,6 +168,7 @@ class Sink(Protocol):
     def update_description_if_ai_or_empty(
         self, asset_id: str, text: str, file_name: str | None = None) -> None: ...
     def clip_dim(self) -> int | None: ...
+    def immich_clip_model(self) -> str | None: ...
     def upsert_clip(self, asset_id: str, embedding: list[float], literal: str) -> None: ...
     def replace_faces(self, asset_id: str, width: int, height: int, rows: list[dict]) -> None: ...
     def record_derivatives(self, asset_id: str, derivatives: list[dict]) -> None: ...
@@ -286,6 +287,7 @@ class PgSink:
     def __init__(self, conn: psycopg.Connection) -> None:
         self.conn = conn
         self._clip_dim: int | None = None
+        self._immich_clip_model: str | None = None
 
     def existing_asset_id(
         self, owner_id: str, library_id: str, checksum: bytes,
@@ -369,6 +371,11 @@ class PgSink:
         if self._clip_dim is None:
             self._clip_dim = pg_mod.fetch_smart_search_dim(self.conn)
         return self._clip_dim
+
+    def immich_clip_model(self) -> str | None:
+        if self._immich_clip_model is None:
+            self._immich_clip_model = pg_mod.fetch_immich_clip_model(self.conn)
+        return self._immich_clip_model
 
     def upsert_clip(self, asset_id: str, embedding: list[float], literal: str) -> None:
         pg_mod.upsert_smart_search(self.conn, asset_id, literal)
@@ -655,6 +662,9 @@ class OfflineSink:
 
     def clip_dim(self) -> int | None:
         return self._clip_dim
+
+    def immich_clip_model(self) -> str | None:
+        return None  # no DB offline; the sync step is where Immich is reachable
 
     def upsert_clip(
         self, asset_id: str, embedding: list[float], literal: str,

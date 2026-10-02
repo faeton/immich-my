@@ -431,6 +431,9 @@ def test_process_trip_with_clip_upserts_smart_search(tmp_path: Path, monkeypatch
         lambda c: 4,
     )
     monkeypatch.setattr(
+        "immy.offline.pg_mod.fetch_immich_clip_model", lambda c: "ViT-B-32__openai",
+    )
+    monkeypatch.setattr(
         "immy.process.derivatives_mod.compute_for_asset",
         lambda **kw: _fake_derivative(
             tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
@@ -503,6 +506,9 @@ def test_process_trip_clip_dim_mismatch_soft_skips_by_default(tmp_path: Path, mo
     conn.cursor.return_value = cur
     monkeypatch.setattr("immy.process.pg_mod.fetch_smart_search_dim", lambda c: 512)
     monkeypatch.setattr(
+        "immy.offline.pg_mod.fetch_immich_clip_model", lambda c: "ViT-B-32__openai",
+    )
+    monkeypatch.setattr(
         "immy.process.derivatives_mod.compute_for_asset",
         lambda **kw: _fake_derivative(
             tmp_path / "preview-out" / f"{kw['asset_id']}_preview.jpeg"
@@ -532,6 +538,9 @@ def test_process_trip_clip_dim_mismatch_raises_when_requested(tmp_path: Path, mo
     cur.fetchone.return_value = ("uuid-x",)
     conn.cursor.return_value = cur
     monkeypatch.setattr("immy.process.pg_mod.fetch_smart_search_dim", lambda c: 512)
+    monkeypatch.setattr(
+        "immy.offline.pg_mod.fetch_immich_clip_model", lambda c: "ViT-B-32__openai",
+    )
     monkeypatch.setattr(
         "immy.process.derivatives_mod.compute_for_asset",
         lambda **kw: _fake_derivative(

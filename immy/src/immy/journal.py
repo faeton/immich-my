@@ -209,7 +209,11 @@ def transcript_version(model: str) -> str:
     return f"whisper:{model}"
 
 
-def caption_version(model: str) -> str:
+def caption_version(model: str, prompt_hash: str | None = None) -> str:
+    # `@<hash>` (see captions.prompt_hash) makes a prompt/max_tokens/extra_body
+    # change a different version. Legacy entries are the bare `caption:{model}`.
+    if prompt_hash:
+        return f"caption:{model}@{prompt_hash}"
     return f"caption:{model}"
 
 

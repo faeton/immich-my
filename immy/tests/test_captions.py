@@ -111,7 +111,7 @@ def test_caption_context_appended_only_when_given(tmp_path: Path):
         endpoint="http://example.invalid/v1", model="m",
         api_key=None, prompt="describe", max_tokens=10,
     )
-    fake_response = {"model": "m", "choices": [{"message": {"content": "x"}}]}
+    fake_response = {"model": "m", "choices": [{"message": {"content": "a small test frame"}}]}
 
     def run(context):
         captured: dict = {}
@@ -139,7 +139,7 @@ def test_caption_extra_body_merged_into_payload(tmp_path: Path):
     src = tmp_path / "sample.jpg"
     _tiny_jpeg(src)
     fake_response = {
-        "model": "m", "choices": [{"message": {"content": "x"}}],
+        "model": "m", "choices": [{"message": {"content": "a small test frame"}}],
     }
     captured: dict = {}
 
@@ -196,7 +196,7 @@ def test_caption_retries_invalid_image_with_reencode(tmp_path: Path):
     _tiny_jpeg(src)
 
     cfg = captions.CaptionerConfig(endpoint="http://example.invalid/v1")
-    ok = {"choices": [{"message": {"content": "recovered"}}], "usage": {}}
+    ok = {"choices": [{"message": {"content": "recovered after reencode"}}], "usage": {}}
     sent_uris: list[str] = []
 
     def fake_post(url, payload, *, api_key, timeout_s):
@@ -213,7 +213,7 @@ def test_caption_retries_invalid_image_with_reencode(tmp_path: Path):
     with patch.object(captions, "_post_json", side_effect=fake_post):
         result = captions.caption(src, config=cfg)
 
-    assert result.text == "recovered"
+    assert result.text == "recovered after reencode"
     assert len(sent_uris) == 2
     # The retry must send different bytes — a re-encoded stream, not the
     # same verbatim payload the server already rejected.
@@ -267,7 +267,7 @@ def test_caption_prefers_preview_when_available(tmp_path: Path):
 
     cfg = captions.CaptionerConfig(endpoint="http://example.invalid/v1")
     fake_response = {
-        "choices": [{"message": {"content": "ok"}}],
+        "choices": [{"message": {"content": "ok then fine image"}}],
         "usage": {},
     }
     with patch.object(

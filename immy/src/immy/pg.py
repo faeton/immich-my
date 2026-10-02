@@ -119,6 +119,25 @@ def fetch_smart_search_dim(conn: psycopg.Connection) -> int | None:
         return None
 
 
+# Immich 3.0.2 `config.ts` default for machineLearning.clip.modelName (also
+# what the live DB implies: no override in system-config, smart_search is
+# vector(512)). Used when system-config carries no explicit model.
+IMMICH_DEFAULT_CLIP_MODEL = "ViT-B-32__openai"
+
+_QUERY_IMMICH_CLIP_MODEL = (
+    "SELECT value #>> '{machineLearning,clip,modelName}' "
+    "FROM system_metadata WHERE key = 'system-config'"
+)
+
+
+def fetch_immich_clip_model(conn: psycopg.Connection) -> str:
+    """Immich's configured CLIP model (read-only): `system_metadata`
+    `system-config` → machineLearning.clip.modelName, else Immich's default."""
+    row = conn.execute(_QUERY_IMMICH_CLIP_MODEL).fetchone()
+    name = row[0] if row else None
+    return str(name) if name else IMMICH_DEFAULT_CLIP_MODEL
+
+
 _UPSERT_SMART_SEARCH = """
 INSERT INTO smart_search ("assetId", embedding)
 VALUES (%(asset_id)s, %(embedding)s::vector)

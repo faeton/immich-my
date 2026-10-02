@@ -4,6 +4,37 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-02 — caption retry/sanitising/prompt hash, CLIP model guard
+
+### Fixed
+
+- **Captions retry transient failures.** Up to 4 attempts with exponential
+  backoff + jitter (1 s base, 30 s cap) on connection errors, timeouts, HTTP
+  429 and 5xx; `Retry-After` is honoured. Other 4xx fail at once (the
+  "invalid image" 400 re-encode path is unchanged).
+- **Captions are sanitised.** `<think>...</think>` (and an unclosed leading
+  `<think>`) is stripped; surrounding quotes/whitespace trimmed. Empty text,
+  fewer than 3 words, and refusals ("I'm sorry", "I cannot", "I can't",
+  "As an AI") are rejected: counted as a caption failure, nothing written,
+  journal not marked.
+- **A prompt change now re-captions.** The caption journal version is
+  `caption:<model>@<hash8>` (sha256 of prompt + max_tokens + canonical
+  `extra_body`), and the hash is stored in the cached caption meta. A cached
+  caption made under a different hash is redone even when its DB description
+  is AI-prefixed. Existing entries with no hash (`caption:<model>`) count as
+  matching, so upgrading does not mass re-caption; `--recaption` is still the
+  explicit override. Trip markers record the new version string, so a
+  previously processed trip re-runs once (journal-cached, no VLM calls) to
+  re-stamp its marker.
+- **CLIP writes to `smart_search` are guarded.** immy reads Immich's
+  configured model (`system_metadata` `system-config` ->
+  `machineLearning.clip.modelName`, default `ViT-B-32__openai` as in Immich
+  3.0.2 when unset; read-only) and refuses CLIP writes on mismatch with
+  `ml.clip_model`; other enrichers continue. The `mlx` backend (~0.925 cosine
+  to Immich's vectors) is refused unless `--allow-mlx-clip` or
+  `ml.allow_mlx_clip: true` is given. The default backend is unchanged, so a
+  Mac run on `mlx` now needs the flag or config key to keep writing CLIP.
+
 ## 2026-10-02 — bloat/Insta360 detection, transcode temp name, SRT dialects, altitude sign, immy GPX
 
 ### Fixed

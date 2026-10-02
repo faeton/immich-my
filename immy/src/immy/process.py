@@ -717,6 +717,7 @@ def process_trip(
     clip_model: str = clip_mod.DEFAULT_MODEL,
     clip_backend: str = "mlx",
     clip_endpoint: str | None = None,
+    allow_mlx_clip: bool = True,  # library default permissive; the CLI passes the user's choice (default False)
     faces_model: str = faces_mod.DEFAULT_MODEL,
     transcript_model: str = transcripts_mod.DEFAULT_MODEL,
     transcript_prompt: str | None = None,
@@ -797,6 +798,19 @@ def process_trip(
         if not compute_derivatives:
             raise ValueError("compute_clip requires compute_derivatives=True")
         expected_dim = sink.clip_dim()
+        # Guard smart_search writes; other enrichers carry on without CLIP.
+        try:
+            _immich_model = getattr(sink, "immich_clip_model", lambda: None)()
+            _guard = clip_guard_reason(
+                clip_model=clip_model, clip_backend=clip_backend,
+                allow_mlx_clip=allow_mlx_clip, immich_model=_immich_model,
+            )
+        except Exception as e:  # noqa: BLE001 — can't verify → don't write
+            _guard = f"could not read Immich's CLIP model ({e}); refusing smart_search writes"
+        if _guard:
+            if progress is not None:
+                progress(f"  CLIP disabled: {_guard}")
+            compute_clip = False
 
     # Journal anchors per-phase resumability across crashes / Ctrl-C.
     # On every successful asset insert we drop an "ingest" entry; that
@@ -810,8 +824,12 @@ def process_trip(
     CLIP_VERSION = journal_mod.clip_version(clip_model, clip_backend)
     FACES_VERSION = journal_mod.faces_version(faces_model)
     TRANSCRIPT_VERSION = journal_mod.transcript_version(transcript_model)
+    CAPTION_PROMPT_HASH = (
+        captions_mod.prompt_hash(captioner_config)
+        if captioner_config is not None else None
+    )
     CAPTION_VERSION = (
-        journal_mod.caption_version(captioner_config.model)
+        journal_mod.caption_version(captioner_config.model, CAPTION_PROMPT_HASH)
         if captioner_config is not None else "caption:none"
     )
 
@@ -1339,14 +1357,28 @@ def process_trip(
                 or (asset.asset_type == "VIDEO" and caption_preview is not None)
             )
         )
+        # A prompt/max_tokens/extra_body change since the cached caption was
+        # made forces a re-caption of just this asset, like `--recaption`.
+        _prompt_changed = (
+            caption_eligible and not recaption
+            and caption_prompt_changed(
+                journal.get(cs_hex, "caption"),
+                captioner_config.model, CAPTION_PROMPT_HASH)
+        )
+        force_caption = recaption or _prompt_changed
         # Caption journal-skip path — strongest signal, used in addition
         # to (not instead of) the offline-sink prior_caption check and
         # the DB AI-prefix shortcut. `--recaption` ignores the journal,
         # forcing re-run.
         if (
             caption_eligible
-            and not recaption
-            and journal.is_done(cs_hex, "caption", CAPTION_VERSION)
+            and not force_caption
+            and (
+                journal.is_done(cs_hex, "caption", CAPTION_VERSION)
+                or journal.is_done(
+                    cs_hex, "caption",
+                    journal_mod.caption_version(captioner_config.model))
+            )
         ):
             cached_meta = (journal.get(cs_hex, "caption") or {}).get("meta")
             if cached_meta:
@@ -1376,7 +1408,7 @@ def process_trip(
         elif (
             caption_eligible
             and prior_caption is None
-            and not recaption
+            and not force_caption
         ):
             # Online resume path (and offline-without-prior): if the DB
             # description is already AI-prefixed, skip the VLM call. We
@@ -1404,7 +1436,7 @@ def process_trip(
         if (
             caption_eligible
             and caption_info is None
-            and not recaption
+            and not force_caption
             and caption_fill_missing_only
         ):
             # Only KEEP a prior caption that actually has usable text — an
@@ -1480,7 +1512,7 @@ def process_trip(
                         lambda: _process_caption(
                             sink, asset.id, exif_row.path,
                             captioner_config, preview=caption_preview,
-                            recaption=recaption,
+                            recaption=force_caption,
                             require_preview=asset.asset_type == "VIDEO",
                             paths=paths,
                             context=_caption_context,
@@ -1579,6 +1611,7 @@ def process_trip(
                 "model": result.model,
                 "prompt_tokens": result.prompt_tokens,
                 "completion_tokens": result.completion_tokens,
+                "prompt_hash": CAPTION_PROMPT_HASH,
             }
 
         hb.write(step="caption", index=0, total=len(caption_jobs), file="")
@@ -1850,6 +1883,7 @@ def _process_caption(
         "model": result.model,
         "prompt_tokens": result.prompt_tokens,
         "completion_tokens": result.completion_tokens,
+        "prompt_hash": captions_mod.prompt_hash(config),
     }
 
 
@@ -1893,6 +1927,54 @@ def _process_faces(
 # DB/library, offline, or with an older model is not mistaken for done.
 
 
+_PROMPT_HASH_RE = re.compile(r"@([0-9a-f]{8})$")
+
+
+def caption_prompt_changed(
+    rec: dict | None, model: str, current_hash: str | None,
+) -> bool:
+    """True when a journaled caption for `model` was made under a different
+    prompt/max_tokens/extra_body hash than the current one. A legacy entry
+    (bare `caption:{model}` version, no hash in meta) counts as matching so an
+    upgrade doesn't mass re-caption; `--recaption` is the explicit override."""
+    if not rec or not current_hash:
+        return False
+    version = str(rec.get("version") or "")
+    if not version.startswith(f"caption:{model}"):
+        return False
+    m = _PROMPT_HASH_RE.search(version)
+    stored = m.group(1) if m else (rec.get("meta") or {}).get("prompt_hash")
+    return bool(stored) and stored != current_hash
+
+
+def clip_guard_reason(
+    *,
+    clip_model: str,
+    clip_backend: str,
+    allow_mlx_clip: bool,
+    immich_model: str | None,
+) -> str | None:
+    """Why this run must not write CLIP vectors to smart_search, or None.
+
+    Two refusals: the mlx backend (its vectors are ~0.925 cosine to Immich's,
+    which would split the shared index) unless explicitly allowed, and an
+    immy `clip_model` that differs from the model Immich is configured with
+    (`immich_model`, None = unknown/offline → not checked)."""
+    if clip_backend == "mlx" and not allow_mlx_clip:
+        return (
+            "CLIP backend 'mlx' produces vectors ~0.925 cosine to Immich's own; "
+            "refusing smart_search writes. Use backend onnx/immich-ml, or pass "
+            "--allow-mlx-clip (or ml.allow_mlx_clip: true) to accept the drift."
+        )
+    if immich_model is not None and immich_model != clip_model:
+        return (
+            f"immy clip_model {clip_model!r} != Immich's configured CLIP model "
+            f"{immich_model!r}; refusing smart_search writes (mixed vector "
+            "spaces would corrupt search). Fix ml.clip_model or Immich's setting."
+        )
+    return None
+
+
 def marker_steps(
     *,
     compute_derivatives: bool = False,
@@ -1918,7 +2000,8 @@ def marker_steps(
     if compute_transcripts:
         steps["transcript"] = journal_mod.transcript_version(transcript_model)
     if compute_captions and captioner_config is not None:
-        steps["caption"] = journal_mod.caption_version(captioner_config.model)
+        steps["caption"] = journal_mod.caption_version(
+            captioner_config.model, captions_mod.prompt_hash(captioner_config))
     return steps
 
 

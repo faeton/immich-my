@@ -39,13 +39,17 @@ non-`AI:`-prefixed descriptions are never clobbered — user text wins.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
+import random
+import re
+import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 
 DEFAULT_ENDPOINT = "http://localhost:1234/v1"  # LM Studio default
@@ -120,6 +124,47 @@ class CaptionerConfig:
     extra_body: dict[str, Any] | None = None
 
 
+_THINK_BLOCK = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
+_THINK_UNCLOSED = re.compile(r"^\s*<think>.*\Z", re.DOTALL | re.IGNORECASE)
+_REFUSAL = re.compile(
+    r"^(i['\u2019]m sorry|i am sorry|i cannot|i can['\u2019]?t|i['\u2019]m unable|"
+    r"i am unable|sorry,|as an ai\b)",
+    re.IGNORECASE,
+)
+MIN_CAPTION_WORDS = 3
+
+
+def clean_caption(text: str) -> str:
+    """Strip `<think>…</think>` blocks (and an unclosed leading `<think>`),
+    then surrounding whitespace and quote characters."""
+    text = _THINK_BLOCK.sub("", text)
+    text = _THINK_UNCLOSED.sub("", text)
+    return text.strip().strip("\"'`\u201c\u201d\u2018\u2019").strip()
+
+
+def rejection_reason(text: str) -> str | None:
+    """Why `text` must not be stored as a caption, or None if it's usable:
+    empty, fewer than MIN_CAPTION_WORDS words, or a model refusal."""
+    if not text.strip():
+        return "empty"
+    if len(text.split()) < MIN_CAPTION_WORDS:
+        return f"fewer than {MIN_CAPTION_WORDS} words"
+    if _REFUSAL.match(text.strip()):
+        return "refusal"
+    return None
+
+
+def prompt_hash(config: "CaptionerConfig") -> str:
+    """Short (8 hex) digest of everything that shapes the request besides the
+    model id and image: prompt, max_tokens, canonical extra_body. Folded into
+    the caption journal version so a prompt change re-captions."""
+    blob = json.dumps(
+        [config.prompt, config.max_tokens, config.extra_body or {}],
+        sort_keys=True, separators=(",", ":"), ensure_ascii=False,
+    )
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:8]
+
+
 def _encode_image(source: Path, *, force_reencode: bool = False) -> str:
     """Return a `data:image/jpeg;base64,...` URI.
 
@@ -192,7 +237,26 @@ def detect_lm_studio_model(
     return str(pick["id"]) if pick and pick.get("id") else None
 
 
-def _post_json(
+_sleep = time.sleep  # indirection so tests can stub the backoff wait
+MAX_ATTEMPTS = 4
+BACKOFF_BASE_S = 1.0
+BACKOFF_CAP_S = 30.0
+RETRY_AFTER_CAP_S = 120.0
+
+
+def _retry_delay(attempt: int, retry_after: str | None) -> float:
+    """Seconds to wait before retry number `attempt` (1-based): honour a
+    numeric `Retry-After`, else exponential backoff with full-ish jitter."""
+    if retry_after:
+        try:
+            return max(0.0, min(float(retry_after), RETRY_AFTER_CAP_S))
+        except ValueError:
+            pass
+    base = min(BACKOFF_CAP_S, BACKOFF_BASE_S * (2 ** (attempt - 1)))
+    return base * (0.5 + random.random() / 2)
+
+
+def _post_json_once(
     url: str,
     payload: dict,
     *,
@@ -213,11 +277,45 @@ def _post_json(
         # Surface the server's error body — most providers return JSON
         # with a useful `error.message` we want in the logs.
         detail = e.read().decode("utf-8", errors="replace")[:500]
-        raise CaptionError(f"HTTP {e.code} from {url}: {detail}") from e
+        err = _RetryableCaptionError if (e.code == 429 or e.code >= 500) else CaptionError
+        exc = err(f"HTTP {e.code} from {url}: {detail}")
+        if err is _RetryableCaptionError:
+            exc.retry_after = e.headers.get("Retry-After") if e.headers else None
+        raise exc from e
     except urllib.error.URLError as e:
-        raise CaptionError(f"connection to {url} failed: {e.reason}") from e
+        raise _RetryableCaptionError(
+            f"connection to {url} failed: {e.reason}") from e
+    except (TimeoutError, ConnectionError) as e:
+        raise _RetryableCaptionError(f"connection to {url} failed: {e!r}") from e
     except json.JSONDecodeError as e:
         raise CaptionError(f"non-JSON response from {url}: {e}") from e
+
+
+class _RetryableCaptionError(CaptionError):
+    """Transient transport/server failure worth another attempt."""
+    retry_after: str | None = None
+
+
+def _post_json(
+    url: str,
+    payload: dict,
+    *,
+    api_key: str | None,
+    timeout_s: float,
+    sleep: Callable[[float], None] | None = None,
+) -> dict:
+    """POST with up to MAX_ATTEMPTS tries on transient failures (URLError,
+    timeouts, connection errors, HTTP 429/5xx). Other 4xx fail at once."""
+    for attempt in range(1, MAX_ATTEMPTS + 1):
+        try:
+            return _post_json_once(
+                url, payload, api_key=api_key, timeout_s=timeout_s)
+        except _RetryableCaptionError as e:
+            if attempt == MAX_ATTEMPTS:
+                raise CaptionError(
+                    f"{e} (after {MAX_ATTEMPTS} attempts)") from e
+            (sleep or _sleep)(_retry_delay(attempt, e.retry_after))
+    raise AssertionError("unreachable")  # pragma: no cover
 
 
 def _is_invalid_image_rejection(e: CaptionError) -> bool:
@@ -298,7 +396,10 @@ def caption(
         text = message["content"]
     except (KeyError, IndexError, TypeError) as e:
         raise CaptionError(f"unexpected response shape: {response}") from e
-    text = str(text or "").strip()
+    raw_text = str(text or "")
+    text = clean_caption(raw_text)
+    if not text and raw_text.strip():
+        raise CaptionError("caption rejected: nothing left after stripping <think> block")
     if not text:
         # The reasoning-leak trap: a model with thinking on (e.g. gemma4 on
         # Ollama's /v1) returns its answer in a `reasoning` field and leaves
@@ -311,6 +412,10 @@ def caption(
                 "{reasoning_effort: none} for this endpoint."
             )
         raise CaptionError("empty caption in model response")
+
+    reason = rejection_reason(text)
+    if reason:
+        raise CaptionError(f"caption rejected: {reason}: {text[:80]!r}")
 
     usage = response.get("usage") or {}
     return CaptionResult(
@@ -360,6 +465,7 @@ __all__ = [
     "DEFAULT_ENDPOINT", "DEFAULT_MODEL", "DEFAULT_PROMPT", "DEFAULT_MAX_TOKENS",
     "LM_STUDIO_PREFERRED_MODELS", "LM_STUDIO_FALLBACK_MODEL",
     "CaptionError", "CaptionResult", "CaptionerConfig",
-    "caption", "detect_lm_studio_model",
+    "caption", "detect_lm_studio_model", "prompt_hash",
+    "clean_caption", "rejection_reason",
     "format_description", "is_ai_description", "is_camera_boilerplate",
 ]

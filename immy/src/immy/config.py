@@ -128,6 +128,9 @@ class MLConfig:
     # path — no GPU/weights on the immy side). `immich_ml_url` is that
     # server's URL (e.g. http://n5:3003), required when clip_backend=immich-ml.
     clip_backend: str = "mlx"
+    # mlx vectors are only ~0.925 cosine to Immich's own, so writing them to
+    # smart_search is refused unless this (or `--allow-mlx-clip`) is set.
+    allow_mlx_clip: bool = False
     immich_ml_url: str | None = None
     whisper_model: str | None = None
     whisper_prompt: str | None = None
@@ -243,6 +246,7 @@ def load(path: Path | None = None) -> Config:
         ml = MLConfig(
             clip_model=str(ml_raw["clip_model"]) if ml_raw.get("clip_model") else None,
             clip_backend=str(ml_raw.get("clip_backend") or "mlx"),
+            allow_mlx_clip=bool(ml_raw.get("allow_mlx_clip", False)),
             immich_ml_url=(
                 str(ml_raw["immich_ml_url"])
                 if ml_raw.get("immich_ml_url") else None

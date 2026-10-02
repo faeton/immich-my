@@ -1504,6 +1504,7 @@ def _run_one_trip(
     caption_workers: int,
     clip_model: str,
     clip_backend: str = "mlx",
+    allow_mlx_clip: bool = False,
     clip_endpoint: str | None = None,
     transcript_model: str,
     transcript_prompt: str | None,
@@ -1610,6 +1611,7 @@ def _run_one_trip(
             clip_model=clip_model,
             clip_backend=clip_backend,
             clip_endpoint=clip_endpoint,
+            allow_mlx_clip=allow_mlx_clip,
             transcript_model=transcript_model,
             transcript_prompt=transcript_prompt,
             transcript_backend=transcript_backend,
@@ -1684,6 +1686,10 @@ def process(
     with_captions: bool = typer.Option(
         False, "--with-captions/--no-captions",
         help="Phase 3b — VLM caption per image via OpenAI-compat endpoint (LM Studio / OpenAI / Anthropic / Gemini). Writes 'AI: ...' into asset_exif.description. Configured under `ml.captioner` in config.yml. Off by default (costs tokens on cloud backends).",
+    ),
+    allow_mlx_clip: bool = typer.Option(
+        False, "--allow-mlx-clip",
+        help="Permit the mlx CLIP backend to write smart_search. Off by default: mlx vectors are only ~0.925 cosine to Immich's own and would split the shared index (also settable as ml.allow_mlx_clip in config.yml).",
     ),
     recaption: bool = typer.Option(
         False, "--recaption",
@@ -1791,6 +1797,25 @@ def process(
     clip_endpoint = os.environ.get("IMMY_IMMICH_ML_URL") or (
         config.ml.immich_ml_url if config.ml is not None else None
     )
+    allow_mlx_clip = allow_mlx_clip or bool(
+        config.ml is not None and config.ml.allow_mlx_clip
+    )
+    if compute_clip:
+        # Decide once, up front, so the marker below doesn't claim a CLIP
+        # step this run won't perform. Other enrichers carry on.
+        try:
+            immich_clip = (
+                None if conn is None else pg_mod.fetch_immich_clip_model(conn)
+            )
+            clip_block = process_mod.clip_guard_reason(
+                clip_model=clip_model, clip_backend=clip_backend,
+                allow_mlx_clip=allow_mlx_clip, immich_model=immich_clip,
+            )
+        except Exception as e:  # noqa: BLE001
+            clip_block = f"could not read Immich's CLIP model ({e})"
+        if clip_block:
+            console.print(f"[yellow]CLIP skipped:[/yellow] {clip_block}")
+            compute_clip = False
     transcript_model = transcripts_mod.DEFAULT_MODEL
     if config.ml is not None and config.ml.whisper_model:
         transcript_model = config.ml.whisper_model
@@ -1932,6 +1957,7 @@ def process(
                 clip_model=clip_model,
                 clip_backend=clip_backend,
                 clip_endpoint=clip_endpoint,
+                allow_mlx_clip=allow_mlx_clip,
                 transcript_model=transcript_model,
                 transcript_prompt=transcript_prompt,
                 transcript_backend=transcript_backend,
