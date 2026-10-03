@@ -22,6 +22,8 @@ reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
 `tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — to Immich's native
 Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·
 `tags camera` (backfill the blank Camera field for DJI MP4s from the notes gear tag; see `docs/TELEMETRY.md`) ·
+`photos diff` (read-only: Photos.app assets missing from Immich → UUID list
+for `osxphotos export`; no iCloud login) ·
 `similar` (image→image search on Immich's CLIP index: find the library shot a re-shared
 photo came from) · `status <trip>` (marker/journal/offline/derivatives/heartbeat summary) ·
 `doctor` (read-only preflight: binaries, paths, Immich API, Postgres

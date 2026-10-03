@@ -183,6 +183,8 @@ Verified against the installed package.
   it crashes on import — `TypeError: unsupported operand type(s) for |` at
   `osxphotos/bookmark.py:12` (PEP 604 union under too old an interpreter). Reinstall on a
   supported Python and pin the version. **This is a Phase 0 blocker the brief does not list.**
+  **Fixed 2026-10-03:** `uv tool install --python 3.12 'osxphotos==0.77.2'`; reads the
+  macOS 27 library fine (`osxphotos query` smoke-tested).
 - **`--skip-original-if-edited` already exists**, as does `--export-aae`. §7's option 3 is a
   one-flag change, not "the most work and hardest to reverse".
 - **`--only-new`** — "ignores any previously exported files, even if missing from the export
@@ -294,6 +296,11 @@ already checksums every file it transfers. Cut the double hash, not the director
 | **6** | Monitoring (trimmed); two weeks of clean runs | then and only then, brief §9 decommissioning of the icloudpd stub tree |
 
 Phase 0.5 is new and did not appear in the brief. Phase 2 remains worth doing on its own merits.
+
+**Where this stands (2026-10-03):** osxphotos is reinstalled and pinned (0.77.2). `immy photos diff` is the
+read-only hole-finder, done without downloading: 4,657 assets (~68 GB) added since 2026-06 are missing from Immich,
+starting ~2026-07-13. Next: Phase 4 `immy photos pull` (export just those UUIDs → n5 `ready/`), which needs the
+unacknowledged-delivery queue.
 
 **Where this stands (2026-09-23):** Phases 0.5 and 2 are done, and Phase 3 is done on the n5 side.
 Phase 0 is still the gate (below), then the real-batch check for Phase 3, then Phase 4.

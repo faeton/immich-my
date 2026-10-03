@@ -4235,5 +4235,156 @@ def pano_server(
 app.add_typer(triage_app, name="triage")
 
 
+photos_app = typer.Typer(
+    help="Apple Photos.app → Immich bridge. Uses the Mac's own Photos/iCloud "
+    "session, so n5 never logs into iCloud.",
+    no_args_is_help=True,
+)
+
+
+@photos_app.command("diff")
+def photos_diff(
+    since: str = typer.Option(
+        None, "--since",
+        help="Only assets ADDED to Photos on/after this date (YYYY-MM-DD). "
+        "Default: 120 days ago.",
+    ),
+    all_: bool = typer.Option(False, "--all", help="Whole library, no --since cut."),
+    photos_library: Path = typer.Option(
+        Path.home() / "Pictures" / "Photos Library.photoslibrary",
+        "--photos-db",
+        help="Path to a `.photoslibrary` bundle, or directly to Photos.sqlite.",
+    ),
+    snapshot_path: Path = typer.Option(
+        Path.home() / ".immy" / "library-snapshot.sqlite", "--snapshot",
+        help="SQLite snapshot produced by `immy snapshot`.",
+    ),
+    out: Path = typer.Option(
+        Path.home() / ".immy" / "photos-missing.txt", "--out",
+        help="Write missing asset UUIDs here, one per line "
+        "(feeds `osxphotos export --uuid-from-file`).",
+    ),
+    as_json: bool = typer.Option(False, "--json", help="Machine-readable output."),
+) -> None:
+    """List Photos.app assets that Immich does not have yet. Read-only.
+
+    Compares `Photos.sqlite` with an `immy snapshot` — no downloads, no
+    iCloud traffic, nothing written except the UUID list. An asset counts as
+    present on (filename + size) or on capture time within ±1 s; filename
+    alone is not enough (IMG_NNNN counters repeat). See `immy.photos_diff`.
+    """
+    import json
+    from datetime import datetime, timedelta, timezone
+    from collections import Counter
+    from . import photos_diff as pd
+
+    if all_ and since:
+        console.print("[red]--all and --since are mutually exclusive[/red]")
+        raise typer.Exit(code=2)
+    if all_:
+        added_since = None
+    elif since:
+        try:
+            added_since = datetime.fromisoformat(since).replace(tzinfo=timezone.utc)
+        except ValueError:
+            console.print(f"[red]bad --since date:[/red] {since}")
+            raise typer.Exit(code=2)
+    else:
+        added_since = datetime.now(timezone.utc) - timedelta(days=120)
+
+    try:
+        db_path = apple_photos_mod.resolve_db_path(photos_library)
+    except FileNotFoundError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    if not snapshot_path.exists():
+        console.print(
+            f"[red]snapshot not found:[/red] {snapshot_path}\n"
+            "Run `immy snapshot` first (needs Immich DB access)."
+        )
+        raise typer.Exit(code=2)
+
+    snap = snapshot_mod.open_for_read(snapshot_path)
+    created = snapshot_mod.read_meta(snap).get("created_at")
+    age_h = None
+    if created:
+        age_h = (datetime.now(timezone.utc) - datetime.fromisoformat(created)).total_seconds() / 3600
+    photos = pd.open_live_ro(db_path)
+    try:
+        result = pd.diff(photos, snap, added_since)
+    finally:
+        photos.close()
+        snap.close()
+
+    missing = result.by_status("missing")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text("".join(f"{a.uuid}\n" for a in missing))
+
+    counts = result.counts()
+    missing_bytes = sum(a.size_bytes or 0 for a in missing)
+    by_month = Counter(pd.month(a.created_unix) for a in missing)
+    by_kind = Counter(a.kind for a in missing)
+    by_camera = Counter(a.camera or "(none)" for a in missing)
+
+    if as_json:
+        print(json.dumps({
+            "added_since": added_since.date().isoformat() if added_since else None,
+            "snapshot_created_at": created,
+            "counts": {"exact": counts["exact"], "time": counts["time"],
+                       "missing": counts["missing"],
+                       "skipped_hidden_bursts": result.skipped_hidden_bursts},
+            "missing_bytes": missing_bytes,
+            "missing_by_capture_month": dict(sorted(by_month.items())),
+            "missing_by_kind": dict(by_kind),
+            "missing_by_camera": dict(by_camera.most_common()),
+            "out": str(out),
+        }, indent=2))
+        return
+
+    scope = f"added since {added_since.date()}" if added_since else "whole library"
+    console.print(
+        f"[bold]photos diff[/bold] ({scope})\n"
+        f"  photos:   [cyan]{db_path}[/cyan]\n"
+        f"  snapshot: [cyan]{snapshot_path}[/cyan]"
+        + (f" [dim]({age_h:.0f} h old)[/dim]" if age_h is not None else "")
+    )
+    if age_h is not None and age_h > 24:
+        console.print(
+            "  [yellow]snapshot is over a day old — anything Immich got since "
+            "will show as missing. Re-run `immy snapshot`.[/yellow]"
+        )
+
+    total = len(result.items)
+    t = Table(show_header=True, header_style="bold")
+    t.add_column("status")
+    t.add_column("assets", justify="right")
+    t.add_row("in Immich (filename + size)", f"{counts['exact']:,}")
+    t.add_row("in Immich (capture time ±1 s)", f"{counts['time']:,}")
+    t.add_row("[bold]missing[/bold]", f"[bold]{counts['missing']:,}[/bold]")
+    t.add_row("[dim]total[/dim]", f"[dim]{total:,}[/dim]")
+    console.print(t)
+    if result.skipped_hidden_bursts:
+        console.print(f"  [dim]skipped {result.skipped_hidden_bursts:,} non-pick burst frame(s)[/dim]")
+
+    if missing:
+        console.print(
+            f"\n[bold]missing:[/bold] {by_kind['photo']:,} photo(s), "
+            f"{by_kind['video']:,} video(s), ~{missing_bytes / 1e9:.1f} GB"
+        )
+        mt = Table(show_header=True, header_style="bold", title="by capture month")
+        mt.add_column("month")
+        mt.add_column("assets", justify="right")
+        for m, n in sorted(by_month.items()):
+            mt.add_row(m, f"{n:,}")
+        console.print(mt)
+        console.print(
+            "  cameras: " + ", ".join(f"{c} {n:,}" for c, n in by_camera.most_common(6))
+        )
+    console.print(f"\n[green]✓[/green] {len(missing):,} UUID(s) → [cyan]{out}[/cyan]")
+
+
+app.add_typer(photos_app, name="photos")
+
+
 if __name__ == "__main__":
     app()

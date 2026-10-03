@@ -4,6 +4,36 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-03 — `immy photos diff`: what Photos.app has that Immich doesn't
+
+Phase 0 (osxphotos) and the first read-only step of the Photos Bridge
+(`todo/PHOTOS-BRIDGE-REVIEW.md`). No iCloud login and no downloads: it reads
+the Mac's `Photos.sqlite` and an `immy snapshot`.
+
+### Added
+
+- **`immy photos diff [--since DATE | --all]`.** Lists every non-trashed Photos
+  asset added since the cut (default: 120 days ago) and sorts each one into
+  `exact` (filename + size), `time` (capture instant ±1 s) or `missing`. Writes the
+  missing UUIDs to `~/.immy/photos-missing.txt`, ready for
+  `osxphotos export --uuid-from-file`. Skips burst frames that weren't picked.
+  Reads Photos.sqlite WAL-aware (`mode=ro`, not `immutable=1`), because the newest
+  additions are still in the WAL.
+
+### Findings
+
+- **Filename alone doesn't prove a match.** `IMG_NNNN` counters wrap and several devices
+  share them. A filename-only rule said ~3.7k recent shots were already in Immich,
+  because older photos with the same name were. Spot-checks against Postgres found
+  nothing within ±2 min of them.
+- **The gap is real and clean.** On 2026-10-03: 4,657 assets added since 2026-06-05
+  are missing from Immich (~68 GB, 3,934 photos + 723 videos). They start at
+  ~2026-07-13, matching the known forward-sync stop. Mostly iPhone 17/18 Pro and
+  Ray-Ban Meta glasses.
+- **osxphotos is reinstalled** as a uv tool on Python 3.12, pinned at 0.77.2
+  (`uv tool install --python 3.12 'osxphotos==0.77.2'`). The old Python 3.9 user-site
+  copy crashed on import; it is now shadowed on PATH by `~/.local/bin`.
+
 ## 2026-10-02 — final-review fixes (backup state, drift dates, dedup holds, markers)
 
 ### Fixed
