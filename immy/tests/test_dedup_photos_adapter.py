@@ -117,6 +117,39 @@ def test_sidecar_agreeing_with_exif_changes_nothing(tmp_path):
     assert out["taken_src"] == "exif"
 
 
+def test_photos_rounding_noise_is_not_a_correction(tmp_path):
+    """Real osxphotos 0.77.2 export: Photos' GPS differs from EXIF by ~5e-7°
+    and its date has no sub-seconds. Neither is an edit — no XMP rescue."""
+    root = _batch(tmp_path, {"IMG_1615.HEIC": "U-1"})
+    media = root / "IMG_1615.HEIC"
+    media.with_name(media.name + ".json").write_text(json.dumps([{
+        "EXIF:DateTimeOriginal": "2026:10:03 16:02:42",
+        "EXIF:GPSLatitude": 34.708936666666666, "EXIF:GPSLatitudeRef": "N",
+        "EXIF:GPSLongitude": 32.57512166666667, "EXIF:GPSLongitudeRef": "E",
+    }]))
+    out = photos.companion_fields(media, {
+        "taken_at": "2026-10-03T16:02:42.996000", "taken_src": "exif",
+        "gps_lat": 34.7089361111111, "gps_lon": 32.5751222222222,
+    })
+    assert out["taken_src"] == "exif"
+    assert out["taken_at"] == "2026-10-03T16:02:42.996000"
+    assert out["gps_lat"] == 34.7089361111111
+
+
+def test_photos_location_edit_of_metres_still_wins(tmp_path):
+    root = _batch(tmp_path, {"IMG_1.HEIC": "U-1"})
+    media = root / "IMG_1.HEIC"
+    media.with_name(media.name + ".json").write_text(json.dumps([{
+        "EXIF:GPSLatitude": 34.7090, "EXIF:GPSLatitudeRef": "N",
+        "EXIF:GPSLongitude": 32.5751, "EXIF:GPSLongitudeRef": "E",
+    }]))
+    out = photos.companion_fields(media, {
+        "taken_at": None, "taken_src": "exif",
+        "gps_lat": 34.7089361111111, "gps_lon": 32.5751222222222,
+    })
+    assert out["taken_src"] == "json" and out["gps_lat"] == 34.7090
+
+
 def test_register_and_fingerprint_a_photos_batch(tmp_path):
     import numpy as np
     import pyvips

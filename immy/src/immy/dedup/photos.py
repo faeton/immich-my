@@ -121,6 +121,34 @@ def _parse_exif_datetime(value: object) -> datetime | None:
         return None
 
 
+# Photos stores its own rounded copy of the location: on a real 2026-10
+# export, 49 of 50 sidecars differed from the file's EXIF by ~5e-7° (~6 cm),
+# and an exact compare turned every one into a "correction" — an XMP that
+# overrides good camera EXIF at promote. A location edit in Photos moves
+# metres at least; 1e-5° is ~1 m.
+_GPS_TOLERANCE_DEG = 1e-5
+
+
+def _same_wall_second(when: datetime, taken_at: object) -> bool:
+    """The JSON date is whole seconds, local wall clock. EXIF-derived
+    `taken_at` may carry sub-seconds (and, defensively, an offset): compare
+    wall-clock seconds only."""
+    if not isinstance(taken_at, str):
+        return False
+    try:
+        exif = datetime.fromisoformat(taken_at)
+    except ValueError:
+        return False
+    return exif.replace(tzinfo=None, microsecond=0) == when.replace(microsecond=0)
+
+
+def _same_place(lat: float, lon: float, cur_lat: object, cur_lon: object) -> bool:
+    if not isinstance(cur_lat, (int, float)) or not isinstance(cur_lon, (int, float)):
+        return False
+    return (abs(lat - cur_lat) <= _GPS_TOLERANCE_DEG
+            and abs(lon - cur_lon) <= _GPS_TOLERANCE_DEG)
+
+
 def companion_fields(path: Path, fields: dict) -> dict:
     """Overlay the Photos library's own identity, date and location onto
     `fingerprint_fields`' output for one staged `photos` file. Returns a new
@@ -136,7 +164,7 @@ def companion_fields(path: Path, fields: dict) -> dict:
     when = _parse_exif_datetime(
         sidecar.get("EXIF:DateTimeOriginal") or sidecar.get("QuickTime:CreationDate")
     )
-    if when is not None and when.isoformat() != out.get("taken_at"):
+    if when is not None and not _same_wall_second(when, out.get("taken_at")):
         out["taken_at"], out["taken_src"] = when.isoformat(), "json"
     lat, lon = sidecar.get("EXIF:GPSLatitude"), sidecar.get("EXIF:GPSLongitude")
     if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
@@ -145,7 +173,7 @@ def companion_fields(path: Path, fields: dict) -> dict:
         if sidecar.get("EXIF:GPSLongitudeRef") == "W":
             lon = -abs(lon)
         if not (abs(lat) < 1e-3 and abs(lon) < 1e-3):
-            if (lat, lon) != (out.get("gps_lat"), out.get("gps_lon")):
+            if not _same_place(lat, lon, out.get("gps_lat"), out.get("gps_lon")):
                 # `taken_src='json'` means "the companion JSON corrected date or
                 # location" (as for Takeout) — it is what makes promote write
                 # the correction out as an XMP sidecar Immich reads.
