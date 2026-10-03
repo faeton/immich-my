@@ -586,6 +586,7 @@ class AssetLite:
     burst_uuid: str | None
     live_cid: str | None
     edited: bool
+    source_uid: str | None = None
 
     @property
     def epoch(self) -> float | None:
@@ -600,7 +601,7 @@ class AssetLite:
 ASSET_LITE_COLUMNS = (
     "id, source, path, bytes, media_type, format, width, height,"
     " taken_at, taken_src, gps_lat, gps_lon, phash, exif_fields,"
-    " burst_uuid, live_cid, edited"
+    " burst_uuid, live_cid, edited, source_uid"
 )
 
 
@@ -612,6 +613,7 @@ def asset_lite_from_row(r: tuple) -> AssetLite:
         gps_lat=r[10], gps_lon=r[11],
         phash=phash.from_hex(r[12]) if r[12] else None,
         exif_fields=r[13] or 0, burst_uuid=r[14], live_cid=r[15], edited=bool(r[16]),
+        source_uid=r[17],
     )
 
 
@@ -727,12 +729,34 @@ def _is_raw_jpeg_companion(a: AssetLite, b: AssetLite) -> bool:
     )
 
 
+def _distinct_captures(a: AssetLite, b: AssetLite) -> bool:
+    """Identity says these are two assets, whatever pHash/time say.
+
+    - Different Apple ContentIdentifiers name different captures. `_decide_one`
+      already refuses such a cluster, but only after union-find has built it:
+      on the first real Photos batch, 21 Live Photo videos shot seconds apart
+      (same 1920x1440, similar frames) chained into 4 review clusters.
+      Barring the edge keeps them out of the queue altogether.
+    - Two different Photos UUIDs from the same source are two assets the user
+      kept in their own library. Photos has its own duplicate merge; this
+      pipeline does not second-guess it.
+    """
+    if a.live_cid and b.live_cid and a.live_cid != b.live_cid:
+        return True
+    return bool(
+        a.source == b.source and a.source_uid and b.source_uid
+        and a.source_uid != b.source_uid
+    )
+
+
 def _pair_evidence(a: AssetLite, b: AssetLite) -> tuple[str, int | None] | None:
     """Stage B verdict for one candidate pair.
 
     Returns (tier, hamming) — tier 'strong'|'candidate' — or None (not a
     dupe pair)."""
     if _is_raw_jpeg_companion(a, b):
+        return None
+    if _distinct_captures(a, b):
         return None
     if a.media_type == "image" and b.media_type == "image":
         if a.phash is None or b.phash is None:

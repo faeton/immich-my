@@ -399,3 +399,29 @@ def test_decide_one_ignores_same_stem_raw_jpeg_in_different_directories():
     dng = _asset(1, source="icloud", path="/tripA/DJI_0655.DNG", format="dng")
     jpg = _asset(2, source="google", path="/tripB/DJI_0655.JPG", format="jpg")
     assert engine._decide_one([dng, jpg]) == "auto"
+
+
+# ------------------------------------- identity bars edges, not just clusters
+
+
+def test_different_live_ids_never_pair():
+    """First real Photos batch: Live videos seconds apart chained into review
+    clusters. Different ContentIdentifiers are different captures — no edge."""
+    a = _asset(1, path="/s/IMG_6479.mov", media_type="video", format="mov", live_cid="A")
+    b = _asset(2, path="/s/IMG_6480.mov", media_type="video", format="mov", live_cid="B")
+    assert engine._pair_evidence(a, b) is None
+    img_a = _asset(3, path="/s/IMG_1.HEIC", live_cid="A")
+    img_b = _asset(4, path="/s/IMG_2.HEIC", live_cid="B")
+    assert engine._pair_evidence(img_a, img_b) is None
+    same = _asset(5, path="/s/IMG_1b.HEIC", live_cid="A")
+    assert engine._pair_evidence(img_a, same) is not None
+
+
+def test_two_photos_uuids_never_pair_but_cross_source_still_does():
+    a = engine.AssetLite(**{**_asset(1, path="/p/IMG_1.HEIC", source="photos").__dict__,
+                            "source_uid": "U-1"})
+    b = engine.AssetLite(**{**_asset(2, path="/p/IMG_2.HEIC", source="photos").__dict__,
+                            "source_uid": "U-2"})
+    icloud = _asset(3, path="/i/IMG_1.HEIC", source="icloud")
+    assert engine._pair_evidence(a, b) is None
+    assert engine._pair_evidence(a, icloud) is not None
