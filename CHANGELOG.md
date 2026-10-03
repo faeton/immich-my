@@ -4,6 +4,32 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-03 — first Photos batch live in Immich; two dedup fixes from real data
+
+### Fixed
+
+- **Photos rounding noise was treated as a correction.** Photos keeps its own copy
+  of location rounded ~5e-7° (~6 cm), and Ray-Ban Meta dates are 1–2 s off EXIF. An
+  exact compare marked 49/50 files as corrected, and each would have got an XMP
+  overriding good EXIF. GPS now matches within 1e-5° and dates within ±2 s. Videos
+  still take the sidecar date, and that is right: `dates.resolve` reads the UTC
+  `QuickTime:CreateDate` as wall clock.
+- **Live Photo videos chained into review clusters.** 21 videos shot seconds apart
+  formed 4 clusters. `_decide_one` refused them, but union-find had already built
+  them. `_pair_evidence` now gives no edge for different ContentIdentifiers, or for
+  two different Photos UUIDs from the same source.
+
+### Ops (n5)
+
+- The test manifest became the live one (`state/manifest.sqlite`, v5). Kept as
+  backups: `manifest.sqlite.pre-photos-2026-10-03` (the untouched v3 file) and
+  `.bak-pre-v5-2026-10-03`.
+- `index-library` 2026/05–07: 51,684 files hashed.
+- Batch 1 (50 assets / 71 media files) went register → fingerprint → cluster →
+  decide (0 clusters) → `promote-rest --write`, then an IMMY-Sync scan. All 71 are in
+  Immich: 21 Live videos paired, dates on all 71, CLIP + faces run automatically.
+  Library-scan imports queue ML on their own, unlike `immy process` inserts.
+
 ## 2026-10-03 — `immy photos pull`: Photos.app → n5 batches
 
 Phase 4 of the Photos Bridge, the laptop side.

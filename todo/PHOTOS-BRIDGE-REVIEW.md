@@ -297,6 +297,11 @@ already checksums every file it transfers. Cut the double hash, not the director
 
 Phase 0.5 is new and did not appear in the brief. Phase 2 remains worth doing on its own merits.
 
+**Update 2026-10-03 (evening):** Phases 0, 3 (real batch) and 4 done. The live manifest is v5. Batch 1 (50 assets)
+is in Immich end to end. Remaining: `immy photos pull` for the other ~4,607 (on LAN), then on n5 register → fingerprint →
+cluster → confirm → decide → promote-rest --write → library scan. Open: osxphotos `.xmp` sidecars (Photos
+keywords/people) stay in `ready/<batch>` and aren't promoted yet.
+
 **Where this stands (2026-10-03):** osxphotos is reinstalled and pinned (0.77.2). `immy photos diff` is the
 read-only hole-finder, done without downloading: 4,657 assets (~68 GB) added since 2026-06 are missing from Immich,
 starting ~2026-07-13. Next: Phase 4 `immy photos pull` (export just those UUIDs → n5 `ready/`), which needs the
