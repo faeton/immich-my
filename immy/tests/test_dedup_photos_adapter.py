@@ -136,6 +136,19 @@ def test_photos_rounding_noise_is_not_a_correction(tmp_path):
     assert out["gps_lat"] == 34.7089361111111
 
 
+def test_meta_glasses_two_second_skew_is_noise_but_video_utc_is_not(tmp_path):
+    root = _batch(tmp_path, {"photo-1.heic": "U-1", "IMG_1839.MOV": "U-2"})
+    still, video = root / "photo-1.heic", root / "IMG_1839.MOV"
+    still.with_name(still.name + ".json").write_text(json.dumps([{
+        "EXIF:DateTimeOriginal": "2026:07:14 10:55:56"}]))
+    video.with_name(video.name + ".json").write_text(json.dumps([{
+        "QuickTime:CreationDate": "2026:07:14 08:18:08+02:00"}]))
+    s = photos.companion_fields(still, {"taken_at": "2026-07-14T10:55:58", "taken_src": "exif"})
+    v = photos.companion_fields(video, {"taken_at": "2026-07-14T06:18:08", "taken_src": "exif"})
+    assert s["taken_src"] == "exif"
+    assert (v["taken_at"], v["taken_src"]) == ("2026-07-14T08:18:08", "json")
+
+
 def test_photos_location_edit_of_metres_still_wins(tmp_path):
     root = _batch(tmp_path, {"IMG_1.HEIC": "U-1"})
     media = root / "IMG_1.HEIC"

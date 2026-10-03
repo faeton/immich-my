@@ -129,17 +129,28 @@ def _parse_exif_datetime(value: object) -> datetime | None:
 _GPS_TOLERANCE_DEG = 1e-5
 
 
-def _same_wall_second(when: datetime, taken_at: object) -> bool:
+# Ray-Ban Meta exports: Photos' date runs 1–2 s ahead of the file's EXIF
+# (7 of 50 on the first real batch). A date edit in Photos moves minutes
+# or hours, not seconds.
+_DATE_TOLERANCE_S = 2
+
+
+def _same_wall_time(when: datetime, taken_at: object) -> bool:
     """The JSON date is whole seconds, local wall clock. EXIF-derived
     `taken_at` may carry sub-seconds (and, defensively, an offset): compare
-    wall-clock seconds only."""
+    wall-clock time within `_DATE_TOLERANCE_S`.
+
+    Videos legitimately differ by hours: `dates.resolve` takes the UTC
+    `QuickTime:CreateDate` as wall clock, while the sidecar's
+    `QuickTime:CreationDate` is the true local time — so the sidecar wins."""
     if not isinstance(taken_at, str):
         return False
     try:
         exif = datetime.fromisoformat(taken_at)
     except ValueError:
         return False
-    return exif.replace(tzinfo=None, microsecond=0) == when.replace(microsecond=0)
+    delta = exif.replace(tzinfo=None) - when
+    return abs(delta.total_seconds()) < _DATE_TOLERANCE_S + 1
 
 
 def _same_place(lat: float, lon: float, cur_lat: object, cur_lon: object) -> bool:
@@ -164,7 +175,7 @@ def companion_fields(path: Path, fields: dict) -> dict:
     when = _parse_exif_datetime(
         sidecar.get("EXIF:DateTimeOriginal") or sidecar.get("QuickTime:CreationDate")
     )
-    if when is not None and not _same_wall_second(when, out.get("taken_at")):
+    if when is not None and not _same_wall_time(when, out.get("taken_at")):
         out["taken_at"], out["taken_src"] = when.isoformat(), "json"
     lat, lon = sidecar.get("EXIF:GPSLatitude"), sidecar.get("EXIF:GPSLongitude")
     if isinstance(lat, (int, float)) and isinstance(lon, (int, float)):
