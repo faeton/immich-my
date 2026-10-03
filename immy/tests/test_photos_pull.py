@@ -175,6 +175,8 @@ class FakeRemote:
     def __call__(self, cmd):
         ok = subprocess.CompletedProcess(cmd, 0, "", "")
         bad = subprocess.CompletedProcess(cmd, 1, "", "boom")
+        if cmd[0] == "ssh":
+            cmd = ["ssh", cmd[-2], cmd[-1]]   # drop SSH_OPTS: host, script last
         if cmd[0] == "rsync":
             self.rsyncs += 1
             if self.fail_rsync:

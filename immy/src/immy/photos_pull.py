@@ -73,7 +73,11 @@ _SIDECAR_FLAGS = ("sidecar_xmp", "sidecar_json", "sidecar_exiftool", "sidecar_us
 OSXPHOTOS_EXPORT_ARGS = [
     "--download-missing", "--use-photokit",   # Photos.app fetches iCloud-only originals
     "--skip-edited",                          # decision #1: originals only
-    "--sidecar", "xmp", "--sidecar", "json",  # XMP for Immich, JSON for dedup's date/GPS
+    # JSON only: dedup reads it for date/GPS the user corrected in Photos.
+    # No XMP — on the 2026-10 backlog it carried no keywords or titles, only
+    # Photos' rounded date/GPS (which would override exact camera EXIF in
+    # Immich) and Meta-glasses serials as "captions".
+    "--sidecar", "json",
     "--directory", "{created.year}/{created.mm}",
     "--retry", "2",
 ]
@@ -225,6 +229,11 @@ class Remote:
 
 Runner = Callable[[list[str]], subprocess.CompletedProcess]
 
+# Unattended overnight runs: a dead tailnet path must fail fast instead of
+# hanging an ssh/rsync forever, so the retry loop in the CLI gets a turn.
+SSH_OPTS = ["-o", "ConnectTimeout=20", "-o", "ServerAliveInterval=30",
+            "-o", "ServerAliveCountMax=4", "-o", "BatchMode=yes"]
+
 
 def _run(cmd: list[str]) -> subprocess.CompletedProcess:
     return subprocess.run(cmd, capture_output=True, text=True)
@@ -233,7 +242,7 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess:
 def remote_listing(remote: Remote, path: str, run: Runner = _run) -> dict[str, int] | None:
     """`{relpath: size}` of a remote dir, or None if it doesn't exist."""
     q = shlex.quote(path)
-    r = run(["ssh", remote.host,
+    r = run(["ssh", *SSH_OPTS, remote.host,
              f"test -d {q} && cd {q} && find . -type f -printf '%s %P\\n'"])
     if r.returncode != 0:
         return None
@@ -259,11 +268,12 @@ def deliver(batch_dir: Path, remote: Remote, run: Runner = _run) -> None:
     want = local_listing(batch_dir)
     if remote_listing(remote, remote.ready(batch), run) == want:
         return
-    r = run(["ssh", remote.host, f"mkdir -p {shlex.quote(remote.root + '/.staging')} "
+    r = run(["ssh", *SSH_OPTS, remote.host, f"mkdir -p {shlex.quote(remote.root + '/.staging')} "
              f"{shlex.quote(remote.root + '/ready')}"])
     if r.returncode != 0:
         raise DeliveryError(f"ssh mkdir failed: {r.stderr.strip()}")
-    r = run(["rsync", "-a", "--partial", "--delete",
+    r = run(["rsync", "-a", "--partial", "--delete", "--timeout=300",
+             "-e", shlex.join(["ssh", *SSH_OPTS]),
              f"{batch_dir}/", f"{remote.host}:{remote.staging(batch)}/"])
     if r.returncode != 0:
         raise DeliveryError(f"rsync failed ({r.returncode}): {r.stderr.strip()[-500:]}")
@@ -271,7 +281,7 @@ def deliver(batch_dir: Path, remote: Remote, run: Runner = _run) -> None:
     if got != want:
         raise DeliveryError("remote listing differs from local after rsync")
     staging, ready = shlex.quote(remote.staging(batch)), shlex.quote(remote.ready(batch))
-    r = run(["ssh", remote.host, f"test ! -e {ready} && mv {staging} {ready}"])
+    r = run(["ssh", *SSH_OPTS, remote.host, f"test ! -e {ready} && mv {staging} {ready}"])
     if r.returncode != 0:
         raise DeliveryError(f"publish (mv to ready/) failed: {r.stderr.strip()}")
 

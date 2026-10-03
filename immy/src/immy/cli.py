@@ -4412,6 +4412,13 @@ def photos_pull(
         help="Path to a `.photoslibrary` bundle, or directly to Photos.sqlite.",
     ),
     keep_local: bool = typer.Option(False, "--keep-local", help="Keep batch exports after delivery."),
+    delivery_retries: int = typer.Option(
+        12, "--delivery-retries",
+        help="Re-try a failed transfer this many times before giving up the run.",
+    ),
+    retry_wait: int = typer.Option(
+        300, "--retry-wait", help="Seconds between transfer retries (12 × 300 s rides out a 1 h outage).",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show the queue; export and send nothing."),
 ) -> None:
     """Export queued Photos.app assets and deliver them to n5 as batches.
@@ -4423,6 +4430,7 @@ def photos_pull(
     not delivered are re-sent first on the next run. See `immy.photos_pull`.
     """
     import shutil
+    import time
     from . import photos_diff as pd
     from . import photos_pull as pp
 
@@ -4472,11 +4480,17 @@ def photos_pull(
             conn.commit()
             console.print(f"  [yellow]{batch}: local export missing — re-queued[/yellow]")
             return True
-        try:
-            pp.deliver(batch_dir, remote)
-        except pp.DeliveryError as e:
-            console.print(f"  [red]{batch}: {e}[/red]\n  (kept locally; re-sent on the next run)")
-            return False
+        for attempt in range(delivery_retries + 1):
+            try:
+                pp.deliver(batch_dir, remote)
+                break
+            except pp.DeliveryError as e:
+                if attempt == delivery_retries:
+                    console.print(f"  [red]{batch}: {e}[/red]\n  (kept locally; re-sent on the next run)")
+                    return False
+                console.print(f"  [yellow]{batch}: {e} — retry {attempt + 1}/{delivery_retries} "
+                              f"in {retry_wait}s[/yellow]")
+                time.sleep(retry_wait)
         pp.mark_delivered(conn, batch)
         if not keep_local:
             shutil.rmtree(batch_dir)
