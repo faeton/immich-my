@@ -136,6 +136,7 @@ def test_build_rows_keeps_original_file_name(tmp_path: Path):
     rows = read_folder(trip)
     asset, _ = process_mod.build_rows(f, trip, rows[0], LIB)
     assert asset.original_file_name == "GP Temp Download.jpg"
+    assert asset.original_path.endswith("/GP Temp Download.jpg")
 
 
 def test_asset_row_has_no_columns_immich_3_dropped(tmp_path: Path):

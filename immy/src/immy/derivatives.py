@@ -141,7 +141,7 @@ class DerivativeResult:
     so portrait iPhone clips report portrait dims.
 
     `duration` is non-None only for videos; surfaced so `process.py`
-    can overwrite an EXIF-derived `asset.duration` with the ffprobe
+    can overwrite an EXIF-derived `asset.duration` (ms) with the ffprobe
     value when they disagree (ffprobe wins — it reads the container
     directly instead of guessing from QuickTime tags). Integer
     milliseconds — Immich 3.x's `asset.duration` is int4.

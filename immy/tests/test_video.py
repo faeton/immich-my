@@ -89,6 +89,8 @@ def test_duration_ms_is_integer_milliseconds():
     assert video_mod.duration_ms(0) == 0
     assert video_mod.duration_ms(3661.5) == 3_661_500
     assert video_mod.duration_ms(14.269989) == 14_270
+    # Matches what Immich's own scanner wrote for this clip.
+    assert video_mod.duration_ms(44.8448) == 44_845
     assert video_mod.duration_ms(-1.0) == 0
 
 

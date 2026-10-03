@@ -436,6 +436,16 @@ file's own offset in `timeZone` and in the localDateTime it derives.
   later step write unchecked. `doctor` now reports the same check
   for all seven write tables (it used to check a hand-written subset).
 - `docs/IMMICH-INGEST.md` notes the 3.0.2 differences.
+## 2026-09-30 — `clock-drift` no longer collapses a second shooting day
+
+### Fixed
+
+- **`clock-drift` on multi-day trips.** The rule flagged every file >24 h from the
+  folder median and proposed the median itself as the fix — the *same* instant for
+  every outlier. On `2026-08-la-manga` (flights Aug 31 + Sep 4) that meant 24 Sep-4
+  files, all with correct SRT-derived dates, proposed as `2026-08-31 10:50:13`.
+  Timestamps are now split into sessions on >24 h gaps; a session of ≥ 3 files is a
+  real day and is left alone. Lone stragglers are still flagged.
 
 ## 2026-09-23 — manifest identity (schema v4), `photos` adapter, doctor/status/prune
 

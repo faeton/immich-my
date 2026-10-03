@@ -54,6 +54,7 @@ from .registry import Finding, Rule, register
 ISOLATION_SECONDS = 24 * 3600
 MIN_SAMPLES = 3
 MAX_OUTLIER_FRACTION = 0.25
+REAL_SESSION_FILES = 3
 
 
 def _multi_camera_folder(rows: list[ExifRow]) -> bool:
@@ -118,9 +119,14 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
     all_sessions = split_sessions(list(by_dt))
     # The folder's biggest session is the body of the trip, never an outlier
     # (in a two-session folder both sessions are "isolated" from each other).
+    # A session of REAL_SESSION_FILES or more is a real shooting day (a
+    # second flight four days later), not a stray clock — leave it alone.
     sizes = [sum(len(by_dt[t]) for t in sess) for sess in all_sessions]
     body = max(range(len(all_sessions)), key=sizes.__getitem__)
-    isolated = set(_isolated_sessions(all_sessions)) - {body}
+    isolated = {
+        i for i in _isolated_sessions(all_sessions)
+        if i != body and sizes[i] < REAL_SESSION_FILES
+    }
     n_outliers = sum(sizes[i] for i in isolated)
     if not isolated or n_outliers > MAX_OUTLIER_FRACTION * len(authorities):
         return []
