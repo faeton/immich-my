@@ -4383,6 +4383,142 @@ def photos_diff(
     console.print(f"\n[green]✓[/green] {len(missing):,} UUID(s) → [cyan]{out}[/cyan]")
 
 
+@photos_app.command("pull")
+def photos_pull(
+    uuids_file: Path = typer.Option(
+        Path.home() / ".immy" / "photos-missing.txt", "--uuids",
+        help="UUID list to queue (from `immy photos diff`). Already-queued UUIDs are kept as-is.",
+    ),
+    dest: str = typer.Option(
+        "n5:/mnt/tank/media/staging/photos", "--dest",
+        help="host:/path of the photos staging root on n5 (`.staging/` + `ready/` under it). "
+        "Use n5-lan / n5-tb4 at home.",
+    ),
+    batch_size: int = typer.Option(500, "--batch-size", help="Assets per batch (~7 GB at 500)."),
+    max_batches: int = typer.Option(
+        0, "--max-batches", help="Stop after this many NEW batches (0 = until the queue is empty).",
+    ),
+    export_root: Path = typer.Option(
+        Path.home() / ".immy" / "photos-export", "--export-root",
+        help="Local scratch for batch exports; a batch is deleted once n5 has it.",
+    ),
+    ledger_path: Path = typer.Option(
+        Path.home() / ".immy" / "photos-pull.sqlite", "--ledger",
+        help="Per-UUID delivery ledger (what makes failed transfers retry).",
+    ),
+    photos_library: Path = typer.Option(
+        Path.home() / "Pictures" / "Photos Library.photoslibrary",
+        "--photos-db",
+        help="Path to a `.photoslibrary` bundle, or directly to Photos.sqlite.",
+    ),
+    keep_local: bool = typer.Option(False, "--keep-local", help="Keep batch exports after delivery."),
+    dry_run: bool = typer.Option(False, "--dry-run", help="Show the queue; export and send nothing."),
+) -> None:
+    """Export queued Photos.app assets and deliver them to n5 as batches.
+
+    Each batch: `osxphotos export --uuid-from-file` (Photos.app downloads
+    iCloud-only originals) → drop any asset that didn't arrive whole (e.g. a
+    Live Photo missing its video) → rsync to `<dest>/.staging/<batch>` →
+    verify → `mv` to `<dest>/ready/<batch>`. Batches that were exported but
+    not delivered are re-sent first on the next run. See `immy.photos_pull`.
+    """
+    import shutil
+    from . import photos_diff as pd
+    from . import photos_pull as pp
+
+    try:
+        remote = pp.Remote.parse(dest)
+        db_path = apple_photos_mod.resolve_db_path(photos_library)
+    except (ValueError, FileNotFoundError) as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+    if shutil.which("osxphotos") is None:
+        console.print("[red]osxphotos not on PATH[/red] — `uv tool install --python 3.12 'osxphotos==0.77.2'`")
+        raise typer.Exit(code=2)
+
+    conn = pp.open_ledger(ledger_path)
+    if uuids_file.exists():
+        added = pp.enqueue(conn, uuids_file.read_text().split())
+        if added:
+            console.print(f"queued {added:,} new UUID(s) from [cyan]{uuids_file}[/cyan]")
+    export_root = export_root.expanduser().resolve()
+
+    def show_counts() -> None:
+        c = pp.counts(conn)
+        console.print("  ledger: " + " · ".join(
+            f"{k} {c.get(k, 0):,}" for k in (pp.PENDING, pp.EXPORTED, pp.DELIVERED, pp.FAILED)
+        ))
+
+    console.print(f"[bold]photos pull[/bold] → [cyan]{remote.host}:{remote.root}[/cyan]")
+    show_counts()
+    resend = pp.undelivered_batches(conn)
+    if dry_run:
+        nxt = pp.next_uuids(conn, 10**9)
+        console.print(f"  would re-send {len(resend)} batch(es), then export {len(nxt):,} "
+                      f"asset(s) in batches of {batch_size}")
+        for u, why in conn.execute(
+            "SELECT uuid, last_error FROM uuid_state WHERE status=? LIMIT 10", (pp.FAILED,)
+        ):
+            console.print(f"  [yellow]failed[/yellow] {u}: {why}")
+        return
+
+    def send(batch: str) -> bool:
+        batch_dir = export_root / batch
+        if not batch_dir.is_dir():
+            # Local export gone before n5 had it: re-queue its assets.
+            conn.execute("UPDATE uuid_state SET status=?, batch=NULL WHERE batch=?",
+                         (pp.PENDING, batch))
+            conn.execute("DELETE FROM batch WHERE id=?", (batch,))
+            conn.commit()
+            console.print(f"  [yellow]{batch}: local export missing — re-queued[/yellow]")
+            return True
+        try:
+            pp.deliver(batch_dir, remote)
+        except pp.DeliveryError as e:
+            console.print(f"  [red]{batch}: {e}[/red]\n  (kept locally; re-sent on the next run)")
+            return False
+        pp.mark_delivered(conn, batch)
+        if not keep_local:
+            shutil.rmtree(batch_dir)
+        console.print(f"  [green]✓[/green] {batch} → ready/")
+        return True
+
+    for batch in resend:
+        if not send(batch):
+            raise typer.Exit(code=1)
+
+    photos = pd.open_live_ro(db_path)
+    made = 0
+    try:
+        while not max_batches or made < max_batches:
+            uuids = pp.next_uuids(conn, batch_size)
+            if not uuids:
+                break
+            console.print(f"  exporting {len(uuids):,} asset(s)…")
+            batch, check = pp.export_batch(conn, photos, uuids, export_root)
+            made += 1
+            for u, why in list(check.incomplete.items())[:5]:
+                console.print(f"    [yellow]incomplete[/yellow] {u}: {why}")
+            if len(check.incomplete) > 5:
+                console.print(f"    [yellow]… {len(check.incomplete) - 5} more incomplete[/yellow]")
+            if batch is None:
+                console.print("    [yellow]nothing arrived whole — no batch[/yellow]")
+                continue
+            files, size = conn.execute(
+                "SELECT files, bytes FROM batch WHERE id=?", (batch,)).fetchone()
+            console.print(f"    {batch}: {len(check.complete):,} asset(s), "
+                          f"{files:,} file(s), {size / 1e9:.1f} GB")
+            if not send(batch):
+                raise typer.Exit(code=1)
+    finally:
+        photos.close()
+    show_counts()
+    console.print(
+        "\n[dim]on n5: immy dedup register photos /staging/photos/ready "
+        "--manifest /state/manifest-shadow.sqlite, then fingerprint[/dim]"
+    )
+
+
 app.add_typer(photos_app, name="photos")
 
 

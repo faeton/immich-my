@@ -4,6 +4,32 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-03 — `immy photos pull`: Photos.app → n5 batches
+
+Phase 4 of the Photos Bridge, the laptop side.
+
+### Added
+
+- **`immy photos pull`.** Queues the `photos diff` UUID list into a ledger
+  (`~/.immy/photos-pull.sqlite`). Each batch (default 500) goes through
+  `osxphotos export --uuid-from-file --download-missing --use-photokit
+  --skip-edited --sidecar xmp --sidecar json --report osxphotos-report.json`, then
+  rsync to `n5:…/staging/photos/.staging/<batch>/`, a listing check, and a `mv` into
+  `ready/`. Two guarantees come from the per-UUID ledger, not from a watermark:
+  - A batch that fails to transfer is re-sent first on the next run.
+  - An asset that didn't arrive whole (error, nothing exported, a Live Photo
+    without its video) is pruned from the batch and retried, up to 3 attempts.
+  
+  First real batch: 50 assets → 172 files (0.6 GB) in `ready/`.
+
+### n5 prep
+
+- immy image rebuilt from the merged `main`.
+- Live manifest backed up (`state/manifest.sqlite.bak-pre-v5-2026-10-03`).
+- `state/manifest-shadow.sqlite` migrated v3 → v5. Its counts are unchanged and
+  `integrity_check` is ok.
+- `dedup index-library` run over `2026/05–07` into the shadow manifest.
+
 ## 2026-10-03 — `immy photos diff`: what Photos.app has that Immich doesn't
 
 Phase 0 (osxphotos) and the first read-only step of the Photos Bridge
