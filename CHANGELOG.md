@@ -13,12 +13,25 @@ continuously, so entries are dated rather than versioned.
   clusters, 0 errors. `promote-rest --write` then an IMMY-Sync scan. In Immich:
   4,585 on the timeline, 2,227 Live videos paired, dates on all; CLIP and faces
   queued by the scan.
-- **24 Live Photos held back**: edited ones whose original video exists only in
-  iCloud (not local). `--skip-edited` with no iCloud download leaves them
-  incomplete, so the ledger gives up after 3 tries rather than import half a
-  Live Photo.
-- **1 Live Photo unpaired** (2026/10/IMG_1615): its HEIC and `.mov` carry
-  different ContentIdentifiers in the files themselves, so Immich can't pair them.
+- **24 edited Live Photos** failed in `photos pull`: their original video was
+  iCloud-only, and PhotoKit (`--use-photokit`) reports it "missing" without
+  downloading it. Photos.app's own AppleScript `export … with using originals`
+  does fetch it (on the Mac; n5 still never signs in). All 24 were exported that
+  way as original HEIC + `.mov` pairs, ContentIdentifiers checked, delivered as
+  one more batch, and passed the n5 dedup (0 clusters). They are paired in Immich.
+- **IMG_1615 (2026/10)**: HEIC and `.mov` carry different ContentIdentifiers, so
+  Immich couldn't pair them. Linked by hand (`PUT /api/assets/{id}`
+  `livePhotoVideoId`).
+- 4 assets missed CLIP/faces (ML-service blip at 04:41); a queue "missing" run
+  didn't pick them up, per-asset `regenerate-thumbnail` / `refresh-faces` did.
+- `2026/09/IMG_0529.MOV` can't be transcoded: its default audio track is APAC
+  (iPhone 18 spatial audio), which Immich's ffmpeg 7.1 can't decode. It plays
+  from the original.
+- Favorites: 821 of 887 Photos favorites matched to Immich assets (size + capture
+  ±1 s, then filename + time, then size + a whole-timezone shift; unique matches
+  only) and set. The other 66 have no copy in Immich with the same size.
+- `apple-people --apply`: named 3 more clusters. New faces on backlog assets
+  joined the already-named people automatically.
 
 ### Fixed
 

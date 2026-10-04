@@ -299,8 +299,9 @@ Phase 0.5 is new and did not appear in the brief. Phase 2 remains worth doing on
 
 **Update 2026-10-04:** the backlog is done. 4,634 assets (6,812 media files, ~73 GB) went overnight over Tailscale
 → `deploy/n5/photos-ingest.sh` (0 clusters, 0 errors) → `--promote` → library scan, and they are in Immich. 24 edited
-Live Photos are held back (original video iCloud-only); 1 is unpaired (mismatched ContentIdentifier in the source
-files). Next is Phase 5/6: run `~/.immy/photos-overnight.sh` periodically for new shots. The XMP sidecars were
+Live Photos whose original video was iCloud-only (PhotoKit won't fetch it) came in via Photos.app AppleScript
+`export … with using originals` instead — candidate for an automatic fallback in `photos pull`. Favorites (821)
+and apple-people done. Next is Phase 5/6: run `~/.immy/photos-overnight.sh` periodically for new shots. The XMP sidecars were
 dropped (no keywords or titles in this library); favorites and named people are a possible follow-up.
 
 **Update 2026-10-03 (evening):** Phases 0, 3 (real batch) and 4 done. The live manifest is v5. Batch 1 (50 assets)
