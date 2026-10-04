@@ -24,7 +24,8 @@ Tag API; the only channel that reaches video assets, which never read XMP; see `
 `tags camera` (backfill the blank Camera field for DJI MP4s from the notes gear tag; see `docs/TELEMETRY.md`) ·
 `photos diff` (read-only: Photos.app assets missing from Immich → UUID list
 for `osxphotos export`; no iCloud login) · `photos pull` (export those UUIDs via
-Photos.app → rsync batches to n5 `staging/photos/ready/`, per-UUID retry ledger) ·
+Photos.app → rsync batches to n5 `staging/photos/ready/`, per-UUID retry ledger;
+incomplete assets fall back to Photos.app AppleScript originals export) ·
 `similar` (image→image search on Immich's CLIP index: find the library shot a re-shared
 photo came from) · `status <trip>` (marker/journal/offline/derivatives/heartbeat summary) ·
 `doctor` (read-only preflight: binaries, paths, Immich API, Postgres

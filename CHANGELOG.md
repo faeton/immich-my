@@ -33,6 +33,19 @@ continuously, so entries are dated rather than versioned.
 - `apple-people --apply`: named 3 more clusters. New faces on backlog assets
   joined the already-named people automatically.
 
+### Added
+
+- `photos pull` falls back to Photos.app on its own: every UUID osxphotos leaves
+  incomplete (e.g. a Live Photo whose original video is iCloud-only) gets one
+  AppleScript `export … with using originals` into a scratch dir, one UUID per
+  call. If that yields a whole asset, its files replace osxphotos' partial ones
+  in the batch. They keep osxphotos' name, so its JSON sidecar still applies,
+  and get report records (`"exported_by": "photos-app"`) so n5 dedup reads the
+  UUID. Otherwise the reason is appended to the ledger error and the UUID retries
+  as before. Skipped when osxphotos itself failed, capped at 100 per batch, off
+  with `--no-photos-app-fallback`. The first run needs the Automation permission
+  (Terminal → Photos) granted once, by hand.
+
 ### Fixed
 
 - `photos pull` ended with a stale hint pointing at `manifest-shadow.sqlite`; it

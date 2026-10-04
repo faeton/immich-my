@@ -4419,13 +4419,19 @@ def photos_pull(
     retry_wait: int = typer.Option(
         300, "--retry-wait", help="Seconds between transfer retries (12 × 300 s rides out a 1 h outage).",
     ),
+    photos_app_fallback: bool = typer.Option(
+        True, "--photos-app-fallback/--no-photos-app-fallback",
+        help="Re-export assets osxphotos left incomplete via Photos.app AppleScript "
+        "(fetches iCloud-only originals PhotoKit reports missing, e.g. a Live Photo's video).",
+    ),
     dry_run: bool = typer.Option(False, "--dry-run", help="Show the queue; export and send nothing."),
 ) -> None:
     """Export queued Photos.app assets and deliver them to n5 as batches.
 
     Each batch: `osxphotos export --uuid-from-file` (Photos.app downloads
-    iCloud-only originals) → drop any asset that didn't arrive whole (e.g. a
-    Live Photo missing its video) → rsync to `<dest>/.staging/<batch>` →
+    iCloud-only originals) → re-export anything incomplete through Photos.app
+    AppleScript `export … with using originals` → drop any asset that still
+    didn't arrive whole (e.g. a Live Photo missing its video) → rsync to `<dest>/.staging/<batch>` →
     verify → `mv` to `<dest>/ready/<batch>`. Batches that were exported but
     not delivered are re-sent first on the next run. See `immy.photos_pull`.
     """
@@ -4443,6 +4449,12 @@ def photos_pull(
     if shutil.which("osxphotos") is None:
         console.print("[red]osxphotos not on PATH[/red] — `uv tool install --python 3.12 'osxphotos==0.77.2'`")
         raise typer.Exit(code=2)
+    fallback_run = None
+    if photos_app_fallback:
+        if shutil.which("osascript"):
+            fallback_run = pp._run
+        else:
+            console.print("[yellow]osascript not on PATH — no Photos.app fallback[/yellow]")
 
     conn = pp.open_ledger(ledger_path)
     if uuids_file.exists():
@@ -4509,8 +4521,11 @@ def photos_pull(
             if not uuids:
                 break
             console.print(f"  exporting {len(uuids):,} asset(s)…")
-            batch, check = pp.export_batch(conn, photos, uuids, export_root)
+            batch, check = pp.export_batch(conn, photos, uuids, export_root,
+                                           fallback_run=fallback_run)
             made += 1
+            if check.rescued:
+                console.print(f"    {len(check.rescued):,} asset(s) completed via Photos.app")
             for u, why in list(check.incomplete.items())[:5]:
                 console.print(f"    [yellow]incomplete[/yellow] {u}: {why}")
             if len(check.incomplete) > 5:

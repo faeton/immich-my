@@ -102,16 +102,21 @@ def test_enqueue_is_idempotent_and_retries_come_after_pending(tmp_path) -> None:
 # --- export_batch with a fake osxphotos -----------------------------------
 
 
-def _photos_db(live: set[str]) -> sqlite3.Connection:
+def _photos_db(live: set[str], created: dict[str, float] | None = None) -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
-    conn.execute("CREATE TABLE ZASSET (ZUUID TEXT, ZKIND INTEGER, ZKINDSUBTYPE INTEGER)")
-    for u in live:
-        conn.execute("INSERT INTO ZASSET VALUES (?, 0, 2)", (u,))
+    conn.execute("CREATE TABLE ZASSET (ZUUID TEXT, ZKIND INTEGER, ZKINDSUBTYPE INTEGER, "
+                 "ZDATECREATED REAL)")
+    for u in live | set(created or {}):
+        conn.execute("INSERT INTO ZASSET VALUES (?, 0, ?, ?)",
+                     (u, 2 if u in live else 0, (created or {}).get(u)))
     return conn
 
 
-def _fake_osxphotos(exports: dict[str, list[str]]):
-    """Runner that 'exports' the given relpaths per UUID and writes a report."""
+def _fake_osxphotos(exports: dict[str, list[str]], missing: dict[str, list[str]] | None = None,
+                    returncode: int = 0):
+    """Runner that 'exports' the given relpaths per UUID and writes a report;
+    `missing` relpaths get a `missing: true` record and no file (PhotoKit's
+    answer for an iCloud-only Live video)."""
     def run(cmd):
         assert cmd[1] == "export"
         batch_dir = Path(cmd[2])
@@ -122,10 +127,32 @@ def _fake_osxphotos(exports: dict[str, list[str]]):
         for u in wanted:
             for rel in exports.get(u, []):
                 p = _touch(batch_dir / rel)
-                recs.append(_rec(p, u, sidecar_xmp=rel.endswith(".xmp")))
+                recs.append(_rec(p, u, sidecar_xmp=rel.endswith(".xmp"),
+                                 sidecar_json=rel.endswith(".json")))
+            for rel in (missing or {}).get(u, []):
+                recs.append(_rec(batch_dir / rel, u, exported=False, missing=True))
         report.write_text(json.dumps(recs))
-        return subprocess.CompletedProcess(cmd, 0, "", "")
+        return subprocess.CompletedProcess(cmd, returncode, "", "")
     return run
+
+
+class FakePhotosApp:
+    """Runner standing in for `osascript … export … with using originals`:
+    writes the given file names into the destination dir per UUID."""
+
+    def __init__(self, exports: dict[str, list[str]], returncode: int = 0):
+        self.exports = exports
+        self.returncode = returncode
+        self.calls: list[str] = []
+
+    def __call__(self, cmd):
+        assert cmd[0] == "osascript" and "with using originals" in cmd[2]
+        uuid, dest = cmd[-2].split("/")[0], Path(cmd[-1])
+        assert cmd[-2] == f"{uuid}/L0/001"
+        self.calls.append(uuid)
+        for name in self.exports.get(uuid, []):
+            _touch(dest / name, name.encode())
+        return subprocess.CompletedProcess(cmd, self.returncode, "", "" if not self.returncode else "-1728")
 
 
 def test_export_batch_records_complete_and_requeues_incomplete(tmp_path) -> None:
@@ -157,6 +184,96 @@ def test_export_batch_with_nothing_whole_leaves_no_batch(tmp_path) -> None:
     assert batch is None
     assert list((tmp_path / "exp").iterdir()) == []
     assert conn.execute("SELECT status, attempts FROM uuid_state").fetchone() == (pp.FAILED, 1)
+
+
+# --- Photos.app fallback --------------------------------------------------
+
+
+def test_fallback_completes_a_live_photo_photokit_left_without_video(tmp_path) -> None:
+    conn = pp.open_ledger(tmp_path / "l.sqlite")
+    pp.enqueue(conn, ["LIVE", "OK"])
+    run = _fake_osxphotos(
+        {"LIVE": ["2026/09/IMG_7.HEIC", "2026/09/IMG_7.HEIC.json"], "OK": ["2026/09/IMG_1.jpg"]},
+        missing={"LIVE": ["2026/09/IMG_7.mov"]},
+    )
+    app = FakePhotosApp({"LIVE": ["IMG_7.HEIC", "IMG_7.MOV", "IMG_7.AAE"]})
+    batch, check = pp.export_batch(conn, _photos_db({"LIVE"}), ["LIVE", "OK"],
+                                   tmp_path / "exp", run=run, fallback_run=app)
+    assert app.calls == ["LIVE"]
+    assert check.rescued == ["LIVE"] and check.incomplete == {}
+    bdir = tmp_path / "exp" / batch
+    assert sorted(pp.local_listing(bdir)) == sorted([
+        "2026/09/IMG_1.jpg", "2026/09/IMG_7.HEIC", "2026/09/IMG_7.HEIC.json",
+        "2026/09/IMG_7.MOV", REPORT_NAME,
+    ])
+    assert (bdir / "2026/09/IMG_7.HEIC").read_bytes() == b"IMG_7.HEIC"   # Photos.app's copy
+    assert [p.name for p in (tmp_path / "exp").iterdir()] == [batch]     # scratch removed
+    recs = [r for r in json.loads((bdir / REPORT_NAME).read_text()) if r["uuid"] == "LIVE"]
+    assert not any(r["missing"] or r["error"] for r in recs)
+    assert sorted(Path(r["filename"]).name for r in recs if r.get("exported_by") == "photos-app") \
+        == ["IMG_7.HEIC", "IMG_7.MOV"]
+    assert dict(conn.execute("SELECT uuid, status FROM uuid_state")) == \
+        {"LIVE": pp.EXPORTED, "OK": pp.EXPORTED}
+
+
+def test_fallback_files_carry_the_uuid_for_dedup(tmp_path) -> None:
+    from immy.dedup import photos as adapter
+    conn = pp.open_ledger(tmp_path / "l.sqlite")
+    pp.enqueue(conn, ["LIVE"])
+    run = _fake_osxphotos({"LIVE": ["2026/09/IMG_7.HEIC"]}, missing={"LIVE": ["2026/09/IMG_7.mov"]})
+    app = FakePhotosApp({"LIVE": ["IMG_7.HEIC", "IMG_7.MOV"]})
+    batch, _ = pp.export_batch(conn, _photos_db({"LIVE"}), ["LIVE"], tmp_path / "exp",
+                               run=run, fallback_run=app)
+    mov = tmp_path / "exp" / batch / "2026/09/IMG_7.MOV"
+    assert adapter.uuid_for(mov) == "LIVE"
+    assert adapter.component_for(mov, "LIVE") == "live_video"
+
+
+def test_fallback_that_still_lacks_the_video_is_pruned_and_retried(tmp_path) -> None:
+    conn = pp.open_ledger(tmp_path / "l.sqlite")
+    pp.enqueue(conn, ["LIVE"])
+    run = _fake_osxphotos({"LIVE": ["2026/09/IMG_7.HEIC"]}, missing={"LIVE": ["2026/09/IMG_7.mov"]})
+    app = FakePhotosApp({"LIVE": ["IMG_7.HEIC"]})
+    batch, check = pp.export_batch(conn, _photos_db({"LIVE"}), ["LIVE"], tmp_path / "exp",
+                                   run=run, fallback_run=app)
+    assert batch is None and check.rescued == []
+    assert check.incomplete["LIVE"] == \
+        "missing in Photos library; Photos.app: live photo without its video"
+    assert list((tmp_path / "exp").iterdir()) == []
+    assert conn.execute("SELECT status, attempts FROM uuid_state").fetchone() == (pp.FAILED, 1)
+
+
+def test_fallback_error_is_recorded(tmp_path) -> None:
+    conn = pp.open_ledger(tmp_path / "l.sqlite")
+    pp.enqueue(conn, ["X"])
+    app = FakePhotosApp({}, returncode=1)
+    _, check = pp.export_batch(conn, _photos_db(set()), ["X"], tmp_path / "exp",
+                               run=_fake_osxphotos({}), fallback_run=app)
+    assert check.incomplete["X"].startswith("nothing exported; Photos.app: osascript exited 1")
+
+
+def test_fallback_places_unexported_asset_by_date_without_clobbering(tmp_path) -> None:
+    conn = pp.open_ledger(tmp_path / "l.sqlite")
+    pp.enqueue(conn, ["A", "B"])
+    run = _fake_osxphotos({"A": ["2026/09/IMG_5.HEIC"]})
+    app = FakePhotosApp({"B": ["IMG_5.HEIC"]})
+    sept_2026 = 1789000000 - pp._APPLE_EPOCH                      # 2026-09-09 UTC
+    batch, check = pp.export_batch(conn, _photos_db(set(), {"B": sept_2026}), ["A", "B"],
+                                   tmp_path / "exp", run=run, fallback_run=app)
+    bdir = tmp_path / "exp" / batch
+    assert check.rescued == ["B"]
+    assert (bdir / "2026/09/IMG_5.HEIC").read_bytes() == b"x"          # A untouched
+    assert (bdir / "2026/09/IMG_5 (1).HEIC").read_bytes() == b"IMG_5.HEIC"
+
+
+def test_no_fallback_when_osxphotos_itself_failed(tmp_path) -> None:
+    conn = pp.open_ledger(tmp_path / "l.sqlite")
+    pp.enqueue(conn, ["X"])
+    app = FakePhotosApp({"X": ["IMG_1.HEIC"]})
+    batch, check = pp.export_batch(conn, _photos_db(set()), ["X"], tmp_path / "exp",
+                                   run=_fake_osxphotos({}, returncode=1), fallback_run=app)
+    assert batch is None and app.calls == []
+    assert check.incomplete == {"X": "nothing exported"}
 
 
 # --- delivery with a fake ssh/rsync acting on a local dir -----------------
