@@ -4528,8 +4528,8 @@ def photos_pull(
         photos.close()
     show_counts()
     console.print(
-        "\n[dim]on n5: immy dedup register photos /staging/photos/ready "
-        "--manifest /state/manifest-shadow.sqlite, then fingerprint[/dim]"
+        "\n[dim]on n5: deploy/n5/photos-ingest.sh (dedup report), "
+        "then photos-ingest.sh --promote[/dim]"
     )
 
 

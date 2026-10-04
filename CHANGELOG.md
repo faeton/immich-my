@@ -4,6 +4,27 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-04 — Photos backlog (4,634 assets) live in Immich
+
+### Ops
+
+- Overnight `photos pull` over Tailscale: 10 batches of 500, ~73 GB, no delivery
+  retries, no iCloud login anywhere. n5 dedup over 6,812 media files: 0 new
+  clusters, 0 errors. `promote-rest --write` then an IMMY-Sync scan. In Immich:
+  4,585 on the timeline, 2,227 Live videos paired, dates on all; CLIP and faces
+  queued by the scan.
+- **24 Live Photos held back**: edited ones whose original video exists only in
+  iCloud (not local). `--skip-edited` with no iCloud download leaves them
+  incomplete, so the ledger gives up after 3 tries rather than import half a
+  Live Photo.
+- **1 Live Photo unpaired** (2026/10/IMG_1615): its HEIC and `.mov` carry
+  different ContentIdentifiers in the files themselves, so Immich can't pair them.
+
+### Fixed
+
+- `photos pull` ended with a stale hint pointing at `manifest-shadow.sqlite`; it
+  now points at `deploy/n5/photos-ingest.sh`.
+
 ## 2026-10-03 — first Photos batch live in Immich; two dedup fixes from real data
 
 ### Fixed
