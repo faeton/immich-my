@@ -47,6 +47,23 @@ Shape:
           reasoning_effort: none     # Ollama gemma4 needs this or content
                                      # comes back empty (answer goes to a
                                      # `reasoning` field instead)
+    trips:                           # optional; `immy trips` (docs/TRIPS.md)
+      homes:                         # days matching one are not travel;
+        - name: Lisbon               # none at all → every day is travel
+          until: 2021-06-30          # from:/until: bound the window (open if unset)
+          lat: 38.72                 # centre + radius_km, and/or
+          lon: -9.14
+          radius_km: 50
+        - name: Winter base
+          from: 2023-11-01
+          until: 2024-03-31
+          country: ES                # alpha-2 or Immich's English name
+      max_gap_days: 3                # empty days a trip may bridge
+      transit_days: 1                # runs this short fold into a neighbour
+      min_assets: 20                 # smaller trips get no album
+      tag_root: Trips                # `--tags` → Trips/<year>/<album name>
+      regions:                       # alpha-2 → region label; "" = own region
+        TR: Middle East
 
 Missing config file is not an error for `audit`; `promote` checks what it
 needs and raises a clear message if `originals_root` is absent.
@@ -158,6 +175,19 @@ class MLConfig:
 
 
 @dataclass(frozen=True)
+class TripsConfig:
+    """`immy trips` knobs. `homes` holds `trips.HomeStay` values (typed as a
+    plain tuple so importing config doesn't import the trips module)."""
+
+    homes: tuple = ()
+    max_gap_days: int | None = None
+    transit_days: int | None = None
+    min_assets: int | None = None
+    tag_root: str | None = None
+    regions: dict[str, str] | None = None
+
+
+@dataclass(frozen=True)
 class Config:
     originals_root: Path | None
     immich: ImmichConfig | None
@@ -171,6 +201,7 @@ class Config:
     # defaults so existing positional/keyword constructions stay valid.
     state_root: Path | None = None
     sidecars_root: Path | None = None
+    trips: TripsConfig | None = None
 
 
 def _resolve_path(explicit: Path | None) -> Path | None:
@@ -281,6 +312,8 @@ def load(path: Path | None = None) -> Config:
             ),
         )
 
+    trips = _parse_trips(data.get("trips"), resolved)
+
     return Config(
         originals_root=root,
         immich=immich,
@@ -291,4 +324,51 @@ def load(path: Path | None = None) -> Config:
         source=resolved,
         state_root=state_root,
         sidecars_root=sidecars_root,
+        trips=trips,
+    )
+
+
+def _parse_date(value: Any, where: str):
+    """YAML gives `2024-01-01` as a date already; accept strings too."""
+    from datetime import date
+    if value is None or isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(str(value))
+    except ValueError:
+        raise ValueError(f"{where}: not a YYYY-MM-DD date: {value!r}")
+
+
+def _parse_trips(raw: Any, source: Path) -> TripsConfig | None:
+    if not raw:
+        return None
+    from .trips import HomeStay, country_code
+    homes = []
+    for i, h in enumerate(raw.get("homes") or []):
+        where = f"{source}: trips.homes[{i}]"
+        country = None
+        if h.get("country"):
+            country = country_code(str(h["country"]))
+            if not country:
+                raise ValueError(f"{where}: unknown country {h['country']!r}")
+        has_centre = h.get("lat") is not None and h.get("lon") is not None
+        if not country and not has_centre:
+            raise ValueError(f"{where}: needs country and/or lat+lon")
+        homes.append(HomeStay(
+            name=str(h.get("name") or f"home {i + 1}"),
+            start=_parse_date(h.get("from"), where),
+            end=_parse_date(h.get("until"), where),
+            country=country,
+            lat=float(h["lat"]) if has_centre else None,
+            lon=float(h["lon"]) if has_centre else None,
+            radius_km=float(h.get("radius_km") or 50),
+        ))
+    regions = raw.get("regions")
+    return TripsConfig(
+        homes=tuple(homes),
+        max_gap_days=int(raw["max_gap_days"]) if raw.get("max_gap_days") is not None else None,
+        transit_days=int(raw["transit_days"]) if raw.get("transit_days") is not None else None,
+        min_assets=int(raw["min_assets"]) if raw.get("min_assets") is not None else None,
+        tag_root=str(raw["tag_root"]) if raw.get("tag_root") else None,
+        regions={str(k): str(v or "") for k, v in regions.items()} if isinstance(regions, dict) else None,
     )

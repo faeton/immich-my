@@ -66,6 +66,8 @@ srtgeo_mod = _LazyModule("srtgeo")
 tagsync_mod = _LazyModule("tagsync")
 track_mod = _LazyModule("track")
 transcripts_mod = _LazyModule("transcripts")
+trips_mod = _LazyModule("trips")
+from . import config as config_mod
 from .config import load as load_config
 from .exif import has_valid_gps as has_gps, read_folder
 from .immich import ImmichClient, ImmichError
@@ -2550,6 +2552,270 @@ def cluster(
         f"\n[green]✓[/green] {created} album(s) created, "
         f"{updated} updated, {added_assets_total} asset-link(s) added"
         + (f", {removed_total} pruned" if prune else "")
+    )
+
+
+@app.command("trips")
+def trips(
+    dry_run: bool = typer.Option(
+        True, "--dry-run/--apply",
+        help="Default: print the proposed trips only. `--apply` creates/updates "
+             "one Immich album per trip.",
+    ),
+    since: str = typer.Option(None, "--since", help="Only trips starting on/after YYYY-MM-DD."),
+    until: str = typer.Option(None, "--until", help="Only trips starting on/before YYYY-MM-DD."),
+    min_assets: int = typer.Option(
+        None, "--min-assets",
+        help=f"Trips with fewer assets get no album (default: config, else {trips_mod.DEFAULT_MIN_ASSETS}).",
+    ),
+    max_gap_days: int = typer.Option(
+        None, "--max-gap-days",
+        help=f"Days with nothing geotagged a trip may bridge (default: config, else {trips_mod.DEFAULT_MAX_GAP_DAYS}).",
+    ),
+    transit_days: int = typer.Option(
+        None, "--transit-days",
+        help="A run this short that touches another folds into it as a stopover "
+             f"(default: config, else {trips_mod.DEFAULT_TRANSIT_DAYS}; 0 disables).",
+    ),
+    owner: str = typer.Option(
+        None, "--owner",
+        help="Immich user email whose assets to use. Required when the server has more than one user.",
+    ),
+    tags: bool = typer.Option(
+        False, "--tags/--no-tags",
+        help="Also tag each trip's assets `<tag_root>/<year>/<album name>`: the "
+             "nesting albums can't do.",
+    ),
+    prune: bool = typer.Option(
+        False, "--prune/--no-prune",
+        help="Remove assets immy put in a trip album earlier that no longer belong "
+             "to that trip. Never touches assets immy did not add.",
+    ),
+    csv_path: Path = typer.Option(None, "--csv", help="Also write the trip table here, for review."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+) -> None:
+    """Find trips in the library's day-by-day geography; one album each.
+
+    Each day gets a country by majority vote of its geotagged assets. Days
+    at a configured home (`trips.homes`) are not travel; the rest are cut
+    into trips where the region changes (Oceania, Southeast Asia, …; most
+    European countries count alone) or the track goes quiet for more than
+    `--max-gap-days`. A trip's album holds every asset dated inside it,
+    with or without GPS. See docs/TRIPS.md.
+
+    Idempotent via an `immy-trip:<key>` line in each album description;
+    names and description text you edit in Immich are kept.
+    """
+    import csv
+    from datetime import date as _date
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red]")
+        raise typer.Exit(code=2)
+    if not dry_run and config.immich is None:
+        console.print("[red]no immich: block in immy config[/red] — "
+                      "trips --apply needs api_key to create albums.")
+        raise typer.Exit(code=2)
+    tc = config.trips or config_mod.TripsConfig()
+    min_assets = min_assets if min_assets is not None else (
+        tc.min_assets if tc.min_assets is not None else trips_mod.DEFAULT_MIN_ASSETS)
+    max_gap_days = max_gap_days if max_gap_days is not None else (
+        tc.max_gap_days if tc.max_gap_days is not None else trips_mod.DEFAULT_MAX_GAP_DAYS)
+    transit_days = transit_days if transit_days is not None else (
+        tc.transit_days if tc.transit_days is not None else trips_mod.DEFAULT_TRANSIT_DAYS)
+    tag_root = tc.tag_root or trips_mod.DEFAULT_TAG_ROOT
+    try:
+        since_d = _date.fromisoformat(since) if since else None
+        until_d = _date.fromisoformat(until) if until else None
+    except ValueError as e:
+        console.print(f"[red]bad date:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    try:
+        conn = pg_mod.connect(config.pg)
+    except Exception as e:
+        console.print(f"[red]pg connect failed:[/red] {e}")
+        raise typer.Exit(code=2)
+
+    # `localDateTime` is the shot's wall-clock time stored as if it were UTC,
+    # so reading it back in UTC yields the local calendar day.
+    with conn.cursor() as cur:
+        cur.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL')
+        users = cur.fetchall()
+        if owner:
+            match = [u for u in users if u[1] == owner]
+            if not match:
+                console.print(f"[red]no Immich user {owner!r}[/red]")
+                conn.close()
+                raise typer.Exit(code=2)
+            owner_id = str(match[0][0])
+        elif len(users) == 1:
+            owner_id = str(users[0][0])
+        else:
+            console.print(f"[red]{len(users)} Immich users[/red] — pass --owner <email>.")
+            conn.close()
+            raise typer.Exit(code=2)
+        cur.execute(trips_mod.DAY_BUCKETS_SQL, {"owner": owner_id})
+        buckets = [
+            trips_mod.PlaceCount(day=r[0], country=r[1], city=r[2],
+                                 lat=float(r[3]), lon=float(r[4]), n=int(r[5]))
+            for r in cur.fetchall()
+        ]
+        cur.execute("""
+            SELECT a.id, (a."localDateTime" AT TIME ZONE 'UTC')::date
+            FROM asset a
+            WHERE a."deletedAt" IS NULL
+              AND a.visibility = 'timeline'
+              AND a."ownerId" = %s
+        """, (owner_id,))
+        assets = [(str(r[0]), r[1]) for r in cur.fetchall()]
+    conn.close()
+
+    days = trips_mod.build_days(buckets)
+    found = trips_mod.segment(
+        days,
+        homes=list(tc.homes),
+        regions=trips_mod.Regions(tc.regions),
+        max_gap_days=max_gap_days,
+        transit_days=transit_days,
+    )
+    trips_mod.assign_assets(found, assets)
+    kept = [t for t in found if trips_mod.keep(t, min_assets=min_assets)]
+    small = len(found) - len(kept)
+    if since_d:
+        kept = [t for t in kept if t.start >= since_d]
+    if until_d:
+        kept = [t for t in kept if t.start <= until_d]
+
+    home_days = sum(1 for d in days if any(h.matches(d) for h in tc.homes))
+    console.print(
+        f"[bold]trips[/bold] — {len(days)} geotagged day(s), {home_days} at home, "
+        f"{len(assets)} timeline asset(s) → {len(found)} trip(s), "
+        f"{small} under {min_assets} assets skipped"
+        + (f", {len(kept)} in range" if since_d or until_d else "")
+    )
+    if not kept:
+        return
+
+    table = Table(show_lines=False, pad_edge=False)
+    for col, kw in (("album", {}), ("dates", {}), ("days", {"justify": "right"}),
+                    ("assets", {"justify": "right"}), ("countries", {})):
+        table.add_column(col, **kw)
+    for t in kept:
+        table.add_row(
+            t.name(), trips_mod.format_range(t.start, t.end), str(t.span_days),
+            str(len(t.asset_ids)), ", ".join(n for _, n in t.countries()),
+        )
+    console.print(table)
+    by_year: dict[int, int] = {}
+    for t in kept:
+        by_year[t.start.year] = by_year.get(t.start.year, 0) + 1
+    console.print("per year: " + ", ".join(f"{y} {n}" for y, n in sorted(by_year.items())))
+
+    if csv_path:
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["key", "album", "start", "end", "days", "geotagged_days",
+                        "assets", "region", "countries", "tag"])
+            for t in kept:
+                w.writerow([
+                    t.key(), t.name(), t.start.isoformat(), t.end.isoformat(),
+                    t.span_days, len(t.days), len(t.asset_ids), t.region_label or "",
+                    "; ".join(n for _, n in t.countries()), trips_mod.tag_for(t, tag_root),
+                ])
+        console.print(f"wrote {csv_path}")
+
+    ledger_path = (config.state_root or Path.home() / ".immy") / trips_mod.LEDGER_FILENAME
+    ledger = trips_mod.load_ledger(ledger_path)
+
+    if dry_run:
+        console.print(
+            f"\n[yellow]dry-run[/yellow] — pass `--apply` to create/update {len(kept)} album(s)"
+            + (" and tag their assets" if tags else "") + "."
+        )
+        return
+
+    client = ImmichClient(
+        url=config.immich.url,
+        api_key=config.immich.api_key,
+        ssh_host=config.immich.ssh_host,
+    )
+    key_to_album: dict[str, dict] = {}
+    existing = client._request("GET", "/api/albums")
+    for alb in existing if isinstance(existing, list) else []:
+        if isinstance(alb, dict):
+            k = trips_mod.extract_key(alb.get("description"))
+            if k:
+                key_to_album[k] = alb
+
+    created = updated = linked = removed_total = 0
+    taken: set[str] = set()
+    for t in kept:
+        key = t.key()
+        ids = t.asset_ids
+        # A trip whose first day moved has a new key; find its old album by
+        # region + overlapping dates and carry it over to the new key.
+        old_key = key if key in key_to_album else trips_mod.ledger_match(t, ledger, taken)
+        album = key_to_album.get(old_key) if old_key else None
+        taken.add(old_key or key)
+        # Claims only carry over when the album they were made in still
+        # exists; a hand-deleted album starts the new one from scratch.
+        previous = (set((ledger.get(old_key) or {}).get("assets", []))
+                    if old_key and album is not None else set())
+        if album is None:
+            album_id = client.create_album(
+                t.name(), description=trips_mod.description_for(t), asset_ids=ids,
+            )
+            if not album_id:
+                console.print(f"  [red]create failed[/red] {t.name()}")
+                continue
+            created += 1
+            linked += len(ids)
+            console.print(f"  [green]created[/green] {t.name()} [dim]({len(ids)} asset(s))[/dim]")
+        else:
+            album_id = album["id"]
+            desc = album.get("description") or ""
+            if trips_mod.extract_key(desc) != key:
+                # Keep whatever the user wrote; only the marker line moves.
+                kept_lines = [ln for ln in desc.splitlines()
+                              if not ln.strip().startswith(trips_mod.IMMY_TRIP_MARKER)]
+                client.update_album(album_id, description="\n".join(
+                    kept_lines + [trips_mod.marker_line(key)]))
+            result = client.add_assets_to_album(album_id, ids)
+            added = sum(1 for r in result if isinstance(r, dict) and r.get("success"))
+            linked += added
+            updated += 1
+            stale = sorted(previous - set(ids)) if prune else []
+            if stale:
+                res = client.remove_assets_from_album(album_id, stale)
+                removed_total += sum(1 for r in res if isinstance(r, dict) and r.get("success"))
+            console.print(
+                f"  [green]updated[/green] {album.get('albumName') or t.name()} "
+                f"[dim]({added} new" + (f", {len(stale)} pruned" if stale else "") + ")[/dim]"
+            )
+        if old_key and old_key != key:
+            ledger.pop(old_key, None)
+        # Without --prune, keep remembering stale claims so a later --prune
+        # can still remove them.
+        claims = set(ids) | (set() if prune else previous)
+        ledger[key] = {
+            "start": t.start.isoformat(), "end": t.end.isoformat(),
+            "region": t.region, "assets": sorted(claims),
+        }
+        trips_mod.save_ledger(ledger_path, ledger)
+
+        if tags:
+            name = trips_mod.tag_for(t, tag_root)
+            tag_id = client.upsert_tags([name]).get(name)
+            if tag_id:
+                client.tag_assets(tag_id, ids)
+            else:
+                console.print(f"  [red]tag upsert failed[/red] {name}")
+
+    console.print(
+        f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "
+        f"{linked} asset-link(s) added" + (f", {removed_total} pruned" if prune else "")
     )
 
 

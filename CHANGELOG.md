@@ -4,6 +4,31 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-04 — `immy trips`: dated travel albums
+
+### Added
+
+- **`immy trips`**: one Immich album per trip, found from where the library was
+  shot day by day. Each day gets a country by majority vote. Days at a
+  configured home stay (`trips.homes`: date window plus country and/or centre
+  and radius) are not travel. The rest are cut into trips where the region
+  changes. Regions: Oceania, Southeast Asia, …; most European countries count
+  alone. One-day stopovers fold into the trip they touch. Every timeline asset
+  dated inside a trip joins it, GPS or not. Dry run by default; `--csv` writes
+  a review table; `--tags` adds `Trips/<year>/<album>` (albums can't nest, tags
+  can); `--prune` drops only links immy added. Idempotent via an `immy-trip:`
+  description marker, plus a ledger that follows a trip whose first day moves.
+  See `docs/TRIPS.md`.
+- **Sign-flipped GPS is dropped before voting.** Both `(-lat, -lon)` and
+  `(lat, -lon)` ghosts exist in real libraries. Without the filter, an
+  Antarctic cruise came out as "Russia · Ovgort" and a Chicago stopover as
+  China.
+
+### Findings
+
+- First dry run over the whole library: 4,577 geotagged days → 394 trips, 354
+  with ≥ 20 assets (2009–2026).
+
 ## 2026-10-04 — Photos backlog (4,634 assets) live in Immich
 
 ### Ops

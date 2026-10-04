@@ -1,0 +1,419 @@
+"""`immy trips`: day track → trips → albums. Synthetic data throughout."""
+
+from __future__ import annotations
+
+from datetime import date, timedelta
+from pathlib import Path
+
+import pytest
+from typer.testing import CliRunner
+
+from immy import cli
+from immy import trips as T
+from immy.config import load as load_config
+
+D0 = date(2025, 3, 1)
+
+# Rough city centres, enough for radius checks.
+LISBON = (38.72, -9.14, "Portugal", "Lisbon")
+PORTO = (41.15, -8.61, "Portugal", "Porto")
+MADRID = (40.42, -3.70, "Spain", "Madrid")
+PARIS = (48.86, 2.35, "France", "Paris")
+DUBAI = (25.20, 55.27, "United Arab Emirates", "Dubai")
+DOHA = (25.29, 51.53, "Qatar", "Doha")
+NADI = (-17.80, 177.42, "Fiji", "Nadi")
+SUVA = (-18.14, 178.44, "Fiji", "Suva")
+VILA = (-17.73, 168.32, "Vanuatu", "Port Vila")
+AUCKLAND = (-36.85, 174.76, "New Zealand", "Auckland")
+MAHE = (-4.62, 55.45, "Seychelles", "Victoria")
+
+
+def day(offset: int, place, n: int = 10) -> T.PlaceCount:
+    lat, lon, country, city = place
+    return T.PlaceCount(day=D0 + timedelta(days=offset), country=country,
+                        city=city, lat=lat, lon=lon, n=n)
+
+
+def track(*spec) -> list[T.Day]:
+    """`track((0, LISBON), (1, PARIS), …)` → built days."""
+    return T.build_days([day(o, p) for o, p in spec])
+
+
+def run(spec, **kw) -> list[T.Trip]:
+    return T.segment(track(*spec), **kw)
+
+
+# --- day track ---------------------------------------------------------------
+
+
+def test_country_is_majority_vote_and_city_comes_from_winning_country() -> None:
+    # Five shots in Paris, three on the Madrid tarmac: France wins, and the
+    # city is voted only among French buckets.
+    days = T.build_days([day(0, PARIS, 5), day(0, MADRID, 3)])
+    assert len(days) == 1
+    assert (days[0].country, days[0].code, days[0].city) == ("France", "FR", "Paris")
+
+
+def test_vote_tie_breaks_on_name_not_row_order() -> None:
+    a = T.build_days([day(0, PARIS, 4), day(0, MADRID, 4)])
+    b = T.build_days([day(0, MADRID, 4), day(0, PARIS, 4)])
+    assert a[0].country == b[0].country == "France"
+
+
+def test_unknown_country_names_are_ignored() -> None:
+    bogus = T.PlaceCount(day=D0, country="Atlantis", city=None, lat=0, lon=0, n=50)
+    assert T.build_days([bogus]) == []
+
+
+def test_longitude_mean_survives_the_antimeridian() -> None:
+    east = T.PlaceCount(day=D0, country="Fiji", city="A", lat=-17, lon=179.5, n=1)
+    west = T.PlaceCount(day=D0, country="Fiji", city="B", lat=-17, lon=-179.5, n=1)
+    lon = T.build_days([east, west])[0].lon
+    assert abs(abs(lon) - 180) < 0.01
+
+
+# --- homes -------------------------------------------------------------------
+
+
+def test_home_by_radius_inside_window_only() -> None:
+    home = T.HomeStay(lat=LISBON[0], lon=LISBON[1], radius_km=50, end=D0 + timedelta(days=1))
+    d_in, d_far, d_late = track((0, LISBON), (1, PORTO), (2, LISBON))
+    assert home.matches(d_in)
+    assert not home.matches(d_far)    # Porto is ~275 km away
+    assert not home.matches(d_late)   # after the window
+
+
+def test_home_by_country() -> None:
+    home = T.HomeStay(country="PT")
+    lis, par = track((0, LISBON), (1, PARIS))
+    assert home.matches(lis) and not home.matches(par)
+
+
+def test_home_needs_a_place() -> None:
+    assert not T.HomeStay().matches(track((0, LISBON))[0])
+
+
+def test_home_days_split_trips() -> None:
+    home = T.HomeStay(country="PT")
+    trips = run([(0, PARIS), (1, LISBON), (2, PARIS)], homes=[home])
+    assert [(t.start, t.end) for t in trips] == [(D0, D0), (D0 + timedelta(days=2),) * 2]
+
+
+def test_no_homes_means_every_day_is_travel() -> None:
+    trips = run([(0, LISBON), (1, LISBON), (2, LISBON)])
+    assert len(trips) == 1 and trips[0].span_days == 3
+
+
+# --- regions / gaps / transit --------------------------------------------------
+
+
+def test_regional_countries_stay_one_trip() -> None:
+    trips = run([(0, VILA), (1, VILA), (2, NADI), (3, SUVA), (4, AUCKLAND)])
+    assert len(trips) == 1
+    assert trips[0].region_label == "Oceania"
+
+
+def test_european_countries_are_their_own_region() -> None:
+    trips = run([(0, LISBON), (1, LISBON), (2, MADRID), (3, MADRID), (4, PARIS), (5, PARIS)])
+    assert [t.countries()[0][1] for t in trips] == ["Portugal", "Spain", "France"]
+
+
+def test_quiet_gap_longer_than_limit_splits() -> None:
+    trips = run([(0, PARIS), (1, PARIS), (6, PARIS)], max_gap_days=3)
+    assert len(trips) == 2
+    trips = run([(0, PARIS), (1, PARIS), (5, PARIS)], max_gap_days=3)
+    assert len(trips) == 1
+
+
+def test_one_day_stopover_folds_into_the_trip_it_touches() -> None:
+    # Spain → a day in Dubai → a week in the Seychelles.
+    spec = [(0, MADRID), (1, MADRID), (2, MADRID), (3, DUBAI)]
+    spec += [(4 + i, MAHE) for i in range(5)]
+    trips = run(spec)
+    assert len(trips) == 2
+    africa = trips[1]
+    assert africa.start == D0 + timedelta(days=3)
+    assert [n for _, n in africa.countries()] == ["Seychelles", "UAE"]
+    # The stopover is in the description but not the album name.
+    assert africa.name() == "2025-03 Seychelles · Victoria"
+
+
+def test_stopover_between_two_stints_rejoins_them() -> None:
+    trips = run([(0, PARIS), (1, PARIS), (2, MADRID), (3, PARIS), (4, PARIS)])
+    assert len(trips) == 1
+    assert trips[0].name() == "2025-03 France · Paris"
+
+
+def test_transit_zero_disables_folding() -> None:
+    trips = run([(0, PARIS), (1, PARIS), (2, MADRID), (3, PARIS)], transit_days=0)
+    assert len(trips) == 3
+
+
+def test_two_day_trip_is_not_a_stopover() -> None:
+    spec = [(0, PARIS), (1, PARIS), (2, DOHA), (3, DOHA), (4, PARIS), (5, PARIS)]
+    trips = run(spec)
+    assert [t.countries()[0][1] for t in trips] == ["France", "Qatar", "France"]
+
+
+def test_region_override_from_config() -> None:
+    # Make Spain and Portugal one region.
+    regions = T.Regions({"ES": "Iberia", "PT": "Iberia"})
+    trips = run([(0, LISBON), (1, LISBON), (2, MADRID), (3, MADRID)], regions=regions)
+    assert len(trips) == 1
+    assert trips[0].name() == "2025-03 Iberia · Portugal, Spain"
+
+
+# --- membership / naming ---------------------------------------------------------
+
+
+def test_assets_join_by_date_including_untagged_days() -> None:
+    trips = run([(0, PARIS), (2, PARIS), (10, MADRID)])
+    T.assign_assets(trips, [
+        ("a", D0), ("drone", D0 + timedelta(days=1)), ("b", D0 + timedelta(days=2)),
+        ("gap", D0 + timedelta(days=5)), ("c", D0 + timedelta(days=10)),
+        ("before", D0 - timedelta(days=1)),
+    ])
+    assert trips[0].asset_ids == ["a", "drone", "b"]
+    assert trips[1].asset_ids == ["c"]
+
+
+def test_keep_drops_small_trips() -> None:
+    t = run([(0, PARIS)])[0]
+    T.assign_assets([t], [(f"x{i}", D0) for i in range(5)])
+    assert not T.keep(t, min_assets=20)
+    assert T.keep(t, min_assets=5)
+
+
+def test_names() -> None:
+    assert run([(0, PARIS), (1, PARIS)])[0].name() == "2025-03 France · Paris"
+    # A tour across towns gets no city.
+    tour = run([(0, LISBON), (1, PORTO), (2, (37.02, -7.93, "Portugal", "Faro"))])[0]
+    assert tour.name() == "2025-03 Portugal"
+    many = run([(0, VILA), (1, NADI), (2, AUCKLAND), (3, (-33.87, 151.21, "Australia", "Sydney")),
+                (4, (-21.14, -175.2, "Tonga", "Nukuʻalofa"))])[0]
+    assert many.name() == "2025-03 Oceania · Vanuatu, Fiji, New Zealand +2"
+
+
+def test_parenthetical_place_qualifier_is_dropped() -> None:
+    q = (34.75, 32.45, "Cyprus", "Geroskípou (quarter)")
+    assert run([(0, q), (1, q)])[0].name() == "2025-03 Cyprus · Geroskípou"
+
+
+def test_format_range() -> None:
+    assert T.format_range(date(2024, 4, 15), date(2024, 4, 15)) == "15 Apr 2024"
+    assert T.format_range(date(2024, 4, 15), date(2024, 4, 17)) == "15–17 Apr 2024"
+    assert T.format_range(date(2024, 4, 29), date(2024, 5, 3)) == "29 Apr – 3 May 2024"
+    assert T.format_range(date(2024, 12, 29), date(2025, 1, 3)) == "29 Dec 2024 – 3 Jan 2025"
+
+
+def test_marker_roundtrip_and_tag() -> None:
+    t = run([(0, PARIS), (1, PARIS)])[0]
+    desc = T.description_for(t)
+    assert T.extract_key(desc) == t.key()
+    assert T.extract_key("my notes\nimmy-trip:abc") == "abc"
+    assert T.extract_key("no marker") is None
+    assert T.tag_for(t) == "Trips/2025/2025-03 France · Paris"
+
+
+def test_ledger_match_by_region_and_overlap() -> None:
+    t = run([(0, PARIS), (1, PARIS), (2, PARIS)])[0]
+    ledger = {
+        "old": {"start": (D0 - timedelta(days=1)).isoformat(),
+                "end": (D0 + timedelta(days=1)).isoformat(), "region": "FR"},
+        "elsewhere": {"start": D0.isoformat(), "end": D0.isoformat(), "region": "ES"},
+    }
+    assert T.ledger_match(t, ledger, set()) == "old"
+    assert T.ledger_match(t, ledger, {"old"}) is None
+
+
+# --- config ---------------------------------------------------------------------
+
+
+def test_config_parses_trips_block(tmp_path: Path) -> None:
+    p = tmp_path / "config.yml"
+    p.write_text(
+        "trips:\n"
+        "  homes:\n"
+        "    - name: Lisbon\n      until: 2021-06-30\n      lat: 38.72\n      lon: -9.14\n"
+        "    - from: 2023-11-01\n      until: '2024-03-31'\n      country: Spain\n"
+        "  max_gap_days: 5\n  min_assets: 10\n  regions:\n    TR: Middle East\n    ES: ''\n"
+    )
+    tc = load_config(p).trips
+    assert tc is not None
+    lis, es = tc.homes
+    assert (lis.name, lis.end, lis.lat, lis.radius_km) == ("Lisbon", date(2021, 6, 30), 38.72, 50.0)
+    assert (es.start, es.end, es.country) == (date(2023, 11, 1), date(2024, 3, 31), "ES")
+    assert (tc.max_gap_days, tc.min_assets, tc.transit_days) == (5, 10, None)
+    assert tc.regions == {"TR": "Middle East", "ES": ""}
+
+
+@pytest.mark.parametrize("body,msg", [
+    ("    - name: x\n", "needs country"),
+    ("    - country: Atlantis\n", "unknown country"),
+    ("    - country: PT\n      from: someday\n", "YYYY-MM-DD"),
+])
+def test_config_rejects_bad_homes(tmp_path: Path, body: str, msg: str) -> None:
+    p = tmp_path / "config.yml"
+    p.write_text("trips:\n  homes:\n" + body)
+    with pytest.raises(ValueError, match=msg):
+        load_config(p)
+
+
+# --- CLI ------------------------------------------------------------------------
+
+
+class _Cursor:
+    def __init__(self, buckets, assets):
+        self.buckets, self.assets, self._rows = buckets, assets, []
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=None):
+        if 'FROM "user"' in sql:
+            self._rows = [("u1", "me@example.com")]
+        elif "GROUP BY 1, 2, 3" in sql:
+            self._rows = self.buckets
+        else:
+            self._rows = self.assets
+
+    def fetchall(self):
+        return self._rows
+
+
+class _Conn:
+    def __init__(self, buckets, assets):
+        self.c = _Cursor(buckets, assets)
+
+    def cursor(self):
+        return self.c
+
+    def close(self):
+        pass
+
+
+class _Immich:
+    albums: dict[str, dict] = {}
+    tags: dict[str, set] = {}
+
+    def __init__(self, **kw):
+        pass
+
+    def _request(self, method, path, body=None):
+        assert (method, path) == ("GET", "/api/albums")
+        return [{"id": k, "albumName": v["name"], "description": v["description"]}
+                for k, v in self.albums.items()]
+
+    def create_album(self, name, *, description, asset_ids):
+        aid = f"al{len(self.albums)}"
+        self.albums[aid] = {"name": name, "description": description, "assets": set(asset_ids)}
+        return aid
+
+    def update_album(self, album_id, *, description):
+        self.albums[album_id]["description"] = description
+
+    def add_assets_to_album(self, album_id, ids):
+        have = self.albums[album_id]["assets"]
+        out = [{"id": i, "success": i not in have} for i in ids]
+        have.update(ids)
+        return out
+
+    def remove_assets_from_album(self, album_id, ids):
+        have = self.albums[album_id]["assets"]
+        out = [{"id": i, "success": i in have} for i in ids]
+        have.difference_update(ids)
+        return out
+
+    def upsert_tags(self, names):
+        for n in names:
+            self.tags.setdefault(n, set())
+        return {n: n for n in names}
+
+    def tag_assets(self, tag_id, ids):
+        self.tags[tag_id].update(ids)
+        return [{"id": i, "success": True} for i in ids]
+
+
+def _setup(monkeypatch, tmp_path, buckets, assets):
+    cfg = tmp_path / "config.yml"
+    cfg.write_text(
+        f"state_root: {tmp_path / 'state'}\n"
+        "pg: {host: h, port: 1, user: u, password: p, database: d}\n"
+        "immich: {url: http://x, api_key: k, library_id: l}\n"
+        "trips:\n  min_assets: 2\n  homes:\n    - country: PT\n"
+    )
+    monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: _Conn(buckets, assets))
+    _Immich.albums, _Immich.tags = {}, {}
+    monkeypatch.setattr(cli, "ImmichClient", _Immich)
+    return cfg
+
+
+def _rows(spec):
+    return [(b.day, b.country, b.city, b.lat, b.lon, b.n) for b in (day(o, p) for o, p in spec)]
+
+
+def test_cli_dry_run_writes_nothing(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [(f"a{i}", D0 + timedelta(days=i)) for i in range(4)]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    out = tmp_path / "trips.csv"
+    res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg), "--csv", str(out)])
+    assert res.exit_code == 0, res.output
+    assert "2025-03 France · Paris" in res.output
+    assert "dry-run" in res.output
+    assert _Immich.albums == {}
+    assert not (tmp_path / "state").exists()
+    assert "2025-03 France · Paris" in out.read_text()
+
+
+def test_cli_apply_is_idempotent_and_follows_a_moved_start(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (2, PARIS), (3, PARIS), (4, LISBON)])
+    assets = [("a0", D0), ("a2", D0 + timedelta(days=2)), ("a3", D0 + timedelta(days=3))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    r = CliRunner()
+    res = r.invoke(cli.app, ["trips", "--config", str(cfg), "--apply", "--tags"])
+    assert res.exit_code == 0, res.output
+    assert len(_Immich.albums) == 1
+    album = next(iter(_Immich.albums.values()))
+    assert album["assets"] == {"a2", "a3"}
+    assert _Immich.tags == {"Trips/2025/2025-03 France · Paris": {"a2", "a3"}}
+
+    # The user renames the album and adds a note above the marker.
+    album["name"] = "Paris with friends"
+    album["description"] = "Best croissants.\n" + album["description"].splitlines()[-1]
+
+    # A late import adds a Paris day earlier: the trip's key changes, but it
+    # must land in the same album, keep the note, and prune the day-3 asset
+    # that no longer belongs.
+    buckets2 = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON), (4, LISBON)])
+    assets2 = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2)),
+               ("a3", D0 + timedelta(days=3))]
+    monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: _Conn(buckets2, assets2))
+    res = r.invoke(cli.app, ["trips", "--config", str(cfg), "--apply", "--prune"])
+    assert res.exit_code == 0, res.output
+    assert len(_Immich.albums) == 1
+    assert album["name"] == "Paris with friends"
+    assert album["assets"] == {"a1", "a2"}
+    lines = album["description"].splitlines()
+    assert lines[0] == "Best croissants."
+    assert T.extract_key(album["description"]) == T.stable_key("FR", D0 + timedelta(days=1))
+    ledger = T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME)
+    assert list(ledger) == [T.stable_key("FR", D0 + timedelta(days=1))]
+
+
+def test_cli_requires_owner_with_several_users(monkeypatch, tmp_path) -> None:
+    cfg = _setup(monkeypatch, tmp_path, [], [])
+
+    class Multi(_Cursor):
+        def execute(self, sql, params=None):
+            self._rows = [("u1", "a@x"), ("u2", "b@x")]
+
+    monkeypatch.setattr(cli.pg_mod, "connect",
+                        lambda _cfg: type("C", (), {"cursor": lambda s: Multi([], []),
+                                                    "close": lambda s: None})())
+    res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg)])
+    assert res.exit_code == 2
+    assert "--owner" in res.output

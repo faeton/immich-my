@@ -28,6 +28,7 @@ The main operational interface is `immy`:
 - `process` computes derivatives, CLIP, and faces, then inserts directly into Immich Postgres
 - `promote` uploads a curated trip into the external library and syncs the album
 - `cluster` groups geo-dated assets into events and auto-creates Immich albums
+- `trips` finds trips in the library's day-by-day geography (homes, regions, stopovers, flipped-GPS repair) and keeps one dated album per trip, plus optional `Trips/<year>/…` tags for nesting; see `docs/TRIPS.md`
 - `srt` harvests DJI `.SRT` telemetry → GPX/JSON tracks, durable GPS, reverse-geocode
 - `tags sync` pushes a trip's notes tags (gear/camera, event, source) to Immich's native Tag API — the only channel that reaches video assets, which never read XMP
 - `tags camera` backfills the blank "Camera" field for DJI MP4s from the notes gear tag
@@ -103,6 +104,7 @@ brew install exiftool ffmpeg vips
 - CLIP embeddings and face embeddings during ingest
 - Album sync on promote
 - Event clustering into auto-named albums (`immy cluster`)
+- Dated travel albums across the whole library (`immy trips`, see `docs/TRIPS.md`)
 - DJI drone telemetry: GPX/JSON tracks, durable locked GPS, library-matched
   reverse-geocode (`immy srt`, see `docs/TELEMETRY.md`)
 - Portable Immich library snapshot + external-disk duplicate scan
@@ -244,6 +246,10 @@ Docs grouped by role:
 - Event clustering via `immy cluster` — sweep-based `(time, lat, lon)`
   grouping, auto-named albums from Immich's city/country, idempotent via a
   marker line in each album's description.
+
+- Travel albums via `immy trips` — day-track majority vote, configurable
+  home stays, region-aware runs with stopover folding, sign-flipped GPS
+  dropped, one dated album per trip; see `docs/TRIPS.md`.
 
 - External-disk matching. `immy snapshot` dumps the Immich library index
   (filename, size, SHA1, taken-at) into a portable SQLite file. On any
