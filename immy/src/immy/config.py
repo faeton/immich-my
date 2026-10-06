@@ -61,6 +61,8 @@ Shape:
       max_gap_days: 3                # empty days a trip may bridge
       transit_days: 1                # runs this short fold into a neighbour
       min_assets: 20                 # smaller trips get no album
+      placeholder_min: 10            # on-the-hour time shared by this many
+                                     # assets = fallback date, ignored
       tag_root: Trips                # `--tags` → Trips/<year>/<album name>
       regions:                       # alpha-2 → region label; "" = own region
         TR: Middle East
@@ -185,6 +187,7 @@ class TripsConfig:
     min_assets: int | None = None
     tag_root: str | None = None
     regions: dict[str, str] | None = None
+    placeholder_min: int | None = None
 
 
 @dataclass(frozen=True)
@@ -370,5 +373,7 @@ def _parse_trips(raw: Any, source: Path) -> TripsConfig | None:
         transit_days=int(raw["transit_days"]) if raw.get("transit_days") is not None else None,
         min_assets=int(raw["min_assets"]) if raw.get("min_assets") is not None else None,
         tag_root=str(raw["tag_root"]) if raw.get("tag_root") else None,
+        placeholder_min=(int(raw["placeholder_min"])
+                         if raw.get("placeholder_min") is not None else None),
         regions={str(k): str(v or "") for k, v in regions.items()} if isinstance(regions, dict) else None,
     )

@@ -276,9 +276,10 @@ class _Cursor:
         if 'FROM "user"' in sql:
             self._rows = [("u1", "me@example.com")]
         elif "GROUP BY 1, 2, 3" in sql:
+            assert params["placeholder_min"] == 10
             self._rows = self.buckets
         else:
-            self._rows = self.assets
+            self._rows = [r if len(r) == 3 else (*r, False) for r in self.assets]
 
     def fetchall(self):
         return self._rows
@@ -489,3 +490,16 @@ def test_tag_segments_never_contain_a_slash() -> None:
     odd = (48.86, 2.35, "France", "A/B")
     t = run([(0, odd), (1, odd)])[0]
     assert T.tag_for(t) == "Trips/2025/2025-03 France · A-B"
+
+
+def test_cli_skips_placeholder_dated_assets(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1), False), ("a2", D0 + timedelta(days=2), False),
+              ("fake", D0 + timedelta(days=1), True)]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    out = tmp_path / "t.csv"
+    res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg), "--csv", str(out)])
+    assert res.exit_code == 0, res.output
+    assert "+1 with a placeholder date" in " ".join(res.output.split())
+    row = out.read_text().splitlines()[1].split(",")
+    assert row[6] == "2"   # assets column: the placeholder-dated one is out

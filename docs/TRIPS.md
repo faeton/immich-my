@@ -33,6 +33,12 @@ gives thousands of albums; trips give a few hundred.
    majority over ±5 days. Nearby days where every file flipped are caught when
    their mirror lands on real points from that window. Null island `(0, 0)` is
    dropped too.
+   **Placeholder dates** go too: an importer that only knew the year (a Takeout
+   "Photos from 2019" folder) stamps every such file `2019-01-01 12:00:00`. An
+   exact on-the-hour time shared by `placeholder_min` (10) or more assets is
+   treated as no date at all. Otherwise it invents a New Year's Day trip and
+   pulls those files into any real trip that spans 1 January. The dry run
+   prints how many were skipped.
 3. **Home.** Days matching a configured home stay are not travel. With no homes
    configured, every day is travel.
 4. **Runs.** The remaining days are cut where the **region** changes, a home day
@@ -86,6 +92,7 @@ trips:
   max_gap_days: 3
   transit_days: 1
   min_assets: 20
+  placeholder_min: 10
   tag_root: Trips
 ```
 

@@ -60,6 +60,9 @@ DEFAULT_MAX_GAP_DAYS = 3
 DEFAULT_TRANSIT_DAYS = 1
 DEFAULT_MIN_ASSETS = 20
 DEFAULT_TAG_ROOT = "Trips"
+# An exact on-the-hour local time shared by this many assets is a fallback
+# stamp (a year-only date written as `YYYY-01-01 12:00:00`), not a shot time.
+DEFAULT_PLACEHOLDER_MIN = 10
 
 _DATA = Path(__file__).parent / "data"
 
@@ -191,8 +194,41 @@ ghost_{tag} AS MATERIALIZED (
 )"""
 
 
+# Placeholder dates: an importer that only knew the year (a Takeout
+# "Photos from 2019" folder) stamps every such file with the same exact time,
+# typically `2019-01-01 12:00:00`. Real shots don't pile up on one exact
+# on-the-hour second, so a whole-hour local time shared by
+# `placeholder_min`+ assets is treated as no date at all: it would otherwise
+# invent a New Year's Day trip and pull those files into any real trip that
+# spans the date.
+_PLACEHOLDER_CTE = """
+placeholder AS MATERIALIZED (
+  SELECT a."localDateTime" AS t
+  FROM asset a
+  WHERE a."deletedAt" IS NULL
+    AND a.visibility = 'timeline'
+    AND a."ownerId" = %(owner)s
+    AND date_trunc('hour', a."localDateTime" AT TIME ZONE 'UTC')
+        = a."localDateTime" AT TIME ZONE 'UTC'
+  GROUP BY 1
+  HAVING count(*) >= %(placeholder_min)s
+)"""
+
+# Every live timeline asset with its local day; `placeholder` flags the
+# fallback-dated ones so the caller can count and skip them.
+ASSETS_SQL = f"""
+WITH {_PLACEHOLDER_CTE.strip()}
+SELECT a.id, (a."localDateTime" AT TIME ZONE 'UTC')::date,
+       EXISTS (SELECT 1 FROM placeholder p WHERE p.t = a."localDateTime")
+FROM asset a
+WHERE a."deletedAt" IS NULL
+  AND a.visibility = 'timeline'
+  AND a."ownerId" = %(owner)s
+"""
+
 DAY_BUCKETS_SQL = f"""
-WITH gps AS MATERIALIZED (
+WITH {_PLACEHOLDER_CTE.strip()},
+gps AS MATERIALIZED (
   SELECT a.id, (a."localDateTime" AT TIME ZONE 'UTC')::date AS d,
          ae.country, ae.city, ae.latitude AS lat, ae.longitude AS lon
   FROM asset a
@@ -203,6 +239,7 @@ WITH gps AS MATERIALIZED (
     AND ae.latitude IS NOT NULL AND ae.longitude IS NOT NULL
     AND ae.country IS NOT NULL
     AND NOT (abs(ae.latitude) < 0.01 AND abs(ae.longitude) < 0.01)
+    AND NOT EXISTS (SELECT 1 FROM placeholder p WHERE p.t = a."localDateTime")
 ),{_ghost_ctes("ll", axis="lat", lat_op="+", min_abs=0.5)},{_ghost_ctes("lon", axis="lon", lat_op="-", min_abs=5)}
 SELECT g.d, g.country, g.city, avg(g.lat), avg(g.lon), count(*)
 FROM gps g
@@ -654,6 +691,7 @@ def ledger_match(trip: Trip, ledger: dict[str, dict], taken: set[str]) -> str | 
 
 __all__ = [
     "IMMY_TRIP_MARKER", "LEDGER_FILENAME",
+    "DEFAULT_PLACEHOLDER_MIN", "ASSETS_SQL", "DAY_BUCKETS_SQL",
     "DEFAULT_MAX_GAP_DAYS", "DEFAULT_TRANSIT_DAYS", "DEFAULT_MIN_ASSETS", "DEFAULT_TAG_ROOT",
     "Regions", "PlaceCount", "Day", "HomeStay", "Trip",
     "country_code", "build_days", "segment", "assign_assets", "keep",

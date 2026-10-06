@@ -2625,6 +2625,8 @@ def trips(
     transit_days = transit_days if transit_days is not None else (
         tc.transit_days if tc.transit_days is not None else trips_mod.DEFAULT_TRANSIT_DAYS)
     tag_root = tc.tag_root or trips_mod.DEFAULT_TAG_ROOT
+    placeholder_min = (tc.placeholder_min if tc.placeholder_min is not None
+                       else trips_mod.DEFAULT_PLACEHOLDER_MIN)
     try:
         since_d = _date.fromisoformat(since) if since else None
         until_d = _date.fromisoformat(until) if until else None
@@ -2656,20 +2658,17 @@ def trips(
             console.print(f"[red]{len(users)} Immich users[/red] — pass --owner <email>.")
             conn.close()
             raise typer.Exit(code=2)
-        cur.execute(trips_mod.DAY_BUCKETS_SQL, {"owner": owner_id})
+        params = {"owner": owner_id, "placeholder_min": placeholder_min}
+        cur.execute(trips_mod.DAY_BUCKETS_SQL, params)
         buckets = [
             trips_mod.PlaceCount(day=r[0], country=r[1], city=r[2],
                                  lat=float(r[3]), lon=float(r[4]), n=int(r[5]))
             for r in cur.fetchall()
         ]
-        cur.execute("""
-            SELECT a.id, (a."localDateTime" AT TIME ZONE 'UTC')::date
-            FROM asset a
-            WHERE a."deletedAt" IS NULL
-              AND a.visibility = 'timeline'
-              AND a."ownerId" = %s
-        """, (owner_id,))
-        assets = [(str(r[0]), r[1]) for r in cur.fetchall()]
+        cur.execute(trips_mod.ASSETS_SQL, params)
+        rows = cur.fetchall()
+        assets = [(str(r[0]), r[1]) for r in rows if not r[2]]
+        placeholders = len(rows) - len(assets)
     conn.close()
 
     days = trips_mod.build_days(buckets)
@@ -2692,7 +2691,9 @@ def trips(
     home_days = sum(1 for d in days if any(h.matches(d) for h in tc.homes))
     console.print(
         f"[bold]trips[/bold] — {len(days)} geotagged day(s), {home_days} at home, "
-        f"{len(assets)} timeline asset(s) → {len(found)} trip(s), "
+        f"{len(assets)} timeline asset(s)"
+        + (f" (+{placeholders} with a placeholder date, skipped)" if placeholders else "")
+        + f" → {len(found)} trip(s), "
         f"{small} under {min_assets} assets skipped"
         + (f", {len(kept)} in range" if since_d or until_d else "")
     )
