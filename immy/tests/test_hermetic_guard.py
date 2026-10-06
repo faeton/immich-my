@@ -35,3 +35,18 @@ def test_pg_connect_to_live_port_raises_through_fail_open_handlers():
 def test_psycopg_connect_default_port_raises():
     with pytest.raises(LiveServiceAccess):
         psycopg.connect("host=127.0.0.1 dbname=immich")
+
+
+def test_unmarked_test_cannot_reach_the_scratch_db_either():
+    """The scratch_pg opt-in is per test: without the marker, even the
+    throwaway DSN is refused."""
+    import psycopg
+    from conftest import LiveServiceAccess
+    with pytest.raises(LiveServiceAccess):
+        psycopg.connect("postgresql://postgres:test@127.0.0.1:55432/postgres")
+
+
+def test_scratch_dsn_port_parsing():
+    from conftest import _scratch_dsn_port
+    assert _scratch_dsn_port("postgresql://u:p@127.0.0.1:55432/db") == 55432
+    assert _scratch_dsn_port("postgresql://u:p@127.0.0.1/db") is None   # implicit 5432 → refused

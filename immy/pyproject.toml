@@ -53,6 +53,7 @@ testpaths = ["tests"]
 addopts = "-n auto"
 markers = [
     "integration: hits the network / a real model or server (skips when unavailable)",
+    "scratch_pg: runs SQL against the throwaway Postgres in IMMY_TEST_PG_DSN (scripts/test-pg.sh); skips without it",
 ]
 
 [tool.ruff]

@@ -228,6 +228,12 @@ class _Cur:
             self.rows = d["twins"].get(params["orig"], [])
         elif "FROM asset_file" in q:
             self.rows = list(d["registered"].items())
+        elif q.startswith('SELECT "stackId" FROM asset'):
+            self.rows = [(d["stacks_of"].get(params[0]),)]
+        elif q.startswith('SELECT "primaryAssetId" FROM stack'):
+            self.rows = [(d["stacks"][params[0]][0],)]
+        elif q.startswith('SELECT id FROM asset WHERE "stackId"'):
+            self.rows = [(m,) for m in d["stacks"][params[0]]]
         elif q.startswith("INSERT INTO asset_file"):
             d["inserted"].append(params)
             self.rows = []
@@ -265,9 +271,19 @@ class _Api:
     def refresh_metadata(self, ids):
         self.calls.append(("refresh", tuple(ids)))
 
+    db: dict = {}
+
     def create_stack(self, primary, others):
+        """Like Immich: stacks whose primary is listed merge into one."""
         self.calls.append(("stack", primary, tuple(others)))
-        return "s1"
+        ids = [primary, *others]
+        for sid in [sid for sid, m in self.db["stacks"].items() if m[0] in ids]:
+            del self.db["stacks"][sid]
+        sid = f"s{len(self.calls)}"
+        self.db["stacks"][sid] = ids
+        for a in ids:
+            self.db["stacks_of"][a] = sid
+        return sid
 
 
 def _setup_cli(tmp_path, monkeypatch, roots, placeholders, registered=None, twins=None):
@@ -284,7 +300,8 @@ def _setup_cli(tmp_path, monkeypatch, roots, placeholders, registered=None, twin
                    "pg: {host: h, port: 1, user: u, password: p, database: d}\n"
                    "immich: {url: http://x, api_key: k, library_id: l}\n")
     db = {"roots": roots, "placeholders": placeholders, "registered": registered or {},
-          "twins": twins or {}, "inserted": []}
+          "twins": twins or {}, "inserted": [], "stacks": {}, "stacks_of": {}}
+    _Api.db = db
     monkeypatch.setattr(cli.pg_mod, "connect", lambda _c: _PG(db))
     monkeypatch.setattr(cli, "ImmichClient", _Api)
     _Api.calls = []
@@ -331,3 +348,45 @@ def test_cli_keeps_an_already_registered_sidecar(tmp_path, monkeypatch) -> None:
     assert res.exit_code == 0, res.output
     assert writes[0][2] == tmp_path / "lib/2026/06/IMG_1711(1).xmp"
     assert db["inserted"][0][1] == "/b/2026/06/IMG_1711(1).xmp"
+
+
+def test_cli_stacks_two_copies_of_one_original_into_one_stack(tmp_path, monkeypatch) -> None:
+    other = f"{PREFIX}/{FOLDER_2019}/IMG_1711(2).MP4"
+    ph = [("c1", "/b/2026/06/IMG_1711(1).MP4"), ("c2", "/b/2026/06/IMG_1711(2).MP4")]
+    twin_row = ("orig", datetime(2019, 11, 15, 1, 43, 25, tzinfo=UTC), None, 0.01)
+    db, _, args = _setup_cli(tmp_path, monkeypatch, ["/b"], ph, twins={"IMG_1711.MP4": [twin_row]})
+    # The second copy, with its own JSON and manifest row.
+    _json(tmp_path / "takeout" / FOLDER_2019, "IMG_1711.HEIC.supplemental-metadata(2).json",
+          "IMG_1711.HEIC", SHOT)
+    con = sqlite3.connect(tmp_path / "manifest.sqlite")
+    con.execute("INSERT INTO asset VALUES (8, ?, '2026-06-20T18:10:06', 'google', 'promoted')", (other,))
+    con.commit()
+    con.close()
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    (members,) = db["stacks"].values()
+    assert members[0] == "orig" and sorted(members[1:]) == ["c1", "c2"]
+
+
+def test_cli_rerun_does_not_restack_a_stacked_copy(tmp_path, monkeypatch) -> None:
+    ph = [("c1", "/b/2026/06/IMG_1711(1).MP4")]
+    twin_row = ("orig", datetime(2019, 11, 15, 1, 43, 25, tzinfo=UTC), "s0", 0.01)
+    db, _, args = _setup_cli(tmp_path, monkeypatch, ["/b"], ph, twins={"IMG_1711.MP4": [twin_row]})
+    db["stacks"]["s0"] = ["orig", "c1"]
+    db["stacks_of"].update({"orig": "s0", "c1": "s0"})
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert not [c for c in _Api.calls if c[0] == "stack"]
+
+
+def test_cli_joins_an_existing_stack_keeping_its_primary(tmp_path, monkeypatch) -> None:
+    # The original is a non-primary member of a RAW+JPEG stack.
+    ph = [("c1", "/b/2026/06/IMG_1711(1).MP4")]
+    twin_row = ("orig", datetime(2019, 11, 15, 1, 43, 25, tzinfo=UTC), "s0", 0.01)
+    db, _, args = _setup_cli(tmp_path, monkeypatch, ["/b"], ph, twins={"IMG_1711.MP4": [twin_row]})
+    db["stacks"]["s0"] = ["raw", "orig"]
+    db["stacks_of"].update({"raw": "s0", "orig": "s0"})
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    (members,) = db["stacks"].values()
+    assert members == ["raw", "orig", "c1"]

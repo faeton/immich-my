@@ -41,10 +41,13 @@ Qwen-ASR, Immich's own CLIP). The same code runs both; backend is config-selecte
 cd immy && uv sync
 uv run immy --help
 uv run pytest            # run from immy/ (cwd matters for venv/PIL)
+scripts/test-pg.sh up    # optional: throwaway Postgres for tests/test_sql_pg.py
 ```
 On n5 (no compiler, no system libvips/exiftool): `uv sync --no-install-package insightface`,
 `uv pip install pyvips-binary`, exiftool unpacked under `~/.local/bin`; then
 `uv run --no-sync pytest` — the full suite runs there (faces tests skip).
+- SQL logic gets a real-Postgres test in `tests/test_sql_pg.py` (throwaway DB, see
+  `docs/TESTING.md`), never the live Immich DB.
 - **Originals are immutable** — never rewrite source files; metadata goes to XMP sidecars / the DB.
 - **Keep the Mac path byte-identical** when adding NAS behavior (new config defaults to the old path).
 - **Git**: work, commit, and merge on `main` directly; branch only when explicitly asked.

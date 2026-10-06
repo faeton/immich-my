@@ -150,11 +150,14 @@ class Regions:
 # asset is dropped when its mirror lands within ~3° of real points from that
 # window (a genuine Ushuaia → Urals hop would not mirror onto itself). Null island (0, 0) is dropped
 # too: a chip with no fix, not a spot in the Atlantic.
-def _ghost_ctes(tag: str, *, axis: str, lat_op: str, min_abs: float) -> str:
+def _ghost_ctes(tag: str, *, axis: str, lat_op: str, min_abs: float, max_abs: float = 1000) -> str:
     """CTEs that find one class of sign-flipped GPS. `axis` is the column
     whose sign decides the hemisphere (`lat` for a full (-lat, -lon) flip,
     `lon` for a longitude-only one). A mirror's latitude satisfies
-    `o.lat <lat_op> g.lat ≈ 0`: `+` for a full flip, `-` for lon-only."""
+    `o.lat <lat_op> g.lat ≈ 0`: `+` for a full flip, `-` for lon-only.
+    Only |axis| in (`min_abs`, `max_abs`) counts: near 0 a "mirror" is just
+    the other side of the equator or of Greenwich, and for longitude near
+    ±180 it's the other side of the date line, a few km away in Fiji."""
     return f"""
 hemi_{tag} AS MATERIALIZED (
   SELECT d FROM gps GROUP BY d
@@ -163,7 +166,7 @@ hemi_{tag} AS MATERIALIZED (
 mirrored_{tag} AS MATERIALIZED (
   SELECT g.d, g.{axis} AS v
   FROM gps g JOIN hemi_{tag} h ON h.d = g.d
-  WHERE abs(g.{axis}) > {min_abs}
+  WHERE abs(g.{axis}) > {min_abs} AND abs(g.{axis}) < {max_abs}
     AND EXISTS (SELECT 1 FROM gps o
                 WHERE o.d = g.d
                   AND abs(o.lat {lat_op} g.lat) < 0.5 AND abs(o.lon + g.lon) < 0.5)
@@ -180,12 +183,12 @@ side_{tag} AS MATERIALIZED (
 kept_{tag} AS MATERIALIZED (
   SELECT DISTINCT g.d, round(g.lat) AS rlat, round(g.lon) AS rlon
   FROM gps g JOIN side_{tag} s ON s.d = g.d
-  WHERE abs(g.{axis}) > {min_abs} AND sign(g.{axis}) = s.sgn
+  WHERE abs(g.{axis}) > {min_abs} AND abs(g.{axis}) < {max_abs} AND sign(g.{axis}) = s.sgn
 ),
 ghost_{tag} AS MATERIALIZED (
   SELECT g.id
   FROM gps g JOIN side_{tag} s ON s.d = g.d
-  WHERE abs(g.{axis}) > {min_abs} AND sign(g.{axis}) <> s.sgn
+  WHERE abs(g.{axis}) > {min_abs} AND abs(g.{axis}) < {max_abs} AND sign(g.{axis}) <> s.sgn
     AND (EXISTS (SELECT 1 FROM affected_{tag} af WHERE af.d = g.d)
          OR EXISTS (SELECT 1 FROM kept_{tag} c
                     WHERE c.d BETWEEN g.d - 5 AND g.d + 5
@@ -240,7 +243,7 @@ gps AS MATERIALIZED (
     AND ae.country IS NOT NULL
     AND NOT (abs(ae.latitude) < 0.01 AND abs(ae.longitude) < 0.01)
     AND NOT EXISTS (SELECT 1 FROM placeholder p WHERE p.t = a."localDateTime")
-),{_ghost_ctes("ll", axis="lat", lat_op="+", min_abs=0.5)},{_ghost_ctes("lon", axis="lon", lat_op="-", min_abs=5)}
+),{_ghost_ctes("ll", axis="lat", lat_op="+", min_abs=0.5)},{_ghost_ctes("lon", axis="lon", lat_op="-", min_abs=5, max_abs=175)}
 SELECT g.d, g.country, g.city, avg(g.lat),
        -- circular mean: +179 and -179 average to 180, not 0
        degrees(atan2(avg(sin(radians(g.lon))), avg(cos(radians(g.lon))))),

@@ -4900,16 +4900,26 @@ def takeout_redate(
                   f"metadata refresh queued. Undo log: {log_path}")
 
     stacked = 0
-    for copy_id, (twin_id, stack_id) in twins.items():
+    for copy_id, (twin_id, _) in twins.items():
         if copy_id not in written:
             continue
-        ids = [twin_id, copy_id]
+        # Read the twin's stack now, not at planning time: an earlier copy of
+        # the same original may have just stacked it. Immich's create merges
+        # every stack whose primary is in the list, so the original's stack
+        # (primary first) plus this copy keeps one stack per original.
+        cur.execute('SELECT "stackId" FROM asset WHERE id = %s', (twin_id,))
+        row = cur.fetchone()
+        stack_id = str(row[0]) if row and row[0] else None
+        ids = [twin_id]
         if stack_id:
             cur.execute('SELECT "primaryAssetId" FROM stack WHERE id = %s', (stack_id,))
             primary = str(cur.fetchone()[0])
             cur.execute('SELECT id FROM asset WHERE "stackId" = %s AND "deletedAt" IS NULL', (stack_id,))
             members = [str(r[0]) for r in cur.fetchall()]
-            ids = [primary] + [m for m in members if m != primary] + [copy_id]
+            if copy_id in members:
+                continue  # already stacked (a re-run)
+            ids = [primary] + [m for m in members if m != primary]
+        ids.append(copy_id)
         try:
             if client.create_stack(ids[0], ids[1:]):
                 stacked += 1

@@ -35,12 +35,25 @@ def _port_of(address) -> int | None:
     return None
 
 
+def _scratch_dsn_port(dsn: str) -> int | None:
+    """Port of a `postgresql://…` URL, or None if it has none."""
+    from urllib.parse import urlsplit
+    try:
+        return urlsplit(dsn).port
+    except ValueError:
+        return None
+
+
 @pytest.fixture(autouse=True)
-def _block_live_services(monkeypatch):
+def _block_live_services(monkeypatch, request):
     """Hermeticity guard: any socket connect to a live Immich/Postgres port,
     and any real `psycopg.connect` aimed at one (libpq opens its own socket,
     which Python-level socket patching cannot see), raises. Tests that need a
-    DB must stub `immy.pg.connect` / pass a fake connection."""
+    DB must stub `immy.pg.connect` / pass a fake connection.
+
+    One narrow exception: a test marked `scratch_pg` may connect to exactly
+    the throwaway database in `IMMY_TEST_PG_DSN` (scripts/test-pg.sh), and
+    only if that DSN names an explicit port that isn't a live one."""
     real_connect = socket.socket.connect
     real_connect_ex = socket.socket.connect_ex
 
@@ -62,7 +75,17 @@ def _block_live_services(monkeypatch):
     except ImportError:  # pragma: no cover
         return
 
+    import os
+    scratch = os.environ.get("IMMY_TEST_PG_DSN", "")
+    scratch_port = _scratch_dsn_port(scratch) if scratch else None
+    allow_scratch = (request.node.get_closest_marker("scratch_pg") is not None
+                     and scratch_port is not None and scratch_port not in _LIVE_PORTS)
+    real_pg_connect = psycopg.connect
+
     def guarded_pg_connect(*args, **kwargs):
+        conninfo = args[0] if args else kwargs.get("conninfo", "")
+        if allow_scratch and conninfo == scratch and "port" not in kwargs:
+            return real_pg_connect(*args, **kwargs)
         # Every port libpq would default to (none given → 5432) is live.
         port = kwargs.get("port")
         conninfo = args[0] if args else kwargs.get("conninfo", "")

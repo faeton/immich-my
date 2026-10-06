@@ -9,6 +9,27 @@ Conventions:
 - `${MAC_HOST}` = the MacBook / ML node.
 - Commands run on n5 may need `sudo docker` (the user is not in the docker group).
 
+## Unit suite and SQL tests
+
+`cd immy && uv run pytest` is hermetic: `tests/conftest.py` refuses any
+connection to the live Immich ports (5432, 15432, 2283) and any real
+`psycopg.connect`.
+
+Logic that lives in SQL can't be tested with mocks: sign-flipped GPS, the
+antimeridian mean, placeholder dates, and durable tag links. That goes in
+`tests/test_sql_pg.py`, which runs against a **throwaway** Postgres: Immich's
+own image, on tmpfs, localhost-only, never the live database.
+
+```sh
+scripts/test-pg.sh up        # prints the DSN to export
+export IMMY_TEST_PG_DSN=postgresql://postgres:test@127.0.0.1:55432/postgres
+uv run pytest                # SQL tests now run (each in its own schema)
+scripts/test-pg.sh down
+```
+
+Without `IMMY_TEST_PG_DSN` they skip. Only tests marked `scratch_pg` may
+connect, only to exactly that DSN, and only if it names a non-live port.
+
 ## Phase 0 — Base stack
 
 | # | Test | Pass criteria |

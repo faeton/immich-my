@@ -4,6 +4,33 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-06 — SQL tests on a real Postgres; antimeridian ghost fix
+
+### Added
+
+- **`tests/test_sql_pg.py`**: 13 tests of the SQL itself, against a
+  throwaway Postgres (`scripts/test-pg.sh`: Immich's image, tmpfs,
+  localhost:55432). Covered: sign-flip ghosts on mixed and fully-flipped days,
+  lon-only flips, real hemisphere-crossing trips, Greenwich, null
+  island/deleted/hidden/other owner, the circular longitude mean, the local
+  day under a Europe/Lisbon session, placeholder thresholds, and link/unlink
+  and backfill of locked tags. Each test gets its own schema (xdist-safe).
+  Skipped without `IMMY_TEST_PG_DSN`. The hermetic guard gains a per-test
+  `scratch_pg` opt-in for exactly that DSN, on a non-live port.
+- Stacking tests: two copies of one original end in one stack, a re-run
+  doesn't re-stack, and an existing RAW+JPEG stack keeps its primary.
+
+### Fixed
+
+- **The longitude-flip ghost filter dropped real photos at the date line.**
+  +179.5 and −179.5 at the same latitude are a few km apart in Fiji, not a
+  flip. Lon-flip detection now ignores |lon| ≥ 175, as it ignores |lon| ≤ 5
+  at Greenwich. Found by the new SQL test. No live data affected; the trip
+  plan is identical.
+- **`takeout redate` built a stack list with the copy twice** on a re-run
+  (the copy was already in the original's stack). The twin's stack is now
+  read at stacking time, and an already-stacked copy is skipped.
+
 ## 2026-10-06 — Codex review: ownership, retirement, root, lookup fixes
 
 All eight findings from a Codex review of the trips/takeout work, fixed with
