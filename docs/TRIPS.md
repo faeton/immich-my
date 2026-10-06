@@ -155,6 +155,16 @@ Trips/
     2025-06 Norway, Svalbard
 ```
 
+**How tags are written.** Not through Immich's tag-assign API: on
+read-only originals, assigning a tag queues a SidecarWrite. That write can't
+land, unlocks `asset_exif.tags` anyway, and queues a re-extraction that
+replaces the asset's tags with the files' (none of ours). Seen live: thousands
+of trip tags gone within minutes. Instead, tags are created through the API
+(`PUT /api/tags`, no per-asset jobs), and links go in by SQL together with the
+tag list and a `tags` lock. A later extraction keeps the locked list and
+rebuilds the links from it. The trade-off: those assets no longer pick up tag
+changes from their files (photo `HierarchicalSubject`).
+
 Each asset gets only the most specific tag: its leg, or the trip for a
 one-country trip. Immich resolves a parent tag through its closure table, so
 opening a trip or year tag still lists everything below it. Tags are also the

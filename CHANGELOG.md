@@ -4,6 +4,26 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-06 — Trip albums live for 2025; tags written durably
+
+### Fixed
+
+- **Immich's tag API silently un-tags on read-only originals.** `trips
+  --apply --tags` for 2025 created 35 albums (17,448 assets) and tagged them
+  through `PUT /api/tags/{id}/assets`. Minutes later 3,700+ tags were gone.
+  Each assignment queues a SidecarWrite. That write can't land on `:ro`
+  originals (`Error creating file …xmp`), unlocks `asset_exif.tags`
+  regardless, and queues a re-extraction. The re-extraction's
+  `replaceAssetTags` then rewrites the links from the files, which carry
+  none of ours. It's the same trap as API descriptions and geotags
+  (2026-06/07 entries). Tags are now created through the API, but linked by
+  SQL (`tag_asset`) together with the `asset_exif.tags` list and a `tags`
+  lock, so no job ever unlocks them. The 2025 links were restored that way
+  and held at 17,448 while ~14,700 queued extractions drained.
+  `schema_contract` now covers `tag_asset` and `asset_exif.tags`; snapshot
+  regenerated.
+- `immy tags sync` still uses the API path and has the same exposure.
+
 ## 2026-10-06 — Takeout dates repaired; `immy takeout redate`
 
 ### Fixed

@@ -652,6 +652,41 @@ def leg_tags(trip: Trip, root: str = DEFAULT_TAG_ROOT) -> list[tuple["Leg", str]
     return [(leg, f"{base}/{_tag_segment(leg.label())}") for leg in legs]
 
 
+# --- durable tagging --------------------------------------------------------
+#
+# Immich's tag API is not safe on read-only originals. Attaching a tag locks
+# `asset_exif.tags` and queues a SidecarWrite. That write can't land, unlocks
+# the field anyway and queues a metadata re-extraction. The re-extraction
+# then replaces the asset's tags with what the files say: none of ours.
+# Observed live: thousands of trip tags gone within minutes. So the link, the
+# tag list and its lock go in together through SQL, and no job ever unlocks
+# them. A later extraction skips the locked list and rebuilds the links from
+# it (`applyTagList`). Tags themselves are still created through the API
+# (`PUT /api/tags`), which queues nothing per asset.
+
+LOCK_TAG_SQL = """
+UPDATE asset_exif SET
+  tags = (SELECT array(SELECT DISTINCT unnest(coalesce(tags, '{}') || ARRAY[%(value)s]::varchar[]))),
+  "lockedProperties" = (SELECT array(SELECT DISTINCT unnest(
+      coalesce("lockedProperties", '{}') || ARRAY['tags']::varchar[])))
+WHERE "assetId" = %(asset)s
+"""
+
+LINK_TAG_SQL = """
+INSERT INTO tag_asset ("assetId", "tagId") VALUES (%(asset)s, %(tag)s)
+ON CONFLICT DO NOTHING
+"""
+
+
+def link_tags(conn, links: list[tuple[str, str, str]]) -> None:
+    """(asset id, tag id, tag value) → linked and locked, in one commit."""
+    with conn.cursor() as cur:
+        params = [{"asset": a, "tag": t, "value": v} for a, t, v in links]
+        cur.executemany(LOCK_TAG_SQL, params)
+        cur.executemany(LINK_TAG_SQL, params)
+    conn.commit()
+
+
 # --- ledger ----------------------------------------------------------------
 #
 # key → {start, end, region, assets}. `assets` is what immy last put in the
@@ -696,7 +731,7 @@ __all__ = [
     "Regions", "PlaceCount", "Day", "HomeStay", "Trip",
     "country_code", "build_days", "segment", "assign_assets", "keep",
     "name_for_trip", "format_range", "stable_key", "marker_line", "extract_key",
-    "Leg", "assets_by_leg", "leg_tags",
-    "Leg", "assets_by_leg", "leg_tags",
+    "Leg", "assets_by_leg", "leg_tags", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
+    "Leg", "assets_by_leg", "leg_tags", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
     "description_for", "tag_for", "load_ledger", "save_ledger", "ledger_match",
 ]

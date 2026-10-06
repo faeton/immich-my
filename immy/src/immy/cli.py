@@ -2757,7 +2757,8 @@ def trips(
             if k:
                 key_to_album[k] = alb
 
-    created = updated = linked = removed_total = 0
+    created = updated = linked = removed_total = tagged = 0
+    tag_conn = None
     taken: set[str] = set()
     for t in kept:
         key = t.key()
@@ -2815,20 +2816,30 @@ def trips(
 
         if tags:
             # Most specific level only (the leg); Immich lists a parent
-            # tag's assets through its closure table.
+            # tag's assets through its closure table. Linked by SQL with the
+            # tag list locked: see trips.link_tags for why not the tag API.
             pairs = trips_mod.leg_tags(t, tag_root)
             tag_ids = client.upsert_tags([name for _, name in pairs])
             split = dict(trips_mod.assets_by_leg(t, asset_day))
+            links = []
             for leg, name in pairs:
                 tag_id = tag_ids.get(name)
-                if tag_id:
-                    client.tag_assets(tag_id, split.get(leg, []))
-                else:
+                if not tag_id:
                     console.print(f"  [red]tag upsert failed[/red] {name}")
+                    continue
+                links += [(aid, tag_id, name) for aid in split.get(leg, [])]
+            if links:
+                if tag_conn is None:
+                    tag_conn = pg_mod.connect(config.pg)
+                trips_mod.link_tags(tag_conn, links)
+                tagged += len(links)
 
+    if tag_conn is not None:
+        tag_conn.close()
     console.print(
         f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "
         f"{linked} asset-link(s) added" + (f", {removed_total} pruned" if prune else "")
+        + (f", {tagged} asset(s) tagged (locked)" if tags else "")
     )
 
 

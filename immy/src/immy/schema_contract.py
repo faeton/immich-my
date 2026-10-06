@@ -43,7 +43,7 @@ WRITE_COLUMNS: dict[str, tuple[str, ...]] = {
         "exifImageWidth", "exifImageHeight", "fileSizeInByte",
         "dateTimeOriginal", "modifyDate", "fNumber", "focalLength", "iso",
         "exposureTime", "fps", "latitude", "longitude", "timeZone",
-        "lockedProperties", "country", "state", "city",
+        "lockedProperties", "country", "state", "city", "tags",
     ),
     "asset_file": (
         "assetId", "type", "path", "isEdited", "isProgressive", "isTransparent",
@@ -54,6 +54,7 @@ WRITE_COLUMNS: dict[str, tuple[str, ...]] = {
         "sourceType", "isVisible",
     ),
     "face_search": ("faceId", "embedding"),
+    "tag_asset": ("assetId", "tagId"),
     "smart_search": ("assetId", "embedding"),
     "person": ("name",),
 }
@@ -64,6 +65,7 @@ WRITE_COLUMNS: dict[str, tuple[str, ...]] = {
 # guarantees every snapshot-required column is supplied).
 INSERT_TABLES: frozenset[str] = frozenset({
     "asset", "asset_exif", "asset_file", "asset_face", "face_search", "smart_search",
+    "tag_asset",
 })
 
 

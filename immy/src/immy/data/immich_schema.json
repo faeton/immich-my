@@ -622,6 +622,20 @@
         "is_nullable": false,
         "column_default": null
       }
+    },
+    "tag_asset": {
+      "assetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "tagId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      }
     }
   }
 }

@@ -284,6 +284,12 @@ class _Cursor:
     def fetchall(self):
         return self._rows
 
+    def executemany(self, sql, params):
+        LINKS.extend((sql.strip().split()[0], p["asset"], p["tag"], p["value"]) for p in params)
+
+
+LINKS: list[tuple] = []
+
 
 class _Conn:
     def __init__(self, buckets, assets):
@@ -291,6 +297,9 @@ class _Conn:
 
     def cursor(self):
         return self.c
+
+    def commit(self):
+        pass
 
     def close(self):
         pass
@@ -348,6 +357,7 @@ def _setup(monkeypatch, tmp_path, buckets, assets):
     )
     monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: _Conn(buckets, assets))
     _Immich.albums, _Immich.tags = {}, {}
+    LINKS.clear()
     monkeypatch.setattr(cli, "ImmichClient", _Immich)
     return cfg
 
@@ -380,7 +390,12 @@ def test_cli_apply_is_idempotent_and_follows_a_moved_start(monkeypatch, tmp_path
     assert len(_Immich.albums) == 1
     album = next(iter(_Immich.albums.values()))
     assert album["assets"] == {"a2", "a3"}
-    assert _Immich.tags == {"Trips/2025/2025-03 France · Paris": {"a2", "a3"}}
+    # Tags are created by API, linked and locked by SQL, never via tag_assets.
+    assert set(_Immich.tags) == {"Trips/2025/2025-03 France · Paris"}
+    assert _Immich.tags["Trips/2025/2025-03 France · Paris"] == set()
+    tag = "Trips/2025/2025-03 France · Paris"
+    assert sorted(LINKS) == sorted(
+        [(verb, a, tag, tag) for verb in ("UPDATE", "INSERT") for a in ("a2", "a3")])
 
     # The user renames the album and adds a note above the marker.
     album["name"] = "Paris with friends"
