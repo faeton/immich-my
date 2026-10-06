@@ -24,6 +24,26 @@ continuously, so entries are dated rather than versioned.
   regenerated.
 - `immy tags sync` still uses the API path and has the same exposure.
 
+### Ops (n5): cleaning up after the API tagging
+
+- The failed SidecarWrites also **registered sidecars that don't exist**:
+  10,820 `asset_file` rows like `<file>.JPG.xmp` on the `:ro` mount. That made
+  ~26k "File not found" warnings in 20 minutes. In 514 cases a real stem-form
+  sidecar (`DJI_0362.xmp`, from immy audit) sat right beside the fake, and the
+  fake hid it. Another 2,078 older rows had the same shape. All were fixed the
+  way Immich's own SidecarCheck would fix them: 10,306 rows with no sidecar on
+  disk deleted, 2,592 pointed at the real sidecar, and the 514 recent ones
+  re-read. Afterwards 0 of 24,581 registered sidecars are missing. The
+  pre-cleanup rows are kept in
+  `state/asset-file-sidecars-before-cleanup-20261006.tsv`.
+- The ~7,100 re-extractions still queued (pure fallout, nothing needed them)
+  were emptied. They included 2025 `.insv` files, where exiftool hits
+  Immich's 120 s timeout on 5–16 GB files with a worker pinned at 100 %. All
+  754 `.insv` assets keep their immy-written dates. Any Immich-side
+  re-extraction of `.insv` (a forced metadata refresh, a scan that sees them
+  as changed) will time out the same way.
+- Trip tags held throughout: 107,659 before and after.
+
 ## 2026-10-06 — Takeout dates repaired; `immy takeout redate`
 
 ### Fixed
