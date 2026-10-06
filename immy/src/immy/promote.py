@@ -1128,22 +1128,35 @@ def _sync_album(
 
     # Tag the trip's assets (merge markers like `post-edited` / `with-anya`).
     # Soft: a tag failure must not flip a successful album sync to error.
+    # Tags are created through the API but linked by SQL with
+    # `asset_exif.tags` locked (`trips.link_tags`): on read-only originals
+    # the tag-assign API ends in a re-extraction that wipes them again.
     if tags and asset_ids:
         tag_summary: dict = {"requested": list(tags)}
         try:
             ids = client.upsert_tags(list(tags))
-            applied = {}
+            applied: dict = {}
+            links = []
             for name in tags:
                 tid = ids.get(name)
                 if tid is None:
                     applied[name] = "no-id"
                     continue
-                res = client.tag_assets(tid, asset_ids)
-                applied[name] = sum(
-                    1 for r in res if isinstance(r, dict) and r.get("success")
-                )
+                links += [(aid, tid, name) for aid in asset_ids]
+            if links:
+                from .trips import link_tags
+                tconn = _connect_checked(config)
+                try:
+                    link_tags(tconn, links)
+                except Exception:
+                    tconn.rollback()
+                    raise
+                finally:
+                    tconn.close()
+            for _, _, name in links:
+                applied[name] = applied.get(name, 0) + 1
             tag_summary["applied"] = applied
-        except ImmichError as e:
+        except Exception as e:  # ImmichError or a DB error: soft
             tag_summary["error"] = str(e)
         summary["tags"] = tag_summary
     return summary

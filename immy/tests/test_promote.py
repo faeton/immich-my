@@ -754,7 +754,7 @@ def test_promote_into_album_merges_into_existing(no_schema_guard, config_file, d
 def test_promote_applies_tags(no_schema_guard, config_file, dji_ready, monkeypatch):
     """`--tag a --tag b` upserts both tags and attaches each to the trip's
     assets."""
-    _enable_fake_album_pg(config_file, monkeypatch)
+    fake_conn = _enable_fake_album_pg(config_file, monkeypatch)
     fake = FakeClient(indexed=_indexed_set(dji_ready))
     monkeypatch.setattr("immy.cli.ImmichClient", lambda **kw: fake)
     monkeypatch.setattr(promote_mod, "wait_for_asset", lambda c, n, **kw: c.find_asset_id(n))
@@ -765,10 +765,16 @@ def test_promote_applies_tags(no_schema_guard, config_file, dji_ready, monkeypat
     )
     assert result.exit_code == 0, result.stdout
     assert fake.tags_upserted == [["post-edited", "with-anya"]]
-    tagged = {tid for tid, _ in fake.assets_tagged}
-    assert tagged == {"tag-post-edited", "tag-with-anya"}
-    for _, ids in fake.assets_tagged:
-        assert ids  # asset ids attached to each tag
+    # Linked by SQL (lock + tag_asset insert), never through the tag API.
+    assert not hasattr(fake, "assets_tagged")
+    cur = fake_conn.cursor.return_value
+    linked = [p for call in cur.executemany.call_args_list
+              if "tag_asset" in call.args[0] for p in call.args[1]]
+    assert {p["tag"] for p in linked} == {"tag-post-edited", "tag-with-anya"}
+    assert all(p["asset"] for p in linked)
+    locked = [call for call in cur.executemany.call_args_list
+              if "lockedProperties" in call.args[0]]
+    assert locked
 
 
 def test_promote_no_tags_leaves_tag_surface_untouched(no_schema_guard, config_file, dji_ready, monkeypatch):

@@ -376,7 +376,12 @@ class ImmichClient:
         return out
 
     def tag_assets(self, tag_id: str, asset_ids: list[str]) -> list[dict]:
-        """`PUT /api/tags/{id}/assets` body `{ids}` — attach a tag to assets.
+        """NOT safe on read-only originals: each attach queues a SidecarWrite
+        that can't land, unlocks `asset_exif.tags`, and triggers a
+        re-extraction that wipes the tag again. immy links tags by SQL
+        instead (`trips.link_tags`); this stays for writable libraries.
+
+        `PUT /api/tags/{id}/assets` body `{ids}` — attach a tag to assets.
         Idempotent like album-add (already-tagged → `success=false,
         error='duplicate'`). Batched (request body cap) and returns the
         per-asset result list."""

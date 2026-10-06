@@ -20,15 +20,17 @@ _LIB = LibraryInfo(id="lib", owner_id="owner", container_root="/originals")
 class _FakeClient:
     def __init__(self):
         self.tags_upserted: list[list[str]] = []
-        self.assets_tagged: list[tuple[str, list[str]]] = []
 
     def upsert_tags(self, names):
         self.tags_upserted.append(list(names))
         return {n: f"tag-{n}" for n in names}
 
+    @property
+    def assets_tagged(self):
+        return []
+
     def tag_assets(self, tag_id, asset_ids):
-        self.assets_tagged.append((tag_id, list(asset_ids)))
-        return [{"id": aid, "success": True} for aid in asset_ids]
+        raise AssertionError("the tag-assign API must not be used (see trips.link_tags)")
 
 
 class _Cursor:
@@ -48,6 +50,13 @@ class _Cursor:
             self.rowcount = 1
         return self
 
+    def executemany(self, sql, params):
+        if self.conn.fail_links:
+            raise RuntimeError("db down")
+        verb = sql.lstrip().split()[0].upper()
+        for p in params:
+            self.conn.links.append((verb, p["asset"], p["tag"], p["value"]))
+
 
 class _Conn:
     """Resolves any `FROM asset` lookup to `id-<filename>`; None to fail it.
@@ -58,6 +67,20 @@ class _Conn:
         self.resolves = resolves
         self.camera = camera or {}
         self.calls: list = []
+        self.links: list = []
+        self.fail_links = False
+        self.rolled_back = False
+
+    def rollback(self):
+        self.rolled_back = True
+
+    def tagged(self) -> dict[str, list[str]]:
+        """tag id → asset ids linked (the tag_asset INSERTs)."""
+        out: dict[str, list[str]] = {}
+        for verb, asset, tag, _ in self.links:
+            if verb == "INSERT":
+                out.setdefault(tag, []).append(asset)
+        return out
 
     def cursor(self):
         return _Cursor(self)
@@ -130,14 +153,15 @@ def test_dry_run_reports_would_tag_without_api_calls(tmp_path: Path):
     assert len(out) == 1
     assert out[0].status == "would-tag"
     assert "Gear/Camera/DJI FC8282" in out[0].tags
-    assert client.tags_upserted == [] and client.assets_tagged == []
+    assert client.tags_upserted == []
 
 
 def test_write_pushes_native_tags_per_camera(tmp_path: Path):
     trip = _trip(tmp_path, notes=_NOTES)
     client = _FakeClient()
+    conn = _Conn()
     out = tagsync.tag_sync_folder(
-        _Conn(), client, _LIB, trip,
+        conn, client, _LIB, trip,
         rows=[_DJI_ROW(trip), _INSTA360_ROW(trip)], write=True)
     assert all(o.status == "tagged" for o in out)
 
@@ -146,9 +170,33 @@ def test_write_pushes_native_tags_per_camera(tmp_path: Path):
     assert "Gear/Camera/Insta360" in pushed
     assert "Events/2026-06-corsica-sardinia-yacht" in pushed
 
-    tagged_ids = dict(client.assets_tagged)
+    tagged_ids = conn.tagged()
     assert tagged_ids["tag-Gear/Camera/DJI FC8282"] == ["id-DJI_0001.MP4"]
     assert tagged_ids["tag-Gear/Camera/Insta360"] == ["id-VID_20260625.insv"]
+
+
+def test_links_lock_the_tag_list(tmp_path: Path):
+    """Every link comes with an UPDATE that appends the tag value to
+    asset_exif.tags and locks `tags`, so no re-extraction can drop it."""
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn()
+    tagsync.tag_sync_folder(conn, _FakeClient(), _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
+    inserts = {(a, v) for verb, a, _, v in conn.links if verb == "INSERT"}
+    updates = {(a, v) for verb, a, _, v in conn.links if verb == "UPDATE"}
+    assert inserts and inserts == updates
+    from immy.trips import LOCK_TAG_SQL
+    assert "'tags'" in LOCK_TAG_SQL and '"lockedProperties"' in LOCK_TAG_SQL
+
+
+def test_db_failure_marks_every_row_tag_failed(tmp_path: Path):
+    trip = _trip(tmp_path, notes=_NOTES)
+    conn = _Conn()
+    conn.fail_links = True
+    out = tagsync.tag_sync_folder(
+        conn, _FakeClient(), _LIB, trip,
+        rows=[_DJI_ROW(trip), _INSTA360_ROW(trip)], write=True)
+    assert all(o.status == "tag-failed" for o in out)
+    assert conn.rolled_back
 
 
 def test_no_asset_skips_without_failing(tmp_path: Path):
@@ -158,7 +206,7 @@ def test_no_asset_skips_without_failing(tmp_path: Path):
         _Conn(resolves=False), client, _LIB, trip,
         rows=[_DJI_ROW(trip)], write=True)
     assert out[0].status == "no-asset"
-    assert client.tags_upserted == [] and client.assets_tagged == []
+    assert client.tags_upserted == []
 
 
 # --- tag-failed: upsert_tags doesn't return an id for a requested name ----
@@ -190,12 +238,12 @@ def test_tag_failed_when_upsert_omits_a_requested_name(tmp_path: Path):
         "Events/2026-06-corsica-sardinia-yacht", "Source/DJI",
         "Gear/Camera/Insta360",
     })
+    conn = _Conn()
     out = tagsync.tag_sync_folder(
-        _Conn(), client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
+        conn, client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
     assert out[0].status == "tag-failed"
     # Only the resolved tags got attached; the unresolved one never fires.
-    attached_tags = {tag_id for tag_id, _ in client.assets_tagged}
-    assert "tag-Gear/Camera/DJI FC8282" not in attached_tags
+    assert "tag-Gear/Camera/DJI FC8282" not in conn.tagged()
 
 
 def test_tag_failed_does_not_mask_other_rows_success(tmp_path: Path):
@@ -215,71 +263,11 @@ def test_tag_failed_does_not_mask_other_rows_success(tmp_path: Path):
 def test_total_upsert_failure_marks_all_rows_tag_failed(tmp_path: Path):
     trip = _trip(tmp_path, notes=_NOTES)
     client = _PartiallyBrokenClient(working=set())  # nothing resolves
+    conn = _Conn()
     out = tagsync.tag_sync_folder(
-        _Conn(), client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
+        conn, client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
     assert out[0].status == "tag-failed"
-    assert client.assets_tagged == []  # tag_assets never called for anything
-
-
-# --- tag_assets() itself reporting a genuine per-asset failure ------------
-# The id-resolution fix above doesn't catch a failure at the SECOND API call
-# — `tag_assets` can resolve a tag id fine and still fail to attach it to a
-# given asset. `success=False, error="duplicate"` is expected/idempotent
-# (already attached) and must NOT count as a failure; anything else must.
-
-class _AttachFailingClient(_FakeClient):
-    """`tag_assets` reports failure for asset ids in `failing_asset_ids`,
-    with `error`. Everything else succeeds normally."""
-
-    def __init__(self, failing_asset_ids: set[str], error: str = "server-error"):
-        super().__init__()
-        self.failing_asset_ids = failing_asset_ids
-        self.error = error
-
-    def tag_assets(self, tag_id, asset_ids):
-        self.assets_tagged.append((tag_id, list(asset_ids)))
-        return [
-            {"id": aid, "success": False, "error": self.error}
-            if aid in self.failing_asset_ids
-            else {"id": aid, "success": True}
-            for aid in asset_ids
-        ]
-
-
-def test_tag_assets_genuine_failure_marks_row_tag_failed(tmp_path: Path):
-    trip = _trip(tmp_path, notes=_NOTES)
-    client = _AttachFailingClient(failing_asset_ids={"id-DJI_0001.MP4"})
-    out = tagsync.tag_sync_folder(
-        _Conn(), client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
-    assert out[0].status == "tag-failed"
-
-
-def test_tag_assets_duplicate_is_not_a_failure(tmp_path: Path):
-    trip = _trip(tmp_path, notes=_NOTES)
-    client = _AttachFailingClient(
-        failing_asset_ids={"id-DJI_0001.MP4"}, error="duplicate")
-    out = tagsync.tag_sync_folder(
-        _Conn(), client, _LIB, trip, rows=[_DJI_ROW(trip)], write=True)
-    assert out[0].status == "tagged"
-
-
-class _UnattributableFailureClient(_FakeClient):
-    """`tag_assets` reports a failure with no `id` at all — can't tell which
-    asset it belongs to. Every asset requested for that tag must fail
-    conservatively rather than default to success."""
-
-    def tag_assets(self, tag_id, asset_ids):
-        self.assets_tagged.append((tag_id, list(asset_ids)))
-        return [{"success": False, "error": "server-error"}]
-
-
-def test_tag_assets_failure_without_id_fails_whole_batch(tmp_path: Path):
-    trip = _trip(tmp_path, notes=_NOTES)
-    client = _UnattributableFailureClient()
-    out = tagsync.tag_sync_folder(
-        _Conn(), client, _LIB, trip,
-        rows=[_DJI_ROW(trip), _INSTA360_ROW(trip)], write=True)
-    assert all(o.status == "tag-failed" for o in out)
+    assert conn.links == []  # nothing linked
 
 
 # --- camera_sync_folder: backfill asset_exif.make/model via devices.resolve

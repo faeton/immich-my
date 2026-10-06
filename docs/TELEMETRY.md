@@ -108,17 +108,26 @@ The same video/XMP blind spot documented above for GPS applies to tags. The
 (`Gear/Camera/*`, `Events/*`, `Source/*`, …) to each file's `.xmp` sidecar —
 Immich reads that back for photos on its own library scan, never for videos.
 So a DJI/Insta360/GoPro clip's device tag never reaches Immich's UI or search
-unless pushed through the native Tag API directly (`PUT /api/tags` +
-`PUT /api/tags/{id}/assets` — the same API `promote --tag` uses for one-off
-merge markers like `post-edited`).
+unless pushed into Immich's native tags directly: created with `PUT /api/tags`,
+linked by SQL. The same path `promote --tag` uses for one-off merge markers
+like `post-edited`.
 
 `immy tags sync <trip> [--write]` is that push, applied to the *whole* trip's
 notes tag set (not just whatever a manual `--tag` invocation happened to
 pass): `tagsync.py` recomputes each file's tag set with the exact same
 per-camera matching logic the XMP rule uses (`rules/trip_tags.tags_for_file`,
 extracted so the two channels can't disagree), resolves each file to its
-Immich asset id the same way `srt geotag` does, and upserts + attaches every
-tag. Idempotent — safe to re-run after adding new footage to a trip.
+Immich asset id the same way `srt geotag` does, creates every tag through
+the API, and links them by SQL with `asset_exif.tags` locked
+(`trips.link_tags`). Idempotent: safe to re-run after adding new footage to a
+trip.
+
+> **Why not `PUT /api/tags/{id}/assets`.** On read-only originals the
+> tag-assign API ends in a wipe. Each assignment queues a SidecarWrite that
+> can't land; it unlocks the field anyway, registers a sidecar path that
+> doesn't exist, and queues a re-extraction whose `replaceAssetTags` rewrites
+> the tags from the files. Observed live on 2026-10-06: thousands of tags gone
+> within minutes. `promote --tag` uses the same SQL path.
 
 ## Camera model for videos (`immy tags camera`)
 

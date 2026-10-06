@@ -22,7 +22,9 @@ continuously, so entries are dated rather than versioned.
   and held at 17,448 while ~14,700 queued extractions drained.
   `schema_contract` now covers `tag_asset` and `asset_exif.tags`; snapshot
   regenerated.
-- `immy tags sync` still uses the API path and has the same exposure.
+- `immy tags sync` and `promote --tag` moved to the same SQL path. Nothing in
+  immy calls the tag-assign API any more; `ImmichClient.tag_assets` carries
+  a warning.
 
 ### Ops (n5): cleaning up after the API tagging
 

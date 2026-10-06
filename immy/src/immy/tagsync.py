@@ -12,13 +12,15 @@ etc. never reach Immich unless pushed through the native Tag API directly.
 `tag_sync_folder` is that push: it recomputes the exact same per-file tag
 set `trip-tags-from-notes` would (via `rules.trip_tags.tags_for_file`, so
 the two channels never disagree), resolves each file to its Immich asset id
-the same way `srtgeo.resolve_asset_id` does, and calls `upsert_tags` +
-`tag_assets`. Safe to re-run: both the Immich tag API and the resolution are
-idempotent.
+the same way `srtgeo.resolve_asset_id` does, creates the tags with
+`upsert_tags` and links them by SQL with `asset_exif.tags` locked
+(`trips.link_tags`). The tag-assign API is not used: on read-only originals
+it ends in a re-extraction that wipes the tags again. Safe to re-run: the
+upsert, the links and the resolution are all idempotent.
 
 Add-only, by design: if you remove a tag from a trip's notes and re-run,
 the stale tag is NOT detached from assets that already carry it — this
-mirrors the underlying Immich Tag API (`tag_assets` only attaches) and the
+mirrors attach-only linking (`trips.link_tags` only adds) and the
 existing XMP rule has the same property. Detaching would need to diff
 against what was pushed last time, which this module doesn't track.
 """
@@ -165,9 +167,7 @@ def tag_sync_folder(
     # See `upsert_tags`'s docstring for the concrete bug this guards against:
     # a full-library run once reported success here while attaching nothing.
     resolved_ids: dict[str, str] = {}
-    # (asset_id, tag_name) pairs `tag_assets` itself reported as failed —
-    # `success=False, error="duplicate"` is expected/idempotent (already
-    # attached), anything else is a genuine attach failure.
+    # (asset_id, tag_name) pairs that could not be linked.
     failed_pairs: set[tuple[str, str]] = set()
     if write and by_tag:
         resolved_ids = client.upsert_tags(list(by_tag.keys()))
@@ -176,28 +176,22 @@ def tag_sync_folder(
             emit(f"  [warn] upsert_tags returned no id for: "
                  f"{', '.join(failed_names)} — assets needing only these "
                  f"tags will show as tag-failed")
-        for name, asset_ids in by_tag.items():
-            tid = resolved_ids.get(name)
-            if tid is None:
-                continue
-            for r in client.tag_assets(tid, asset_ids):
-                if not isinstance(r, dict) or r.get("success") is not False:
-                    continue
-                if r.get("error") == "duplicate":
-                    continue
-                aid = r.get("id")
-                if aid:
-                    failed_pairs.add((aid, name))
-                    emit(f"  [warn] tag_assets failed for {aid} / {name}: "
-                         f"{r.get('error')}")
-                else:
-                    # Can't tell which asset this result belongs to — fail
-                    # the whole batch for this tag rather than silently
-                    # treating unattributable failures as success.
-                    failed_pairs.update((a, name) for a in asset_ids)
-                    emit(f"  [warn] tag_assets failure with no asset id for "
-                         f"{name}: {r.get('error')} — failing all "
-                         f"{len(asset_ids)} asset(s) requested for this tag")
+        # Linked by SQL with `asset_exif.tags` locked, never through the
+        # tag-assign API. On read-only originals that API queues a
+        # SidecarWrite that can't land, unlocks the field anyway and
+        # triggers a re-extraction that rewrites the asset's tags from its
+        # files, which wiped thousands of tags live. See `trips.link_tags`.
+        links = [(aid, resolved_ids[name], name)
+                 for name, asset_ids in by_tag.items() if name in resolved_ids
+                 for aid in asset_ids]
+        if links:
+            from .trips import link_tags
+            try:
+                link_tags(conn, links)
+            except Exception as e:  # one transaction: all or nothing
+                conn.rollback()
+                failed_pairs.update((aid, name) for aid, _, name in links)
+                emit(f"  [warn] linking tags failed, nothing written: {e}")
 
     for row, asset_id, per_file in pending:
         if not write:
