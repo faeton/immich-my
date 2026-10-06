@@ -88,3 +88,39 @@ def test_same_kind_other_extension_is_a_last_resort(tmp_path: Path) -> None:
     assert _ts(tmp_path, "IMG_4(1).jpg") == 4
     _json(tmp_path, "IMG_6.mp4.supplemental-metadata(1).json", "IMG_6.mp4", 6)
     assert _ts(tmp_path, "IMG_6(1).HEIC") is None
+
+
+def test_literal_parentheses_in_a_real_name(tmp_path: Path) -> None:
+    # The file is really called "shot (1).png"; its JSON carries no counter.
+    _json(tmp_path, "shot (1).png.json", "shot (1).png", 9)
+    assert _ts(tmp_path, "shot (1).png") == 9
+    (tmp_path / "shot (1).png.json").unlink()
+    _json(tmp_path, "shot (1).png.supplemental-metadata.json", "shot (1).png", 10)
+    assert _ts(tmp_path, "shot (1).png") == 10
+
+
+def test_literal_edited_in_a_real_name(tmp_path: Path) -> None:
+    _json(tmp_path, "trip-edited.jpg.supplemental-metadata.json", "trip-edited.jpg", 11)
+    assert _ts(tmp_path, "trip-edited.jpg") == 11
+
+
+def test_exact_json_with_another_title_is_not_trusted(tmp_path: Path) -> None:
+    _json(tmp_path, "IMG_7.JPG.json", "SOMETHING_ELSE.JPG", 1)
+    assert _ts(tmp_path, "IMG_7.JPG") is None
+
+
+def test_exact_lookup_never_falls_back(tmp_path: Path) -> None:
+    from immy.dedup.engine import takeout_json_exact
+    _json(tmp_path, "IMG_5.HEIC.supplemental-metadata.json", "IMG_5.HEIC", 5)
+    assert takeout_json_exact(tmp_path / "IMG_5.HEIC")["title"] == "IMG_5.HEIC"
+    assert takeout_json_exact(tmp_path / "IMG_5.MP4") is None    # no Live Photo borrowing
+    assert takeout_json_exact(tmp_path / "IMG_5.heic") is None   # case matters
+
+
+def test_zone_at_rejects_null_island_and_nonsense() -> None:
+    from immy.dedup.engine import zone_at
+    assert zone_at(0.0, 0.0) is None
+    assert zone_at(0.0005, -0.0002) is None
+    assert zone_at(95.0, 10.0) is None
+    assert zone_at(10.0, 200.0) is None
+    assert zone_at(41.88, -87.63).key == "America/Chicago"

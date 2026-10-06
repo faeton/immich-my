@@ -2588,8 +2588,16 @@ def trips(
     ),
     prune: bool = typer.Option(
         False, "--prune/--no-prune",
-        help="Remove assets immy put in a trip album earlier that no longer belong "
-             "to that trip. Never touches assets immy did not add.",
+        help="Remove album links and trip tags immy added earlier that no longer "
+             "belong (an asset moved to another trip, a trip that disappeared). "
+             "Never touches assets or tags immy did not add; albums are kept.",
+    ),
+    refresh_descriptions: bool = typer.Option(
+        False, "--refresh-descriptions",
+        help="Rewrite each album's generated description (dates + itinerary) even "
+             "if it was edited or predates tracking. Your own lines are kept only "
+             "if you wrote them above the marker; without this flag only unedited "
+             "descriptions follow the trip.",
     ),
     csv_path: Path = typer.Option(None, "--csv", help="Also write the trip table here, for review."),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
@@ -2697,9 +2705,6 @@ def trips(
         f"{small} under {min_assets} assets skipped"
         + (f", {len(kept)} in range" if since_d or until_d else "")
     )
-    if not kept:
-        return
-
     table = Table(show_lines=False, pad_edge=False)
     for col, kw in (("album", {}), ("dates", {}), ("days", {"justify": "right"}),
                     ("assets", {"justify": "right"}), ("countries", {})):
@@ -2713,11 +2718,13 @@ def trips(
         if len(legs) > 1:
             for leg in legs:
                 table.add_row(f"[dim]  {leg.short_label()}[/dim]", "", "", "", "")
-    console.print(table)
+    if kept:
+        console.print(table)
     by_year: dict[int, int] = {}
     for t in kept:
         by_year[t.start.year] = by_year.get(t.start.year, 0) + 1
-    console.print("per year: " + ", ".join(f"{y} {n}" for y, n in sorted(by_year.items())))
+    if by_year:
+        console.print("per year: " + ", ".join(f"{y} {n}" for y, n in sorted(by_year.items())))
 
     if csv_path:
         with open(csv_path, "w", newline="") as fh:
@@ -2737,7 +2744,17 @@ def trips(
     ledger_path = (config.state_root or Path.home() / ".immy") / trips_mod.LEDGER_FILENAME
     ledger = trips_mod.load_ledger(ledger_path)
 
+    def in_scope(start):
+        return (not since_d or start >= since_d) and (not until_d or start <= until_d)
+
     if dry_run:
+        _, orphans = trips_mod.match_ledger(kept, ledger, in_scope=in_scope)
+        if orphans:
+            console.print(
+                f"[yellow]{len(orphans)} earlier trip(s) no longer found[/yellow] "
+                "(home added, merged, or under min_assets): `--apply --prune` removes "
+                "what immy put in their albums and tags; the albums stay."
+            )
         console.print(
             f"\n[yellow]dry-run[/yellow] — pass `--apply` to create/update {len(kept)} album(s)"
             + (" and tag their assets" if tags else "") + "."
@@ -2750,28 +2767,45 @@ def trips(
         ssh_host=config.immich.ssh_host,
     )
     key_to_album: dict[str, dict] = {}
+    by_id: dict[str, dict] = {}
     existing = client._request("GET", "/api/albums")
     for alb in existing if isinstance(existing, list) else []:
         if isinstance(alb, dict):
+            by_id[str(alb.get("id"))] = alb
             k = trips_mod.extract_key(alb.get("description"))
             if k:
                 key_to_album[k] = alb
 
-    created = updated = linked = removed_total = tagged = 0
+    def album_for(key, entry):
+        """The album a ledger key lives in: by its marker line, else by the
+        album id the ledger recorded (the marker may have been edited)."""
+        if key and key in key_to_album:
+            return key_to_album[key]
+        return by_id.get(str((entry or {}).get("album_id")))
+
+    def ok_ids(result) -> set[str]:
+        return {str(r.get("id")) for r in result if isinstance(r, dict) and r.get("success")}
+
     tag_conn = None
-    taken: set[str] = set()
-    for t in kept:
+
+    def tconn():
+        nonlocal tag_conn
+        if tag_conn is None:
+            tag_conn = pg_mod.connect(config.pg)
+        return tag_conn
+
+    pairs, orphans = trips_mod.match_ledger(
+        kept, ledger, album_keys=set(key_to_album), in_scope=in_scope)
+    created = updated = linked = removed_total = tagged = untagged = 0
+    for t, old_key in pairs:
         key = t.key()
         ids = t.asset_ids
-        # A trip whose first day moved has a new key; find its old album by
-        # region + overlapping dates and carry it over to the new key.
-        old_key = key if key in key_to_album else trips_mod.ledger_match(t, ledger, taken)
-        album = key_to_album.get(old_key) if old_key else None
-        taken.add(old_key or key)
-        # Claims only carry over when the album they were made in still
-        # exists; a hand-deleted album starts the new one from scratch.
-        previous = (set((ledger.get(old_key) or {}).get("assets", []))
-                    if old_key and album is not None else set())
+        entry = ledger.get(old_key) if old_key else None
+        album = album_for(old_key, entry) if old_key else None
+        # Claims carry over only while the album they were made in exists;
+        # a hand-deleted album starts from scratch. Tag ownership doesn't
+        # depend on the album.
+        previous = set((entry or {}).get("assets", [])) if album is not None else set()
         if album is None:
             album_id = client.create_album(
                 t.name(), description=trips_mod.description_for(t), asset_ids=ids,
@@ -2779,60 +2813,115 @@ def trips(
             if not album_id:
                 console.print(f"  [red]create failed[/red] {t.name()}")
                 continue
+            owned = set(ids)  # a fresh album holds only what immy put in it
             created += 1
             linked += len(ids)
             console.print(f"  [green]created[/green] {t.name()} [dim]({len(ids)} asset(s))[/dim]")
         else:
             album_id = album["id"]
             desc = album.get("description") or ""
-            if trips_mod.extract_key(desc) != key:
+            generated = trips_mod.description_for(t)
+            if desc == (entry or {}).get("description") or (
+                    refresh_descriptions and desc != generated):
+                # Unedited since immy wrote it (or forced): follow the trip.
+                # Forced keeps any lines the user put above immy's block.
+                own = [ln for ln in desc.splitlines()
+                       if ln.strip() and not trips_mod.is_generated_line(ln)]
+                new_desc = "\n".join(own + [generated])
+                if new_desc != desc:
+                    client.update_album(album_id, description=new_desc)
+                    desc = new_desc
+            elif trips_mod.extract_key(desc) != key:
                 # Keep whatever the user wrote; only the marker line moves.
                 kept_lines = [ln for ln in desc.splitlines()
                               if not ln.strip().startswith(trips_mod.IMMY_TRIP_MARKER)]
-                client.update_album(album_id, description="\n".join(
-                    kept_lines + [trips_mod.marker_line(key)]))
-            result = client.add_assets_to_album(album_id, ids)
-            added = sum(1 for r in result if isinstance(r, dict) and r.get("success"))
-            linked += added
+                desc = "\n".join(kept_lines + [trips_mod.marker_line(key)])
+                client.update_album(album_id, description=desc)
+            added = ok_ids(client.add_assets_to_album(album_id, ids))
+            linked += len(added)
             updated += 1
-            stale = sorted(previous - set(ids)) if prune else []
-            if stale:
-                res = client.remove_assets_from_album(album_id, stale)
-                removed_total += sum(1 for r in res if isinstance(r, dict) and r.get("success"))
+            # Owned: what immy owned before and still wants, plus what it just
+            # added. An asset that was already there (added by hand) and not
+            # owned before stays the user's.
+            owned = (previous & set(ids)) | added
+            stale = sorted(previous - set(ids))
+            if prune and stale:
+                client.remove_assets_from_album(album_id, stale)
+                removed_total += len(stale)
+            elif stale:
+                owned |= set(stale)  # remembered so a later --prune can remove them
             console.print(
                 f"  [green]updated[/green] {album.get('albumName') or t.name()} "
-                f"[dim]({added} new" + (f", {len(stale)} pruned" if stale else "") + ")[/dim]"
+                f"[dim]({len(added)} new" + (f", {len(stale)} pruned" if prune and stale else "") + ")[/dim]"
             )
-        if old_key and old_key != key:
-            ledger.pop(old_key, None)
-        # Without --prune, keep remembering stale claims so a later --prune
-        # can still remove them.
-        claims = set(ids) | (set() if prune else previous)
-        ledger[key] = {
-            "start": t.start.isoformat(), "end": t.end.isoformat(),
-            "region": t.region, "assets": sorted(claims),
-        }
-        trips_mod.save_ledger(ledger_path, ledger)
 
+        owned_tags = trips_mod.owned_pairs(entry)
+        if tags and entry is not None and "tags" not in entry:
+            owned_tags = trips_mod.backfill_owned_tags(
+                tconn(), owner_id, list(entry.get("assets", [])), tag_root)
         if tags:
             # Most specific level only (the leg); Immich lists a parent
             # tag's assets through its closure table. Linked by SQL with the
             # tag list locked: see trips.link_tags for why not the tag API.
-            pairs = trips_mod.leg_tags(t, tag_root)
-            tag_ids = client.upsert_tags([name for _, name in pairs])
+            leg_pairs = trips_mod.leg_tags(t, tag_root)
+            tag_ids = client.upsert_tags([name for _, name in leg_pairs])
             split = dict(trips_mod.assets_by_leg(t, asset_day))
             links = []
-            for leg, name in pairs:
+            for leg, name in leg_pairs:
                 tag_id = tag_ids.get(name)
                 if not tag_id:
                     console.print(f"  [red]tag upsert failed[/red] {name}")
                     continue
                 links += [(aid, tag_id, name) for aid in split.get(leg, [])]
             if links:
-                if tag_conn is None:
-                    tag_conn = pg_mod.connect(config.pg)
-                trips_mod.link_tags(tag_conn, links)
+                trips_mod.link_tags(tconn(), links)
                 tagged += len(links)
+            wanted = {(a, v) for a, _, v in links}
+            stale_tags = owned_tags - wanted
+            if prune and stale_tags:
+                trips_mod.unlink_tags(tconn(), owner_id, sorted(stale_tags))
+                untagged += len(stale_tags)
+                stale_tags = set()
+            owned_tags = wanted | stale_tags
+
+        if old_key and old_key != key:
+            ledger.pop(old_key, None)
+        ledger[key] = {
+            "start": t.start.isoformat(), "end": t.end.isoformat(),
+            "region": t.region, "album_id": str(album_id),
+            "assets": sorted(owned), "tags": trips_mod.tags_by_value(owned_tags),
+            # What immy last wrote, if the album still shows exactly that;
+            # an edited description is never tracked (so never overwritten).
+            "description": (trips_mod.description_for(t) if album is None
+                            else (desc if desc == trips_mod.description_for(t) else
+                                  (entry or {}).get("description"))),
+        }
+        trips_mod.save_ledger(ledger_path, ledger)
+
+    # Trips that no longer exist: take back only what immy put there. The
+    # album itself stays, since it may hold the user's own additions and edits.
+    if orphans and not prune:
+        console.print(
+            f"[yellow]{len(orphans)} earlier trip(s) no longer found[/yellow] — "
+            "re-run with `--prune` to remove what immy put in their albums and tags."
+        )
+    for key in orphans if prune else []:
+        entry = ledger.get(key) or {}
+        album = album_for(key, entry)
+        claimed = sorted(entry.get("assets", []))
+        if album is not None and claimed:
+            client.remove_assets_from_album(album["id"], claimed)
+            removed_total += len(claimed)
+        stale_tags = sorted(trips_mod.owned_pairs(entry))
+        if stale_tags:
+            trips_mod.unlink_tags(tconn(), owner_id, stale_tags)
+            untagged += len(stale_tags)
+        console.print(
+            f"  [yellow]retired[/yellow] {(album or {}).get('albumName') or key} "
+            f"[dim]({len(claimed)} album link(s), {len(stale_tags)} tag(s) removed; album kept)[/dim]"
+        )
+        ledger.pop(key, None)
+        trips_mod.save_ledger(ledger_path, ledger)
 
     if tag_conn is not None:
         tag_conn.close()
@@ -2840,6 +2929,7 @@ def trips(
         f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "
         f"{linked} asset-link(s) added" + (f", {removed_total} pruned" if prune else "")
         + (f", {tagged} asset(s) tagged (locked)" if tags else "")
+        + (f", {untagged} stale tag(s) removed" if untagged else "")
     )
 
 
@@ -4548,6 +4638,11 @@ def takeout_redate(
         help="The library's import path as seen from here, where sidecars are "
              "written (default: config originals_root).",
     ),
+    import_path: str = typer.Option(
+        None, "--import-path",
+        help="The Immich-side import path that --originals is (default: the "
+             "library's only import path). Assets under any other path are skipped.",
+    ),
     placeholders: bool = typer.Option(
         True, "--placeholders/--no-placeholders",
         help="Re-date assets stamped with a placeholder (on-the-hour time shared by many assets).",
@@ -4628,13 +4723,18 @@ def takeout_redate(
         raise typer.Exit(code=2)
     owner_id = str(match[0][0])
     cur.execute('SELECT "importPaths" FROM library WHERE "deletedAt" IS NULL')
-    import_paths = sorted({p for (paths,) in cur.fetchall() for p in (paths or [])}, key=len, reverse=True)
+    import_paths = sorted({p.rstrip("/") for (paths,) in cur.fetchall() for p in (paths or [])})
+    # Every path below is relative to ONE import root, the one --originals
+    # shows from here, so a sidecar can never be written under one root and
+    # registered under another.
+    root = (import_path or "").rstrip("/") or (import_paths[0] if len(import_paths) == 1 else None)
+    if root is None:
+        console.print(f"[red]{len(import_paths)} import paths[/red] ({', '.join(import_paths)}) — "
+                      "pass --import-path for the one --originals points at.")
+        raise typer.Exit(code=2)
 
     def rel_of(path: str) -> str | None:
-        for ip in import_paths:
-            if path.startswith(ip.rstrip("/") + "/"):
-                return path[len(ip.rstrip("/")) + 1:]
-        return None
+        return path[len(root) + 1:] if path.startswith(root + "/") else None
 
     select = """
         SELECT a.id, a."originalPath", a."localDateTime" AT TIME ZONE 'UTC',
@@ -4766,11 +4866,14 @@ def takeout_redate(
     with open(log_path, "w") as log:
         for f in good:
             aid = f.target.asset_id
-            immich_original = next(
-                ip.rstrip("/") + "/" + f.target.rel for ip in import_paths
-            )
+            immich_original = root + "/" + f.target.rel
             immich_sidecar = registered.get(aid) or immich_original + ".xmp"
-            local_sidecar = originals / rel_of(immich_sidecar)
+            sidecar_rel = rel_of(immich_sidecar)
+            if sidecar_rel is None:
+                console.print(f"  [yellow]skipped[/yellow] {f.target.rel}: its sidecar "
+                              f"{immich_sidecar} is outside {root}")
+                continue
+            local_sidecar = originals / sidecar_rel
             before = local_sidecar.read_text() if local_sidecar.is_file() else None
             try:
                 sidecar_mod.write(originals / f.target.rel, {"DateTimeOriginal": f.xmp},

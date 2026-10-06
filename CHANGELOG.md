@@ -4,6 +4,49 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-06 — Codex review: ownership, retirement, root, lookup fixes
+
+All eight findings from a Codex review of the trips/takeout work, fixed with
+tests.
+
+### Fixed
+
+- **`--prune` could remove an asset the user added.** Ownership now counts only
+  what immy created: a fresh album's contents, or adds that returned success.
+- **Disappeared trips were never reconciled.** There was also an early return
+  when no trips remained. Ledger entries no current trip continues, within
+  `--since`/`--until`, are listed in dry runs. `--apply --prune` takes back
+  their links and tags and keeps the album.
+- **Stale tags were permanent.** The ledger records tag ownership. `--prune`
+  unlinks immy's tags that no longer apply, from both `tag_asset` and the
+  locked `asset_exif.tags`. Ledgers from before tracking are backfilled from
+  each trip's own `Trips/<year>/<trip>` tag.
+- **`takeout redate` could register a sidecar under the wrong import root.**
+  Everything is now relative to one root (`--import-path` when several).
+- **Neighbour interpolation could borrow another device's JSON** through the
+  Live Photo / cross-extension fallback. It now uses `takeout_json_exact`.
+- **A literal `shot (1).png`** lost its exact JSON to counter parsing. Exact
+  names are tried first, and the name is read literally as a fallback.
+- **The antimeridian.** Bucket longitude is averaged on the circle in SQL;
+  +179/−179 had averaged to 0.
+- **Null-island GPS** (0, 0) is no longer handed to the timezone lookup, so
+  JSON geo or nearby shots get their turn.
+
+### Added
+
+- Generated album descriptions follow the trip while unedited (tracked in the
+  ledger). `--refresh-descriptions` forces the update and keeps user lines.
+
+### Ops (n5)
+
+- `trips --apply --tags --prune` after the date repair. 55 assets moved
+  between albums. 3,497 stale tags were removed: two Oceania legs were
+  relabelled (French Polynesia 21–30 Oct, New Zealand 31 Oct – 21 Nov), and
+  the December Portugal trip was renamed when its key changed. Afterwards
+  every one of 107,659 assets has exactly one trip tag, both as a link and in
+  its locked list. A second run changed nothing. 350/350 descriptions
+  tracked.
+
 ## 2026-10-06 — Trip albums live for 2025; tags written durably
 
 ### Fixed

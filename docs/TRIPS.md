@@ -131,8 +131,11 @@ included, is in exactly one leg. A one-day hop over a border and back doesn't
 split a leg, and territories count as their country.
 
 The marker line is the album's identity. Rename the album or edit the
-description freely: the itinerary is written when the album is created, and
-later runs only add assets and keep your text. When a late
+description freely. The ledger remembers the description immy last wrote:
+while the album still shows exactly that, it follows the trip (a leg's dates
+shift, the trip grows). Once you edit it, it's yours and is never overwritten.
+`--refresh-descriptions` forces the update anyway, keeping every line that
+isn't immy's (header, leg or marker line). When a late
 import moves a trip's first day, its key changes. The ledger
 (`trips-ledger.json` under `state_root`) records each trip's region and date
 range, so the trip is matched back to its album by overlap instead of
@@ -170,8 +173,24 @@ one-country trip. Immich resolves a parent tag through its closure table, so
 opening a trip or year tag still lists everything below it. Tags are also the
 only channel that reaches video assets' metadata (see `TELEMETRY.md`).
 
-## Undo
+## Ownership and `--prune`
 
-Every album immy made has an `immy-trip:` line in its description, and every
-asset link it added is in the ledger. `--prune` removes only album links immy added;
-tags are never pruned. Assets themselves are never touched.
+The ledger (`trips-ledger.json` under `state_root`) records, per trip, exactly
+what immy put there:
+- **Album links:** the album immy created, or adds that returned success. An
+  asset that was already in the album (added by hand) is never claimed.
+- **Tags:** each trip/leg tag value and the assets immy linked it to.
+
+`--prune` removes only those:
+- **Moved assets:** an asset that moved to another trip (after a date fix)
+  loses its old album link and its old tag. The tag goes from both
+  `tag_asset` and the locked `asset_exif.tags` list.
+- **Relabelled legs:** a leg whose dates changed gets a new tag. The old one is
+  unlinked, and Immich's TagCleanup removes it once empty.
+- **Disappeared trips:** a trip that no longer exists (a new home, merged into
+  a neighbour, under `min_assets`) is retired. Its claimed links and tags go;
+  the album stays, with anything you added. A dry run lists these first.
+  `--since`/`--until` limit this to that range.
+
+Without `--prune`, everything is add-only and stale claims are remembered for
+a later `--prune`. Assets themselves are never touched.

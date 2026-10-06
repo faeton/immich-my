@@ -285,10 +285,17 @@ class _Cursor:
         return self._rows
 
     def executemany(self, sql, params):
-        LINKS.extend((sql.strip().split()[0], p["asset"], p["tag"], p["value"]) for p in params)
+        verb = sql.strip().split()[0]
+        for p in params:
+            LINKS.append((verb, p["asset"], p.get("tag"), p["value"]))
+            if verb == "INSERT":
+                TAGGED.add((p["asset"], p["value"]))
+            elif verb == "DELETE":
+                TAGGED.discard((p["asset"], p["value"]))
 
 
 LINKS: list[tuple] = []
+TAGGED: set[tuple[str, str]] = set()   # (asset, tag value) currently linked
 
 
 class _Conn:
@@ -358,6 +365,7 @@ def _setup(monkeypatch, tmp_path, buckets, assets):
     monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: _Conn(buckets, assets))
     _Immich.albums, _Immich.tags = {}, {}
     LINKS.clear()
+    TAGGED.clear()
     monkeypatch.setattr(cli, "ImmichClient", _Immich)
     return cfg
 
@@ -518,3 +526,143 @@ def test_cli_skips_placeholder_dated_assets(monkeypatch, tmp_path) -> None:
     assert "+1 with a placeholder date" in " ".join(res.output.split())
     row = out.read_text().splitlines()[1].split(",")
     assert row[6] == "2"   # assets column: the placeholder-dated one is out
+
+
+# --- reconciliation: ownership, disappeared trips, stale tags ---------------
+
+
+def _run(cfg, *extra):
+    res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg), "--apply", *extra])
+    assert res.exit_code == 0, res.output
+    return res
+
+
+def _use(monkeypatch, buckets, assets):
+    monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: _Conn(buckets, assets))
+
+
+def test_prune_never_removes_an_asset_the_user_added(monkeypatch, tmp_path) -> None:
+    # Paris trip, days 1-2; "mine" is shot on day 2.
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("mine", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg)
+    album = next(iter(_Immich.albums.values()))
+    # Pretend "mine" was added by hand first: reset ownership to a1 only.
+    ledger_path = tmp_path / "state" / T.LEDGER_FILENAME
+    ledger = T.load_ledger(ledger_path)
+    (key,) = ledger
+    ledger[key]["assets"] = ["a1"]
+    T.save_ledger(ledger_path, ledger)
+    # Re-run: "mine" is already there → not claimed.
+    _run(cfg)
+    assert T.load_ledger(ledger_path)[key]["assets"] == ["a1"]
+    # Day 2 stops being Paris; the trip shrinks to day 1. Prune keeps "mine".
+    _use(monkeypatch, _rows([(0, LISBON), (1, PARIS), (2, LISBON), (3, LISBON)]), assets)
+    _run(cfg, "--prune")
+    assert "mine" in album["assets"]
+
+
+def test_disappeared_trip_is_retired_only_with_prune(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    album = next(iter(_Immich.albums.values()))
+    album["assets"].add("by-hand")
+    # Paris becomes home: the trip is gone.
+    cfg.write_text(cfg.read_text().replace("    - country: PT\n", "    - country: PT\n    - country: FR\n"))
+    res = _run(cfg, "--tags")
+    assert "no longer found" in " ".join(res.output.split())
+    assert album["assets"] == {"a1", "a2", "by-hand"}       # nothing without --prune
+    res = _run(cfg, "--tags", "--prune")
+    assert album["assets"] == {"by-hand"}                   # only immy's links go
+    assert TAGGED == set()                                  # and its tags
+    assert len(_Immich.albums) == 1                         # the album stays
+    assert T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME) == {}
+
+
+def test_orphans_outside_the_scope_are_left_alone(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg)
+    _use(monkeypatch, _rows([(0, LISBON)]), [])
+    _run(cfg, "--prune", "--since", "2026-01-01")
+    album = next(iter(_Immich.albums.values()))
+    assert album["assets"] == {"a1", "a2"}
+
+
+def test_moved_asset_loses_its_old_trip_tag_with_prune(monkeypatch, tmp_path) -> None:
+    # Paris days 1-2, Madrid days 4-5; "x" starts on day 2 (Paris).
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON), (4, MADRID), (5, MADRID)])
+    assets = [("p", D0 + timedelta(days=1)), ("p2", D0 + timedelta(days=1)),
+              ("x", D0 + timedelta(days=2)), ("m", D0 + timedelta(days=4))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    paris = "Trips/2025/2025-03 France · Paris"
+    madrid = "Trips/2025/2025-03 Spain · Madrid"
+    assert ("x", paris) in TAGGED
+    # A date fix moves "x" to day 5: it now belongs to Madrid.
+    moved = [("p", D0 + timedelta(days=1)), ("p2", D0 + timedelta(days=1)),
+             ("x", D0 + timedelta(days=5)), ("m", D0 + timedelta(days=4))]
+    _use(monkeypatch, buckets, moved)
+    _run(cfg, "--tags")
+    assert ("x", paris) in TAGGED and ("x", madrid) in TAGGED   # add-only without --prune
+    _run(cfg, "--tags", "--prune")
+    assert ("x", paris) not in TAGGED and ("x", madrid) in TAGGED
+    assert ("p", paris) in TAGGED
+    drops = [l for l in LINKS if l[0] == "UPDATE" and l[1:] == ("x", None, paris)]
+    assert drops  # the value left the locked asset_exif.tags list too
+
+
+def test_backfill_owned_tags_picks_the_trips_own_tag() -> None:
+    rows = [("a", "Trips/2025/2025-12 Portugal/Lisbon · 1–2 Dec 2025"),
+            ("b", "Trips/2025/2025-12 Portugal/Porto · 3 Dec 2025"),
+            ("c", "Trips/2025/2025-12 Portugal"),
+            ("c", "Trips/2025/2025-12 Poland · Warsaw")]   # c moved; Warsaw's own
+
+    class Cur:
+        def __enter__(self): return self
+        def __exit__(self, *e): return False
+        def execute(self, sql, p): assert p["root"] == "Trips/%"
+        def fetchall(self): return rows
+
+    conn = type("C", (), {"cursor": lambda self: Cur()})()
+    got = T.backfill_owned_tags(conn, "u1", ["a", "b", "c"], "Trips")
+    assert got == {rows[0], rows[1], rows[2]}
+    assert T.backfill_owned_tags(conn, "u1", [], "Trips") == set()
+
+
+def test_generated_lines_are_recognised() -> None:
+    t = _pacific()
+    for line in T.description_for(t).splitlines():
+        assert T.is_generated_line(line), line
+    for line in ("2 Oct – 11 Dec 2025 · 71 days · 6 countries",
+                 "Australia · 22 Nov – 11 Dec", "Fiji · 8–9 Oct", "Tonga · 5 Mar"):
+        assert T.is_generated_line(line), line
+    for line in ("Best croissants.", "with Anna and Max", "Day 3: whales!"):
+        assert not T.is_generated_line(line), line
+
+
+def test_unedited_description_follows_the_trip_edited_one_stays(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg)
+    album = next(iter(_Immich.albums.values()))
+    assert album["description"].startswith("2–3 Mar 2025 · 2 days")
+    # The trip grows by a day: an unedited description follows it.
+    longer = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, PARIS), (4, LISBON)])
+    _use(monkeypatch, longer, assets)
+    _run(cfg)
+    assert album["description"].startswith("2–4 Mar 2025 · 3 days")
+    # The user edits it: later changes leave it alone…
+    album["description"] = "Best croissants.\n" + album["description"]
+    _use(monkeypatch, _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)]), assets)
+    _run(cfg)
+    assert album["description"].startswith("Best croissants.\n2–4 Mar 2025")
+    # …unless forced, which keeps the user's own line.
+    _run(cfg, "--refresh-descriptions")
+    assert album["description"].startswith("Best croissants.\n2–3 Mar 2025 · 2 days")
+    assert T.extract_key(album["description"])

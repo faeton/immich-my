@@ -152,23 +152,44 @@ def _google_json_companion(path: Path) -> dict | None:
                                 (a Live Photo's video shares its still's JSON)
         IMG_0001-edited.JPG   → IMG_0001.JPG.supplemental-metadata.json
 
-    Exact forms are tried first for plain names. Otherwise sibling JSONs are
-    matched on what the JSON says about itself, its `title` (the original file
-    name) and its trailing counter, never on a bare filename prefix. A prefix
-    match handed `IMG_0001(1).MP4` nothing, and could hand a different
-    photo's JSON to a name that merely starts the same way.
+    A JSON named after this exact file is tried first, accepted when its
+    title fits. Otherwise sibling JSONs are matched on what they say about
+    themselves, their `title` and trailing counter, never on a bare
+    filename prefix. The name is read two ways: as Takeout's duplicate or
+    edit (`(1)`, `-edited`), then literally, since `shot (1).png` can simply
+    be a file's real name.
     """
     stem, n, edited, ext = _split_takeout_name(path.name)
-    if n == 0 and not edited:
-        for candidate in (
-            path.with_name(path.name + ".json"),
-            path.with_name(path.name + ".supplemental-metadata.json"),
-        ):
-            if candidate.is_file():
-                return _read_json(candidate)
+    for candidate in (
+        path.with_name(path.name + ".json"),
+        path.with_name(path.name + ".supplemental-metadata.json"),
+    ):
+        if candidate.is_file():
+            data = _read_json(candidate)
+            if isinstance(data, dict) and _title_fits(data, path.name, stem + ext):
+                return data
+    found = _scan_takeout_json(path, stem, n, ext)
+    if found is not None:
+        return found
+    literal = Path(path.name)
+    if (literal.stem, literal.suffix.lower()) != (stem, ext) or n:
+        return _scan_takeout_json(path, literal.stem, 0, literal.suffix.lower())
+    return None
+
+
+def _title_fits(data: dict, *names: str) -> bool:
+    title = str(data.get("title") or "")
+    return not title or title.lower() in {n.lower() for n in names}
+
+
+def _scan_takeout_json(path: Path, stem: str, n: int, ext: str) -> dict | None:
+    """Siblings whose trailing counter is `n` and whose title is `stem`
+    under the same extension, else a still for a video, else the same kind
+    of media under another extension. Ambiguity → None, not a guess."""
     same: list[dict] = []
     still: list[dict] = []
     other: list[dict] = []
+    is_video = ext.lstrip(".") in VIDEO_EXTS
     # Truncation can cut into the stem itself on very long names; 20 chars of
     # it is enough to narrow the glob, the title check does the rest.
     for sibling in path.parent.glob(glob_escape(stem[:20]) + "*.json"):
@@ -184,7 +205,6 @@ def _google_json_companion(path: Path) -> dict | None:
         t_stem, t_ext = title.stem, title.suffix.lower()
         if t_stem.lower() != stem.lower():
             continue
-        is_video = ext.lstrip(".") in VIDEO_EXTS
         if t_ext == ext:
             same.append(data)
         elif t_ext in _STILL_EXTS and is_video:
@@ -197,6 +217,28 @@ def _google_json_companion(path: Path) -> dict | None:
         if len(group) == 1:
             return group[0]
     return other[0] if len(other) == 1 and not same and not still else None
+
+
+def takeout_json_exact(path: Path) -> dict | None:
+    """The JSON for exactly this file: same name, same extension, no
+    counter, no Live Photo or cross-extension fallback. For inference
+    that needs to be sure which file it's reading (neighbour dating)."""
+    for candidate in (
+        path.with_name(path.name + ".json"),
+        path.with_name(path.name + ".supplemental-metadata.json"),
+    ):
+        if candidate.is_file():
+            data = _read_json(candidate)
+            if isinstance(data, dict) and str(data.get("title") or "") == path.name:
+                return data
+    hits = []
+    for sibling in path.parent.glob(glob_escape(Path(path.name).stem[:20]) + "*.json"):
+        if _JSON_COUNTER.search(sibling.name):
+            continue
+        data = _read_json(sibling)
+        if isinstance(data, dict) and str(data.get("title") or "") == path.name:
+            hits.append(data)
+    return hits[0] if len(hits) == 1 else None
 
 
 def glob_escape(text: str) -> str:
@@ -1701,8 +1743,12 @@ def _move_asset(
 
 
 def zone_at(lat: float | None, lon: float | None):
-    """IANA zone at a position (offline `timezonefinder`), or None."""
+    """IANA zone at a position (offline `timezonefinder`), or None. Null
+    island (0, 0), a GPS chip with no fix, and out-of-range values are no
+    position at all, so the caller's next source gets its turn."""
     if lat is None or lon is None:
+        return None
+    if not (-90 <= lat <= 90 and -180 <= lon <= 180) or (abs(lat) < 1e-3 and abs(lon) < 1e-3):
         return None
     from zoneinfo import ZoneInfo
     from ..rules.trip_timezone_guess import _tz_finder

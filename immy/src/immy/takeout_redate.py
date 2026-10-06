@@ -43,7 +43,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from .dedup.engine import _google_json_companion, _promote_dest, xmp_datetime, zone_at
+from .dedup.engine import (
+    _google_json_companion, _promote_dest, takeout_json_exact, xmp_datetime, zone_at,
+)
 
 
 # --- linking Immich assets to Takeout sources --------------------------------
@@ -135,8 +137,11 @@ def neighbour_taken(media: Path, *, reach: int = 5, agree: timedelta = timedelta
     # phones' IMG_#### ranges, and the extension (`.mp4` vs `.MOV` vs
     # `.HEIC`) is the best same-device signal a name carries.
     def at(n: int) -> datetime | None:
-        t = json_taken(media.with_name(f"{prefix}{n:0{width}d}{ext}"))
-        return t.instant if t else None
+        # Exact-file JSON only: no Live Photo or cross-extension fallback,
+        # which would let another device's HEIC date an .mp4.
+        data = takeout_json_exact(media.with_name(f"{prefix}{n:0{width}d}{ext}"))
+        ts = (data or {}).get("photoTakenTime", {}).get("timestamp")
+        return datetime.fromtimestamp(int(ts), timezone.utc) if ts else None
 
     below = next(((num - k, t) for k in range(1, reach + 1) if (t := at(num - k))), None)
     above = next(((num + k, t) for k in range(1, reach + 1) if (t := at(num + k))), None)

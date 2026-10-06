@@ -16,9 +16,11 @@ to the very end, and truncates long names:
 | `IMG_0001(1).MP4`      | `IMG_0001.HEIC.supplemental-metadata(1).json` (a Live Photo's video shares its still's JSON) |
 | `IMG_0001-edited.JPG`  | `IMG_0001.JPG.supplemental-metadata.json`     |
 
-`dedup.engine._google_json_companion` matches sibling JSONs on what they say
-about themselves, their `title` and trailing counter, never on a filename
-prefix. An older prefix lookup missed every `(n)` file. Those came in
+`dedup.engine._google_json_companion` first tries a JSON named after the
+exact file, accepted when its title fits. Then it matches sibling JSONs on
+what they say about themselves, their `title` and trailing counter, never on
+a filename prefix. It reads the name both as Takeout's duplicate or edit and
+literally, since `shot (1).png` can be a file's real name. An older prefix lookup missed every `(n)` file. Those came in
 dateless, and a folder-year fallback stamped them `YYYY-01-01 12:00:00`.
 
 ## The UTC clock
@@ -46,6 +48,12 @@ immy takeout redate … --apply
   or more assets.
 - With `--utc` (the default), Takeout assets Immich shows in UTC.
 
+**One import root.** Paths are taken relative to the single Immich import
+path that `--originals` shows from here. That's the library's only one, or
+`--import-path` when there are several. Assets under any other root are
+skipped, so a sidecar is never written under one root and registered under
+another.
+
 **Finding each source.** Promote put every file at a path derived from its
 staging path and date (`_promote_dest`, or its `__<id>` collision name). Each
 asset maps back to its Takeout file exactly; a name guess is never needed.
@@ -56,10 +64,13 @@ Several candidates are narrowed by consistency, and exactly one must remain:
 **The date.**
 1. The Takeout JSON.
 2. Else the file's own embedded capture time, when absolute.
-3. Else interpolation between numbered neighbours of the same extension in the
-   same Takeout folder, on both sides, agreeing to within two days.
+3. Else interpolation between numbered neighbours in the same Takeout folder.
+   Each neighbour must be the exact name with the same extension and case,
+   read through its own JSON with no Live Photo or cross-extension fallback.
+   Both sides must exist and agree to within two days.
 
-**The zone.**
+**The zone.** Null island (0, 0) and out-of-range coordinates count as no
+position.
 1. The file's GPS.
 2. Else the JSON's `geoData`.
 3. Else the zone most shots within 3 h (then 24 h) carry.

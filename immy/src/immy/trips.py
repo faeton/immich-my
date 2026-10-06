@@ -241,7 +241,10 @@ gps AS MATERIALIZED (
     AND NOT (abs(ae.latitude) < 0.01 AND abs(ae.longitude) < 0.01)
     AND NOT EXISTS (SELECT 1 FROM placeholder p WHERE p.t = a."localDateTime")
 ),{_ghost_ctes("ll", axis="lat", lat_op="+", min_abs=0.5)},{_ghost_ctes("lon", axis="lon", lat_op="-", min_abs=5)}
-SELECT g.d, g.country, g.city, avg(g.lat), avg(g.lon), count(*)
+SELECT g.d, g.country, g.city, avg(g.lat),
+       -- circular mean: +179 and -179 average to 180, not 0
+       degrees(atan2(avg(sin(radians(g.lon))), avg(cos(radians(g.lon))))),
+       count(*)
 FROM gps g
 WHERE NOT EXISTS (SELECT 1 FROM ghost_ll x WHERE x.id = g.id)
   AND NOT EXISTS (SELECT 1 FROM ghost_lon x WHERE x.id = g.id)
@@ -629,6 +632,21 @@ def description_for(trip: Trip) -> str:
     return "\n".join(lines)
 
 
+_MON = r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)"
+_DAY_RANGE = rf"\d{{1,2}}(?:–\d{{1,2}})?(?: {_MON})?(?: \d{{4}})?(?: – \d{{1,2}} {_MON}(?: \d{{4}})?)?"
+_GENERATED = re.compile(
+    rf"^(?:{_DAY_RANGE} · \d+ days · .+"          # header: dates · N days · countries
+    rf"|[^·]+ · {_DAY_RANGE}"                     # a leg: Country · dates
+    rf"|{re.escape(IMMY_TRIP_MARKER)}\S+)$"       # the marker
+)
+
+
+def is_generated_line(line: str) -> bool:
+    """A line immy writes into a trip album's description (header, leg,
+    marker), as opposed to one the user added."""
+    return bool(_GENERATED.match(line.strip()))
+
+
 def _tag_segment(text: str) -> str:
     # `/` is Immich's tag hierarchy separator.
     return text.replace("/", "-")
@@ -687,11 +705,42 @@ def link_tags(conn, links: list[tuple[str, str, str]]) -> None:
     conn.commit()
 
 
+# Removing one of immy's tags from an asset: the link, and the value from
+# the locked list (else the next extraction re-links it). The lock stays
+# for the asset's other tags. A tag left with no assets is removed by
+# Immich's own TagCleanup job.
+DROP_TAG_VALUE_SQL = """
+UPDATE asset_exif SET tags = array_remove(tags, %(value)s::varchar)
+WHERE "assetId" = %(asset)s
+"""
+
+UNLINK_TAG_SQL = """
+DELETE FROM tag_asset
+WHERE "assetId" = %(asset)s
+  AND "tagId" IN (SELECT id FROM tag WHERE value = %(value)s AND "userId" = %(owner)s)
+"""
+
+
+def unlink_tags(conn, owner_id: str, removals: list[tuple[str, str]]) -> None:
+    """(asset id, tag value) pairs immy put there → removed, in one commit."""
+    if not removals:
+        return
+    with conn.cursor() as cur:
+        params = [{"asset": a, "value": v, "owner": owner_id} for a, v in removals]
+        cur.executemany(DROP_TAG_VALUE_SQL, params)
+        cur.executemany(UNLINK_TAG_SQL, params)
+    conn.commit()
+
+
 # --- ledger ----------------------------------------------------------------
 #
-# key → {start, end, region, assets}. `assets` is what immy last put in the
-# album (prune only ever removes those); start/end/region let a trip whose
-# key changed (first day moved) find its old album by overlap.
+# key → {start, end, region, album_id, assets, tags}.
+#   assets: album memberships immy created (an album it made, or an add that
+#           returned success). An asset already in the album, e.g. added by
+#           hand, is never claimed, so --prune can never remove it.
+#   tags:   {tag value: [asset ids]} immy linked.
+# start/end/region let a trip whose key changed (first day moved) find its
+# old album by overlap; album_id finds it even if its marker line was edited.
 
 
 def load_ledger(path: Path) -> dict[str, dict]:
@@ -724,14 +773,91 @@ def ledger_match(trip: Trip, ledger: dict[str, dict], taken: set[str]) -> str | 
     return None
 
 
+def match_ledger(
+    trips: list[Trip],
+    ledger: dict[str, dict],
+    *,
+    album_keys: set[str] = frozenset(),
+    in_scope=lambda start: True,
+) -> tuple[list[tuple[Trip, str | None]], list[str]]:
+    """Pair each trip with the ledger key it continues (its own key when
+    known, else the same region with overlapping dates), and list the ledger
+    keys no trip continues: trips that disappeared (a home added, merged
+    into a neighbour, dropped under min_assets). Only ledger entries whose
+    start is `in_scope` can be orphans, so a `--since` run never touches
+    other years."""
+    taken: set[str] = set()
+    pairs: list[tuple[Trip, str | None]] = []
+    for t in trips:
+        k = t.key()
+        old = k if (k in ledger or k in album_keys) and k not in taken else ledger_match(t, ledger, taken)
+        if old:
+            taken.add(old)
+        pairs.append((t, old))
+    orphans = []
+    for k, entry in ledger.items():
+        if k in taken:
+            continue
+        try:
+            start = date.fromisoformat(entry["start"])
+        except (KeyError, ValueError):
+            continue
+        if in_scope(start):
+            orphans.append(k)
+    return pairs, orphans
+
+
+OWNED_TAGS_SQL = """
+SELECT ta."assetId", t.value FROM tag_asset ta
+JOIN tag t ON t.id = ta."tagId"
+WHERE t."userId" = %(owner)s AND ta."assetId" = ANY(%(assets)s::uuid[])
+  AND t.value LIKE %(root)s
+"""
+
+
+def backfill_owned_tags(conn, owner_id: str, asset_ids: list[str], root: str) -> set[tuple[str, str]]:
+    """Tag ownership for a ledger entry written before ownership was
+    recorded. Everything under `root` is immy's; of those links on the
+    entry's assets, the ones under the trip-level tag most of them share
+    (`Trips/<year>/<album>`) are this trip's. Another trip's tag on a moved
+    asset is left for that trip to reconcile."""
+    if not asset_ids:
+        return set()
+    with conn.cursor() as cur:
+        cur.execute(OWNED_TAGS_SQL, {"owner": owner_id, "assets": list(asset_ids),
+                                     "root": root.rstrip("/") + "/%"})
+        rows = [(str(a), v) for a, v in cur.fetchall()]
+    if not rows:
+        return set()
+    trip_of = lambda v: "/".join(v.split("/")[:3])
+    top = Counter(trip_of(v) for _, v in rows).most_common(1)[0][0]
+    return {(a, v) for a, v in rows if trip_of(v) == top}
+
+
+def owned_pairs(entry: dict | None) -> set[tuple[str, str]]:
+    """(asset id, tag value) immy linked for a ledger entry."""
+    tags = (entry or {}).get("tags") or {}
+    return {(a, v) for v, ids in tags.items() for a in ids}
+
+
+def tags_by_value(pairs: set[tuple[str, str]]) -> dict[str, list[str]]:
+    out: dict[str, list[str]] = {}
+    for a, v in pairs:
+        out.setdefault(v, []).append(a)
+    return {v: sorted(ids) for v, ids in sorted(out.items())}
+
+
 __all__ = [
+    "match_ledger", "owned_pairs", "tags_by_value", "backfill_owned_tags",
     "IMMY_TRIP_MARKER", "LEDGER_FILENAME",
     "DEFAULT_PLACEHOLDER_MIN", "ASSETS_SQL", "DAY_BUCKETS_SQL",
     "DEFAULT_MAX_GAP_DAYS", "DEFAULT_TRANSIT_DAYS", "DEFAULT_MIN_ASSETS", "DEFAULT_TAG_ROOT",
     "Regions", "PlaceCount", "Day", "HomeStay", "Trip",
     "country_code", "build_days", "segment", "assign_assets", "keep",
     "name_for_trip", "format_range", "stable_key", "marker_line", "extract_key",
-    "Leg", "assets_by_leg", "leg_tags", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
-    "Leg", "assets_by_leg", "leg_tags", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
+    "Leg", "assets_by_leg", "leg_tags", "is_generated_line", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
+    "unlink_tags", "DROP_TAG_VALUE_SQL", "UNLINK_TAG_SQL",
+    "Leg", "assets_by_leg", "leg_tags", "is_generated_line", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
+    "unlink_tags", "DROP_TAG_VALUE_SQL", "UNLINK_TAG_SQL",
     "description_for", "tag_for", "load_ledger", "save_ledger", "ledger_match",
 ]
