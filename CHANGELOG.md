@@ -75,6 +75,12 @@ continuously, so entries are dated rather than versioned.
   with `--no-photos-app-fallback`. The first run needs the Automation permission
   (Terminal → Photos) granted once, by hand.
 
+### Docs
+
+- README (CLI list, capabilities), `docs/ARCHITECTURE.md` (sources table) and
+  `docs/ROADMAP.md` (Apple Photos section) describe the shipped Photos bridge,
+  including the Photos.app fallback.
+
 ### Fixed
 
 - `photos pull` ended with a stale hint pointing at `manifest-shadow.sqlite`; it

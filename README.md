@@ -36,6 +36,10 @@ The main operational interface is `immy`:
 - `similar <photo>` finds the library assets that look like a photo (image→image search
   on Immich's own CLIP index; ≥0.95 = same frame, 0.85–0.95 = same subject)
 - `find-duplicates` scans any disk/folder and reports what's already in Immich
+- `photos diff` lists the Photos.app assets missing from Immich (read-only, no iCloud login)
+- `photos pull` exports those UUIDs with osxphotos, re-exports anything incomplete through
+  Photos.app AppleScript (iCloud-only originals, e.g. a Live Photo's video), and delivers
+  batches to n5 `staging/photos/ready/` with a per-UUID retry ledger
 
 Typical development commands:
 
@@ -109,6 +113,8 @@ brew install exiftool ffmpeg vips
   reverse-geocode (`immy srt`, see `docs/TELEMETRY.md`)
 - Portable Immich library snapshot + external-disk duplicate scan
   (`immy snapshot`, `immy find-duplicates`)
+- Apple Photos → Immich bridge (`immy photos diff`, `immy photos pull`, n5
+  `deploy/n5/photos-ingest.sh`); the 4,634-asset backlog is in
 
 ## Local Setup
 
@@ -258,6 +264,18 @@ Docs grouped by role:
   snapshot — tells you which backup drive content is already in Immich
   (safe to delete) vs which is a candidate for ingest. Default mode
   hashes only on name+size hits; `--thorough` catches pure renames.
+
+- Apple Photos bridge. On the Mac, `immy photos diff` reads Photos.sqlite
+  and the Immich snapshot and lists the UUIDs Immich lacks. `immy photos pull`
+  exports them in batches with `osxphotos` (PhotoKit downloads iCloud-only
+  originals). Any asset that comes out incomplete gets one more try through
+  Photos.app's own AppleScript `export … with using originals`, which fetches
+  what PhotoKit reports missing (the original video of an edited Live Photo).
+  Half an asset is never delivered: whatever is still incomplete is dropped
+  from the batch and retried next run. Batches are rsynced to n5, checked
+  file by file, then published to `staging/photos/ready/`, where
+  `deploy/n5/photos-ingest.sh` dedups them against the library before
+  promote. Design and history: `todo/PHOTOS-BRIDGE-REVIEW.md`.
 
 ## Known gaps
 

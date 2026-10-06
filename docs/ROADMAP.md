@@ -80,19 +80,17 @@ Plan: [TESLA-PLAN.md](TESLA-PLAN.md) (design only, not built). One mosaic
 video per event with baked-in GPS/date, SEI telemetry → GPX, grouped-confirm
 retention for EncryptedClips / RecentClips / raw Sentry.
 
-### Apple Photos People Apply
+### Apple Photos Bridge
 
-Spec: [raw/PLAN.md](../raw/PLAN.md) — external-library matching.
-`snapshot` + `find-duplicates` shipped; `find-similar` deferred (see below);
-`apple-people --apply` pending a good match rate from a fresh snapshot.
+Done 2026-10-04: the 4,634-asset backlog is in Immich via `photos diff` →
+`photos pull` → n5 `photos-ingest.sh`. `apple-people --apply` and favorites
+are applied. `photos pull` now completes iCloud-only originals through
+Photos.app on its own. Plan: `todo/PHOTOS-BRIDGE-REVIEW.md`.
 
-The dry-run importer exists. The apply path should wait until a fresh snapshot
-shows a good match rate.
-
-Work:
-- create Immich people through the API
-- attach only high-confidence face matches
-- emit an audit report before writing rows
+Next:
+- run `~/.immy/photos-overnight.sh` periodically for new shots (Phase 5/6)
+- grant the Mac's Automation permission (Terminal → Photos) once, so the
+  Photos.app fallback can run unattended
 
 ### CLIP Near-Duplicate Search
 

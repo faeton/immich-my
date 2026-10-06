@@ -70,7 +70,7 @@ One container module per source. Each owns its mount lifecycle.
 | NAS / remote Mac | `mount_smbfs`, NFS, `sshfs` | `autofs` or systemd `.automount` so scanner doesn't hang offline |
 | Cloud (Drive, S3, Dropbox) | `rclone mount --vfs-cache-mode full` | Cache capped on tier-0 |
 | iPhone / iCloud | `icloudpd` | Scheduled sync, not a live mount |
-| Apple Photos | `osxphotos export --update` | Preserves people, keywords, edits |
+| Apple Photos | `immy photos diff` + `photos pull` (osxphotos, Photos.app AppleScript fallback) | Originals only, batches → n5 dedup; people/favorites applied after |
 | Offline drives | catalog-only | Ghost assets |
 
 Adapter responsibilities:
