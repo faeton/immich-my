@@ -46,7 +46,7 @@ import os
 import re
 from collections import Counter
 from dataclasses import dataclass, field
-from datetime import date
+from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
 
@@ -126,6 +126,10 @@ class Regions:
     def label(self, code: str) -> str | None:
         """Region label for naming, None for a country that is its own region."""
         return self._label.get(self._aliases.get(code, code))
+
+    def fold(self, code: str) -> str:
+        """The country a territory counts as (Gibraltar → Spain)."""
+        return self._aliases.get(code, code)
 
 
 # --- inputs ----------------------------------------------------------------
@@ -360,6 +364,56 @@ class Trip:
     def key(self) -> str:
         return stable_key(self.region, self.start)
 
+    def legs(self) -> list["Leg"]:
+        """The itinerary: one leg per stretch in one country, in order.
+
+        A leg runs from its first geotagged day to the day before the next
+        leg starts, so the photo-less days between (flights, drone-only days)
+        belong somewhere and every date in the trip is in exactly one leg. A
+        one-day blip inside a country (a day trip over a border and back)
+        doesn't break that country's leg. Territories count as their country.
+        """
+        fold = self._regions.fold if self._regions else (lambda c: c)
+        runs: list[list[Day]] = []
+        for d in self.days:
+            if runs and fold(runs[-1][-1].code) == fold(d.code):
+                runs[-1].append(d)
+            else:
+                runs.append([d])
+        # Fold a one-day run sandwiched by the same country back into it.
+        i = 1
+        while i < len(runs) - 1:
+            prev, cur, nxt = runs[i - 1], runs[i], runs[i + 1]
+            if len(cur) == 1 and fold(prev[0].code) == fold(nxt[0].code):
+                runs[i - 1] = prev + cur + nxt
+                del runs[i:i + 2]
+            else:
+                i += 1
+        legs: list[Leg] = []
+        for j, run in enumerate(runs):
+            end = runs[j + 1][0].day - timedelta(days=1) if j + 1 < len(runs) else self.end
+            code = fold(run[0].code)
+            name = next((d.country for d in run if d.code == code), run[0].country)
+            legs.append(Leg(code=code, country=short_country(code, name),
+                            start=run[0].day, end=end))
+        return legs
+
+
+@dataclass(frozen=True)
+class Leg:
+    code: str
+    country: str
+    start: date
+    end: date
+
+    def label(self) -> str:
+        return f"{self.country} · {format_range(self.start, self.end)}"
+
+    def short_label(self) -> str:
+        """`Tonga · 2–7 Oct`: the year is already on the trip."""
+        return f"{self.country} · {format_range(self.start, self.end).rsplit(' ', 1)[0]}" \
+            if self.start.year == self.end.year else self.label()
+
 
 def _home_between(a: date, b: date, home_days: list[date]) -> bool:
     """Any home day strictly between `a` and `b` (sorted list)."""
@@ -451,6 +505,20 @@ def assign_assets(trips: list[Trip], assets: list[tuple[str, date]]) -> None:
             ordered[i].asset_ids.append(asset_id)
 
 
+def assets_by_leg(trip: Trip, assets: dict[str, date]) -> list[tuple["Leg", list[str]]]:
+    """Split a trip's assets across its legs by date."""
+    legs = trip.legs()
+    out: list[tuple[Leg, list[str]]] = [(leg, []) for leg in legs]
+    starts = [leg.start for leg in legs]
+    for aid in trip.asset_ids:
+        day = assets.get(aid)
+        if day is None:
+            continue
+        i = max(bisect.bisect_right(starts, day) - 1, 0)
+        out[i][1].append(aid)
+    return out
+
+
 def keep(trip: Trip, *, min_assets: int = DEFAULT_MIN_ASSETS) -> bool:
     return len(trip.asset_ids) >= min_assets
 
@@ -504,17 +572,47 @@ def extract_key(description: str | None) -> str | None:
 
 
 def description_for(trip: Trip) -> str:
-    countries = ", ".join(n for _, n in trip.countries())
-    return (
-        f"{format_range(trip.start, trip.end)} · {trip.span_days} days · {countries}\n"
-        f"{marker_line(trip.key())}"
-    )
+    """Dates, then the itinerary one leg per line when there is more than
+    one country, then the marker:
+
+        2 Oct – 11 Dec 2025 · 71 days · 6 countries
+        Tonga · 2–7 Oct
+        Fiji · 8–9 Oct
+        …
+        immy-trip:3f9c1a2b7d40
+    """
+    legs = trip.legs()
+    head = f"{format_range(trip.start, trip.end)} · {trip.span_days} days"
+    countries = {leg.code for leg in legs}
+    if len(legs) == 1:
+        return f"{head} · {legs[0].country}\n{marker_line(trip.key())}"
+    lines = [f"{head} · {len(countries)} countries"]
+    lines += [leg.short_label() for leg in legs]
+    lines.append(marker_line(trip.key()))
+    return "\n".join(lines)
+
+
+def _tag_segment(text: str) -> str:
+    # `/` is Immich's tag hierarchy separator.
+    return text.replace("/", "-")
 
 
 def tag_for(trip: Trip, root: str = DEFAULT_TAG_ROOT) -> str:
     """Hierarchical tag `Trips/2025/<album name>`: albums can't nest in
     Immich, tags can, so the year → trip tree lives here."""
-    return f"{root}/{trip.start.year}/{trip.name()}"
+    return f"{root}/{trip.start.year}/{_tag_segment(trip.name())}"
+
+
+def leg_tags(trip: Trip, root: str = DEFAULT_TAG_ROOT) -> list[tuple["Leg", str]]:
+    """`Trips/2025/<album name>/Tonga · 2–7 Oct 2025` per leg, or just the
+    trip tag for a one-country trip. Immich resolves a parent tag through
+    its closure table, so tagging only the most specific level still lists
+    every leg's assets under the trip."""
+    legs = trip.legs()
+    base = tag_for(trip, root)
+    if len(legs) == 1:
+        return [(legs[0], base)]
+    return [(leg, f"{base}/{_tag_segment(leg.label())}") for leg in legs]
 
 
 # --- ledger ----------------------------------------------------------------
@@ -560,5 +658,7 @@ __all__ = [
     "Regions", "PlaceCount", "Day", "HomeStay", "Trip",
     "country_code", "build_days", "segment", "assign_assets", "keep",
     "name_for_trip", "format_range", "stable_key", "marker_line", "extract_key",
+    "Leg", "assets_by_leg", "leg_tags",
+    "Leg", "assets_by_leg", "leg_tags",
     "description_for", "tag_for", "load_ledger", "save_ledger", "ledger_match",
 ]

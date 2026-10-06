@@ -19,6 +19,10 @@ continuously, so entries are dated rather than versioned.
   can); `--prune` drops only links immy added. Idempotent via an `immy-trip:`
   description marker, plus a ledger that follows a trip whose first day moves.
   See `docs/TRIPS.md`.
+- **Legs.** A multi-country trip's album description lists its itinerary, one
+  country per line with dates. `--tags` nests each leg under its trip
+  (`Trips/<year>/<trip>/<country · dates>`), tagging only the most specific
+  level. Immich's tag closure lists the rest under each parent.
 - **Sign-flipped GPS is dropped before voting.** Both `(-lat, -lon)` and
   `(lat, -lon)` ghosts exist in real libraries. Without the filter, an
   Antarctic cruise came out as "Russia · Ovgort" and a Chicago stopover as
@@ -26,8 +30,8 @@ continuously, so entries are dated rather than versioned.
 
 ### Findings
 
-- First dry run over the whole library: 4,577 geotagged days → 394 trips, 354
-  with ≥ 20 assets (2009–2026).
+- First dry run over the whole library (2009–2026): 4,577 geotagged days → 393
+  trips, 354 with ≥ 20 assets, 69 of them spanning several countries.
 
 ## 2026-10-04 — Photos backlog (4,634 assets) live in Immich
 

@@ -104,15 +104,28 @@ order:
 ```
 
 A country that was only a one-day stopover stays out of the name. It is still
-in the description:
+in the description, which also carries the itinerary for a multi-country trip,
+one **leg** per line:
 
 ```
-2 Oct – 11 Dec 2025 · 71 days · New Zealand, Australia, Vanuatu, …
+2 Oct – 11 Dec 2025 · 71 days · 6 countries
+Tonga · 2–7 Oct
+Fiji · 8–9 Oct
+Vanuatu · 10–20 Oct
+French Polynesia · 21–31 Oct
+New Zealand · 1–21 Nov
+Australia · 22 Nov – 11 Dec
 immy-trip:3f9c1a2b7d40
 ```
 
-The marker line is the album's identity. Rename the album or write above the
-marker freely: `--apply` only adds assets and keeps your text. When a late
+A leg is a stretch in one country. It runs from its first geotagged day to the
+day before the next leg starts, so every date in the trip, photo-less ones
+included, is in exactly one leg. A one-day hop over a border and back doesn't
+split a leg, and territories count as their country.
+
+The marker line is the album's identity. Rename the album or edit the
+description freely: the itinerary is written when the album is created, and
+later runs only add assets and keep your text. When a late
 import moves a trip's first day, its key changes. The ledger
 (`trips-ledger.json` under `state_root`) records each trip's region and date
 range, so the trip is matched back to its album by overlap instead of
@@ -120,9 +133,25 @@ duplicated.
 
 ## Nesting
 
-Immich albums are flat. Tags nest. `--tags` gives every trip's assets
-`Trips/<year>/<album name>`, so the Tags page browses year → trip. Tags are also
-the only channel that reaches video assets' metadata (see `TELEMETRY.md`).
+Immich albums are flat. Tags nest. `--tags` builds the tree:
+
+```
+Trips/
+  2025/
+    2025-02 Southeast Asia · Vietnam, Cambodia, Thailand/
+      Vietnam · 23 Feb – 2 Mar 2025
+      Cambodia · 3–5 Mar 2025
+      …
+    2025-10 Oceania · New Zealand, Australia, Vanuatu +3/
+      Tonga · 2–7 Oct 2025
+      …
+    2025-06 Norway, Svalbard
+```
+
+Each asset gets only the most specific tag: its leg, or the trip for a
+one-country trip. Immich resolves a parent tag through its closure table, so
+opening a trip or year tag still lists everything below it. Tags are also the
+only channel that reaches video assets' metadata (see `TELEMETRY.md`).
 
 ## Undo
 

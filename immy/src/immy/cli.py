@@ -2681,6 +2681,7 @@ def trips(
         transit_days=transit_days,
     )
     trips_mod.assign_assets(found, assets)
+    asset_day = dict(assets)
     kept = [t for t in found if trips_mod.keep(t, min_assets=min_assets)]
     small = len(found) - len(kept)
     if since_d:
@@ -2707,6 +2708,10 @@ def trips(
             t.name(), trips_mod.format_range(t.start, t.end), str(t.span_days),
             str(len(t.asset_ids)), ", ".join(n for _, n in t.countries()),
         )
+        legs = t.legs()
+        if len(legs) > 1:
+            for leg in legs:
+                table.add_row(f"[dim]  {leg.short_label()}[/dim]", "", "", "", "")
     console.print(table)
     by_year: dict[int, int] = {}
     for t in kept:
@@ -2717,12 +2722,14 @@ def trips(
         with open(csv_path, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["key", "album", "start", "end", "days", "geotagged_days",
-                        "assets", "region", "countries", "tag"])
+                        "assets", "region", "countries", "legs", "tag"])
             for t in kept:
                 w.writerow([
                     t.key(), t.name(), t.start.isoformat(), t.end.isoformat(),
                     t.span_days, len(t.days), len(t.asset_ids), t.region_label or "",
-                    "; ".join(n for _, n in t.countries()), trips_mod.tag_for(t, tag_root),
+                    "; ".join(n for _, n in t.countries()),
+                    "; ".join(leg.short_label() for leg in t.legs()),
+                    trips_mod.tag_for(t, tag_root),
                 ])
         console.print(f"wrote {csv_path}")
 
@@ -2806,12 +2813,17 @@ def trips(
         trips_mod.save_ledger(ledger_path, ledger)
 
         if tags:
-            name = trips_mod.tag_for(t, tag_root)
-            tag_id = client.upsert_tags([name]).get(name)
-            if tag_id:
-                client.tag_assets(tag_id, ids)
-            else:
-                console.print(f"  [red]tag upsert failed[/red] {name}")
+            # Most specific level only (the leg); Immich lists a parent
+            # tag's assets through its closure table.
+            pairs = trips_mod.leg_tags(t, tag_root)
+            tag_ids = client.upsert_tags([name for _, name in pairs])
+            split = dict(trips_mod.assets_by_leg(t, asset_day))
+            for leg, name in pairs:
+                tag_id = tag_ids.get(name)
+                if tag_id:
+                    client.tag_assets(tag_id, split.get(leg, []))
+                else:
+                    console.print(f"  [red]tag upsert failed[/red] {name}")
 
     console.print(
         f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "

@@ -417,3 +417,75 @@ def test_cli_requires_owner_with_several_users(monkeypatch, tmp_path) -> None:
     res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg)])
     assert res.exit_code == 2
     assert "--owner" in res.output
+
+
+# --- legs ------------------------------------------------------------------------
+
+TONGA = (-21.14, -175.2, "Tonga", "Nukuʻalofa")
+GIBRALTAR = (36.14, -5.35, "Gibraltar", "Gibraltar")
+
+
+def _pacific() -> T.Trip:
+    # Tonga 0–2, (photo-less 3), Fiji 4, Vanuatu 5–6, NZ 7–8, Vanuatu 9 (blip), NZ 10.
+    spec = [(0, TONGA), (1, TONGA), (2, TONGA), (4, NADI), (5, VILA), (6, VILA),
+            (7, AUCKLAND), (8, AUCKLAND), (9, VILA), (10, AUCKLAND)]
+    trips = run(spec)
+    assert len(trips) == 1
+    return trips[0]
+
+
+def test_legs_cover_every_day_in_order() -> None:
+    legs = _pacific().legs()
+    assert [(l.country, l.start.day, l.end.day) for l in legs] == [
+        ("Tonga", 1, 4),        # the photo-less day 3 stays with Tonga
+        ("Fiji", 5, 5),
+        ("Vanuatu", 6, 7),
+        ("New Zealand", 8, 11),  # the one-day Vanuatu blip doesn't split it
+    ]
+
+
+def test_territory_counts_as_its_country_in_legs() -> None:
+    t = run([(0, MADRID), (1, GIBRALTAR), (2, MADRID), (3, GIBRALTAR), (4, GIBRALTAR)])[0]
+    assert [(l.code, l.country) for l in t.legs()] == [("ES", "Spain")]
+
+
+def test_description_lists_the_itinerary() -> None:
+    t = _pacific()
+    lines = T.description_for(t).splitlines()
+    assert lines[0] == "1–11 Mar 2025 · 11 days · 4 countries"
+    assert lines[1:5] == ["Tonga · 1–4 Mar", "Fiji · 5 Mar", "Vanuatu · 6–7 Mar",
+                          "New Zealand · 8–11 Mar"]
+    assert T.extract_key("\n".join(lines)) == t.key()
+
+
+def test_one_country_description_has_no_itinerary() -> None:
+    lines = T.description_for(run([(0, PARIS), (1, PARIS)])[0]).splitlines()
+    assert lines[0] == "1–2 Mar 2025 · 2 days · France"
+    assert len(lines) == 2
+
+
+def test_leg_tags_nest_under_the_trip_and_split_assets_by_date() -> None:
+    t = _pacific()
+    T.assign_assets([t], [(f"d{i}", D0 + timedelta(days=i)) for i in range(11)])
+    pairs = T.leg_tags(t)
+    base = "Trips/2025/2025-03 Oceania · Tonga, Vanuatu, New Zealand +1"
+    assert T.tag_for(t) == base
+    assert [name for _, name in pairs] == [
+        f"{base}/Tonga · 1–4 Mar 2025", f"{base}/Fiji · 5 Mar 2025",
+        f"{base}/Vanuatu · 6–7 Mar 2025", f"{base}/New Zealand · 8–11 Mar 2025",
+    ]
+    split = T.assets_by_leg(t, {f"d{i}": D0 + timedelta(days=i) for i in range(11)})
+    assert [ids for _, ids in split] == [
+        ["d0", "d1", "d2", "d3"], ["d4"], ["d5", "d6"], ["d7", "d8", "d9", "d10"],
+    ]
+
+
+def test_single_country_trip_tags_at_trip_level() -> None:
+    t = run([(0, PARIS), (1, PARIS)])[0]
+    assert [name for _, name in T.leg_tags(t)] == ["Trips/2025/2025-03 France · Paris"]
+
+
+def test_tag_segments_never_contain_a_slash() -> None:
+    odd = (48.86, 2.35, "France", "A/B")
+    t = run([(0, odd), (1, odd)])[0]
+    assert T.tag_for(t) == "Trips/2025/2025-03 France · A-B"
