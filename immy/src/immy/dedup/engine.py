@@ -184,11 +184,14 @@ def _google_json_companion(path: Path) -> dict | None:
         t_stem, t_ext = title.stem, title.suffix.lower()
         if t_stem.lower() != stem.lower():
             continue
+        is_video = ext.lstrip(".") in VIDEO_EXTS
         if t_ext == ext:
             same.append(data)
-        elif t_ext in _STILL_EXTS and ext.lstrip(".") in VIDEO_EXTS:
+        elif t_ext in _STILL_EXTS and is_video:
             still.append(data)
-        else:
+        elif (t_ext.lstrip(".") in VIDEO_EXTS) == is_video:
+            # Same kind under another extension (`.jpeg` for `.jpg`, a MOV
+            # Takeout re-wrapped as MP4); a still never takes a video's JSON.
             other.append(data)
     for group in (same, still):
         if len(group) == 1:

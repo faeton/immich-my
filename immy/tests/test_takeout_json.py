@@ -81,3 +81,10 @@ def test_ambiguous_match_returns_nothing(tmp_path: Path) -> None:
     _json(tmp_path, "IMG_3.HEIC.supplemental-metadata(1).json", "IMG_3.HEIC", 1)
     _json(tmp_path, "IMG_3.JPG.supplemental-metadata(1).json", "IMG_3.JPG", 2)
     assert _ts(tmp_path, "IMG_3(1).MP4") is None
+
+
+def test_same_kind_other_extension_is_a_last_resort(tmp_path: Path) -> None:
+    _json(tmp_path, "IMG_4.jpeg.supplemental-metadata(1).json", "IMG_4.jpeg", 4)
+    assert _ts(tmp_path, "IMG_4(1).jpg") == 4
+    _json(tmp_path, "IMG_6.mp4.supplemental-metadata(1).json", "IMG_6.mp4", 6)
+    assert _ts(tmp_path, "IMG_6(1).HEIC") is None

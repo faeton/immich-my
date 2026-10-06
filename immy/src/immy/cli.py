@@ -4514,6 +4514,301 @@ def pano_server(
 app.add_typer(triage_app, name="triage")
 
 
+takeout_app = typer.Typer(
+    help="Repairs for Google Takeout imports.",
+    no_args_is_help=True,
+)
+
+
+@takeout_app.command("redate")
+def takeout_redate(
+    manifest_path: Path = typer.Option(..., "--manifest", help="The dedup manifest.sqlite the Takeout import went through."),
+    takeout_root: Path = typer.Option(
+        ..., "--takeout-root",
+        help="Where the Takeout tree (its *.json companions are enough) lives now; "
+             "stands in for --staging-prefix in the manifest's paths.",
+    ),
+    staging_prefix: str = typer.Option(
+        "/staging/google-takeout", "--staging-prefix",
+        help="The manifest's path prefix for the Takeout tree.",
+    ),
+    originals: Path = typer.Option(
+        None, "--originals",
+        help="The library's import path as seen from here, where sidecars are "
+             "written (default: config originals_root).",
+    ),
+    placeholders: bool = typer.Option(
+        True, "--placeholders/--no-placeholders",
+        help="Re-date assets stamped with a placeholder (on-the-hour time shared by many assets).",
+    ),
+    utc: bool = typer.Option(
+        True, "--utc/--no-utc",
+        help="Re-zone Takeout assets Immich shows in UTC (right instant, wrong clock).",
+    ),
+    placeholder_min: int = typer.Option(
+        None, "--placeholder-min",
+        help="How many assets must share an on-the-hour time for it to count as a "
+             "placeholder (default: trips.placeholder_min, else 10). Lower it to "
+             "reach the stragglers; a source must still sit in that year's folder.",
+    ),
+    stack_copies: bool = typer.Option(
+        True, "--stack-copies/--no-stack-copies",
+        help="Stack each re-dated Takeout copy onto the library original it duplicates.",
+    ),
+    owner: str = typer.Option(None, "--owner", help="Immich user email (required with several users)."),
+    only: list[str] = typer.Option(None, "--asset", help="Limit to these Immich asset ids (repeatable): a pilot run."),
+    csv_path: Path = typer.Option(None, "--csv", help="Write the per-asset plan here."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Default: plan only."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config (default: ~/.immy/config.yml)."),
+) -> None:
+    """Fix capture dates of Takeout files from their JSON companions.
+
+    Finds each asset's Takeout source through the dedup manifest, reads the
+    JSON's `photoTakenTime`, puts it on the local clock (file GPS → JSON
+    geoData → nearby shots → UTC) and, with `--apply`, writes it to the XMP
+    sidecar, registers the sidecar on the asset and has Immich refresh its
+    metadata. A file with no JSON is dated from its numbered neighbours.
+    Originals are never touched; every change is logged for undo.
+    """
+    import csv
+    import json
+    import sqlite3
+    from collections import Counter
+    from datetime import datetime as _dt, timedelta as _td
+
+    from . import sidecar as sidecar_mod
+    from . import takeout_redate as tr
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red]")
+        raise typer.Exit(code=2)
+    if not dry_run and config.immich is None:
+        console.print("[red]no immich: block in immy config[/red] — --apply needs the API.")
+        raise typer.Exit(code=2)
+    originals = originals or config.originals_root
+    if not dry_run and originals is None:
+        console.print("[red]--originals (or originals_root) is needed to write sidecars[/red]")
+        raise typer.Exit(code=2)
+    if not manifest_path.is_file():
+        console.print(f"[red]no manifest at {manifest_path}[/red]")
+        raise typer.Exit(code=2)
+
+    mconn = sqlite3.connect(f"file:{manifest_path}?mode=ro", uri=True)
+    has_fix = mconn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='date_fix'").fetchone()
+    rows = mconn.execute(
+        "SELECT a.id, a.path, a.taken_at, "
+        + ("df.old_taken_at " if has_fix else "NULL ")
+        + "FROM asset a "
+        + ("LEFT JOIN date_fix df ON df.asset_id = a.id " if has_fix else "")
+        + "WHERE a.source = 'google' AND a.status = 'promoted'"
+    ).fetchall()
+    mconn.close()
+    index = tr.manifest_index(rows)
+
+    conn = pg_mod.connect(config.pg)
+    cur = conn.cursor()
+    cur.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL')
+    users = cur.fetchall()
+    match = [u for u in users if not owner or u[1] == owner]
+    if len(match) != 1:
+        console.print("[red]pass --owner <email>[/red]" if match else f"[red]no Immich user {owner!r}[/red]")
+        raise typer.Exit(code=2)
+    owner_id = str(match[0][0])
+    cur.execute('SELECT "importPaths" FROM library WHERE "deletedAt" IS NULL')
+    import_paths = sorted({p for (paths,) in cur.fetchall() for p in (paths or [])}, key=len, reverse=True)
+
+    def rel_of(path: str) -> str | None:
+        for ip in import_paths:
+            if path.startswith(ip.rstrip("/") + "/"):
+                return path[len(ip.rstrip("/")) + 1:]
+        return None
+
+    select = """
+        SELECT a.id, a."originalPath", a."localDateTime" AT TIME ZONE 'UTC',
+               e.latitude, e.longitude, %(reason)s
+        FROM asset a JOIN asset_exif e ON e."assetId" = a.id
+        WHERE a."deletedAt" IS NULL AND a."ownerId" = %(owner)s
+    """
+    found: dict[str, tuple] = {}
+    if placeholders:
+        cur.execute(
+            "WITH " + trips_mod._PLACEHOLDER_CTE.strip() + select
+            + ' AND a."localDateTime" IN (SELECT t FROM placeholder)',
+            {"owner": owner_id, "reason": "placeholder",
+             "placeholder_min": placeholder_min or (config.trips and config.trips.placeholder_min)
+             or trips_mod.DEFAULT_PLACEHOLDER_MIN},
+        )
+        found.update({str(r[0]): r for r in cur.fetchall()})
+    if utc:
+        cur.execute(select + """ AND e."timeZone" IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00')""",
+                    {"owner": owner_id, "reason": "utc"})
+        for r in cur.fetchall():
+            found.setdefault(str(r[0]), r)
+    targets = []
+    for aid, path, local, lat, lon, reason in found.values():
+        aid = str(aid)
+        if only and aid not in only:
+            continue
+        rel = rel_of(path)
+        if rel is None or (reason == "utc" and rel not in index):
+            continue  # a UTC asset that isn't a Takeout import is not ours
+        targets.append(tr.Target(aid, rel, local, lat, lon, reason))
+
+    def neighbour_zone(instant, asset_id):
+        # The zone most shots within 3 h carry; failing that, within a day.
+        for hours in (3, 24):
+            cur.execute("""
+                SELECT e."timeZone", count(*) FROM asset a
+                JOIN asset_exif e ON e."assetId" = a.id
+                WHERE a."deletedAt" IS NULL AND a."ownerId" = %(owner)s AND a.id <> %(id)s
+                  AND a."fileCreatedAt" BETWEEN %(t)s - make_interval(hours => %(h)s)
+                                            AND %(t)s + make_interval(hours => %(h)s)
+                  AND e."timeZone" IS NOT NULL
+                  AND e."timeZone" NOT IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00')
+                GROUP BY 1 ORDER BY 2 DESC LIMIT 1
+            """, {"owner": owner_id, "id": asset_id, "t": instant, "h": hours})
+            row = cur.fetchone()
+            if row:
+                return row[0]
+        return None
+
+    fixes = tr.plan(targets, index, takeout_root=takeout_root,
+                    staging_prefix=staging_prefix, neighbour_zone=neighbour_zone,
+                    library_root=originals)
+    good = [f for f in fixes if f.problem is None]
+
+    # Twins: a library original this Takeout copy duplicates. Placeholder
+    # assets are never twins: their own date is the fake one.
+    fake = {t.asset_id for t in targets if t.reason == "placeholder"}
+    twins: dict[str, tuple[str, str | None]] = {}
+    if stack_copies:
+        for f in good:
+            if f.target.reason != "placeholder":
+                continue
+            name = Path(f.target.rel).name
+            orig = tr.original_name(name)
+            if orig == name:
+                continue
+            cur.execute("""
+                SELECT a.id, a."fileCreatedAt", a."stackId", s2.embedding <=> s1.embedding
+                FROM asset a
+                LEFT JOIN smart_search s2 ON s2."assetId" = a.id
+                LEFT JOIN smart_search s1 ON s1."assetId" = %(copy)s
+                WHERE a."deletedAt" IS NULL AND a."ownerId" = %(owner)s
+                  AND a."originalFileName" = %(orig)s AND a.id <> %(copy)s
+            """, {"copy": f.target.asset_id, "owner": owner_id, "orig": orig})
+            cands = [tr.Candidate(str(r[0]), r[1], str(r[2]) if r[2] else None,
+                                  float(r[3]) if r[3] is not None else None)
+                     for r in cur.fetchall() if str(r[0]) not in fake]
+            twin = tr.pick_twin(f.taken.instant, cands)
+            if twin:
+                twins[f.target.asset_id] = (twin.asset_id, twin.stack_id)
+
+    # --- report ---
+    by = Counter()
+    for f in fixes:
+        if f.problem:
+            by[("problem", f.problem)] += 1
+        else:
+            by[(f.target.reason, f.taken.source, f.zone_source)] += 1
+    console.print(
+        f"[bold]takeout redate[/bold] — {len(targets)} asset(s): "
+        f"{sum(1 for t in targets if t.reason == 'placeholder')} placeholder, "
+        f"{sum(1 for t in targets if t.reason == 'utc')} UTC → {len(good)} fixable"
+        + (f", {len(twins)} copies to stack" if stack_copies else "")
+    )
+    for k, n in sorted(by.items(), key=lambda kv: -kv[1]):
+        console.print(f"  {n:5}  {' · '.join(k)}")
+    if csv_path:
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["asset_id", "path", "reason", "old_local", "new_local", "zone",
+                        "zone_source", "date_source", "staging", "twin", "problem"])
+            for f in fixes:
+                w.writerow([
+                    f.target.asset_id, f.target.rel, f.target.reason,
+                    f.target.local_date.isoformat(sep=" "),
+                    f.local.isoformat(sep=" ") if f.local else "",
+                    tr.zone_label(f.zone) if f.zone else ("UTC" if f.taken else ""),
+                    f.zone_source, f.taken.source if f.taken else "", f.staging or "",
+                    (twins.get(f.target.asset_id) or ("",))[0], f.problem or "",
+                ])
+        console.print(f"wrote {csv_path}")
+    if dry_run or not good:
+        if dry_run:
+            console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to write {len(good)} sidecar(s).")
+        conn.close()
+        return
+
+    # --- apply ---
+    state = config.state_root or Path.home() / ".immy"
+    state.mkdir(parents=True, exist_ok=True)
+    log_path = state / f"takeout-redate-{_dt.now().strftime('%Y%m%dT%H%M%S')}.jsonl"
+    cur.execute(
+        """SELECT "assetId", path FROM asset_file WHERE type = 'sidecar' AND "assetId" = ANY(%s)""",
+        ([f.target.asset_id for f in good],),
+    )
+    registered = {str(a): p for a, p in cur.fetchall()}
+    written: list[str] = []
+    with open(log_path, "w") as log:
+        for f in good:
+            aid = f.target.asset_id
+            immich_original = next(
+                ip.rstrip("/") + "/" + f.target.rel for ip in import_paths
+            )
+            immich_sidecar = registered.get(aid) or immich_original + ".xmp"
+            local_sidecar = originals / rel_of(immich_sidecar)
+            before = local_sidecar.read_text() if local_sidecar.is_file() else None
+            try:
+                sidecar_mod.write(originals / f.target.rel, {"DateTimeOriginal": f.xmp},
+                                  xmp_path=local_sidecar)
+            except RuntimeError as e:
+                console.print(f"  [red]sidecar failed[/red] {f.target.rel}: {e}")
+                continue
+            cur.execute("""
+                INSERT INTO asset_file ("assetId", type, path) VALUES (%s, 'sidecar', %s)
+                ON CONFLICT ("assetId", type, "isEdited")
+                DO UPDATE SET path = EXCLUDED.path
+            """, (aid, immich_sidecar))
+            conn.commit()
+            log.write(json.dumps({
+                "asset_id": aid, "sidecar": str(local_sidecar), "sidecar_before": before,
+                "registered_before": registered.get(aid), "registered_now": immich_sidecar,
+                "old_local": f.target.local_date.isoformat(), "new": f.xmp,
+            }) + "\n")
+            written.append(aid)
+    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key,
+                          ssh_host=config.immich.ssh_host)
+    client.refresh_metadata(written)
+    console.print(f"[green]✓[/green] {len(written)} sidecar(s) written and registered, "
+                  f"metadata refresh queued. Undo log: {log_path}")
+
+    stacked = 0
+    for copy_id, (twin_id, stack_id) in twins.items():
+        if copy_id not in written:
+            continue
+        ids = [twin_id, copy_id]
+        if stack_id:
+            cur.execute('SELECT "primaryAssetId" FROM stack WHERE id = %s', (stack_id,))
+            primary = str(cur.fetchone()[0])
+            cur.execute('SELECT id FROM asset WHERE "stackId" = %s AND "deletedAt" IS NULL', (stack_id,))
+            members = [str(r[0]) for r in cur.fetchall()]
+            ids = [primary] + [m for m in members if m != primary] + [copy_id]
+        try:
+            if client.create_stack(ids[0], ids[1:]):
+                stacked += 1
+        except ImmichError as e:
+            console.print(f"  [red]stack failed[/red] {copy_id}: {e}")
+    if twins:
+        console.print(f"[green]✓[/green] {stacked} cop(ies) stacked under their originals")
+    conn.close()
+
+
+app.add_typer(takeout_app, name="takeout")
+
+
 photos_app = typer.Typer(
     help="Apple Photos.app → Immich bridge. Uses the Mac's own Photos/iCloud "
     "session, so n5 never logs into iCloud.",

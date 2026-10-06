@@ -4,6 +4,51 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-06 — Takeout dates repaired; `immy takeout redate`
+
+### Fixed
+
+- **Takeout JSON lookup missed every duplicate.** Takeout names the JSON for
+  `IMG_1(1).MP4` as `IMG_1.HEIC.supplemental-metadata(1).json`: the counter
+  moves to the end, and a Live Photo's video shares its still's JSON.
+  `_google_json_companion` matched by filename prefix, so it found neither.
+  Those files came in dateless and the date rescue's folder-year fallback
+  stamped them 1 January, 12:00. It now matches the JSON's own `title` and
+  trailing counter: same extension first, then the still for a video, then
+  the same kind under another extension. `-edited` copies use the original's
+  JSON, and an ambiguous match gives no date rather than a guess.
+- **Takeout dates on a UTC clock.** The rescued `photoTakenTime` is now
+  written in the zone at the photo's position, falling back to `+00:00` only
+  without one.
+
+### Added
+
+- **`immy takeout redate`.** For placeholder-dated and UTC-clock Takeout
+  assets:
+  - finds the source through the dedup manifest (promote paths are
+    deterministic, so no name guessing);
+  - dates from the JSON, else the file's own embedded instant, else numbered
+    neighbours;
+  - zones from file GPS → JSON geo → nearby shots;
+  - writes the XMP sidecar, registers it on the asset and refreshes metadata.
+  
+  `--stack-copies` stacks each Takeout copy onto its library original. Dry
+  run, `--csv`, `--asset` pilot, undo log. See `docs/TAKEOUT.md`.
+
+### Ops (n5)
+
+- All **565** placeholder-dated assets re-dated, verified in Immich (instant,
+  local clock and zone all match the plan). 552 had 10+ siblings; the 13
+  stragglers came from years with fewer. Sources: 563 from Takeout JSONs, 2
+  from their own QuickTime time. The 2 JSON-less files would have been 2.5 h
+  off by neighbour interpolation. **81** Takeout copies stacked under their
+  originals. Example: `IMG_1711(1).MP4`, stamped 1 Jan 2019, is really
+  14 Nov 2019 19:43 in Chicago.
+- The **UTC group is bigger than first counted.** 4,908 Takeout assets carry
+  timeZone UTC. 4,335 show exactly Google's instant on a UTC clock and can be
+  re-zoned. 437 carry their own date that disagrees with Google's (GoPro
+  clocks, screen recordings) and are left alone. Not applied yet.
+
 ## 2026-10-04 — `immy trips`: dated travel albums
 
 ### Added

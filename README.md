@@ -28,6 +28,7 @@ The main operational interface is `immy`:
 - `process` computes derivatives, CLIP, and faces, then inserts directly into Immich Postgres
 - `promote` uploads a curated trip into the external library and syncs the album
 - `cluster` groups geo-dated assets into events and auto-creates Immich albums
+- `takeout redate` repairs Google Takeout capture dates (placeholder or UTC-clock) from the JSON companions, via XMP sidecars, and stacks Takeout copies under their originals; see `docs/TAKEOUT.md`
 - `trips` finds trips in the library's day-by-day geography (homes, regions, stopovers, flipped-GPS repair) and keeps one dated album per trip, plus optional `Trips/<year>/…` tags for nesting; see `docs/TRIPS.md`
 - `srt` harvests DJI `.SRT` telemetry → GPX/JSON tracks, durable GPS, reverse-geocode
 - `tags sync` pushes a trip's notes tags (gear/camera, event, source) to Immich's native Tag API — the only channel that reaches video assets, which never read XMP
