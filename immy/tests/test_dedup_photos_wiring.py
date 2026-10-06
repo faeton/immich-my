@@ -108,6 +108,29 @@ def test_takeout_photo_taken_time_is_utc(tmp_path, monkeypatch):
     assert fields["taken_at"] == "2024-06-24T10:00:00"
 
 
+def test_takeout_utc_goes_local_when_the_place_is_known(tmp_path, monkeypatch):
+    """With a position, the UTC instant is written in that place's zone, so
+    Immich shows the photo's own clock (and its local calendar day)."""
+    seen = {}
+    monkeypatch.setattr(engine.sidecar, "write", lambda dest, patch: seen.update(patch))
+    dest = tmp_path / "IMG_1711(1).MP4"
+    # 2019-11-15T01:43:25Z in Chicago is the evening of the 14th, CST.
+    assert engine._rescue_sidecar(dest, "2019-11-15T01:43:25", 41.88, -87.63,
+                                  taken_is_utc=True)
+    assert seen["DateTimeOriginal"] == "2019:11:14 19:43:25-06:00"
+
+
+def test_xmp_datetime_offsets():
+    from datetime import datetime, timedelta, timezone
+    assert engine.xmp_datetime(datetime(2024, 1, 2, 3, 4, 5)) == "2024:01:02 03:04:05"
+    assert engine.xmp_datetime(
+        datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone(timedelta(hours=5, minutes=45)))
+    ) == "2024:01:02 03:04:05+05:45"
+    assert engine.xmp_datetime(
+        datetime(2024, 1, 2, 3, 4, 5, tzinfo=timezone(timedelta(hours=-3, minutes=-30)))
+    ) == "2024:01:02 03:04:05-03:30"
+
+
 def test_rescue_sidecar_keeps_gps_hemisphere(tmp_path):
     """XMP GPSLatitude/Longitude carry the sign; exiftool ignores a separate
     XMP GPS*Ref, so writing abs() values put Los Angeles in China."""

@@ -117,26 +117,88 @@ _COPY_MARKER_RE = re.compile(r"\(\d+\)$")
 # ---------------------------------------------------------------- fingerprint
 
 
+_DUP_COUNTER = re.compile(r"^(?P<stem>.*?)\((?P<n>\d+)\)$")
+_JSON_COUNTER = re.compile(r"\((?P<n>\d+)\)\.json$")
+_STILL_EXTS = {".heic", ".heif", ".jpg", ".jpeg", ".png", ".dng"}
+
+
+def _split_takeout_name(name: str) -> tuple[str, int, bool, str]:
+    """`IMG_1711(1)-edited.MP4` → (`IMG_1711`, 1, True, `.mp4`). Takeout
+    appends `(n)` to the second+ file of a name within one folder, and
+    `-edited` to Google Photos' edited copy."""
+    p = Path(name)
+    stem, ext = p.stem, p.suffix.lower()
+    edited = stem.lower().endswith("-edited")
+    if edited:
+        stem = stem[: -len("-edited")]
+    m = _DUP_COUNTER.match(stem)
+    n = 0
+    if m:
+        stem, n = m.group("stem"), int(m.group("n"))
+    return stem, n, edited, ext
+
+
 def _google_json_companion(path: Path) -> dict | None:
     """Locate and parse a Takeout `*.json` sidecar for a media file.
 
-    Takeout naming has three common shapes: `<name>.json`,
-    `<name>.supplemental-metadata.json`, and a truncated form when the
-    combined name would exceed Google's ~46-char limit. Try exact forms
-    first, then fall back to a prefix glob.
+    Takeout names the JSON after the *original* file name, with any
+    duplicate counter moved to the very end and the name truncated to
+    Google's length limit:
+
+        IMG_0001.JPG          → IMG_0001.JPG.supplemental-metadata.json
+                                (or IMG_0001.JPG.json, or a truncated form)
+        IMG_0001(1).JPG       → IMG_0001.JPG.supplemental-metadata(1).json
+        IMG_0001(1).MP4       → IMG_0001.HEIC.supplemental-metadata(1).json
+                                (a Live Photo's video shares its still's JSON)
+        IMG_0001-edited.JPG   → IMG_0001.JPG.supplemental-metadata.json
+
+    Exact forms are tried first for plain names. Otherwise sibling JSONs are
+    matched on what the JSON says about itself, its `title` (the original file
+    name) and its trailing counter, never on a bare filename prefix. A prefix
+    match handed `IMG_0001(1).MP4` nothing, and could hand a different
+    photo's JSON to a name that merely starts the same way.
     """
-    candidates = [
-        path.with_name(path.name + ".json"),
-        path.with_name(path.name + ".supplemental-metadata.json"),
-    ]
-    for candidate in candidates:
-        if candidate.is_file():
-            return _read_json(candidate)
-    for sibling in path.parent.glob(path.stem[:20] + "*.json"):
-        stem = sibling.name.removesuffix(".json").removesuffix(".supplemental-metadata")
-        if path.name.startswith(stem) or stem.startswith(path.name):
-            return _read_json(sibling)
-    return None
+    stem, n, edited, ext = _split_takeout_name(path.name)
+    if n == 0 and not edited:
+        for candidate in (
+            path.with_name(path.name + ".json"),
+            path.with_name(path.name + ".supplemental-metadata.json"),
+        ):
+            if candidate.is_file():
+                return _read_json(candidate)
+    same: list[dict] = []
+    still: list[dict] = []
+    other: list[dict] = []
+    # Truncation can cut into the stem itself on very long names; 20 chars of
+    # it is enough to narrow the glob, the title check does the rest.
+    for sibling in path.parent.glob(glob_escape(stem[:20]) + "*.json"):
+        m = _JSON_COUNTER.search(sibling.name)
+        if (int(m.group("n")) if m else 0) != n:
+            continue
+        data = _read_json(sibling)
+        if not isinstance(data, dict):
+            continue
+        # The title is the original name as uploaded: no Takeout counter to
+        # strip (a name like `shot (1).png` keeps its own parentheses).
+        title = Path(str(data.get("title") or ""))
+        t_stem, t_ext = title.stem, title.suffix.lower()
+        if t_stem.lower() != stem.lower():
+            continue
+        if t_ext == ext:
+            same.append(data)
+        elif t_ext in _STILL_EXTS and ext.lstrip(".") in VIDEO_EXTS:
+            still.append(data)
+        else:
+            other.append(data)
+    for group in (same, still):
+        if len(group) == 1:
+            return group[0]
+    return other[0] if len(other) == 1 and not same and not still else None
+
+
+def glob_escape(text: str) -> str:
+    """`glob` treats `[` `]` `*` `?` as patterns; Takeout names contain them."""
+    return re.sub(r"([\[\]*?])", r"[\1]", text)
 
 
 def _read_json(path: Path) -> dict | None:
@@ -1635,6 +1697,27 @@ def _move_asset(
     return dest
 
 
+def zone_at(lat: float | None, lon: float | None):
+    """IANA zone at a position (offline `timezonefinder`), or None."""
+    if lat is None or lon is None:
+        return None
+    from zoneinfo import ZoneInfo
+    from ..rules.trip_timezone_guess import _tz_finder
+    name = _tz_finder().timezone_at(lat=lat, lng=lon)
+    return ZoneInfo(name) if name else None
+
+
+def xmp_datetime(dt: datetime) -> str:
+    """`2019:11:14 19:43:25-06:00`: exiftool's form, offset inline."""
+    stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
+    off = dt.utcoffset()
+    if off is None:
+        return stamp
+    mins = int(off.total_seconds() // 60)
+    sign = "-" if mins < 0 else "+"
+    return f"{stamp}{sign}{abs(mins) // 60:02d}:{abs(mins) % 60:02d}"
+
+
 def _rescue_sidecar(
     dest: Path, taken_at: str | None, gps_lat: float | None, gps_lon: float | None,
     *, taken_is_utc: bool = False,
@@ -1651,18 +1734,24 @@ def _rescue_sidecar(
 
     `taken_is_utc`: Google's `photoTakenTime` is a UTC epoch, stored naive in
     the manifest. Written without an offset it would be read as local wall
-    clock and shift by the UTC offset, so it goes out with an explicit
-    `+00:00` (XMP carries the offset inline in DateTimeOriginal — there is
-    no XMP OffsetTimeOriginal). No zone is guessed: Immich shows the true
-    instant. Photos companion dates are local wall clock and stay naive."""
+    clock and shift by the UTC offset. With a position, it goes out as local
+    time with that place's offset (`2019:11:14 19:43:25-06:00`), so Immich
+    shows the clock the photo was taken by. Without one, it goes out as
+    explicit `+00:00`: the true instant, displayed in UTC. XMP carries the
+    offset inline in DateTimeOriginal; there is no XMP OffsetTimeOriginal.
+    Photos companion dates are local wall clock and stay naive."""
     patch: dict[str, object] = {}
     if taken_at:
         try:
             dt = datetime.fromisoformat(taken_at)
-            stamp = dt.strftime("%Y:%m:%d %H:%M:%S")
             if taken_is_utc and dt.tzinfo is None:
-                stamp += "+00:00"
-            patch["DateTimeOriginal"] = stamp
+                dt = dt.replace(tzinfo=timezone.utc)
+                zone = zone_at(gps_lat, gps_lon)
+                if zone is not None:
+                    dt = dt.astimezone(zone)
+                patch["DateTimeOriginal"] = xmp_datetime(dt)
+            else:
+                patch["DateTimeOriginal"] = dt.strftime("%Y:%m:%d %H:%M:%S")
         except ValueError:
             pass
     if gps_lat is not None and gps_lon is not None:
