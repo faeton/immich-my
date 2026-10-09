@@ -5,6 +5,8 @@ from __future__ import annotations
 import socket
 
 import psycopg
+import os
+
 import pytest
 
 from conftest import LiveServiceAccess
@@ -50,3 +52,32 @@ def test_scratch_dsn_port_parsing():
     from conftest import _scratch_dsn_port
     assert _scratch_dsn_port("postgresql://u:p@127.0.0.1:55432/db") == 55432
     assert _scratch_dsn_port("postgresql://u:p@127.0.0.1/db") is None   # implicit 5432 → refused
+    assert _scratch_dsn_port("host=localhost port=55432 dbname=x") == 55432
+
+
+@pytest.mark.parametrize("dsn", [
+    "postgresql://u@127.0.0.1:55432/db?port=5432",          # query overrides the authority
+    "postgresql://u@127.0.0.1:55432/db?port=15432",
+    "postgresql://u@127.0.0.1:55432/db?host=n5",
+    "postgresql://u@127.0.0.1:55432/db?hostaddr=10.0.0.5",
+    "postgresql://u@127.0.0.1:55432/db?service=live",
+    "postgresql://u@127.0.0.1:55432,127.0.0.1:5432/db",     # a host list
+    "postgresql://u@n5:55432/db",                            # not loopback
+    "host=127.0.0.1 port=55432 port=5432",
+    "not a dsn ===",
+])
+def test_scratch_dsn_refuses_anything_that_could_redirect(dsn):
+    from conftest import _scratch_dsn_port
+    assert _scratch_dsn_port(dsn) is None
+
+
+@pytest.mark.scratch_pg
+def test_scratch_marker_still_refuses_keyword_overrides(monkeypatch):
+    """Even a marked test can't redirect the scratch DSN with keywords."""
+    import psycopg
+    from conftest import LiveServiceAccess
+    dsn = "postgresql://postgres:test@127.0.0.1:55432/postgres"
+    if os.environ.get("IMMY_TEST_PG_DSN") != dsn:
+        pytest.skip("needs IMMY_TEST_PG_DSN set to the default scratch DSN")
+    with pytest.raises(LiveServiceAccess):
+        psycopg.connect(dsn, port=5432)

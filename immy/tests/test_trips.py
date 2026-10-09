@@ -274,10 +274,27 @@ class _Cursor:
 
     def execute(self, sql, params=None):
         if 'FROM "user"' in sql:
-            self._rows = [("u1", "me@example.com")]
+            self._rows = list(USERS)
         elif "GROUP BY 1, 2, 3" in sql:
             assert params["placeholder_min"] == 10
             self._rows = self.buckets
+        elif sql is T.OTHER_OWNERS_SQL:
+            self._rows = [(a, ASSET_OWNER.get(a, "u1") == params["owner"]) for a in params["ids"]]
+        elif sql is T.LINK_TAGS_RETURNING_SQL:
+            # The fake's tag ids are the tag names (see _Immich.upsert_tags).
+            self._rows = []
+            for a, v in zip(params["assets"], params["tags"]):
+                LINKS.append(("INSERT", a, v, v))
+                if (a, v) not in TAGGED:
+                    TAGGED.add((a, v))
+                    self._rows.append((a, v))
+        elif sql is T.LINKS_BY_VALUE_SQL:
+            self._rows = [(a, v) for a, v in TAGGED
+                          if a in params["assets"] and v in params["values"]]
+        elif sql is T.OWNED_TAGS_SQL:
+            root = params["root"].rstrip("%")
+            self._rows = [(a, v) for a, v in TAGGED
+                          if a in params["assets"] and v.startswith(root)]
         else:
             self._rows = [r if len(r) == 3 else (*r, False) for r in self.assets]
 
@@ -287,13 +304,17 @@ class _Cursor:
     def executemany(self, sql, params):
         verb = sql.strip().split()[0]
         for p in params:
+            if sql is T.DROP_TAG_VALUE_SQL and ASSET_OWNER.get(p["asset"], "u1") != p["owner"]:
+                continue
             LINKS.append((verb, p["asset"], p.get("tag"), p["value"]))
             if verb == "INSERT":
                 TAGGED.add((p["asset"], p["value"]))
-            elif verb == "DELETE":
+            elif verb == "DELETE" and ASSET_OWNER.get(p["asset"], "u1") == p["owner"]:
                 TAGGED.discard((p["asset"], p["value"]))
 
 
+USERS: list[tuple[str, str]] = [("u1", "me@example.com")]
+ASSET_OWNER: dict[str, str] = {}   # asset → owner id; default u1
 LINKS: list[tuple] = []
 TAGGED: set[tuple[str, str]] = set()   # (asset, tag value) currently linked
 
@@ -344,10 +365,12 @@ class _Immich:
         have.difference_update(ids)
         return out
 
+    failing_tags: set[str] = set()
+
     def upsert_tags(self, names):
         for n in names:
             self.tags.setdefault(n, set())
-        return {n: n for n in names}
+        return {n: n for n in names if n not in self.failing_tags}
 
     def tag_assets(self, tag_id, ids):
         self.tags[tag_id].update(ids)
@@ -363,9 +386,11 @@ def _setup(monkeypatch, tmp_path, buckets, assets):
         "trips:\n  min_assets: 2\n  homes:\n    - country: PT\n"
     )
     monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: _Conn(buckets, assets))
-    _Immich.albums, _Immich.tags = {}, {}
+    _Immich.albums, _Immich.tags, _Immich.failing_tags = {}, {}, set()
     LINKS.clear()
     TAGGED.clear()
+    ASSET_OWNER.clear()
+    USERS[:] = [("u1", "me@example.com")]
     monkeypatch.setattr(cli, "ImmichClient", _Immich)
     return cfg
 
@@ -424,7 +449,7 @@ def test_cli_apply_is_idempotent_and_follows_a_moved_start(monkeypatch, tmp_path
     lines = album["description"].splitlines()
     assert lines[0] == "Best croissants."
     assert T.extract_key(album["description"]) == T.stable_key("FR", D0 + timedelta(days=1))
-    ledger = T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME)
+    ledger = T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME, "u1")
     assert list(ledger) == [T.stable_key("FR", D0 + timedelta(days=1))]
 
 
@@ -550,13 +575,13 @@ def test_prune_never_removes_an_asset_the_user_added(monkeypatch, tmp_path) -> N
     album = next(iter(_Immich.albums.values()))
     # Pretend "mine" was added by hand first: reset ownership to a1 only.
     ledger_path = tmp_path / "state" / T.LEDGER_FILENAME
-    ledger = T.load_ledger(ledger_path)
+    ledger = T.load_ledger(ledger_path, "u1")
     (key,) = ledger
     ledger[key]["assets"] = ["a1"]
-    T.save_ledger(ledger_path, ledger)
+    T.save_ledger(ledger_path, ledger, "u1")
     # Re-run: "mine" is already there → not claimed.
     _run(cfg)
-    assert T.load_ledger(ledger_path)[key]["assets"] == ["a1"]
+    assert T.load_ledger(ledger_path, "u1")[key]["assets"] == ["a1"]
     # Day 2 stops being Paris; the trip shrinks to day 1. Prune keeps "mine".
     _use(monkeypatch, _rows([(0, LISBON), (1, PARIS), (2, LISBON), (3, LISBON)]), assets)
     _run(cfg, "--prune")
@@ -579,7 +604,7 @@ def test_disappeared_trip_is_retired_only_with_prune(monkeypatch, tmp_path) -> N
     assert album["assets"] == {"by-hand"}                   # only immy's links go
     assert TAGGED == set()                                  # and its tags
     assert len(_Immich.albums) == 1                         # the album stays
-    assert T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME) == {}
+    assert T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME, "u1") == {}
 
 
 def test_orphans_outside_the_scope_are_left_alone(monkeypatch, tmp_path) -> None:
@@ -666,3 +691,259 @@ def test_unedited_description_follows_the_trip_edited_one_stays(monkeypatch, tmp
     _run(cfg, "--refresh-descriptions")
     assert album["description"].startswith("Best croissants.\n2–3 Mar 2025 · 2 days")
     assert T.extract_key(album["description"])
+
+
+# --- reconciliation: the second review's cases ----------------------------
+
+PARIS_TAG = "Trips/2025/2025-03 France · Paris"
+
+
+def _ledger(tmp_path, owner="u1"):
+    return T.load_ledger(tmp_path / "state" / T.LEDGER_FILENAME, owner)
+
+
+def test_ledger_is_kept_per_owner_and_a_run_never_retires_anothers(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    USERS[:] = [("u1", "alice@x"), ("u2", "bob@x")]
+    _run(cfg, "--owner", "alice@x", "--tags")
+    alice = _ledger(tmp_path)
+    assert alice and TAGGED == {("a1", PARIS_TAG), ("a2", PARIS_TAG)}
+    # Bob has no trips at all: nothing of Alice's is an orphan to him.
+    _use(monkeypatch, [], [])
+    res = _run(cfg, "--owner", "bob@x", "--tags", "--prune")
+    assert "retired" not in res.output
+    assert _ledger(tmp_path) == alice
+    assert _ledger(tmp_path, "u2") == {}
+    assert TAGGED == {("a1", PARIS_TAG), ("a2", PARIS_TAG)}
+    assert next(iter(_Immich.albums.values()))["assets"] == {"a1", "a2"}
+
+
+def test_drop_tag_value_is_limited_to_the_owner() -> None:
+    assert '"ownerId" = %(owner)s' in T.DROP_TAG_VALUE_SQL
+
+
+def _write_legacy(tmp_path, trips):
+    path = tmp_path / "state" / T.LEDGER_FILENAME
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(__import__("json").dumps({"schema": 1, "trips": trips}))
+    return path
+
+
+def test_schema_1_entries_move_to_the_user_whose_assets_they_are(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    USERS[:] = [("u1", "alice@x"), ("u2", "bob@x")]
+    ASSET_OWNER.update({"b1": "u2"})
+    key = T.stable_key("FR", D0 + timedelta(days=1))
+    path = _write_legacy(tmp_path, {
+        key: {"start": "2025-03-02", "end": "2025-03-03", "region": "FR",
+              "assets": ["a1", "a2"], "tags": {}},
+        "bobs": {"start": "2024-01-01", "end": "2024-01-02", "region": "ES",
+                 "assets": ["b1"], "tags": {}},
+    })
+    _run(cfg, "--owner", "alice@x", "--prune")
+    assert key in _ledger(tmp_path)
+    assert "bobs" not in _ledger(tmp_path)                   # never retired by Alice
+    assert "bobs" in T.load_legacy(path)                     # still waiting for Bob
+    _use(monkeypatch, [], [])
+    _run(cfg, "--owner", "bob@x")
+    assert "bobs" in _ledger(tmp_path, "u2") and not T.load_legacy(path)
+
+
+def test_a_trip_whose_start_moved_out_of_scope_is_not_retired(monkeypatch, tmp_path) -> None:
+    # Paris days 2-3 (Mar 3-4); a late import adds Paris on day 1 (Mar 2).
+    buckets = _rows([(0, LISBON), (2, PARIS), (3, PARIS), (4, LISBON)])
+    assets = [("a2", D0 + timedelta(days=2)), ("a3", D0 + timedelta(days=3))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    buckets2 = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, PARIS), (4, LISBON)])
+    _use(monkeypatch, buckets2, assets + [("a1", D0 + timedelta(days=1))])
+    res = _run(cfg, "--tags", "--prune", "--since", "2025-03-03")
+    assert "retired" not in res.output
+    assert next(iter(_Immich.albums.values()))["assets"] == {"a2", "a3"}
+    assert {("a2", PARIS_TAG), ("a3", PARIS_TAG)} <= TAGGED
+    (entry,) = _ledger(tmp_path).values()
+    assert entry["assets"] == ["a2", "a3"]
+
+
+def test_a_tag_value_two_trips_share_survives_the_old_ones_retirement(monkeypatch, tmp_path) -> None:
+    # Two Paris trips in March: days 1-2 and days 5-6, home in between.
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON), (4, LISBON),
+                     (5, PARIS), (6, PARIS), (7, LISBON)])
+    assets = [("p1", D0 + timedelta(days=1)), ("x", D0 + timedelta(days=2)),
+              ("q1", D0 + timedelta(days=5)), ("q2", D0 + timedelta(days=6))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    assert len(_ledger(tmp_path)) == 2
+    # The first trip disappears (Lisbon after all) and "x" moves to the second.
+    buckets2 = _rows([(0, LISBON), (1, LISBON), (2, LISBON), (3, LISBON), (4, LISBON),
+                      (5, PARIS), (6, PARIS), (7, LISBON)])
+    moved = [("p1", D0 + timedelta(days=1)), ("x", D0 + timedelta(days=6)),
+             ("q1", D0 + timedelta(days=5)), ("q2", D0 + timedelta(days=6))]
+    _use(monkeypatch, buckets2, moved)
+    res = _run(cfg, "--tags", "--prune")
+    assert "retired" in res.output
+    assert ("x", PARIS_TAG) in TAGGED                       # the second trip's now
+    assert ("p1", PARIS_TAG) not in TAGGED
+    (entry,) = _ledger(tmp_path).values()
+    assert sorted(entry["tags"][PARIS_TAG]) == ["q1", "q2", "x"]
+
+
+def test_legacy_tag_ownership_survives_a_run_without_tags(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    path = tmp_path / "state" / T.LEDGER_FILENAME
+    ledger = _ledger(tmp_path)
+    (key,) = ledger
+    del ledger[key]["tags"]                                  # written before tags were tracked
+    T.save_ledger(path, ledger, "u1")
+    _run(cfg)                                                # no --tags
+    assert sorted(_ledger(tmp_path)[key]["tags"][PARIS_TAG]) == ["a1", "a2"]
+    # And retirement of an untracked entry still removes its tags.
+    ledger = _ledger(tmp_path)
+    del ledger[key]["tags"]
+    T.save_ledger(path, ledger, "u1")
+    cfg.write_text(cfg.read_text().replace("    - country: PT\n", "    - country: PT\n    - country: FR\n"))
+    _run(cfg, "--prune")
+    assert TAGGED == set()
+
+
+def test_prune_without_tags_still_removes_stale_trip_tags(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("b1", D0 + timedelta(days=1)),
+              ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    _use(monkeypatch, buckets, assets[:2] + [("a2", D0 + timedelta(days=3))])
+    _run(cfg, "--prune")
+    assert TAGGED == {("a1", PARIS_TAG), ("b1", PARIS_TAG)}
+
+
+def test_a_tag_assigned_by_hand_is_never_claimed(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("mine", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    TAGGED.add(("mine", PARIS_TAG))                          # the user got there first
+    _run(cfg, "--tags")
+    assert _ledger(tmp_path)[T.stable_key("FR", D0 + timedelta(days=1))]["tags"] == {
+        PARIS_TAG: ["a1"]}
+    _use(monkeypatch, buckets, [("a1", D0 + timedelta(days=1)), ("mine", D0 + timedelta(days=3))])
+    _run(cfg, "--tags", "--prune")
+    assert ("mine", PARIS_TAG) in TAGGED
+
+
+def test_a_failed_tag_upsert_never_prunes_a_wanted_tag(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    _run(cfg, "--tags")
+    _Immich.failing_tags = {PARIS_TAG}
+    res = _run(cfg, "--tags", "--prune")
+    assert "tag upsert failed" in res.output
+    assert TAGGED == {("a1", PARIS_TAG), ("a2", PARIS_TAG)}
+    (entry,) = _ledger(tmp_path).values()
+    assert sorted(entry["tags"][PARIS_TAG]) == ["a1", "a2"]
+
+
+def test_a_shared_tag_moving_into_an_out_of_scope_trip_is_kept(monkeypatch, tmp_path) -> None:
+    # Paris on days 1-2 (Mar 2-3) and days 19-20 (Mar 20-21).
+    spec = [(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON), (18, LISBON),
+            (19, PARIS), (20, PARIS), (21, LISBON)]
+    assets = [("p1", D0 + timedelta(days=1)), ("p2", D0 + timedelta(days=2)),
+              ("x", D0 + timedelta(days=19)), ("q", D0 + timedelta(days=20))]
+    cfg = _setup(monkeypatch, tmp_path, _rows(spec), assets)
+    _run(cfg, "--tags")
+    early = T.stable_key("FR", D0 + timedelta(days=1))
+    # The later trip turns out to be Lisbon; "x" was really shot on day 2.
+    spec2 = [(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON), (18, LISBON),
+             (19, LISBON), (20, LISBON), (21, LISBON)]
+    moved = [("p1", D0 + timedelta(days=1)), ("p2", D0 + timedelta(days=2)),
+             ("x", D0 + timedelta(days=2)), ("q", D0 + timedelta(days=20))]
+    _use(monkeypatch, _rows(spec2), moved)
+    res = _run(cfg, "--tags", "--prune", "--since", "2025-03-15")
+    assert "retired" in res.output
+    assert ("x", PARIS_TAG) in TAGGED and ("q", PARIS_TAG) not in TAGGED
+    assert "x" in _ledger(tmp_path)[early]["tags"][PARIS_TAG]   # handed over
+
+
+def test_a_second_apply_run_is_refused_while_one_holds_the_ledger(monkeypatch, tmp_path) -> None:
+    cfg = _setup(monkeypatch, tmp_path, [], [])
+    held = T.lock_ledger(tmp_path / "state" / T.LEDGER_FILENAME)
+    try:
+        res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg), "--apply"])
+        assert res.exit_code == 2 and "holds" in res.output
+        # A dry run only reads, so it still works.
+        assert CliRunner().invoke(cli.app, ["trips", "--config", str(cfg)]).exit_code == 0
+    finally:
+        held.close()
+    _run(cfg)
+
+
+def test_tag_links_commit_only_after_the_ledger_records_them(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+    seen = []
+    monkeypatch.setattr(_Conn, "commit", lambda self: seen.append(
+        _ledger(tmp_path).get(T.stable_key("FR", D0 + timedelta(days=1)), {}).get("pending_tags")))
+    _run(cfg, "--tags")
+    assert seen and seen[0] == {PARIS_TAG: ["a1", "a2"]}
+    (entry,) = _ledger(tmp_path).values()
+    assert entry["tags"] == {PARIS_TAG: ["a1", "a2"]} and "pending_tags" not in entry
+
+
+def test_a_shared_tag_kept_for_a_trip_without_an_entry_stays_owned(monkeypatch, tmp_path) -> None:
+    # Only the later Paris trip exists at first; "x" belongs to it.
+    spec = [(0, LISBON), (1, LISBON), (2, LISBON), (3, LISBON), (18, LISBON),
+            (19, PARIS), (20, PARIS), (21, LISBON)]
+    assets = [("p1", D0 + timedelta(days=1)), ("p2", D0 + timedelta(days=2)),
+              ("x", D0 + timedelta(days=19)), ("q", D0 + timedelta(days=20))]
+    cfg = _setup(monkeypatch, tmp_path, _rows(spec), assets)
+    _run(cfg, "--tags")
+    late = T.stable_key("FR", D0 + timedelta(days=19))
+    # The later one turns out Lisbon; an early Paris trip appears, with "x".
+    spec2 = [(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON), (18, LISBON),
+             (19, LISBON), (20, LISBON), (21, LISBON)]
+    moved = [("p1", D0 + timedelta(days=1)), ("p2", D0 + timedelta(days=2)),
+             ("x", D0 + timedelta(days=2)), ("q", D0 + timedelta(days=20))]
+    _use(monkeypatch, _rows(spec2), moved)
+    _run(cfg, "--tags", "--prune", "--since", "2025-03-15")
+    assert ("x", PARIS_TAG) in TAGGED and ("q", PARIS_TAG) not in TAGGED
+    assert _ledger(tmp_path)[late]["tags"] == {PARIS_TAG: ["x"]}   # still immy's
+    # A full run reaches the early trip: it takes "x" over, the old entry goes.
+    _run(cfg, "--tags", "--prune")
+    early = T.stable_key("FR", D0 + timedelta(days=1))
+    assert set(_ledger(tmp_path)) == {early}
+    assert sorted(_ledger(tmp_path)[early]["tags"][PARIS_TAG]) == ["p1", "p2", "x"]
+    # And it is still prunable as immy's: the early trip goes too.
+    cfg.write_text(cfg.read_text().replace("    - country: PT\n", "    - country: PT\n    - country: FR\n"))
+    _run(cfg, "--prune")
+    assert TAGGED == set()
+
+
+def test_links_whose_commit_was_lost_are_settled_on_the_next_run(monkeypatch, tmp_path) -> None:
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+
+    def crash(self):
+        raise KeyboardInterrupt
+    monkeypatch.setattr(_Conn, "commit", crash)
+    res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg), "--apply", "--tags"])
+    assert res.exit_code != 0
+    del res                      # the crashed run's frame holds the ledger lock;
+    __import__("gc").collect()   # a real process releases it on exit
+    (entry,) = _ledger(tmp_path).values()
+    assert entry["pending_tags"] == {PARIS_TAG: ["a1", "a2"]} and entry["tags"] == {}
+    # The commit was lost for a2 only (a1 made it).
+    TAGGED.discard(("a2", PARIS_TAG))
+    monkeypatch.setattr(_Conn, "commit", lambda self: None)
+    _run(cfg)
+    (entry,) = _ledger(tmp_path).values()
+    assert "pending_tags" not in entry
+    assert entry["tags"] == {PARIS_TAG: ["a1"]}

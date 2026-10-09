@@ -2677,6 +2677,21 @@ def trips(
         rows = cur.fetchall()
         assets = [(str(r[0]), r[1]) for r in rows if not r[2]]
         placeholders = len(rows) - len(assets)
+    # The ledger is kept per user. Entries from before that (schema 1) move
+    # into this user's partition when their assets are this user's.
+    ledger_path = (config.state_root or Path.home() / ".immy") / trips_mod.LEDGER_FILENAME
+    ledger_lock = None
+    if not dry_run:
+        try:
+            ledger_lock = trips_mod.lock_ledger(ledger_path)
+        except RuntimeError as e:
+            console.print(f"[red]{e}[/red]")
+            conn.close()
+            raise typer.Exit(code=2)
+    ledger = trips_mod.load_ledger(ledger_path, owner_id)
+    adopted, legacy = trips_mod.adopt_legacy(
+        conn, owner_id, trips_mod.load_legacy(ledger_path), sole_user=len(users) == 1)
+    ledger = {**adopted, **ledger}
     conn.close()
 
     days = trips_mod.build_days(buckets)
@@ -2691,10 +2706,15 @@ def trips(
     asset_day = dict(assets)
     kept = [t for t in found if trips_mod.keep(t, min_assets=min_assets)]
     small = len(found) - len(kept)
-    if since_d:
-        kept = [t for t in kept if t.start >= since_d]
-    if until_d:
-        kept = [t for t in kept if t.start <= until_d]
+
+    def in_scope(start):
+        return (not since_d or start >= since_d) and (not until_d or start <= until_d)
+
+    # Every trip found continues its ledger entry, in scope or not; the
+    # scope only picks which ones this run touches. Matching only the
+    # in-scope ones would read a trip whose start moved out of scope as gone.
+    all_kept = kept
+    kept = [t for t in kept if in_scope(t.start)]
 
     home_days = sum(1 for d in days if any(h.matches(d) for h in tc.homes))
     console.print(
@@ -2741,14 +2761,8 @@ def trips(
                 ])
         console.print(f"wrote {csv_path}")
 
-    ledger_path = (config.state_root or Path.home() / ".immy") / trips_mod.LEDGER_FILENAME
-    ledger = trips_mod.load_ledger(ledger_path)
-
-    def in_scope(start):
-        return (not since_d or start >= since_d) and (not until_d or start <= until_d)
-
     if dry_run:
-        _, orphans = trips_mod.match_ledger(kept, ledger, in_scope=in_scope)
+        _, orphans = trips_mod.match_ledger(all_kept, ledger, in_scope=in_scope)
         if orphans:
             console.print(
                 f"[yellow]{len(orphans)} earlier trip(s) no longer found[/yellow] "
@@ -2794,10 +2808,46 @@ def trips(
             tag_conn = pg_mod.connect(config.pg)
         return tag_conn
 
+    def save():
+        trips_mod.save_ledger(ledger_path, ledger, owner_id, legacy=legacy)
+
+    # Tag ownership must be known before anything is reconciled: an entry
+    # from before it was tracked gets it from the database now, so neither a
+    # run without --tags nor a retirement can forget it.
+    unknown = [k for k, e in ledger.items() if "tags" not in e]
+    for k in unknown:
+        ledger[k]["tags"] = trips_mod.tags_by_value(trips_mod.backfill_owned_tags(
+            tconn(), owner_id, list(ledger[k].get("assets", [])), tag_root))
+    # Links an interrupted run inserted but may not have committed.
+    settled = [k for k, e in ledger.items() if trips_mod.confirm_pending(tconn(), owner_id, e)
+               ] if any("pending_tags" in e for e in ledger.values()) else []
+    if unknown or adopted or settled:
+        save()
+    # Every (asset, tag) link immy owns for this user, across all trips. An
+    # asset that moved to another trip takes its link along when the new
+    # trip wants the same tag (same month and place).
+    immy_tags = set().union(*(trips_mod.owned_pairs(e) for e in ledger.values()))
+
     pairs, orphans = trips_mod.match_ledger(
-        kept, ledger, album_keys=set(key_to_album), in_scope=in_scope)
+        all_kept, ledger, album_keys=set(key_to_album), in_scope=in_scope)
+    # Tag links to give up: ledger key → (asset, value). Removed once at the
+    # end, minus any another surviving trip still owns (tag values repeat
+    # across trips), and kept in the ledger until then.
+    release: dict[str, set[tuple[str, str]]] = {}
     created = updated = linked = removed_total = tagged = untagged = 0
+    # Links trips outside the scope want: not touched this run, so not
+    # claimed yet, but not to be removed either. Handed to the entry of the
+    # trip that wants them, if it has one.
+    wanted_elsewhere: dict[tuple[str, str], str | None] = {}
     for t, old_key in pairs:
+        if not in_scope(t.start):
+            split = dict(trips_mod.assets_by_leg(t, asset_day))
+            for leg, name in trips_mod.leg_tags(t, tag_root):
+                for a in split.get(leg, []):
+                    wanted_elsewhere[(a, name)] = old_key
+    for t, old_key in pairs:
+        if not in_scope(t.start):
+            continue
         key = t.key()
         ids = t.asset_ids
         entry = ledger.get(old_key) if old_key else None
@@ -2855,48 +2905,57 @@ def trips(
                 f"[dim]({len(added)} new" + (f", {len(stale)} pruned" if prune and stale else "") + ")[/dim]"
             )
 
+        # Tags: the links this trip should have, whether or not --tags adds
+        # them this run (and whether or not a tag could be created), so a
+        # failed upsert or a run without --tags never makes a wanted tag look
+        # stale. Most specific level only (the leg); Immich lists a parent
+        # tag's assets through its closure table.
         owned_tags = trips_mod.owned_pairs(entry)
-        if tags and entry is not None and "tags" not in entry:
-            owned_tags = trips_mod.backfill_owned_tags(
-                tconn(), owner_id, list(entry.get("assets", [])), tag_root)
+        leg_pairs = trips_mod.leg_tags(t, tag_root)
+        split = dict(trips_mod.assets_by_leg(t, asset_day))
+        wanted = {(a, name) for leg, name in leg_pairs for a in split.get(leg, [])}
+        claimed = wanted & (owned_tags | immy_tags)
+        new_links: set[tuple[str, str]] = set()
         if tags:
-            # Most specific level only (the leg); Immich lists a parent
-            # tag's assets through its closure table. Linked by SQL with the
-            # tag list locked: see trips.link_tags for why not the tag API.
-            leg_pairs = trips_mod.leg_tags(t, tag_root)
+            # Linked by SQL with the tag list locked: see trips.link_tags for
+            # why not the tag API. Only links this call creates become
+            # immy's; one assigned by hand stays the user's.
             tag_ids = client.upsert_tags([name for _, name in leg_pairs])
-            split = dict(trips_mod.assets_by_leg(t, asset_day))
-            links = []
-            for leg, name in leg_pairs:
-                tag_id = tag_ids.get(name)
-                if not tag_id:
+            for _, name in leg_pairs:
+                if not tag_ids.get(name):
                     console.print(f"  [red]tag upsert failed[/red] {name}")
-                    continue
-                links += [(aid, tag_id, name) for aid in split.get(leg, [])]
+            links = [(a, tag_ids[v], v) for a, v in sorted(wanted) if tag_ids.get(v)]
             if links:
-                trips_mod.link_tags(tconn(), links)
+                # Recorded as pending before the commit, confirmed after it:
+                # a crash in between is settled on the next run (confirm_pending).
+                new_links = trips_mod.link_tags(tconn(), links, report=True, commit=False)
                 tagged += len(links)
-            wanted = {(a, v) for a, _, v in links}
-            stale_tags = owned_tags - wanted
-            if prune and stale_tags:
-                trips_mod.unlink_tags(tconn(), owner_id, sorted(stale_tags))
-                untagged += len(stale_tags)
-                stale_tags = set()
-            owned_tags = wanted | stale_tags
+        new_links -= claimed
+        stale = owned_tags - wanted
+        if prune and stale:
+            release[key] = stale
 
         if old_key and old_key != key:
             ledger.pop(old_key, None)
         ledger[key] = {
             "start": t.start.isoformat(), "end": t.end.isoformat(),
             "region": t.region, "album_id": str(album_id),
-            "assets": sorted(owned), "tags": trips_mod.tags_by_value(owned_tags),
+            "assets": sorted(owned), "tags": trips_mod.tags_by_value(claimed | stale),
             # What immy last wrote, if the album still shows exactly that;
             # an edited description is never tracked (so never overwritten).
             "description": (trips_mod.description_for(t) if album is None
                             else (desc if desc == trips_mod.description_for(t) else
                                   (entry or {}).get("description"))),
         }
-        trips_mod.save_ledger(ledger_path, ledger)
+        if new_links:
+            ledger[key]["pending_tags"] = trips_mod.tags_by_value(new_links)
+        save()
+        if tag_conn is not None:
+            tag_conn.commit()
+        if new_links:
+            del ledger[key]["pending_tags"]
+            ledger[key]["tags"] = trips_mod.tags_by_value(claimed | stale | new_links)
+            save()
 
     # Trips that no longer exist: take back only what immy put there. The
     # album itself stays, since it may hold the user's own additions and edits.
@@ -2905,26 +2964,52 @@ def trips(
             f"[yellow]{len(orphans)} earlier trip(s) no longer found[/yellow] — "
             "re-run with `--prune` to remove what immy put in their albums and tags."
         )
-    for key in orphans if prune else []:
+    retiring = orphans if prune else []
+    for key in retiring:
         entry = ledger.get(key) or {}
         album = album_for(key, entry)
-        claimed = sorted(entry.get("assets", []))
-        if album is not None and claimed:
-            client.remove_assets_from_album(album["id"], claimed)
-            removed_total += len(claimed)
-        stale_tags = sorted(trips_mod.owned_pairs(entry))
-        if stale_tags:
-            trips_mod.unlink_tags(tconn(), owner_id, stale_tags)
-            untagged += len(stale_tags)
+        claimed_assets = sorted(entry.get("assets", []))
+        if album is not None and claimed_assets:
+            client.remove_assets_from_album(album["id"], claimed_assets)
+            removed_total += len(claimed_assets)
+        release[key] = trips_mod.owned_pairs(entry)
         console.print(
             f"  [yellow]retired[/yellow] {(album or {}).get('albumName') or key} "
-            f"[dim]({len(claimed)} album link(s), {len(stale_tags)} tag(s) removed; album kept)[/dim]"
+            f"[dim]({len(claimed_assets)} album link(s) removed; album kept)[/dim]"
         )
-        ledger.pop(key, None)
-        trips_mod.save_ledger(ledger_path, ledger)
+        entry["assets"] = []
+        save()
+
+    if release:
+        # What each entry owns afterwards (a retiring one: nothing, unless
+        # it keeps a link below).
+        final = {k: trips_mod.owned_pairs(e) - release.get(k, set())
+                 for k, e in ledger.items()}
+        released = set().union(*release.values())
+        for k, given_up in release.items():
+            for pair in given_up & wanted_elsewhere.keys():
+                # To the trip that wants it; if that trip has no entry yet,
+                # the giver keeps it (a retired one lingers holding only
+                # that) until a run that covers the trip takes it over.
+                dest = wanted_elsewhere[pair]
+                final.setdefault(dest if dest in final else k, set()).add(pair)
+        still_owned = set().union(*final.values())
+        removals = sorted(released - still_owned)
+        trips_mod.unlink_tags(tconn(), owner_id, removals)
+        untagged = len(removals)
+        for k, owned_now in final.items():
+            if k in release or owned_now != trips_mod.owned_pairs(ledger[k]):
+                ledger[k]["tags"] = trips_mod.tags_by_value(owned_now)
+    for key in retiring:
+        if not trips_mod.owned_pairs(ledger.get(key)):
+            ledger.pop(key, None)
+    if release or retiring:
+        save()
 
     if tag_conn is not None:
         tag_conn.close()
+    if ledger_lock is not None:
+        ledger_lock.close()
     console.print(
         f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "
         f"{linked} asset-link(s) added" + (f", {removed_total} pruned" if prune else "")

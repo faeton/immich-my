@@ -262,3 +262,66 @@ def test_backfill_owned_tags_reads_the_trips_own_links(conn) -> None:
     T.link_tags(conn, [(a, ids[pt], pt), (b, ids[pt], pt), (b, ids[pl], pl), (a, ids[gear], gear)])
     got = T.backfill_owned_tags(conn, OWNER, [a, b], "Trips")
     assert got == {(a, pt), (b, pt)}
+
+
+def test_link_tags_reports_only_the_links_it_created(conn) -> None:
+    mine = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France")
+    hand = add(conn, datetime(2025, 3, 2, 10), 48.86, 2.35, "France")
+    v = "Trips/2025/2025-03 France · Paris"
+    tid = _tag(conn, v)
+    conn.execute('INSERT INTO tag_asset ("assetId", "tagId") VALUES (%s, %s)', (hand, tid))
+    created = T.link_tags(conn, [(mine, tid, v), (hand, tid, v), (mine, tid, v)], report=True)
+    assert created == {(mine, v)}
+    assert T.link_tags(conn, [(mine, tid, v)], report=True) == set()
+    assert _state(conn, hand)[2] == {v}
+
+
+def test_unlink_tags_never_touches_another_owners_asset(conn) -> None:
+    theirs = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France", owner=OTHER)
+    v = "Trips/2025/2025-03 France · Paris"
+    their_tid = _tag(conn, v, owner=OTHER)
+    T.link_tags(conn, [(theirs, their_tid, v)])
+    T.unlink_tags(conn, OWNER, [(theirs, v)])
+    tags, _, linked = _state(conn, theirs)
+    assert tags == {v} and linked == {v}
+
+
+def test_adopt_legacy_splits_entries_by_asset_owner(conn) -> None:
+    a = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France")
+    b = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France", owner=OTHER)
+    gone = str(uuid.uuid4())   # deleted since: belongs to no one
+    legacy = {
+        "mine": {"assets": [a, gone], "tags": {}},
+        "theirs": {"assets": [b], "tags": {}},
+        "mixed": {"assets": [a], "tags": {"x": [b]}},
+        "empty": {"assets": [], "tags": {}},
+    }
+    adopted, rest = T.adopt_legacy(conn, OWNER, legacy, sole_user=False)
+    assert set(adopted) == {"mine"} and set(rest) == {"theirs", "mixed", "empty"}
+    adopted, _ = T.adopt_legacy(conn, OWNER, legacy, sole_user=True)
+    assert set(adopted) == {"mine", "empty"}
+
+
+def test_uncommitted_links_vanish_on_rollback(conn) -> None:
+    conn.autocommit = False
+    aid = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France")
+    v = "Trips/x"
+    tid = _tag(conn, v)
+    conn.commit()
+    assert T.link_tags(conn, [(aid, tid, v)], report=True, commit=False) == {(aid, v)}
+    conn.rollback()
+    assert _state(conn, aid) == (set(), set(), set())
+    conn.rollback()
+    conn.autocommit = True
+
+
+def test_confirm_pending_keeps_only_links_that_exist(conn) -> None:
+    a = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France")
+    b = add(conn, datetime(2025, 3, 2, 10), 48.86, 2.35, "France")
+    v = "Trips/2025/2025-03 France · Paris"
+    tid = _tag(conn, v)
+    T.link_tags(conn, [(a, tid, v)])
+    entry = {"tags": {}, "pending_tags": {v: [a, b]}}
+    assert T.confirm_pending(conn, OWNER, entry)
+    assert entry == {"tags": {v: [a]}}
+    assert not T.confirm_pending(conn, OWNER, entry)

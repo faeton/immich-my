@@ -4,6 +4,45 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-09 — trips: per-user ledger, safer tag reconciliation
+
+Fixes from a second Codex review.
+
+### Fixed
+
+- **A run for one user could retire another's trips.** The ledger had no
+  owner, and the `asset_exif.tags` cleanup didn't check one. The ledger is now
+  kept per Immich user (schema 2). Old entries move to the user who owns
+  their assets, and tag-value removal is limited to the owner's assets.
+- **`--since` could retire a trip that still exists.** When a late import
+  moved its start out of range, its ledger entry looked orphaned. Trips are now
+  matched against everything found; the range only picks what to touch.
+- **Shared tag values.** Two trips with the same name (two Paris trips in one
+  March) share a tag. Retiring one removed the other's links. Removals now
+  happen once, at the end, minus anything a surviving trip owns. A link an
+  asset carries into its new trip moves to that trip.
+- **Legacy tag ownership could be lost.** A run without `--tags` wrote empty
+  ownership over unknown, and retirement never backfilled. Unknown ownership is
+  now backfilled up front on every `--apply`. `--prune` also cleans stale
+  tags without `--tags`.
+- **Hand-assigned tags were claimed.** Only links immy's insert actually
+  created become immy's (`INSERT … RETURNING`). They're recorded as
+  `pending_tags` before the commit and confirmed after it; a run interrupted in
+  between is settled on the next one against what's actually in the database.
+  Known limit: if that commit was lost and you hand-assign the same trip tag
+  to the same asset before the next run, immy takes it for its own.
+- **Overlapping runs.** `trips --apply` now holds a lock on the ledger for the
+  whole run; a second run is refused. Shared tags wanted by a trip outside
+  `--since`/`--until` are kept and handed to that trip, or, while it has no
+  ledger entry yet, stay owned by the retired one until a wider run takes them
+  over.
+- **A failed tag upsert pruned still-wanted links.** Wanted links are now
+  computed from the trip, not from which tags the API returned.
+- **The test guard's scratch-DB exception** read the DSN's URL port, which a
+  `?port=5432` query overrides in libpq. It now uses libpq's parser and
+  rejects every redirect (query overrides, `hostaddr`, `service`, host lists,
+  keyword arguments).
+
 ## 2026-10-06 — SQL tests on a real Postgres; antimeridian ghost fix
 
 ### Added

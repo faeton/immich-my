@@ -35,13 +35,29 @@ def _port_of(address) -> int | None:
     return None
 
 
+_SCRATCH_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+_SCRATCH_KEYS = frozenset({"host", "port", "user", "password", "dbname"})
+
+
 def _scratch_dsn_port(dsn: str) -> int | None:
-    """Port of a `postgresql://…` URL, or None if it has none."""
-    from urllib.parse import urlsplit
+    """The port of a usable scratch DSN, or None to refuse it.
+
+    Read through libpq's own parser, since a URL's query string can
+    override its authority (`…:55432/db?port=5432`). Usable: a loopback
+    host, one explicit non-live port, and nothing else that could redirect
+    the connection (hostaddr, service, a host list)."""
     try:
-        return urlsplit(dsn).port
+        from psycopg.conninfo import conninfo_to_dict
+        params = conninfo_to_dict(dsn)
+    except Exception:
+        return None
+    if set(params) - _SCRATCH_KEYS or params.get("host") not in _SCRATCH_HOSTS:
+        return None
+    try:
+        port = int(str(params.get("port", "")))
     except ValueError:
         return None
+    return None if port in _LIVE_PORTS else port
 
 
 @pytest.fixture(autouse=True)
@@ -79,12 +95,13 @@ def _block_live_services(monkeypatch, request):
     scratch = os.environ.get("IMMY_TEST_PG_DSN", "")
     scratch_port = _scratch_dsn_port(scratch) if scratch else None
     allow_scratch = (request.node.get_closest_marker("scratch_pg") is not None
-                     and scratch_port is not None and scratch_port not in _LIVE_PORTS)
+                     and scratch_port is not None)
     real_pg_connect = psycopg.connect
 
     def guarded_pg_connect(*args, **kwargs):
         conninfo = args[0] if args else kwargs.get("conninfo", "")
-        if allow_scratch and conninfo == scratch and "port" not in kwargs:
+        # Keyword arguments override the DSN in libpq; only harmless ones pass.
+        if allow_scratch and conninfo == scratch and set(kwargs) <= {"autocommit", "conninfo"}:
             return real_pg_connect(*args, **kwargs)
         # Every port libpq would default to (none given → 5432) is live.
         port = kwargs.get("port")

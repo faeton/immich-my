@@ -699,13 +699,38 @@ ON CONFLICT DO NOTHING
 """
 
 
-def link_tags(conn, links: list[tuple[str, str, str]]) -> None:
-    """(asset id, tag id, tag value) → linked and locked, in one commit."""
+LINK_TAGS_RETURNING_SQL = """
+INSERT INTO tag_asset ("assetId", "tagId")
+SELECT * FROM unnest(%(assets)s::uuid[], %(tags)s::uuid[])
+ON CONFLICT DO NOTHING
+RETURNING "assetId", "tagId"
+"""
+
+
+def link_tags(conn, links: list[tuple[str, str, str]], *, report: bool = False,
+              commit: bool = True) -> set[tuple[str, str]]:
+    """(asset id, tag id, tag value) → linked and locked, in one transaction.
+
+    With `report`, returns the (asset id, tag value) links this insert
+    created (`RETURNING`, so a link someone else made first, a tag assigned
+    by hand, is never counted). With `commit=False` the caller commits, after
+    recording what it was told, so a crash can't leave links nobody owns."""
+    links = list(dict.fromkeys(links))
+    created: set[tuple[str, str]] = set()
     with conn.cursor() as cur:
         params = [{"asset": a, "tag": t, "value": v} for a, t, v in links]
         cur.executemany(LOCK_TAG_SQL, params)
-        cur.executemany(LINK_TAG_SQL, params)
-    conn.commit()
+        if report:
+            if links:
+                cur.execute(LINK_TAGS_RETURNING_SQL, {"assets": [a for a, _, _ in links],
+                                                      "tags": [t for _, t, _ in links]})
+                value = {(a, t): v for a, t, v in links}
+                created = {(str(a), value[(str(a), str(t))]) for a, t in cur.fetchall()}
+        else:
+            cur.executemany(LINK_TAG_SQL, params)
+    if commit:
+        conn.commit()
+    return created
 
 
 # Removing one of immy's tags from an asset: the link, and the value from
@@ -715,6 +740,7 @@ def link_tags(conn, links: list[tuple[str, str, str]]) -> None:
 DROP_TAG_VALUE_SQL = """
 UPDATE asset_exif SET tags = array_remove(tags, %(value)s::varchar)
 WHERE "assetId" = %(asset)s
+  AND "assetId" IN (SELECT id FROM asset WHERE "ownerId" = %(owner)s)
 """
 
 UNLINK_TAG_SQL = """
@@ -737,29 +763,103 @@ def unlink_tags(conn, owner_id: str, removals: list[tuple[str, str]]) -> None:
 
 # --- ledger ----------------------------------------------------------------
 #
-# key → {start, end, region, album_id, assets, tags}.
+# One partition per Immich user (`owners` → user id → trips), so a run for
+# one user never sees, let alone retires, another's trips. Each trip:
+# key → {start, end, region, album_id, assets, tags, description}.
 #   assets: album memberships immy created (an album it made, or an add that
 #           returned success). An asset already in the album, e.g. added by
 #           hand, is never claimed, so --prune can never remove it.
-#   tags:   {tag value: [asset ids]} immy linked.
+#   tags:   {tag value: [asset ids]} links immy created. Absent (an entry
+#           from before tags were tracked) means unknown, not none: see
+#           backfill_owned_tags.
 # start/end/region let a trip whose key changed (first day moved) find its
 # old album by overlap; album_id finds it even if its marker line was edited.
+# Schema 1 kept one flat `trips` map with no owner; adopt_legacy moves its
+# entries into the partition of the user whose assets they are.
 
 
-def load_ledger(path: Path) -> dict[str, dict]:
+def _read_ledger(path: Path) -> dict:
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return {}
-    trips = data.get("trips") if isinstance(data, dict) else None
-    return trips if isinstance(trips, dict) else {}
+    return data if isinstance(data, dict) else {}
 
 
-def save_ledger(path: Path, ledger: dict[str, dict]) -> None:
+def load_ledger(path: Path, owner_id: str) -> dict[str, dict]:
+    owners = _read_ledger(path).get("owners")
+    trips = owners.get(owner_id) if isinstance(owners, dict) else None
+    return dict(trips) if isinstance(trips, dict) else {}
+
+
+def load_legacy(path: Path) -> dict[str, dict]:
+    """Schema-1 entries no user has adopted yet."""
+    trips = _read_ledger(path).get("trips")
+    return dict(trips) if isinstance(trips, dict) else {}
+
+
+def save_ledger(path: Path, ledger: dict[str, dict], owner_id: str, *,
+                legacy: dict[str, dict] | None = None) -> None:
+    """Write one user's partition; the others (and, unless `legacy` is
+    given, the unadopted schema-1 entries) stay as they are on disk."""
+    data = _read_ledger(path)
+    owners = data.get("owners") if isinstance(data.get("owners"), dict) else {}
+    owners[owner_id] = dict(sorted(ledger.items()))
+    out: dict = {"schema": 2, "owners": dict(sorted(owners.items()))}
+    rest = legacy if legacy is not None else data.get("trips")
+    if isinstance(rest, dict) and rest:
+        out["trips"] = dict(sorted(rest.items()))
     path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(json.dumps({"schema": 1, "trips": dict(sorted(ledger.items()))}, indent=1))
+    tmp = path.with_suffix(f"{path.suffix}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(out, indent=1))
     os.replace(tmp, path)
+
+
+def lock_ledger(path: Path):
+    """Exclusive lock for a whole `--apply` run (load, adopt, reconcile,
+    save), so two runs, for one user or two, never interleave. Released
+    when the returned file is closed or the process exits."""
+    import fcntl
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fh = open(path.with_suffix(path.suffix + ".lock"), "w")
+    try:
+        fcntl.flock(fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fh.close()
+        raise RuntimeError(f"another `immy trips --apply` holds {fh.name}") from None
+    return fh
+
+
+OTHER_OWNERS_SQL = """
+SELECT id, "ownerId" = %(owner)s FROM asset WHERE id = ANY(%(ids)s::uuid[])
+"""
+
+
+def _entry_assets(entry: dict) -> set[str]:
+    return set(entry.get("assets", [])) | {a for a, _ in owned_pairs(entry)}
+
+
+def adopt_legacy(conn, owner_id: str, legacy: dict[str, dict], *,
+                 sole_user: bool) -> tuple[dict[str, dict], dict[str, dict]]:
+    """Split schema-1 entries into (this user's, the rest). An entry is
+    this user's when none of its assets belongs to anyone else and at least
+    one belongs to them; one with no live assets only on a one-user server."""
+    if not legacy:
+        return {}, {}
+    ids = sorted(set().union(*(_entry_assets(e) for e in legacy.values())))
+    mine: set[str] = set()
+    theirs: set[str] = set()
+    if ids:
+        with conn.cursor() as cur:
+            cur.execute(OTHER_OWNERS_SQL, {"owner": owner_id, "ids": ids})
+            for aid, is_mine in cur.fetchall():
+                (mine if is_mine else theirs).add(str(aid))
+    adopted, rest = {}, {}
+    for key, entry in legacy.items():
+        own = _entry_assets(entry)
+        ok = not (own & theirs) and (bool(own & mine) or sole_user)
+        (adopted if ok else rest)[key] = entry
+    return adopted, rest
 
 
 def ledger_match(trip: Trip, ledger: dict[str, dict], taken: set[str]) -> str | None:
@@ -788,7 +888,8 @@ def match_ledger(
     keys no trip continues: trips that disappeared (a home added, merged
     into a neighbour, dropped under min_assets). Only ledger entries whose
     start is `in_scope` can be orphans, so a `--since` run never touches
-    other years."""
+    other years. Pass every trip found, not just the ones in scope: a trip
+    whose start moved out of scope still continues its entry."""
     taken: set[str] = set()
     pairs: list[tuple[Trip, str | None]] = []
     for t in trips:
@@ -837,6 +938,32 @@ def backfill_owned_tags(conn, owner_id: str, asset_ids: list[str], root: str) ->
     return {(a, v) for a, v in rows if trip_of(v) == top}
 
 
+LINKS_BY_VALUE_SQL = """
+SELECT ta."assetId", t.value FROM tag_asset ta
+JOIN tag t ON t.id = ta."tagId"
+WHERE t."userId" = %(owner)s AND ta."assetId" = ANY(%(assets)s::uuid[])
+  AND t.value = ANY(%(values)s::varchar[])
+"""
+
+
+def confirm_pending(conn, owner_id: str, entry: dict) -> bool:
+    """Settle an entry's `pending_tags`: links immy inserted and recorded,
+    but whose commit a crash may have lost. The ones that exist were
+    committed and become owned; the rest never happened. True if changed."""
+    pending = {(a, v) for v, ids in (entry.get("pending_tags") or {}).items() for a in ids}
+    if "pending_tags" not in entry:
+        return False
+    entry.pop("pending_tags")
+    if pending:
+        with conn.cursor() as cur:
+            cur.execute(LINKS_BY_VALUE_SQL, {
+                "owner": owner_id, "assets": sorted({a for a, _ in pending}),
+                "values": sorted({v for _, v in pending})})
+            there = {(str(a), v) for a, v in cur.fetchall()}
+        entry["tags"] = tags_by_value(owned_pairs(entry) | (pending & there))
+    return True
+
+
 def owned_pairs(entry: dict | None) -> set[tuple[str, str]]:
     """(asset id, tag value) immy linked for a ledger entry."""
     tags = (entry or {}).get("tags") or {}
@@ -851,15 +978,14 @@ def tags_by_value(pairs: set[tuple[str, str]]) -> dict[str, list[str]]:
 
 
 __all__ = [
-    "match_ledger", "owned_pairs", "tags_by_value", "backfill_owned_tags",
+    "match_ledger", "owned_pairs", "load_legacy", "adopt_legacy",
+    "OTHER_OWNERS_SQL", "LINK_TAGS_RETURNING_SQL", "lock_ledger", "confirm_pending", "LINKS_BY_VALUE_SQL", "tags_by_value", "backfill_owned_tags",
     "IMMY_TRIP_MARKER", "LEDGER_FILENAME",
     "DEFAULT_PLACEHOLDER_MIN", "ASSETS_SQL", "DAY_BUCKETS_SQL",
     "DEFAULT_MAX_GAP_DAYS", "DEFAULT_TRANSIT_DAYS", "DEFAULT_MIN_ASSETS", "DEFAULT_TAG_ROOT",
     "Regions", "PlaceCount", "Day", "HomeStay", "Trip",
     "country_code", "build_days", "segment", "assign_assets", "keep",
     "name_for_trip", "format_range", "stable_key", "marker_line", "extract_key",
-    "Leg", "assets_by_leg", "leg_tags", "is_generated_line", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
-    "unlink_tags", "DROP_TAG_VALUE_SQL", "UNLINK_TAG_SQL",
     "Leg", "assets_by_leg", "leg_tags", "is_generated_line", "link_tags", "LOCK_TAG_SQL", "LINK_TAG_SQL",
     "unlink_tags", "DROP_TAG_VALUE_SQL", "UNLINK_TAG_SQL",
     "description_for", "tag_for", "load_ledger", "save_ledger", "ledger_match",

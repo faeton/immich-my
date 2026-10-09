@@ -175,11 +175,17 @@ only channel that reaches video assets' metadata (see `TELEMETRY.md`).
 
 ## Ownership and `--prune`
 
-The ledger (`trips-ledger.json` under `state_root`) records, per trip, exactly
-what immy put there:
+The ledger (`trips-ledger.json` under `state_root`) is kept per Immich user,
+so a run with `--owner` only ever sees and retires that user's trips. It
+records, per trip, exactly what immy put there:
 - **Album links:** the album immy created, or adds that returned success. An
   asset that was already in the album (added by hand) is never claimed.
-- **Tags:** each trip/leg tag value and the assets immy linked it to.
+- **Tags:** each trip/leg tag value and the assets immy linked it to. A link
+  that already existed (a tag you assigned by hand) is never claimed.
+
+An older ledger (one flat list, no user) is moved over on the next run: each
+entry goes to the user who owns its assets. Entries whose tags weren't
+tracked yet get them from the database first, with or without `--tags`.
 
 `--prune` removes only those:
 - **Moved assets:** an asset that moved to another trip (after a date fix)
@@ -190,7 +196,13 @@ what immy put there:
 - **Disappeared trips:** a trip that no longer exists (a new home, merged into
   a neighbour, under `min_assets`) is retired. Its claimed links and tags go;
   the album stays, with anything you added. A dry run lists these first.
-  `--since`/`--until` limit this to that range.
+  `--since`/`--until` limit this to that range. A trip whose start moved out
+  of the range still exists, so it is left alone, not retired.
 
-Without `--prune`, everything is add-only and stale claims are remembered for
-a later `--prune`. Assets themselves are never touched.
+Tag values can repeat across trips (two Paris trips in one March). A link is
+removed only when no surviving trip owns it; one an asset carries into its new
+trip moves to that trip, even one outside `--since`/`--until`. A tag that couldn't be created this run (API error)
+still counts as wanted, so its links are kept. `--prune` cleans up tags with or
+without `--tags`. Without `--prune`, everything is add-only and stale claims
+are remembered for a later `--prune`. Assets themselves are never touched.
+One `--apply` runs at a time: it locks `trips-ledger.json.lock`.

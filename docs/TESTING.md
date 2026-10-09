@@ -28,7 +28,10 @@ scripts/test-pg.sh down
 ```
 
 Without `IMMY_TEST_PG_DSN` they skip. Only tests marked `scratch_pg` may
-connect, only to exactly that DSN, and only if it names a non-live port.
+connect, only to exactly that DSN, and only if libpq's own reading of it
+gives a loopback host and one explicit non-live port, with nothing that
+could redirect it (a `?port=`/`?host=` override, `hostaddr`, `service`, a
+host list, or keyword arguments to `connect`).
 
 ## Phase 0 — Base stack
 
