@@ -1812,8 +1812,29 @@ def _rescue_sidecar(
         patch["GPSLongitudeRef"] = "E" if gps_lon >= 0 else "W"
     if not patch:
         return False
+    # Never let the sidecar contradict the file it sits next to: a GPS that
+    # is the file's own with a sign lost, or a video's UTC clock written as
+    # wall time (see sidecar_check). The same rules `immy sidecars check`
+    # applies to sidecars already in the library.
+    from .. import sidecar_check
+    patch = sidecar_check.correct_patch(patch, sidecar_check.file_facts(_own_metadata(dest), str(dest)))
     sidecar.write(dest, patch)
     return True
+
+
+def _own_metadata(path: Path) -> dict:
+    """The original's own GPS and dated capture time (exiftool `-j -n`), or {}."""
+    import subprocess
+    try:
+        out = subprocess.run(
+            ["exiftool", "-j", "-n", "-q", "-q", "-api", "largefilesupport=1",
+             "-GPSLatitude", "-GPSLongitude", "-DateTimeOriginal", "-OffsetTimeOriginal",
+             "-CreateDate", "-CreationDate", "-Make", str(path)],
+            capture_output=True, text=True, timeout=120)
+        data = json.loads(out.stdout or "[]")
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return {}
+    return data[0] if data and isinstance(data[0], dict) else {}
 
 
 def promote_rest(

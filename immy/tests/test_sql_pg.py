@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import os
 import uuid
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 
@@ -480,3 +480,32 @@ def test_city_parents_rolls_districts_up_and_leaves_towns_alone(conn) -> None:
     far = T.PlaceCount(d, "Poland", "Bielany", 52.34, 22.25, 50)
     rolled = T.roll_up_cities(b + [far], T.city_parents(conn, b + [far]))
     assert [x.city for x in rolled if x.country == "Poland"] == ["Warsaw", "Warsaw", "Warsaw", "Bielany"]
+
+
+# --- sidecar hints ------------------------------------------------------------------
+
+
+def test_sidecar_hints_use_unsuspect_neighbours(conn) -> None:
+    from zoneinfo import ZoneInfo
+    from immy import sidecar_check as sc
+    conn.execute('ALTER TABLE asset ADD COLUMN "fileCreatedAt" timestamptz')
+    conn.execute('ALTER TABLE asset_exif ADD COLUMN "timeZone" varchar')
+    conn.execute('CREATE TABLE asset_file ("assetId" uuid, type varchar, path varchar)')
+    t = datetime(2025, 10, 7, 15, 29, tzinfo=timezone.utc)
+
+    def shot(minutes, lat, lon, tz, *, sidecar=False, owner=OWNER):
+        aid = add(conn, datetime(2025, 10, 8, 3, 29), lat, lon, "Fiji", owner=owner)
+        conn.execute('UPDATE asset SET "fileCreatedAt" = %s WHERE id = %s', (t + timedelta(minutes=minutes), aid))
+        conn.execute('UPDATE asset_exif SET "timeZone" = %s WHERE "assetId" = %s', (tz, aid))
+        if sidecar:
+            conn.execute("INSERT INTO asset_file VALUES (%s, 'sidecar', 'x.xmp')", (aid,))
+        return aid
+
+    me = shot(0, 17.80, 177.42, "Pacific/Majuro", sidecar=True)       # the suspect
+    shot(5, 17.80, 177.42, "Pacific/Majuro", sidecar=True)            # another suspect: ignored
+    shot(-40, -17.75, 177.45, "Pacific/Fiji")                         # nearest clean shot
+    shot(90, -17.70, 177.40, "Pacific/Fiji")
+    shot(2, 40.0, -3.7, "Europe/Madrid", owner=OTHER)                 # someone else's: ignored
+    got = sc.hints(conn, OWNER, {me: t})[me]
+    assert (got.lat, got.lon) == (-17.75, 177.45)
+    assert got.zone == ZoneInfo("Pacific/Fiji")

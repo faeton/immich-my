@@ -4,6 +4,44 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-10 — sidecars that contradict their originals
+
+### Found
+
+- **19,259 old `name.xmp` sidecars** from promote's write-back before
+  2026-10-02. About 4,900 contradict their originals, and because Immich reads
+  a registered sidecar over the file, they break good files:
+  - **Hemisphere dropped** (GPS written as `abs()`): about 2,400 assets.
+    Fiji was filed in the North Pacific, Las Vegas in China ("Nanle"), French
+    Polynesia as "Saipan", Auckland as "Magadan", with time zones to match.
+    The originals carry the correct signed GPS.
+  - **UTC clock as wall time**: about 4,300 videos. QuickTime `CreateDate` is
+    UTC, and written without an offset Immich reads it as local time: a Las
+    Vegas clip at 15:08 showed 23:08, and Pacific clips landed on the wrong
+    day. Apple files carry their true local time + offset in `CreationDate`;
+    Ray-Ban Meta store a `Z` UTC instant.
+
+### Added
+
+- **`immy sidecars check`** (`sidecar_check.py`, docs/SIDECARS.md) checks
+  every registered sidecar against its original's own GPS and dated capture
+  time. What the file lacks, it checks against your other shots around the
+  same moment (a mirror-image position, the zone most of them carry). It only
+  repairs the bugs' exact signatures:
+  - a positive coordinate that is a lost minus, ≥ 300 km off;
+  - a date with no offset equal to the file's own UTC instant (never on
+    Insta360, whose QuickTime clock is local).
+
+  Deliberate corrections are never undone. Assets sharing a sidecar (Live
+  Photos) are validated together, and one shared with another user's assets is
+  skipped. Each sidecar's previous text is synced to an undo log before it
+  changes; refresh intent survives an interrupted run. Incremental: only new
+  or changed sidecars/originals are re-read. It is the last stage of
+  `photos-ingest.sh --promote`.
+- **Promote's guard**: `_rescue_sidecar` runs the same rules against the
+  original before writing, so a new sidecar can't contradict its file.
+- `schema_contract.READ_COLUMNS` gains `library.importPaths`.
+
 ## 2026-10-10 — trips: city names, tag-only small trips
 
 ### Changed

@@ -19,7 +19,8 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 transcripts → inserts/writes Immich Postgres) · `promote` (upload a trip to an external library) ·
 `cluster` (geo-date albums) · `takeout redate` (fix Takeout capture dates from the JSON companions, stack copies;
 see `docs/TAKEOUT.md`) · `trips` (one dated album per trip from the day-by-day
-geography; homes, regions, stopovers; see `docs/TRIPS.md`) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
+geography; homes, regions, stopovers; see `docs/TRIPS.md`) · `sidecars check` (repair registered
+sidecars that contradict their originals: lost GPS signs, UTC clocks; last ingest stage; see `docs/SIDECARS.md`) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
 reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
 `tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — to Immich's native
 Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·

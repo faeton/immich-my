@@ -697,6 +697,68 @@
         "column_default": null
       }
     },
+    "library": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "name": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "ownerId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "importPaths": {
+        "data_type": "ARRAY",
+        "udt_name": "_text",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "exclusionPatterns": {
+        "data_type": "ARRAY",
+        "udt_name": "_text",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "deletedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "refreshedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      }
+    },
     "naturalearth_countries": {
       "id": {
         "data_type": "integer",

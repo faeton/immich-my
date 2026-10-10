@@ -5094,6 +5094,285 @@ def takeout_redate(
 app.add_typer(takeout_app, name="takeout")
 
 
+sidecars_app = typer.Typer(
+    help="Keep registered XMP sidecars consistent with the originals they describe.",
+    no_args_is_help=True,
+)
+
+
+def _resolve_import_root(cur, import_path: str | None) -> str | None:
+    """The one Immich import path the run works under: `--import-path`, else
+    the library's only one. Paths outside it are skipped, so a sidecar is
+    never written under one root and registered under another."""
+    cur.execute('SELECT "importPaths" FROM library WHERE "deletedAt" IS NULL')
+    paths = sorted({p.rstrip("/") for (ps,) in cur.fetchall() for p in (ps or [])})
+    root = (import_path or "").rstrip("/") or (paths[0] if len(paths) == 1 else None)
+    if root is None:
+        console.print(f"[red]{len(paths)} import paths[/red] ({', '.join(paths)}) — "
+                      "pass --import-path for the one --originals points at.")
+    return root
+
+
+@sidecars_app.command("check")
+def sidecars_check(
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Default: report only."),
+    originals: Path = typer.Option(
+        None, "--originals",
+        help="The library's import path as seen from here (default: config originals_root).",
+    ),
+    import_path: str = typer.Option(
+        None, "--import-path",
+        help="The Immich-side import path --originals is (default: the library's only one).",
+    ),
+    owner: str = typer.Option(None, "--owner", help="Immich user email (required with several users)."),
+    all_: bool = typer.Option(
+        False, "--all",
+        help="Re-check every sidecar, not only new or changed ones since the last run.",
+    ),
+    asset: list[str] = typer.Option(None, "--asset", help="Only these asset ids (pilot)."),
+    csv_path: Path = typer.Option(None, "--csv", help="Write the planned repairs here."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
+) -> None:
+    """Find and repair sidecars that contradict their originals.
+
+    A registered sidecar overrides the file, so a wrong one breaks a good
+    file: a GPS hemisphere dropped (Fiji filed as the North Pacific, Las Vegas
+    as China, with the time zone to match) or a video's UTC clock written as
+    local time (hours off, often the wrong day). Each sidecar is checked
+    against its original's own GPS and dated capture time; what the file
+    lacks is checked against your other shots around the same moment.
+    Deliberate corrections (a location or clock fixed in Photos) are left
+    alone. See `immy/src/immy/sidecar_check.py` and docs/SIDECARS.md.
+
+    With `--apply`: rewrites only the wrong fields, logs every sidecar's
+    previous text to `sidecar-check-<time>.jsonl` under state_root, and
+    queues a metadata refresh for exactly those assets. Runs as the last
+    stage of the ingest (`deploy/n5/photos-ingest.sh --promote`).
+    """
+    import csv
+    import json as _json
+    from datetime import datetime as _dt
+    from . import sidecar as sidecar_mod
+    from . import sidecar_check as sc
+
+    config = load_config(config_path)
+    if config.pg is None:
+        console.print("[red]no pg: block in immy config[/red]")
+        raise typer.Exit(code=2)
+    if not dry_run and config.immich is None:
+        console.print("[red]no immich: block in immy config[/red] — --apply needs the API.")
+        raise typer.Exit(code=2)
+    originals = originals or config.originals_root
+    if originals is None:
+        console.print("[red]pass --originals (or set originals_root)[/red]")
+        raise typer.Exit(code=2)
+
+    conn = pg_mod.connect(config.pg)
+    if not dry_run:
+        _require_live_schema(conn)
+    cur = conn.cursor()
+    cur.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL')
+    users = cur.fetchall()
+    match = [u for u in users if not owner or u[1] == owner]
+    if len(match) != 1:
+        console.print("[red]pass --owner <email>[/red]" if match else f"[red]no Immich user {owner!r}[/red]")
+        conn.close()
+        raise typer.Exit(code=2)
+    owner_id = str(match[0][0])
+    root = _resolve_import_root(cur, import_path)
+    if root is None:
+        conn.close()
+        raise typer.Exit(code=2)
+
+    def local(path: str) -> Path | None:
+        return originals / path[len(root) + 1:] if path.startswith(root + "/") else None
+
+    def stamp(path: Path | None) -> str | None:
+        try:
+            st = path.stat()
+        except (OSError, AttributeError):
+            return None
+        return f"{st.st_size}:{st.st_mtime_ns}"
+
+    cur.execute(sc.SIDECARS_SQL, {"owner": owner_id})
+    rows = [(str(a), o, sp, t) for a, o, sp, t in cur.fetchall()]
+    # Every asset that shares a sidecar is checked with it: a repair has to
+    # be right for all of them (a Live Photo's still and video).
+    members: dict[str, list[tuple[str, str, object]]] = {}
+    for aid, orig, side, created in rows:
+        members.setdefault(side, []).append((aid, orig, created))
+
+    state_path = (config.state_root or Path.home() / ".immy") / "sidecar-check.json"
+    try:
+        state = _json.loads(state_path.read_text())
+    except (OSError, ValueError):
+        state = {}
+    seen: dict[str, str] = state.get("seen", {})
+    # Assets whose sidecar was repaired but whose refresh hasn't been sent:
+    # appended (and synced) before each sidecar changes, so an interrupted
+    # run still refreshes them next time.
+    pending_path = state_path.with_name("sidecar-check-pending.txt")
+    try:
+        pending: list[str] = [ln for ln in pending_path.read_text().split() if ln]
+    except OSError:
+        pending = []
+
+    def save_state():
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = state_path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(_json.dumps({"seen": seen}))
+        os.replace(tmp, state_path)
+
+    def fingerprint(side: str, orig: str) -> str | None:
+        # The sidecar and the original: a replaced original can make an
+        # unchanged sidecar wrong.
+        a, b = stamp(local(side)), stamp(local(orig))
+        return f"{a}|{b}" if a and b else None
+
+    outside = 0
+    selected: list[str] = []
+    for side, ms in members.items():
+        if local(side) is None or any(local(o) is None for _, o, _ in ms):
+            outside += 1
+            continue
+        if asset:
+            if any(a in set(asset) for a, _, _ in ms):
+                selected.append(side)
+        elif all_ or any(seen.get(a) != fingerprint(side, o) for a, o, _ in ms):
+            selected.append(side)
+    cross = set()
+    if selected:
+        cur.execute(sc.SHARED_OWNERS_SQL, {"paths": selected})
+        cross = {p for (p,) in cur.fetchall()}
+        selected = [p for p in selected if p not in cross]
+    unchanged = len(members) - outside - len(selected) - len(cross)
+    console.print(f"[bold]sidecars check[/bold] — {len(members)} sidecar(s) on {len(rows)} asset(s); "
+                  f"{len(selected)} to check" + (f", {unchanged} unchanged since the last check" if unchanged else "")
+                  + (f", {outside} outside {root} skipped" if outside else "")
+                  + (f", {len(cross)} shared with another user's assets skipped" if cross else ""))
+
+    # The originals' own metadata, one exiftool run.
+    exif: dict[str, dict] = {}
+    originals_todo = sorted({str(local(o)) for side in selected for _, o, _ in members[side]})
+    if originals_todo:
+        import subprocess
+        import tempfile
+        with tempfile.NamedTemporaryFile("w", suffix=".txt", delete=False) as fh:
+            fh.write("\n".join(originals_todo))
+            listing = fh.name
+        out = subprocess.run(
+            ["exiftool", "-j", "-n", "-q", "-q", "-api", "largefilesupport=1",
+             "-GPSLatitude", "-GPSLongitude", "-DateTimeOriginal", "-OffsetTimeOriginal",
+             "-CreateDate", "-CreationDate", "-Make", "-@", listing],
+            capture_output=True, text=True)
+        Path(listing).unlink(missing_ok=True)
+        try:
+            exif = {d["SourceFile"]: d for d in _json.loads(out.stdout or "[]") if not d.get("Error")}
+        except ValueError:
+            exif = {}
+
+    facts: dict[str, tuple] = {}            # sidecar → (text, SidecarFacts, [(aid, orig, FileFacts)])
+    unreadable: list[str] = []
+    for side in selected:
+        text = sc.sidecar_text(local(side))
+        fs = [(a, o, sc.file_facts(exif.get(str(local(o)), {}), str(local(o))), c)
+              for a, o, c in members[side]]
+        if text is None or any(not f.read for _, _, f, _ in fs):
+            unreadable.append(side)          # retried next run: never stamped
+            continue
+        facts[side] = (text, sc.read_sidecar(text), fs)
+    want = {a: (f.utc or f.local or c) for _, sf, fs in facts.values()
+            for a, _, f, c in fs if sc.needs_hint(f, sf)}
+    hint = sc.hints(conn, owner_id, want)
+
+    repairs = []                              # (sidecar, patch, reasons, [aid], text, SidecarFacts)
+    conflicts: list[str] = []
+    for side, (text, sf, fs) in facts.items():
+        plans = [(a, sc.plan(f, sf, hint.get(a))) for a, _, f, _ in fs]
+        fixes = [fx for _, fx in plans if fx is not None]
+        if not fixes:
+            for a, o, _, _ in fs:
+                seen[a] = fingerprint(side, o)
+            continue
+        merged: dict[str, object] = {}
+        clash = False
+        for fx in fixes:
+            for k, v in fx.patch.items():
+                clash |= k in merged and merged[k] != v
+                merged[k] = v
+        if clash or not all(sc.agrees(f, merged) for _, _, f, _ in fs):
+            conflicts.append(side)
+            continue
+        reasons = list(dict.fromkeys(r for fx in fixes for r in fx.reasons))
+        repairs.append((side, merged, reasons, [a for a, _, _, _ in fs], text, sf))
+
+    counts: dict[str, int] = {}
+    for r in repairs:
+        k = "+".join(r[2])
+        counts[k] = counts.get(k, 0) + 1
+    console.print("  " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
+                          or "nothing to repair")
+                  + (f"; {len(conflicts)} shared sidecar(s) whose assets disagree, left alone" if conflicts else "")
+                  + (f"; {len(unreadable)} with an unreadable original, retried next run" if unreadable else ""))
+
+    if csv_path:
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["sidecar", "assets", "reasons", "date_before", "date_after",
+                        "lat_before", "lon_before", "lat_after", "lon_after"])
+            for side, patch, reasons, ids, _, sf in repairs:
+                w.writerow([side, " ".join(ids), "+".join(reasons), sf.dto or "",
+                            patch.get("DateTimeOriginal", ""), sf.lat, sf.lon,
+                            patch.get("GPSLatitude", ""), patch.get("GPSLongitude", "")])
+            for side in conflicts:
+                w.writerow([side, " ".join(a for a, _, _ in members[side]), "conflict", "", "", "", "", "", ""])
+        console.print(f"wrote {csv_path}")
+
+    if dry_run:
+        conn.close()
+        console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to repair {len(repairs)} sidecar(s).")
+        return
+
+    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key,
+                          ssh_host=config.immich.ssh_host)
+    state_root = config.state_root or Path.home() / ".immy"
+    state_root.mkdir(parents=True, exist_ok=True)
+    log_path = state_root / f"sidecar-check-{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}-{os.getpid()}.jsonl"
+    written = 0
+    with open(log_path, "x") as log, open(pending_path, "a") as pend:
+        for side, patch, reasons, ids, text, _ in repairs:
+            # The previous text is on disk before the sidecar changes.
+            log.write(_json.dumps({"sidecar": str(local(side)), "assets": ids, "before": text,
+                                   "reasons": reasons, "patch": patch}, default=str) + "\n")
+            log.flush()
+            os.fsync(log.fileno())
+            pend.write("\n".join(ids) + "\n")
+            pend.flush()
+            os.fsync(pend.fileno())
+            try:
+                sidecar_mod.write(local(members[side][0][1]), patch, xmp_path=local(side))
+            except RuntimeError as e:
+                console.print(f"  [red]sidecar failed[/red] {side}: {e}")
+                continue
+            written += 1
+            pending.extend(ids)
+            for a, o, _ in members[side]:
+                seen[a] = fingerprint(side, o)
+    save_state()
+    conn.close()
+    try:
+        client.refresh_metadata(sorted(set(pending)))
+    except Exception as e:  # kept in `pending_refresh`, sent again next run
+        console.print(f"[red]metadata refresh failed[/red] ({e}); retried on the next run.")
+        raise typer.Exit(code=1)
+    refreshed = len(set(pending))
+    pending_path.unlink(missing_ok=True)
+    console.print(f"[green]✓[/green] {written} sidecar(s) repaired, metadata refresh queued for "
+                  f"{refreshed} asset(s). Undo log: {log_path}")
+
+app.add_typer(sidecars_app, name="sidecars")
+
+
 photos_app = typer.Typer(
     help="Apple Photos.app → Immich bridge. Uses the Mac's own Photos/iCloud "
     "session, so n5 never logs into iCloud.",

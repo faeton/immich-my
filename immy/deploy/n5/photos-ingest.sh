@@ -5,7 +5,9 @@
 # Usage:
 #   ./photos-ingest.sh             # register → fingerprint → cluster → confirm → decide
 #                                  # (moves NO files; ends with a report)
-#   ./photos-ingest.sh --promote   # same, then promote-rest --write into the library
+#   ./photos-ingest.sh --promote   # same, then promote-rest --write into the library,
+#                                  # then `sidecars check --apply` (fix any sidecar that
+#                                  # contradicts its original; new/changed ones only)
 #
 # Default stops at `decide` on purpose: read the report (new auto/review clusters
 # touching photos rows) before anything lands in /originals. After --promote,
@@ -44,6 +46,8 @@ immy() { sudo -n docker compose -f "$COMPOSE" run --rm -T immy "$@"; }
   if [ "${1:-}" = "--promote" ]; then
     echo "== promote-rest"
     immy dedup promote-rest $M --originals /originals --write
+    echo "== sidecars check"
+    immy sidecars check --originals /originals --apply
   else
     echo "== stopped before promote (dry-run below); re-run with --promote"
     immy dedup promote-rest $M --originals /originals

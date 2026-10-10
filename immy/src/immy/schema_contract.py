@@ -78,6 +78,7 @@ READ_COLUMNS: dict[str, tuple[str, ...]] = {
     "album": ("id", "albumName", "description", "deletedAt"),
     "album_asset": ("albumId", "assetId"),
     "user": ("id", "email", "deletedAt"),
+    "library": ("importPaths", "deletedAt"),
     "geodata_places": ("id", "name", "admin1Name", "admin2Name", "alternateNames",
                        "countryCode", "latitude", "longitude"),
     "naturalearth_countries": ("admin_a3", "coordinates"),
