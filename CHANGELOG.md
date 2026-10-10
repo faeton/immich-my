@@ -33,6 +33,15 @@ live library:
   and registered, so one cut short is finished exactly.
 - **Zones never overwrite** an existing unregistered `name.ext.xmp` (none
   were overwritten live).
+- **Live, after the final fixes:**
+  - **Zones:** with verified shots now voting, 105 more UTC-clock videos got a
+    clear zone (90 new datings, 15 sidecar clocks).
+  - **25 more stem-shared sidecars split.** iPhone counters reuse names, so
+    `IMG_0146.HEIC`/`.mov`, a Live Photo from 23 Sep 2026, read the 12 Sep
+    video `IMG_0146.MOV`'s date. Sidecars marked as checked by the
+    pre-split version had hidden them; a one-time `--all --split` reached
+    them.
+  - Trips: 24 assets moved; the re-run is idempotent.
 - **A video that only lacks a zone stays eligible** on the next run.
 - `sidecar.create_from` removed.
 
