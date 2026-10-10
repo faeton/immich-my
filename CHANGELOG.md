@@ -15,7 +15,8 @@ live library:
   dropped with it.
   - Now the vote counts offsets at the instant.
   - A shot votes if placed by GPS or carrying an offset from its own file.
-  - Shots with sidecars vote too, now that they are repaired.
+  - Shots with sidecars vote too, now that they are repaired, except those
+    being checked in the same run.
   - It needs two thirds and abstains when UTC wins.
 
   Re-checking the 1,971 dated videos: 1,937 unchanged, 3 got another zone
@@ -27,8 +28,9 @@ live library:
   `own_patch`: the capture time with an explicit offset, plus signed GPS. The
   50 already written were rewritten.
 - **Splitting is opt-in (`--split`).** A mismatch can be a deliberate
-  correction. The routine run reports these; a split cut short resumes from
-  `sidecar-check-splits.txt`.
+  correction. The routine run reports these. A split is staged in full,
+  recorded (`sidecar-check-splits.jsonl`), then moved into place atomically
+  and registered, so one cut short is finished exactly.
 - **Zones never overwrite** an existing unregistered `name.ext.xmp` (none
   were overwritten live).
 - **A video that only lacks a zone stays eligible** on the next run.

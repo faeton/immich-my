@@ -53,7 +53,8 @@ The vote is counted by offset at that moment, so `Pacific/Honolulu` and
 `UTC-10` are one vote. A shot votes when its zone is evidence: placed by its
 own GPS (a UTC there is real, Lisbon in winter), or an offset from its own
 file. A bare `UTC` on a shot with no position means "unknown" and doesn't
-vote.
+vote, and neither does a shot whose sidecar is being checked in the same run
+(a mirrored GPS would vote for the mirror's zone).
 
 Nothing is written:
 - when the vote is split (border days), or when UTC wins;
@@ -84,8 +85,11 @@ A file with nothing to compare, or nothing of its own to say, blocks the
 split. Splitting is opt-in (`--split`): a mismatch can also be a deliberate
 correction (one camera's clock fixed to match another's). The routine run
 reports these as "assets disagree"; review them with `--csv` and split
-deliberately. A split cut short is finished by the next run
-(`sidecar-check-splits.txt`). The old `name.xmp` stays on disk,
+deliberately. Every member's final sidecar is staged first
+(`sidecar-split-staging/`), the split is recorded in
+`sidecar-check-splits.jsonl`, and only then are files moved into place
+(atomically) and registered. A split cut short is finished exactly by the next
+run. The old `name.xmp` stays on disk,
 unregistered.
 A date with an explicit offset is right for both. A sidecar that another
 user's assets also use is skipped.
