@@ -5130,6 +5130,11 @@ def sidecars_check(
         help="Re-check every sidecar, not only new or changed ones since the last run.",
     ),
     asset: list[str] = typer.Option(None, "--asset", help="Only these asset ids (pilot)."),
+    zones: bool = typer.Option(
+        True, "--zones/--no-zones",
+        help="Also date videos with no sidecar and no GPS that Immich shows on the UTC "
+             "clock, in the zone of your shots around them (a new sidecar each).",
+    ),
     csv_path: Path = typer.Option(None, "--csv", help="Write the planned repairs here."),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
@@ -5253,9 +5258,24 @@ def sidecars_check(
                   + (f", {outside} outside {root} skipped" if outside else "")
                   + (f", {len(cross)} shared with another user's assets skipped" if cross else ""))
 
+    # Videos Immich shows on the UTC clock with nothing to correct it from:
+    # no sidecar, no GPS. Each is looked at again only if its original changes.
+    zone_rows = []
+    if zones:
+        cur.execute(sc.UTC_CLOCK_SQL, {"owner": owner_id})
+        for aid, orig, shown, created in cur.fetchall():
+            aid, lo = str(aid), local(orig)
+            if lo is None or (asset and aid not in set(asset)):
+                continue
+            if not all_ and not asset and seen.get(f"zone:{aid}") == stamp(lo):
+                continue
+            zone_rows.append((aid, orig, shown, created))
+        console.print(f"  {len(zone_rows)} video(s) on the UTC clock with no sidecar or GPS to check")
+
     # The originals' own metadata, one exiftool run.
     exif: dict[str, dict] = {}
-    originals_todo = sorted({str(local(o)) for side in selected for _, o, _ in members[side]})
+    originals_todo = sorted({str(local(o)) for side in selected for _, o, _ in members[side]}
+                            | {str(local(o)) for _, o, _, _ in zone_rows})
     if originals_todo:
         import subprocess
         import tempfile
@@ -5285,7 +5305,17 @@ def sidecars_check(
         facts[side] = (text, sc.read_sidecar(text), fs)
     want = {a: (f.utc or f.local or c) for _, sf, fs in facts.values()
             for a, _, f, c in fs if sc.needs_hint(f, sf)}
+    zone_facts = [(a, o, shown, sc.file_facts(exif.get(str(local(o)), {}), str(local(o))))
+                  for a, o, shown, _ in zone_rows]
+    want.update({a: f.utc for a, _, _, f in zone_facts if f.utc is not None and f.local is None})
     hint = sc.hints(conn, owner_id, want)
+    zone_fixes = []                           # (asset, original, patch)
+    for a, o, shown, f in zone_facts:
+        patch = sc.zone_fix(f, shown, hint.get(a))
+        if patch:
+            zone_fixes.append((a, o, patch))
+        elif f.read:
+            seen[f"zone:{a}"] = stamp(local(o))
 
     repairs = []                              # (sidecar, patch, reasons, [aid], text, SidecarFacts)
     conflicts: list[str] = []
@@ -5315,7 +5345,8 @@ def sidecars_check(
     console.print("  " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
                           or "nothing to repair")
                   + (f"; {len(conflicts)} shared sidecar(s) whose assets disagree, left alone" if conflicts else "")
-                  + (f"; {len(unreadable)} with an unreadable original, retried next run" if unreadable else ""))
+                  + (f"; {len(unreadable)} with an unreadable original, retried next run" if unreadable else "")
+                  + (f"; {len(zone_fixes)} UTC-clock video(s) to date" if zone_fixes else ""))
 
     if csv_path:
         with open(csv_path, "w", newline="") as fh:
@@ -5328,11 +5359,14 @@ def sidecars_check(
                             patch.get("GPSLatitude", ""), patch.get("GPSLongitude", "")])
             for side in conflicts:
                 w.writerow([side, " ".join(a for a, _, _ in members[side]), "conflict", "", "", "", "", "", ""])
+            for a, o, patch in zone_fixes:
+                w.writerow([o + ".xmp", a, "zone", "", patch["DateTimeOriginal"], "", "", "", ""])
         console.print(f"wrote {csv_path}")
 
     if dry_run:
         conn.close()
-        console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to repair {len(repairs)} sidecar(s).")
+        console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to repair {len(repairs)} sidecar(s)"
+                      + (f" and date {len(zone_fixes)} video(s)" if zone_fixes else "") + ".")
         return
 
     client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key,
@@ -5360,6 +5394,30 @@ def sidecars_check(
             pending.extend(ids)
             for a, o, _ in members[side]:
                 seen[a] = fingerprint(side, o)
+        dated = 0
+        for a, o, patch in zone_fixes:
+            # A sidecar of its own (`name.ext.xmp`): never shared by accident.
+            lo = local(o)
+            side_local, side_immich = lo.with_name(lo.name + ".xmp"), o + ".xmp"
+            before = sc.sidecar_text(side_local) if side_local.exists() else None
+            log.write(_json.dumps({"sidecar": str(side_local), "assets": [a], "before": before,
+                                   "registered_before": None, "registered_now": side_immich,
+                                   "reasons": ["zone"], "patch": patch}) + "\n")
+            log.flush()
+            os.fsync(log.fileno())
+            pend.write(a + "\n")
+            pend.flush()
+            os.fsync(pend.fileno())
+            try:
+                sidecar_mod.write(lo, patch, xmp_path=side_local)
+            except RuntimeError as e:
+                console.print(f"  [red]sidecar failed[/red] {side_local}: {e}")
+                continue
+            cur.execute(sc.REGISTER_SIDECAR_SQL, {"asset": a, "path": side_immich})
+            conn.commit()
+            pending.append(a)
+            dated += 1
+            seen[a] = fingerprint(side_immich, o)
     save_state()
     conn.close()
     try:
@@ -5369,7 +5427,8 @@ def sidecars_check(
         raise typer.Exit(code=1)
     refreshed = len(set(pending))
     pending_path.unlink(missing_ok=True)
-    console.print(f"[green]✓[/green] {written} sidecar(s) repaired, metadata refresh queued for "
+    console.print(f"[green]✓[/green] {written} sidecar(s) repaired"
+                  + (f", {dated} video(s) dated" if zone_fixes else "") + ", metadata refresh queued for "
                   f"{refreshed} asset(s). Undo log: {log_path}")
 
 app.add_typer(sidecars_app, name="sidecars")

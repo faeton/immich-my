@@ -149,6 +149,11 @@ class _Cur:
             self._rows = [(["/lib"],)]
         elif sql is sc.SIDECARS_SQL:
             self._rows = self.db["sidecars"]
+        elif sql is sc.UTC_CLOCK_SQL:
+            self._rows = self.db.get("utc", [])
+        elif sql is sc.REGISTER_SIDECAR_SQL:
+            self.db.setdefault("registered", []).append((params["asset"], params["path"]))
+            self._rows = []
         elif sql is sc.SHARED_OWNERS_SQL:
             self._rows = [(x,) for x in params["paths"] if x in self.db.get("cross", ())]
         elif sql is sc.HINTS_SQL:
@@ -171,6 +176,9 @@ class _Conn:
         return _Cur(self.db)
 
     def close(self):
+        pass
+
+    def commit(self):
         pass
 
 
@@ -233,9 +241,9 @@ def lib(tmp_path, monkeypatch, no_schema_guard):
 
     def fake_write(media, patch, *, xmp_path=None):
         writes.append((media.name, patch))
-        xmp_path.write_text(_xmp(patch.get("DateTimeOriginal") or sc.read_sidecar(xmp_path.read_text()).dto,
-                                 patch.get("GPSLatitude", sc.read_sidecar(xmp_path.read_text()).lat),
-                                 patch.get("GPSLongitude", sc.read_sidecar(xmp_path.read_text()).lon)))
+        old = sc.read_sidecar(xmp_path.read_text() if xmp_path.exists() else "")
+        xmp_path.write_text(_xmp(patch.get("DateTimeOriginal") or old.dto,
+                                 patch.get("GPSLatitude", old.lat), patch.get("GPSLongitude", old.lon)))
         return xmp_path
     monkeypatch.setattr(sidecar_mod, "write", fake_write)
     db["exif"], db["root"] = exif, root
@@ -408,3 +416,44 @@ def test_cli_refresh_intent_survives_an_interrupted_run(lib, monkeypatch) -> Non
     assert res.exit_code == 0, res.output
     assert set(_Api.refreshed[-1]) >= {"fiji", "vegas"}
     assert not (tmp / "state" / "sidecar-check-pending.txt").exists()
+
+
+
+# --- videos on the UTC clock with no sidecar -------------------------------------
+
+
+def test_zone_fix_dates_a_utc_clock_video_from_its_neighbours() -> None:
+    from zoneinfo import ZoneInfo
+    meta = sc.file_facts({"CreationDate": "2026:05:10 04:52:29Z"}, "mcp_video-20787.mov")
+    shown = datetime(2026, 5, 10, 4, 52, 29)
+    assert sc.zone_fix(meta, shown, sc.Hint(zone=ZoneInfo("Asia/Kolkata"))) == {
+        "DateTimeOriginal": "2026:05:10 10:22:29+05:30"}
+    assert sc.zone_fix(meta, shown, None) is None                      # no zone: no guess
+    assert sc.zone_fix(meta, shown + timedelta(hours=5), sc.Hint(zone=ZoneInfo("Asia/Kolkata"))) is None
+    winter = sc.file_facts({"CreationDate": "2026:01:10 04:52:29Z"}, "mcp_video-1.mov")
+    assert sc.zone_fix(winter, datetime(2026, 1, 10, 4, 52, 29),
+                       sc.Hint(zone=ZoneInfo("Europe/London"))) is None    # UTC is the local clock
+    apple = sc.file_facts({"CreateDate": "2023:11:30 23:08:04",
+                           "CreationDate": "2023:11:30 15:08:04-08:00"}, "IMG_1.MOV")
+    assert sc.zone_fix(apple, datetime(2023, 11, 30, 23, 8, 4), None) == {
+        "DateTimeOriginal": "2023:11:30 15:08:04-08:00"}                   # the file's own offset
+    insta = sc.file_facts({"CreateDate": "2025:10:27 13:55:44"}, "VID_20251027_135544_00_001.mp4")
+    assert sc.zone_fix(insta, datetime(2025, 10, 27, 13, 55, 44), sc.Hint(zone=ZoneInfo("Pacific/Honolulu"))) is None
+
+
+def test_cli_dates_utc_clock_videos_with_a_sidecar_of_their_own(lib) -> None:
+    args, db, writes, tmp = lib
+    root = db["root"]
+    (root / "v" / "mcp_video-20787.mov").write_bytes(b"")
+    db["utc"] = [("mumbai", "/lib/v/mcp_video-20787.mov", datetime(2026, 5, 10, 4, 52, 29),
+                  datetime(2026, 5, 10, 4, 52, 29, tzinfo=UTC))]
+    db["exif"].append({"SourceFile": str(root / "v" / "mcp_video-20787.mov"),
+                       "CreationDate": "2026:05:10 04:52:29Z"})
+    db["hints"]["mumbai"] = (None, None, "Asia/Kolkata")
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert "1 video(s) dated" in " ".join(res.output.split())
+    assert dict(writes)["mcp_video-20787.mov"] == {"DateTimeOriginal": "2026:05:10 10:22:29+05:30"}
+    assert (root / "v" / "mcp_video-20787.mov.xmp").exists()
+    assert db["registered"] == [("mumbai", "/lib/v/mcp_video-20787.mov.xmp")]
+    assert "mumbai" in _Api.refreshed[-1]

@@ -40,6 +40,19 @@ continuously, so entries are dated rather than versioned.
   `photos-ingest.sh --promote`.
 - **Promote's guard**: `_rescue_sidecar` runs the same rules against the
   original before writing, so a new sidecar can't contradict its file.
+- **UTC-clock videos with no sidecar** (`--zones`, default on): 2,925
+  videos had no GPS and no sidecar and showed a bare UTC instant (Ray-Ban Meta,
+  DJI, GoPro, screen recordings, …). 1,971 now carry their true local time in a
+  new `name.ext.xmp`, from the file's own offset or the zone of the shots around
+  them. The rest have no zone to go by (or a local-clock camera) and are left as
+  they are.
+- **Live result** (2026-10-10):
+  - 3,860 sidecars repaired; 4,754 assets refreshed.
+  - Sign-flipped positions went from 1,774 to 20 against your other shots. The
+    rest are among 46 sidecars that two different files share by stem
+    (`IMG_5642.HEIC`/`.MOV`, DJI `.MOV`/`.mov`); those are left for a split
+    into per-file sidecars.
+  - Trip tags intact.
 - `schema_contract.READ_COLUMNS` gains `library.importPaths`.
 
 ## 2026-10-10 — trips: city names, tag-only small trips

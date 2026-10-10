@@ -312,6 +312,27 @@ def correct_patch(patch: dict[str, object], file: FileFacts) -> dict[str, object
     return {**patch, **fix.patch} if fix else patch
 
 
+def zone_fix(file: FileFacts, shown: datetime, hint: Hint | None) -> dict[str, object] | None:
+    """A video with no sidecar and no GPS that Immich shows on the UTC clock
+    (`shown` is its wall time now): the true local time, from the file's own
+    offset (Apple) or the zone the user's shots around it carry. None when
+    the file's clock isn't a known UTC instant, or nothing gives a zone."""
+    if not file.read or file.lat is not None or file.utc is None:
+        return None
+    utc = file.utc.astimezone(timezone.utc).replace(tzinfo=None)
+    if abs((shown - utc).total_seconds()) > 3:
+        return None                     # Immich isn't showing the UTC clock
+    if file.local is not None:
+        local = file.local
+    elif hint is not None and hint.zone is not None:
+        local = file.utc.astimezone(hint.zone)
+    else:
+        return None
+    if not local.utcoffset():
+        return None                     # UTC really is the local clock
+    return {"DateTimeOriginal": _xmp_datetime(local)}
+
+
 # --- the library (Immich DB) ----------------------------------------------------
 
 # Registered sidecars of one owner's live assets.
@@ -319,6 +340,21 @@ SIDECARS_SQL = """
 SELECT a.id, a."originalPath", f.path, a."fileCreatedAt"
 FROM asset a JOIN asset_file f ON f."assetId" = a.id AND f.type = 'sidecar'
 WHERE a."ownerId" = %(owner)s AND a."deletedAt" IS NULL
+"""
+
+# Videos with no sidecar and no position that Immich shows on the UTC clock.
+UTC_CLOCK_SQL = """
+SELECT a.id, a."originalPath", a."localDateTime" AT TIME ZONE 'UTC', a."fileCreatedAt"
+FROM asset a JOIN asset_exif e ON e."assetId" = a.id
+WHERE a."ownerId" = %(owner)s AND a."deletedAt" IS NULL AND a.type = 'VIDEO'
+  AND e.latitude IS NULL
+  AND coalesce(e."timeZone", 'UTC') IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00')
+  AND NOT EXISTS (SELECT 1 FROM asset_file f WHERE f."assetId" = a.id AND f.type = 'sidecar')
+"""
+
+REGISTER_SIDECAR_SQL = """
+INSERT INTO asset_file ("assetId", type, path) VALUES (%(asset)s, 'sidecar', %(path)s)
+ON CONFLICT ("assetId", type, "isEdited") DO UPDATE SET path = EXCLUDED.path
 """
 
 # Sidecar files more than one user's assets point at: repaired by nobody
@@ -392,5 +428,5 @@ def sidecar_text(path: Path) -> str | None:
 __all__ = [
     "FileFacts", "SidecarFacts", "Hint", "Repair", "file_facts", "read_sidecar",
     "plan", "agrees", "correct_patch", "hints", "needs_hint", "sidecar_text", "km",
-    "SIDECARS_SQL", "SHARED_OWNERS_SQL", "HINTS_SQL", "VIDEO_EXTS", "MIRROR_FAR_KM", "MIRROR_NEAR_KM",
+    "SIDECARS_SQL", "SHARED_OWNERS_SQL", "HINTS_SQL", "UTC_CLOCK_SQL", "REGISTER_SIDECAR_SQL", "zone_fix", "VIDEO_EXTS", "MIRROR_FAR_KM", "MIRROR_NEAR_KM",
 ]

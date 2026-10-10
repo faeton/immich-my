@@ -38,6 +38,19 @@ local time with an offset in `CreationDate`. Both were flattened the same way.
 3. **Anything else is deliberate.** A location moved in Photos (km away, not a
    mirror) or a camera clock fixed by hours and minutes is never undone.
 
+## Videos on the UTC clock with no sidecar
+
+A video with no GPS and no sidecar, whose file only knows a UTC instant
+(QuickTime `CreateDate`; Ray-Ban Meta's `Z` time), is shown by Immich on the
+UTC clock. A morning clip in Mumbai shows 04:52 instead of 10:22. With
+`--zones` (the default) the check gives each such video its own sidecar,
+`name.ext.xmp` (never a shared stem). It carries the true local time:
+- from the file's own offset when it has one (Apple);
+- else in the zone most of your shots within 3 h carry.
+
+Nothing is written when no zone is found, when that zone is UTC anyway, or for
+cameras whose QuickTime clock is local (Insta360).
+
 Several assets can share one sidecar (a Live Photo's HEIC and MOV share
 `IMG_1234.xmp`). The repair must be right for every one of them, including a
 still that knows only its wall clock, or that sidecar is skipped and reported.
