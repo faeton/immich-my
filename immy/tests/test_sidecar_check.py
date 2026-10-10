@@ -158,7 +158,10 @@ class _Cur:
             self._rows = [(x,) for x in params["paths"] if x in self.db.get("cross", ())]
         elif sql is sc.HINTS_SQL:
             self.db["hint_calls"].append(sorted(params["ids"]))
-            self._rows = [(i, *self.db["hints"].get(i, (None, None, None))) for i in params["ids"]]
+            self._rows = []
+            for i in params["ids"]:
+                la, lo, tz = self.db["hints"].get(i, (None, None, None))
+                self._rows.append((i, la, lo, [[tz, 1]] if tz else None))
         elif "FROM asset_file" in sql:
             self._rows = [(a, s) for a, _, s, _ in self.db["sidecars"]]
         else:
@@ -333,15 +336,15 @@ def test_cli_splits_a_sidecar_two_different_files_share(lib, monkeypatch) -> Non
     # IMG_3915.HEIC is another photo, an hour later: the stem-named sidecar
     # was written for the video. Each gets a sidecar of its own.
     _share_vegas(db, db["root"], {"DateTimeOriginal": "2023:11:30 16:08:04", "OffsetTimeOriginal": "-08:00"})
-    from immy import sidecar as sidecar_mod
-    created = []
-    monkeypatch.setattr(sidecar_mod, "create_from",
-                        lambda media, xmp: (created.append(media.name), xmp.write_text("own"))[1])
-    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    res = CliRunner().invoke(cli.app, args + ["--apply"])               # not without --split
+    assert "--split gives each file its own" in " ".join(res.output.split())
+    assert "IMG_3915.HEIC" not in dict(writes)
+    res = CliRunner().invoke(cli.app, args + ["--apply", "--split"])
     assert res.exit_code == 0, res.output
     assert "1 shared sidecar(s) split" in " ".join(res.output.split())
     root = db["root"] / "v"
-    assert created == ["IMG_3915.HEIC"]                                   # the still: its own data
+    still = sc.read_sidecar((root / "IMG_3915.HEIC.xmp").read_text())   # the still: its own data
+    assert still.dto == "2023:11:30 16:08:04-08:00" and still.lat is None
     mov = sc.read_sidecar((root / "IMG_3915.MOV.xmp").read_text())        # the video: the copy, repaired
     assert mov.dto == "2023:11:30 15:08:04-08:00" and mov.lon == pytest.approx(-115.1661, abs=1e-4)
     assert sorted(db["registered"]) == [("still", "/lib/v/IMG_3915.HEIC.xmp"),
@@ -480,3 +483,108 @@ def test_describes_and_split_roles() -> None:
     assert sc.split_roles(side, [("v", VEGAS), ("h", other)]) == {"v": "copy", "h": "own"}
     assert sc.split_roles(side, [("v", VEGAS), ("x", sc.FileFacts())]) is None
     assert sc.split_roles(side, [("h", other)]) is None                   # nobody it describes
+
+
+
+def test_own_patch_never_writes_a_bare_utc_clock() -> None:
+    from zoneinfo import ZoneInfo
+    dji = sc.FileFacts(utc=datetime(2024, 2, 21, 18, 1, 58, tzinfo=UTC), video=True)
+    assert sc.own_patch(dji) == {"DateTimeOriginal": "2024:02:21 18:01:58+00:00"}
+    assert sc.own_patch(dji, sc.Hint(zone=ZoneInfo("America/New_York"))) == {
+        "DateTimeOriginal": "2024:02:21 13:01:58-05:00"}
+    assert sc.own_patch(VEGAS)["GPSLongitude"] == -115.1661
+    assert sc.own_patch(sc.FileFacts()) is None
+
+
+def test_cli_zone_fix_never_overwrites_an_existing_sidecar(lib) -> None:
+    args, db, writes, tmp = lib
+    root = db["root"]
+    (root / "v" / "mcp_video-9.mov").write_bytes(b"")
+    (root / "v" / "mcp_video-9.mov.xmp").write_text("someone's correction")
+    db["utc"] = [("x9", "/lib/v/mcp_video-9.mov", datetime(2026, 5, 10, 4, 52, 29),
+                  datetime(2026, 5, 10, 4, 52, 29, tzinfo=UTC))]
+    db["exif"].append({"SourceFile": str(root / "v" / "mcp_video-9.mov"), "CreationDate": "2026:05:10 04:52:29Z"})
+    db["hints"]["x9"] = (None, None, "Asia/Kolkata")
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert "exists, unregistered" in res.output
+    assert (root / "v" / "mcp_video-9.mov.xmp").read_text() == "someone's correction"
+
+
+def test_cli_a_video_without_a_zone_yet_is_retried(lib) -> None:
+    args, db, writes, tmp = lib
+    root = db["root"]
+    (root / "v" / "mcp_video-8.mov").write_bytes(b"")
+    db["utc"] = [("x8", "/lib/v/mcp_video-8.mov", datetime(2026, 5, 10, 4, 52, 29),
+                  datetime(2026, 5, 10, 4, 52, 29, tzinfo=UTC))]
+    db["exif"].append({"SourceFile": str(root / "v" / "mcp_video-8.mov"), "CreationDate": "2026:05:10 04:52:29Z"})
+    CliRunner().invoke(cli.app, args + ["--apply"])                     # no neighbours yet
+    db["hints"]["x8"] = (None, None, "Asia/Kolkata")                    # the phone shots arrive
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert "1 video(s) dated" in " ".join(res.output.split())
+
+
+def test_cli_finishes_a_split_cut_short(lib, monkeypatch) -> None:
+    args, db, writes, tmp = lib
+    _share_vegas(db, db["root"], {"DateTimeOriginal": "2023:11:30 16:08:04", "OffsetTimeOriginal": "-08:00"})
+    real = _Cur.execute
+
+    def die_on_register(self, sql, params=None):
+        if sql is sc.REGISTER_SIDECAR_SQL and params["asset"] == "still":
+            raise KeyboardInterrupt
+        return real(self, sql, params)
+    monkeypatch.setattr(_Cur, "execute", die_on_register)
+    CliRunner().invoke(cli.app, args + ["--apply", "--split"])
+    assert (db["root"] / "v" / "IMG_3915.HEIC.xmp").exists()            # written, not registered
+    monkeypatch.setattr(_Cur, "execute", real)
+    res = CliRunner().invoke(cli.app, args + ["--apply", "--split"])
+    assert res.exit_code == 0, res.output
+    assert ("still", "/lib/v/IMG_3915.HEIC.xmp") in db["registered"]
+
+
+
+def test_zone_vote_counts_offsets_not_spellings() -> None:
+    at = datetime(2023, 11, 26, 2, 54, tzinfo=UTC)
+    z = sc._vote([["Pacific/Honolulu", 67], ["UTC-10", 66], ["America/Los_Angeles", 20]], at)
+    assert str(z) == "Pacific/Honolulu"                        # 133 of 153 at -10:00
+    assert sc._vote([["Pacific/Honolulu", 5], ["America/Lima", 5]], at) is None    # no clear majority
+    assert sc._vote([["UTC", 9], ["Europe/Lisbon", 9], ["Europe/Madrid", 2]],
+                    datetime(2024, 1, 10, tzinfo=UTC)) is None      # UTC really is the clock there
+    assert sc._vote(None, at) is None
+
+
+def test_cli_an_interrupt_while_staging_changes_nothing(lib, monkeypatch) -> None:
+    args, db, writes, tmp = lib
+    _share_vegas(db, db["root"], {"DateTimeOriginal": "2023:11:30 16:08:04", "OffsetTimeOriginal": "-08:00"})
+    from immy import sidecar as sidecar_mod
+    real = sidecar_mod.write
+
+    def die_staging_the_still(media, patch, *, xmp_path=None):
+        if media.name == "IMG_3915.HEIC":
+            raise KeyboardInterrupt
+        return real(media, patch, xmp_path=xmp_path)
+    monkeypatch.setattr(sidecar_mod, "write", die_staging_the_still)
+    CliRunner().invoke(cli.app, args + ["--apply", "--split"])
+    root = db["root"] / "v"
+    assert not (root / "IMG_3915.MOV.xmp").exists() and not (root / "IMG_3915.HEIC.xmp").exists()
+    assert ("vegas", "/lib/v/IMG_3915.MOV.xmp") not in db.get("registered", [])
+    monkeypatch.setattr(sidecar_mod, "write", real)
+    res = CliRunner().invoke(cli.app, args + ["--apply", "--split"])
+    assert "1 shared sidecar(s) split" in " ".join(res.output.split())
+    assert (root / "IMG_3915.HEIC.xmp").exists() and (root / "IMG_3915.MOV.xmp").exists()
+
+
+def test_cli_ignores_zone_stamps_from_the_old_format(lib) -> None:
+    args, db, writes, tmp = lib
+    root = db["root"]
+    (root / "v" / "mcp_video-7.mov").write_bytes(b"")
+    db["utc"] = [("x7", "/lib/v/mcp_video-7.mov", datetime(2026, 5, 10, 4, 52, 29),
+                  datetime(2026, 5, 10, 4, 52, 29, tzinfo=UTC))]
+    db["exif"].append({"SourceFile": str(root / "v" / "mcp_video-7.mov"), "CreationDate": "2026:05:10 04:52:29Z"})
+    db["hints"]["x7"] = (None, None, "Asia/Kolkata")
+    import os
+    st = (root / "v" / "mcp_video-7.mov").stat()
+    (tmp / "state").mkdir(exist_ok=True)
+    (tmp / "state" / "sidecar-check.json").write_text(json.dumps(
+        {"seen": {"zone:x7": f"{st.st_size}:{st.st_mtime_ns}"}}))      # an old, pre-fix stamp
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert "1 video(s) dated" in " ".join(res.output.split())

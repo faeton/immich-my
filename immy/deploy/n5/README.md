@@ -94,6 +94,22 @@ sudo docker compose -f $CF run --rm --entrypoint sh immy -c '
 ./run-batch.sh /originals/<trip> --with-captions --with-transcripts
 ```
 
+## Photos ingest
+
+`photos-ingest.sh` dedups the batches `immy photos pull` delivered to
+`staging/photos/ready/`. It runs register → fingerprint → cluster → confirm →
+decide, then stops with a report.
+
+`photos-ingest.sh --promote` also runs `dedup promote-rest --write` into the
+library, then `sidecars check --apply`. That last stage:
+- repairs any sidecar that contradicts its original;
+- dates videos left on the UTC clock;
+- reports stem-shared sidecars whose files differ. Review them with `--csv`
+  and split them deliberately with `--split`.
+
+It only reads new or changed files (see `docs/SIDECARS.md`). Afterwards, queue
+a library scan.
+
 ## First-run verification (do once)
 
 - **originalPath anchoring** — confirm the `--dry-run` output's would-insert

@@ -19,8 +19,10 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 transcripts → inserts/writes Immich Postgres) · `promote` (upload a trip to an external library) ·
 `cluster` (geo-date albums) · `takeout redate` (fix Takeout capture dates from the JSON companions, stack copies;
 see `docs/TAKEOUT.md`) · `trips` (one dated album per trip from the day-by-day
-geography; homes, regions, stopovers; see `docs/TRIPS.md`) · `sidecars check` (repair registered
-sidecars that contradict their originals: lost GPS signs, UTC clocks; last ingest stage; see `docs/SIDECARS.md`) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
+geography; homes, regions, stopovers, districts rolled up to their city, small trips tagged
+without an album, per-user ledger; see `docs/TRIPS.md`) · `sidecars check` (repair registered
+sidecars that contradict their originals — lost GPS signs, UTC clocks —, date no-GPS videos on
+the UTC clock, split stem-shared sidecars per file with `--split`; last ingest stage; see `docs/SIDECARS.md`) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
 reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
 `tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — to Immich's native
 Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·
@@ -49,6 +51,17 @@ On n5 (no compiler, no system libvips/exiftool): `uv sync --no-install-package i
 `uv run --no-sync pytest` — the full suite runs there (faces tests skip).
 - SQL logic gets a real-Postgres test in `tests/test_sql_pg.py` (throwaway DB, see
   `docs/TESTING.md`), never the live Immich DB.
+- **Immich version**: tested against **3.3.1**. `immy/src/immy/data/immich_schema.json` pins the
+  tables immy writes (`schema_contract.WRITE_COLUMNS`) and reads (`READ_COLUMNS`); every direct
+  DB write path calls `_require_live_schema` first. After an Immich upgrade: regenerate with
+  `scripts/regen_immich_schema.py`, run `tests/test_schema_contract.py`, and PREPARE-check the
+  SQL against the live DB read-only (3.3 renamed `asset_face.personId`, keyed `person` by
+  `(ownerId, personGroupId)`, and renamed 32 countries in `asset_exif.country`).
+- **Sidecars override originals** in Immich. Write dates with an offset and GPS signed; a new
+  sidecar is `name.ext.xmp` (a stem-named `name.xmp` is picked up by every file with that stem).
+  Run new sidecar rules through `sidecar_check` (promote does, via `correct_patch`).
+- Tags are linked by SQL with `asset_exif.tags` locked (`trips.link_tags`), never via the
+  tag-assign API: on read-only originals its re-extraction wipes them.
 - **Originals are immutable** — never rewrite source files; metadata goes to XMP sidecars / the DB.
 - **Keep the Mac path byte-identical** when adding NAS behavior (new config defaults to the old path).
 - **Git**: work, commit, and merge on `main` directly; branch only when explicitly asked.

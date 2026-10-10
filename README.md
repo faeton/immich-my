@@ -29,8 +29,8 @@ The main operational interface is `immy`:
 - `promote` uploads a curated trip into the external library and syncs the album
 - `cluster` groups geo-dated assets into events and auto-creates Immich albums
 - `takeout redate` repairs Google Takeout capture dates (placeholder or UTC-clock) from the JSON companions, via XMP sidecars, and stacks Takeout copies under their originals; see `docs/TAKEOUT.md`
-- `trips` finds trips in the library's day-by-day geography (homes, regions, stopovers, flipped-GPS repair) and keeps one dated album per trip, plus optional `Trips/<year>/…` tags for nesting; see `docs/TRIPS.md`
-- `sidecars check` repairs registered XMP sidecars that contradict their originals (a GPS hemisphere lost, a video's UTC clock read as local); the last stage of the ingest, see `docs/SIDECARS.md`
+- `trips` finds trips in the library's day-by-day geography (homes, regions, stopovers, flipped-GPS repair, districts rolled up to their city) and keeps one dated album per trip, plus optional `Trips/<year>/…` tags for nesting (small trips: tags only); see `docs/TRIPS.md`
+- `sidecars check` repairs registered XMP sidecars that contradict their originals (a GPS hemisphere lost, a video's UTC clock read as local), dates no-GPS videos Immich shows on the UTC clock from the shots around them, and splits stem-shared sidecars per file; the last stage of the ingest, see `docs/SIDECARS.md`
 - `srt` harvests DJI `.SRT` telemetry → GPX/JSON tracks, durable GPS, reverse-geocode
 - `tags sync` pushes a trip's notes tags (gear/camera, event, source) to Immich's native Tag API — the only channel that reaches video assets, which never read XMP
 - `tags camera` backfills the blank "Camera" field for DJI MP4s from the notes gear tag

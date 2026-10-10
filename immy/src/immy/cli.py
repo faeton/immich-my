@@ -5135,6 +5135,12 @@ def sidecars_check(
         help="Also date videos with no sidecar and no GPS that Immich shows on the UTC "
              "clock, in the zone of your shots around them (a new sidecar each).",
     ),
+    split: bool = typer.Option(
+        False, "--split/--no-split",
+        help="Split stem-shared sidecars whose files differ into one per file. Off by "
+             "default: a sidecar can deliberately correct one camera to match another, "
+             "so review the reported ones (--csv) first.",
+    ),
     csv_path: Path = typer.Option(None, "--csv", help="Write the planned repairs here."),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
@@ -5156,6 +5162,7 @@ def sidecars_check(
     """
     import csv
     import json as _json
+    import shutil
     from datetime import datetime as _dt
     from . import sidecar as sidecar_mod
     from . import sidecar_check as sc
@@ -5267,7 +5274,7 @@ def sidecars_check(
             aid, lo = str(aid), local(orig)
             if lo is None or (asset and aid not in set(asset)):
                 continue
-            if not all_ and not asset and seen.get(f"zone:{aid}") == stamp(lo):
+            if not all_ and not asset and seen.get(f"zone2:{aid}") == stamp(lo):
                 continue
             zone_rows.append((aid, orig, shown, created))
         console.print(f"  {len(zone_rows)} video(s) on the UTC clock with no sidecar or GPS to check")
@@ -5308,14 +5315,18 @@ def sidecars_check(
     zone_facts = [(a, o, shown, sc.file_facts(exif.get(str(local(o)), {}), str(local(o))))
                   for a, o, shown, _ in zone_rows]
     want.update({a: f.utc for a, _, _, f in zone_facts if f.utc is not None and f.local is None})
-    hint = sc.hints(conn, owner_id, want)
+    # Sidecars checked in this run aren't verified yet: they don't vote.
+    unverified = [a for side in selected for a, _, _ in members[side]]
+    hint = sc.hints(conn, owner_id, want, exclude=unverified)
     zone_fixes = []                           # (asset, original, patch)
     for a, o, shown, f in zone_facts:
         patch = sc.zone_fix(f, shown, hint.get(a))
         if patch:
             zone_fixes.append((a, o, patch))
-        elif f.read:
-            seen[f"zone:{a}"] = stamp(local(o))
+        elif f.read and (f.utc is None or f.lat is not None):
+            # Never a candidate. One that only lacks a zone stays eligible:
+            # the shots around it may arrive later.
+            seen[f"zone2:{a}"] = stamp(local(o))
 
     repairs = []                              # (sidecar, patch, reasons, [aid], text, SidecarFacts)
     conflicts: list[str] = []
@@ -5326,7 +5337,10 @@ def sidecars_check(
         if len(fs) > 1:
             roles = sc.split_roles(sf, [(a, f) for a, _, f, _ in fs])
             if roles and "own" in roles.values():
-                splits.append((side, roles, fs, text, sf))
+                if split:
+                    splits.append((side, roles, fs, text, sf))
+                else:
+                    conflicts.append(side)      # reported; split with --split
                 continue
         plans = [(a, sc.plan(f, sf, hint.get(a))) for a, _, f, _ in fs]
         fixes = [fx for _, fx in plans if fx is not None]
@@ -5353,7 +5367,9 @@ def sidecars_check(
     console.print("  " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
                           or "nothing to repair")
                   + (f"; {len(splits)} shared sidecar(s) to split per file" if splits else "")
-                  + (f"; {len(conflicts)} shared sidecar(s) whose assets disagree, left alone" if conflicts else "")
+                  + (f"; {len(conflicts)} shared sidecar(s) whose assets disagree, left alone"
+                     + ("" if split else " (review with --csv; --split gives each file its own)")
+                     if conflicts else "")
                   + (f"; {len(unreadable)} with an unreadable original, retried next run" if unreadable else "")
                   + (f"; {len(zone_fixes)} UTC-clock video(s) to date" if zone_fixes else ""))
 
@@ -5388,6 +5404,36 @@ def sidecars_check(
     state_root.mkdir(parents=True, exist_ok=True)
     log_path = state_root / f"sidecar-check-{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}-{os.getpid()}.jsonl"
     written = 0
+    # A split is staged in full (every member's final sidecar) and recorded
+    # as intents before anything in the library changes, so one cut short is
+    # finished exactly by the next run.
+    intent_path = state_path.with_name("sidecar-check-splits.jsonl")
+    staging = state_path.with_name("sidecar-split-staging")
+    try:
+        intents = [_json.loads(ln) for ln in intent_path.read_text().splitlines() if ln.strip()]
+    except OSError:
+        intents = []
+
+    def place(it) -> bool:
+        """Staged sidecar → its target (atomically) → registered."""
+        target, staged = Path(it["target"]), Path(it["staged"])
+        if staged.exists():
+            tmp = target.with_name(target.name + ".immy-tmp")
+            shutil.copyfile(staged, tmp)
+            os.replace(tmp, target)
+        elif not target.exists():
+            return False
+        cur.execute(sc.REGISTER_SIDECAR_SQL, {"asset": it["asset"], "path": it["immich"]})
+        conn.commit()
+        pending.append(it["asset"])
+        return True
+
+    unfinished = [it for it in intents if not place(it)]
+    for it in intents:
+        if it not in unfinished:
+            Path(it["staged"]).unlink(missing_ok=True)
+    if intents:
+        intent_path.write_text("".join(_json.dumps(it) + "\n" for it in unfinished))
     with open(log_path, "x") as log, open(pending_path, "a") as pend:
         for side, patch, reasons, ids, text, _ in repairs:
             # The previous text is on disk before the sidecar changes.
@@ -5413,38 +5459,66 @@ def sidecars_check(
             if any(t[3].exists() for t in targets):
                 console.print(f"  [yellow]not split[/yellow] {side}: a per-file sidecar already exists")
                 continue
+            # 1. Stage every member's final sidecar, complete.
+            staging.mkdir(parents=True, exist_ok=True)
+            staged_ok, its = True, []
             for a, o, f, new_local, new_immich in targets:
-                fix = sc.plan(f, sf, hint.get(a)) if roles[a] == "copy" else None
-                log.write(_json.dumps({"action": "split", "role": roles[a], "assets": [a],
-                                       "sidecar": str(new_local), "before": None,
-                                       "registered_before": side, "registered_now": new_immich,
-                                       "patch": fix.patch if fix else None}, default=str) + "\n")
-                log.flush()
-                os.fsync(log.fileno())
-                pend.write(a + "\n")
-                pend.flush()
-                os.fsync(pend.fileno())
+                patch = (sc.plan(f, sf, hint.get(a)) or sc.Repair()).patch if roles[a] == "copy" \
+                    else sc.own_patch(f, hint.get(a))
+                staged = staging / f"{a}.xmp"
+                staged.unlink(missing_ok=True)
                 try:
                     if roles[a] == "copy":
-                        new_local.write_text(text)
-                        if fix:
-                            sidecar_mod.write(local(o), fix.patch, xmp_path=new_local)
-                    else:
-                        sidecar_mod.create_from(local(o), new_local)
+                        staged.write_text(text)
+                    if patch:
+                        sidecar_mod.write(local(o), patch, xmp_path=staged)
                 except (OSError, RuntimeError) as e:
                     console.print(f"  [red]split failed[/red] {new_local}: {e}")
-                    continue
-                cur.execute(sc.REGISTER_SIDECAR_SQL, {"asset": a, "path": new_immich})
-                conn.commit()
-                pending.append(a)
+                    staged_ok = False
+                    break
+                its.append({"asset": a, "staged": str(staged), "target": str(new_local),
+                            "immich": new_immich, "role": roles[a], "stem": side, "patch": patch})
+            if not staged_ok:
+                for it in its:
+                    Path(it["staged"]).unlink(missing_ok=True)
+                continue
+            # 2. Record the whole split (and its undo) before anything moves.
+            for it in its:
+                log.write(_json.dumps({"action": "split", "assets": [it["asset"]], "sidecar": it["target"],
+                                       "before": None, "role": it["role"], "registered_before": side,
+                                       "registered_now": it["immich"], "patch": it["patch"]},
+                                      default=str) + "\n")
+                pend.write(it["asset"] + "\n")
+            log.flush()
+            os.fsync(log.fileno())
+            pend.flush()
+            os.fsync(pend.fileno())
+            with open(intent_path, "a") as ifh:
+                ifh.write("".join(_json.dumps(it, default=str) + "\n" for it in its))
+                ifh.flush()
+                os.fsync(ifh.fileno())
+            # 3. Move into place and register, member by member.
+            for it, (a, o, _, _, new_immich) in zip(its, targets):
+                place(it)
                 seen[a] = fingerprint(new_immich, o)
             split_done += 1
+            # Done: these intents and their staged copies go.
+            done = {it["asset"] for it in its}
+            remaining = [ln for ln in intent_path.read_text().splitlines()
+                         if ln.strip() and _json.loads(ln)["asset"] not in done]
+            intent_path.write_text("".join(ln + "\n" for ln in remaining))
+            for it in its:
+                Path(it["staged"]).unlink(missing_ok=True)
         dated = 0
         for a, o, patch in zone_fixes:
             # A sidecar of its own (`name.ext.xmp`): never shared by accident.
             lo = local(o)
             side_local, side_immich = lo.with_name(lo.name + ".xmp"), o + ".xmp"
-            before = sc.sidecar_text(side_local) if side_local.exists() else None
+            if side_local.exists():
+                # Someone's sidecar, not registered yet: not ours to overwrite.
+                console.print(f"  [yellow]skipped[/yellow] {side_local}: exists, unregistered")
+                continue
+            before = None
             log.write(_json.dumps({"sidecar": str(side_local), "assets": [a], "before": before,
                                    "registered_before": None, "registered_now": side_immich,
                                    "reasons": ["zone"], "patch": patch}) + "\n")

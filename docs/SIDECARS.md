@@ -46,26 +46,47 @@ UTC clock. A morning clip in Mumbai shows 04:52 instead of 10:22. With
 `--zones` (the default) the check gives each such video its own sidecar,
 `name.ext.xmp` (never a shared stem). It carries the true local time:
 - from the file's own offset when it has one (Apple);
-- else in the zone most of your shots within 3 h carry.
+- else from the zone a clear majority (two thirds) of your shots within 3 h
+  carry.
 
-Nothing is written when no zone is found, when that zone is UTC anyway, or for
-cameras whose QuickTime clock is local (Insta360).
+The vote is counted by offset at that moment, so `Pacific/Honolulu` and
+`UTC-10` are one vote. A shot votes when its zone is evidence: placed by its
+own GPS (a UTC there is real, Lisbon in winter), or an offset from its own
+file. A bare `UTC` on a shot with no position means "unknown" and doesn't
+vote.
+
+Nothing is written:
+- when the vote is split (border days), or when UTC wins;
+- for cameras whose QuickTime clock is local (Insta360);
+- over an existing unregistered `name.ext.xmp`.
+
+A video that only lacks a zone is looked at again on the next run, since the
+shots around it may arrive later.
 
 Several assets can share one sidecar (a Live Photo's HEIC and MOV share
 `IMG_1234.xmp`). The repair must be right for every one of them, including a
 still that knows only its wall clock, or that sidecar is skipped and reported.
 
-Sometimes the files sharing a stem are not one moment: `IMG_5642.HEIC` is a
+Sometimes (only with `--split`) the files sharing a stem are not one moment: `IMG_5642.HEIC` is a
 photo taken ten hours after the clip `IMG_5642.MOV`, or DJI writes `.MOV` and
 `.mov` clips with one name. Then the stem-named sidecar is split per file:
 - **Each file it describes** (by its own date and GPS, allowing for the bugs
   above) gets a copy as `name.ext.xmp`, repaired if needed.
-- **Each file it doesn't describe** gets a `name.ext.xmp` made from its own
-  metadata. Immich prefers a full-name sidecar over a stem match, so its own
-  data wins and the stem file never re-attaches.
+- **Each file it doesn't describe** gets a minimal `name.ext.xmp` of what the
+  file says about itself (`sidecar_check.own_patch`). That is its capture time
+  with an explicit offset (a UTC instant in the zone at its GPS or of the shots
+  around it, else `+00:00`), plus signed GPS. It is never exiftool's generic
+  copy, which would carry QuickTime's UTC `CreateDate` without an offset.
+  Immich prefers a full-name sidecar over a stem match, so the stem file never
+  re-attaches.
 
-A file with no metadata to compare blocks the split. The old `name.xmp` stays
-on disk, unregistered.
+A file with nothing to compare, or nothing of its own to say, blocks the
+split. Splitting is opt-in (`--split`): a mismatch can also be a deliberate
+correction (one camera's clock fixed to match another's). The routine run
+reports these as "assets disagree"; review them with `--csv` and split
+deliberately. A split cut short is finished by the next run
+(`sidecar-check-splits.txt`). The old `name.xmp` stays on disk,
+unregistered.
 A date with an explicit offset is right for both. A sidecar that another
 user's assets also use is skipped.
 

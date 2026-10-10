@@ -509,3 +509,52 @@ def test_sidecar_hints_use_unsuspect_neighbours(conn) -> None:
     got = sc.hints(conn, OWNER, {me: t})[me]
     assert (got.lat, got.lon) == (-17.75, 177.45)
     assert got.zone == ZoneInfo("Pacific/Fiji")
+
+
+
+def test_sidecar_zone_vote_counts_utc_and_needs_a_clear_majority(conn) -> None:
+    from immy import sidecar_check as sc
+    conn.execute('ALTER TABLE asset ADD COLUMN "fileCreatedAt" timestamptz')
+    conn.execute('ALTER TABLE asset_exif ADD COLUMN "timeZone" varchar')
+    conn.execute('CREATE TABLE asset_file ("assetId" uuid, type varchar, path varchar)')
+    t = datetime(2024, 1, 10, 12, 0, tzinfo=timezone.utc)
+
+    def shot(minutes, tz, lat=38.7, lon=-9.1):
+        aid = add(conn, datetime(2024, 1, 10, 12, 0), lat, lon, "Portugal")
+        conn.execute('UPDATE asset SET "fileCreatedAt" = %s WHERE id = %s', (t + timedelta(minutes=minutes), aid))
+        conn.execute('UPDATE asset_exif SET "timeZone" = %s WHERE "assetId" = %s', (tz, aid))
+        return aid
+
+    me = shot(0, "UTC", None, None)                      # the video: no GPS
+    for m in range(5):
+        shot(m + 1, "Europe/Lisbon")                     # Lisbon in winter: UTC+0, real
+    shot(9, "Europe/Warsaw")
+    shot(10, "UTC+2", None, None)                        # no GPS: doesn't vote
+    # 5 Lisbon (+00:00 in January) of 7 votes: UTC is the local clock there,
+    # so no zone is offered (and nothing changes).
+    assert sc.hints(conn, OWNER, {me: t})[me].zone is None
+    for m in range(12):
+        shot(20 + m, "Europe/Warsaw")                    # 13 Warsaw vs 5 Lisbon (+1 UTC+2)
+    assert str(sc.hints(conn, OWNER, {me: t})[me].zone) == "Europe/Warsaw"
+
+
+
+def test_sidecar_zone_vote_skips_unverified_shots(conn) -> None:
+    from immy import sidecar_check as sc
+    conn.execute('ALTER TABLE asset ADD COLUMN "fileCreatedAt" timestamptz')
+    conn.execute('ALTER TABLE asset_exif ADD COLUMN "timeZone" varchar')
+    conn.execute('CREATE TABLE asset_file ("assetId" uuid, type varchar, path varchar)')
+    t = datetime(2025, 10, 7, 15, 0, tzinfo=timezone.utc)
+
+    def shot(minutes, tz, lat, lon):
+        aid = add(conn, datetime(2025, 10, 8, 3, 0), lat, lon, "Fiji")
+        conn.execute('UPDATE asset SET "fileCreatedAt" = %s WHERE id = %s', (t + timedelta(minutes=minutes), aid))
+        conn.execute('UPDATE asset_exif SET "timeZone" = %s WHERE "assetId" = %s', (tz, aid))
+        return aid
+
+    me = shot(0, "UTC", None, None)
+    # French Polynesia: mirrored ghosts read "Saipan" (+10), the truth is -10.
+    ghosts = [shot(m + 1, "Pacific/Saipan", 17.5, 149.6) for m in range(3)]
+    shot(30, "Pacific/Tahiti", -17.5, -149.6)
+    assert str(sc.hints(conn, OWNER, {me: t})[me].zone) == "Pacific/Saipan"   # what the ghosts would do
+    assert str(sc.hints(conn, OWNER, {me: t}, exclude=ghosts)[me].zone) == "Pacific/Tahiti"

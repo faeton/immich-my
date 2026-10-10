@@ -336,7 +336,31 @@ def split_roles(side: SidecarFacts, files: list[tuple[str, FileFacts]]) -> dict[
     verdict = {a: describes(f, side) for a, f in files}
     if any(v is None for v in verdict.values()) or not any(verdict.values()):
         return None
+    if any(own_patch(f) is None for a, f in files if not verdict[a]):
+        return None                     # nothing to give that file of its own
     return {a: "copy" if v else "own" for a, v in verdict.items()}
+
+
+def own_patch(file: FileFacts, hint: Hint | None = None) -> dict[str, object] | None:
+    """A sidecar that says only what this file says about itself, in a form
+    Immich can't misread: the capture time with an explicit offset (a UTC
+    instant goes out in the zone at its GPS or of the shots around it, else
+    as `+00:00`), a still's offset-less wall clock as is, and GPS signed.
+    None when the file says nothing (no sidecar can be made to agree)."""
+    if not file.read:
+        return None
+    patch: dict[str, object] = {}
+    if file.local is not None:
+        patch["DateTimeOriginal"] = _xmp_datetime(file.local)
+    elif file.utc is not None:
+        zone = (_zone_at(file.lat, file.lon) if file.lat is not None else None) or (hint.zone if hint else None)
+        patch["DateTimeOriginal"] = _xmp_datetime(file.utc.astimezone(zone or timezone.utc))
+    elif file.wall is not None:
+        patch["DateTimeOriginal"] = file.wall.strftime("%Y:%m:%d %H:%M:%S")
+    if file.lat is not None and file.lon is not None:
+        patch.update({"GPSLatitude": file.lat, "GPSLatitudeRef": "N" if file.lat >= 0 else "S",
+                      "GPSLongitude": file.lon, "GPSLongitudeRef": "E" if file.lon >= 0 else "W"})
+    return patch or None
 
 
 def correct_patch(patch: dict[str, object], file: FileFacts) -> dict[str, object]:
@@ -412,7 +436,7 @@ HINTS_SQL = """
 WITH q AS (
   SELECT * FROM unnest(%(ids)s::uuid[], %(ts)s::timestamptz[]) AS q(id, t)
 )
-SELECT q.id, n.lat, n.lon, z.tz
+SELECT q.id, n.lat, n.lon, z.votes
 FROM q
 LEFT JOIN LATERAL (
   SELECT e.latitude AS lat, e.longitude AS lon
@@ -425,27 +449,65 @@ LEFT JOIN LATERAL (
   ORDER BY abs(extract(epoch FROM a."fileCreatedAt" - q.t))
   LIMIT 1) n ON true
 LEFT JOIN LATERAL (
-  SELECT e."timeZone" AS tz
-  FROM asset a JOIN asset_exif e ON e."assetId" = a.id
-  WHERE a."ownerId" = %(owner)s AND a."deletedAt" IS NULL AND a.id <> q.id
-    AND a."fileCreatedAt" BETWEEN q.t - interval '3 hours' AND q.t + interval '3 hours'
-    AND e."timeZone" IS NOT NULL
-    AND e."timeZone" NOT IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00')
-    AND NOT EXISTS (SELECT 1 FROM asset_file s WHERE s."assetId" = a.id AND s.type = 'sidecar')
-  GROUP BY 1 ORDER BY count(*) DESC, 1
-  LIMIT 1) z ON true
+  -- A shot votes when its zone is evidence: placed by its own GPS (so a
+  -- UTC there is real, Lisbon in winter), or an offset from its own file.
+  -- A bare UTC on a shot with no position only means "unknown". Shots with
+  -- a sidecar vote once it has been checked; `exclude` holds the ones not
+  -- verified yet (a mirrored GPS would vote for the mirror's zone).
+  SELECT json_agg(json_build_array(v.tz, v.n)) AS votes
+  FROM (
+    SELECT e."timeZone" AS tz, count(*) AS n
+    FROM asset a JOIN asset_exif e ON e."assetId" = a.id
+    WHERE a."ownerId" = %(owner)s AND a."deletedAt" IS NULL AND a.id <> q.id
+      AND a."fileCreatedAt" BETWEEN q.t - interval '3 hours' AND q.t + interval '3 hours'
+      AND e."timeZone" IS NOT NULL
+      AND ((e.latitude IS NOT NULL AND NOT (abs(e.latitude) < 0.001 AND abs(e.longitude) < 0.001))
+           OR e."timeZone" NOT IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00'))
+      AND NOT (a.id = ANY(%(exclude)s::uuid[]))
+    GROUP BY 1) v) z ON true
 """
 
 
-def hints(conn, owner_id: str, wanted: dict[str, datetime]) -> dict[str, Hint]:
-    """`asset id → Hint` for the assets in `wanted` (id → true instant)."""
+def hints(conn, owner_id: str, wanted: dict[str, datetime],
+          exclude: list[str] | tuple = ()) -> dict[str, Hint]:
+    """`asset id → Hint` for the assets in `wanted` (id → true instant).
+    `exclude`: assets whose zone isn't evidence yet (unverified sidecars)."""
     from .takeout_redate import parse_zone
     if not wanted:
         return {}
     ids = sorted(wanted)
     with conn.cursor() as cur:
-        cur.execute(HINTS_SQL, {"owner": owner_id, "ids": ids, "ts": [wanted[i] for i in ids]})
-        return {str(a): Hint(_num(la), _num(lo), parse_zone(tz)) for a, la, lo, tz in cur.fetchall()}
+        cur.execute(HINTS_SQL, {"owner": owner_id, "ids": ids, "ts": [wanted[i] for i in ids],
+                                "exclude": sorted(set(exclude))})
+        rows = cur.fetchall()
+    return {str(a): Hint(_num(la), _num(lo), _vote(votes, wanted[str(a)]))
+            for a, la, lo, votes in rows}
+
+
+def _vote(votes, at: datetime):
+    """The zone of a clear (two-thirds) majority of the shots around `at`,
+    counted by their offset at that moment: `Pacific/Honolulu` and `UTC-10`
+    are one vote. The majority's most common spelling is returned (an IANA
+    name keeps DST right). A UTC majority, or none, is None: no change."""
+    from .takeout_redate import parse_zone
+    by_offset: dict[timedelta, list[tuple[int, object]]] = {}
+    total = 0
+    for tz, n in (votes or []):
+        if tz in ("UTC", "UTC+0", "Etc/UTC", "UTC+00:00"):
+            off, zone = timedelta(0), None
+        else:
+            zone = parse_zone(tz)
+            if zone is None:
+                continue
+            off = at.astimezone(zone).utcoffset()
+        by_offset.setdefault(off, []).append((int(n), zone))
+        total += int(n)
+    if not total:
+        return None
+    off, group = max(by_offset.items(), key=lambda kv: sum(n for n, _ in kv[1]))
+    if sum(n for n, _ in group) * 3 < total * 2 or not off:
+        return None
+    return max(((n, z) for n, z in group if z is not None), key=lambda nz: nz[0])[1]
 
 
 def needs_hint(file: FileFacts, side: SidecarFacts) -> bool:
@@ -467,6 +529,6 @@ def sidecar_text(path: Path) -> str | None:
 
 __all__ = [
     "FileFacts", "SidecarFacts", "Hint", "Repair", "file_facts", "read_sidecar",
-    "plan", "agrees", "describes", "split_roles", "correct_patch", "hints", "needs_hint", "sidecar_text", "km",
+    "plan", "agrees", "describes", "split_roles", "own_patch", "correct_patch", "hints", "needs_hint", "sidecar_text", "km",
     "SIDECARS_SQL", "SHARED_OWNERS_SQL", "HINTS_SQL", "UTC_CLOCK_SQL", "REGISTER_SIDECAR_SQL", "zone_fix", "VIDEO_EXTS", "MIRROR_FAR_KM", "MIRROR_NEAR_KM",
 ]

@@ -4,6 +4,36 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-10 — sidecars check: review fixes (zones, splits)
+
+Codex reviewed `--zones` and the per-file split. Fixed, and applied to the
+live library:
+
+- **Zone vote by offset, from evidence only.** `Pacific/Honolulu` and `UTC-10`
+  were counted as rival zones, so true majorities were missed. A bare `UTC` on
+  a shot with no position was dropped, but real UTC (Lisbon in winter) was
+  dropped with it.
+  - Now the vote counts offsets at the instant.
+  - A shot votes if placed by GPS or carrying an offset from its own file.
+  - Shots with sidecars vote too, now that they are repaired.
+  - It needs two thirds and abstains when UTC wins.
+
+  Re-checking the 1,971 dated videos: 1,937 unchanged, 3 got another zone
+  (June 2025: +03:00, not +02:00), and 31 now abstain, mostly
+  Peru/Bolivia border flights where the shots around disagree. Their sidecars
+  were removed and unregistered, so they're back on the UTC clock.
+- **A split never writes exiftool's generic copy.** It carried QuickTime's
+  UTC `CreateDate` without an offset. The "own" sidecar is now
+  `own_patch`: the capture time with an explicit offset, plus signed GPS. The
+  50 already written were rewritten.
+- **Splitting is opt-in (`--split`).** A mismatch can be a deliberate
+  correction. The routine run reports these; a split cut short resumes from
+  `sidecar-check-splits.txt`.
+- **Zones never overwrite** an existing unregistered `name.ext.xmp` (none
+  were overwritten live).
+- **A video that only lacks a zone stays eligible** on the next run.
+- `sidecar.create_from` removed.
+
 ## 2026-10-10 — sidecars that contradict their originals
 
 ### Found
