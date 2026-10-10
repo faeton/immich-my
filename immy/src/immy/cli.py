@@ -2566,7 +2566,7 @@ def trips(
     until: str = typer.Option(None, "--until", help="Only trips starting on/before YYYY-MM-DD."),
     min_assets: int = typer.Option(
         None, "--min-assets",
-        help=f"Trips with fewer assets get no album (default: config, else {trips_mod.DEFAULT_MIN_ASSETS}).",
+        help=f"Trips with fewer assets get no album, only tags with --tags (default: config, else {trips_mod.DEFAULT_MIN_ASSETS}).",
     ),
     max_gap_days: int = typer.Option(
         None, "--max-gap-days",
@@ -2675,6 +2675,9 @@ def trips(
                                  lat=float(r[3]), lon=float(r[4]), n=int(r[5]))
             for r in cur.fetchall()
         ]
+        # Districts vote as their city (Mokotów, Wola → Warsaw).
+        raw_buckets = buckets
+        buckets = trips_mod.roll_up_cities(buckets, trips_mod.city_parents(conn, buckets))
         cur.execute(trips_mod.ASSETS_SQL, params)
         rows = cur.fetchall()
         assets = [(str(r[0]), r[1]) for r in rows if not r[2]]
@@ -2706,8 +2709,16 @@ def trips(
     )
     trips_mod.assign_assets(found, assets)
     asset_day = dict(assets)
+    # The names these trips had before district roll-up: an album still
+    # carrying one was named by immy, not by you, so it may follow.
+    legacy_names = {t.key(): t.name() for t in trips_mod.segment(
+        trips_mod.build_days(raw_buckets), homes=list(tc.homes),
+        regions=trips_mod.Regions(tc.regions), max_gap_days=max_gap_days,
+        transit_days=transit_days)}
     kept = [t for t in found if trips_mod.keep(t, min_assets=min_assets)]
-    small = len(found) - len(kept)
+    # Smaller trips get no album, only their tags (with --tags).
+    tag_only = {t.key() for t in found if not trips_mod.keep(t, min_assets=min_assets)}
+    small = len(tag_only)
 
     def in_scope(start):
         return (not since_d or start >= since_d) and (not until_d or start <= until_d)
@@ -2715,7 +2726,8 @@ def trips(
     # Every trip found continues its ledger entry, in scope or not; the
     # scope only picks which ones this run touches. Matching only the
     # in-scope ones would read a trip whose start moved out of scope as gone.
-    all_kept = kept
+    all_kept = found
+    small_in_scope = [t for t in found if t.key() in tag_only and in_scope(t.start)]
     kept = [t for t in kept if in_scope(t.start)]
 
     home_days = sum(1 for d in days if any(h.matches(d) for h in tc.homes))
@@ -2724,7 +2736,7 @@ def trips(
         f"{len(assets)} timeline asset(s)"
         + (f" (+{placeholders} with a placeholder date, skipped)" if placeholders else "")
         + f" → {len(found)} trip(s), "
-        f"{small} under {min_assets} assets skipped"
+        f"{small} under {min_assets} assets: tags only, no album"
         + (f", {len(kept)} in range" if since_d or until_d else "")
     )
     table = Table(show_lines=False, pad_edge=False)
@@ -2752,14 +2764,15 @@ def trips(
         with open(csv_path, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["key", "album", "start", "end", "days", "geotagged_days",
-                        "assets", "region", "countries", "legs", "tag"])
-            for t in kept:
+                        "assets", "region", "countries", "legs", "tag", "has_album"])
+            for t in sorted(kept + small_in_scope, key=lambda t: t.start):
                 w.writerow([
                     t.key(), t.name(), t.start.isoformat(), t.end.isoformat(),
                     t.span_days, len(t.days), len(t.asset_ids), t.region_label or "",
                     "; ".join(n for _, n in t.countries()),
                     "; ".join(leg.short_label() for leg in t.legs()),
                     trips_mod.tag_for(t, tag_root),
+                    "no" if t.key() in tag_only else "yes",
                 ])
         console.print(f"wrote {csv_path}")
 
@@ -2773,7 +2786,8 @@ def trips(
             )
         console.print(
             f"\n[yellow]dry-run[/yellow] — pass `--apply` to create/update {len(kept)} album(s)"
-            + (" and tag their assets" if tags else "") + "."
+            + (f" and tag their assets, plus {len(small_in_scope)} small trip(s) tagged without an album"
+               if tags else "") + "."
         )
         return
 
@@ -2792,11 +2806,19 @@ def trips(
             if k:
                 key_to_album[k] = alb
 
+    # Each album belongs to one ledger entry. A marker can go stale: a small
+    # trip's album isn't touched (so keeps its old key) while its entry moves
+    # on, and a new trip may later take that key.
+    album_owner = {str(e["album_id"]): k for k, e in ledger.items() if e.get("album_id")}
+
     def album_for(key, entry):
-        """The album a ledger key lives in: by its marker line, else by the
-        album id the ledger recorded (the marker may have been edited)."""
+        """The album a ledger key lives in: by its marker line (unless another
+        entry owns that album), else by the album id the ledger recorded (the
+        marker may have been edited)."""
         if key and key in key_to_album:
-            return key_to_album[key]
+            alb = key_to_album[key]
+            if album_owner.get(str(alb.get("id")), key) == key:
+                return alb
         return by_id.get(str((entry or {}).get("album_id")))
 
     def ok_ids(result) -> set[str]:
@@ -2836,7 +2858,7 @@ def trips(
     # end, minus any another surviving trip still owns (tag values repeat
     # across trips), and kept in the ledger until then.
     release: dict[str, set[tuple[str, str]]] = {}
-    created = updated = linked = removed_total = tagged = new_tagged = untagged = 0
+    created = updated = linked = removed_total = tagged = new_tagged = untagged = renamed = 0
     # Links trips outside the scope want: not touched this run, so not
     # claimed yet, but not to be removed either. Handed to the entry of the
     # trip that wants them, if it has one.
@@ -2858,7 +2880,17 @@ def trips(
         # a hand-deleted album starts from scratch. Tag ownership doesn't
         # depend on the album.
         previous = set((entry or {}).get("assets", [])) if album is not None else set()
-        if album is None:
+        # The name immy gave this album; it follows the trip only while the
+        # album still has it.
+        immy_name = (entry or {}).get("name") or legacy_names.get(key)
+        did_rename = False
+        if key in tag_only:
+            # No album for a small trip. One it had while bigger is left as
+            # it is, and so are immy's claims in it.
+            album_id = (album or {}).get("id")
+            owned = previous
+            desc = (album or {}).get("description") or ""
+        elif album is None:
             album_id = client.create_album(
                 t.name(), description=trips_mod.description_for(t), asset_ids=ids,
             )
@@ -2871,6 +2903,14 @@ def trips(
             console.print(f"  [green]created[/green] {t.name()} [dim]({len(ids)} asset(s))[/dim]")
         else:
             album_id = album["id"]
+            # Rename while the album still carries the name immy gave it.
+            current = album.get("albumName") or ""
+            if current == immy_name and current != t.name():
+                client.update_album(album_id, name=t.name())
+                console.print(f"  [green]renamed[/green] {current} → {t.name()}")
+                album["albumName"] = current = t.name()
+                renamed += 1
+                did_rename = True
             desc = album.get("description") or ""
             generated = trips_mod.description_for(t)
             if desc == (entry or {}).get("description") or (
@@ -2940,16 +2980,27 @@ def trips(
 
         if old_key and old_key != key:
             ledger.pop(old_key, None)
+        if album_id:
+            album_owner[str(album_id)] = key
         ledger[key] = {
             "start": t.start.isoformat(), "end": t.end.isoformat(),
-            "region": t.region, "album_id": str(album_id),
+            "region": t.region, "album_id": str(album_id) if album_id else None,
             "assets": sorted(owned), "tags": trips_mod.tags_by_value(claimed | stale),
+            # The name immy last gave the album. Only immy's own create or
+            # rename changes it; once you rename the album, this never matches
+            # again, even if your name happens to equal a later generated one.
+            "name": t.name() if album is None or did_rename else immy_name,
             # What immy last wrote, if the album still shows exactly that;
             # an edited description is never tracked (so never overwritten).
             "description": (trips_mod.description_for(t) if album is None
                             else (desc if desc == trips_mod.description_for(t) else
                                   (entry or {}).get("description"))),
         }
+        if key in tag_only:
+            # Album fields carry over untouched (none, or one from before).
+            ledger[key]["tag_only"] = True
+            for f in ("name", "description"):
+                ledger[key][f] = (entry or {}).get(f)
         if new_links:
             ledger[key]["pending_tags"] = trips_mod.tags_by_value(new_links)
         save()
@@ -3014,7 +3065,8 @@ def trips(
     if ledger_lock is not None:
         ledger_lock.close()
     console.print(
-        f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "
+        f"\n[green]✓[/green] {created} album(s) created, {updated} updated"
+        + (f" ({renamed} renamed)" if renamed else "") + ", "
         f"{linked} asset-link(s) added" + (f", {removed_total} pruned" if prune else "")
         + (f", {new_tagged} new tag link(s) ({tagged} checked, all locked)" if tags else "")
         + (f", {untagged} stale tag(s) removed" if untagged else "")

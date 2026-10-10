@@ -45,7 +45,7 @@ import math
 import os
 import re
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import date, timedelta
 from functools import lru_cache
 from pathlib import Path
@@ -334,6 +334,96 @@ def _circular_mean_lon(pairs: list[tuple[float, int]]) -> float:
     s = sum(math.sin(math.radians(lon)) * w for lon, w in pairs)
     c = sum(math.cos(math.radians(lon)) * w for lon, w in pairs)
     return math.degrees(math.atan2(s, c))
+
+
+# --- neighbourhood → city ------------------------------------------------
+#
+# Immich names a place after the nearest GeoNames populated place, and in big
+# cities that is often a district: Mokotów, Wola and Ursynów are all Warsaw,
+# Bang Na is Bangkok, Alvalade is Lisbon. A place rolls up to the city its own
+# admin area is named after (GeoNames' admin2, else admin1, as a place name or
+# one of its alternate names; "Greater London", "Kyiv City" and "Mumbai
+# Suburban" count as London, Kyiv, Mumbai), when that city lies within
+# `CITY_ROLLUP_KM`.
+# A town that merely shares a province with its capital (Santiago de la
+# Ribera, 40 km from Murcia) stays itself.
+
+CITY_ROLLUP_KM = 25  # Immich's own reverse-geocoding radius
+
+CITY_PARENTS_SQL = """
+WITH q AS (
+  SELECT * FROM unnest(%(names)s::text[], %(codes)s::text[],
+                       %(lats)s::float8[], %(lons)s::float8[])
+                WITH ORDINALITY AS q(name, cc, lat, lon, i)
+)
+SELECT q.i, p.name
+FROM q
+JOIN LATERAL (
+  SELECT g.* FROM geodata_places g
+  WHERE g.name = q.name AND g."countryCode" = q.cc
+  ORDER BY earth_distance(ll_to_earth_public(g.latitude, g.longitude),
+                          ll_to_earth_public(q.lat, q.lon))
+  LIMIT 1) g ON true
+JOIN LATERAL (
+  SELECT c.name FROM geodata_places c,
+       LATERAL (SELECT unnest(ARRAY[g."admin2Name", g."admin1Name",
+                                    regexp_replace(g."admin2Name", '^Greater | (City|Suburban)$', '', 'g'),
+                                    regexp_replace(g."admin1Name", '^Greater | (City|Suburban)$', '', 'g')]) AS a) adm
+  WHERE c."countryCode" = g."countryCode" AND c.id <> g.id AND adm.a <> ''
+    AND (c.name = adm.a OR ',' || coalesce(c."alternateNames", '') || ',' LIKE '%%,' || adm.a || ',%%')
+    AND earth_box(ll_to_earth_public(g.latitude, g.longitude), %(radius)s)
+        @> ll_to_earth_public(c.latitude, c.longitude)
+    AND earth_distance(ll_to_earth_public(g.latitude, g.longitude),
+                       ll_to_earth_public(c.latitude, c.longitude)) <= %(radius)s
+  -- A place named exactly that ("London") beats one that only lists it
+  -- among its alternate names ("City of London"); then the nearest.
+  ORDER BY (c.name = adm.a) DESC,
+           earth_distance(ll_to_earth_public(c.latitude, c.longitude),
+                          ll_to_earth_public(g.latitude, g.longitude))
+  LIMIT 1) p ON true
+WHERE p.name <> q.name
+"""
+
+
+def _place_key(b: PlaceCount) -> tuple[str, str, float, float]:
+    """A place where it is: same name, same country, same ~10 km cell. Two
+    Bielanys (one a Warsaw district, one a village 90 km east) stay apart;
+    two same-named places closer than that are one place."""
+    return (country_code(b.country) or "", b.city or "",
+            round(b.lat, 1), round(b.lon, 1))
+
+
+def city_parents(conn, buckets: list[PlaceCount]) -> dict[tuple, str]:
+    """`_place_key` → the city it is a district of, for the places in
+    `buckets` that are one. Read-only, one query."""
+    places: dict[tuple, list[tuple[float, float, int]]] = {}
+    for b in buckets:
+        k = _place_key(b)
+        if k[0] and k[1]:
+            places.setdefault(k, []).append((b.lat, b.lon, b.n))
+    if not places:
+        return {}
+    keys = sorted(places)
+    lats, lons = [], []
+    for k in keys:
+        pts = places[k]
+        n = sum(w for _, _, w in pts)
+        lats.append(sum(la * w for la, _, w in pts) / n)
+        lons.append(_circular_mean_lon([(lo, w) for _, lo, w in pts]))
+    with conn.cursor() as cur:
+        cur.execute(CITY_PARENTS_SQL, {
+            "names": [k[1] for k in keys], "codes": [k[0] for k in keys],
+            "lats": lats, "lons": lons, "radius": CITY_ROLLUP_KM * 1000})
+        return {keys[int(i) - 1]: parent for i, parent in cur.fetchall()}
+
+
+def roll_up_cities(buckets: list[PlaceCount], parents: dict[tuple, str]) -> list[PlaceCount]:
+    """`buckets` with each district renamed to its city."""
+    out = []
+    for b in buckets:
+        parent = parents.get(_place_key(b))
+        out.append(replace(b, city=parent) if parent else b)
+    return out
 
 
 def build_days(buckets: list[PlaceCount]) -> list[Day]:
@@ -1013,7 +1103,8 @@ def tags_by_value(pairs: set[tuple[str, str]]) -> dict[str, list[str]]:
 
 
 __all__ = [
-    "match_ledger", "owned_pairs", "load_legacy", "adopt_legacy",
+    "match_ledger", "owned_pairs", "city_parents", "roll_up_cities",
+    "CITY_PARENTS_SQL", "CITY_ROLLUP_KM", "load_legacy", "adopt_legacy",
     "OTHER_OWNERS_SQL", "LINK_TAGS_RETURNING_SQL", "lock_ledger", "confirm_pending", "LINKS_BY_VALUE_SQL", "tags_by_value", "backfill_owned_tags",
     "IMMY_TRIP_MARKER", "LEDGER_FILENAME",
     "DEFAULT_PLACEHOLDER_MIN", "ASSETS_SQL", "DAY_BUCKETS_SQL",

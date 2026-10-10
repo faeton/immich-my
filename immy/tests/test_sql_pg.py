@@ -422,3 +422,61 @@ def test_orphans_attach_only_to_the_named_person_with_a_feature_face(conn) -> No
     b = add(conn, datetime(2025, 3, 2, 9), owner=OTHER)
     theirs = _face(conn, b)
     assert pg.attach_orphan_faces(conn, [theirs], gid, owner_id=OWNER, name="Anya") == 0
+
+
+# --- districts → city -------------------------------------------------------------
+
+_GEO = """
+SELECT pg_advisory_lock(4242);
+CREATE EXTENSION IF NOT EXISTS cube SCHEMA public;
+CREATE EXTENSION IF NOT EXISTS earthdistance SCHEMA public;
+CREATE OR REPLACE FUNCTION public.ll_to_earth_public(latitude double precision, longitude double precision)
+ RETURNS public.earth LANGUAGE sql IMMUTABLE PARALLEL SAFE STRICT AS $f$
+  SELECT public.cube(public.cube(public.cube(public.earth()*cos(radians(latitude))*cos(radians(longitude))),
+         public.earth()*cos(radians(latitude))*sin(radians(longitude))),
+         public.earth()*sin(radians(latitude)))::public.earth $f$;
+SELECT pg_advisory_unlock(4242);
+SELECT set_config('search_path', current_setting('search_path') || ', public', false);
+CREATE TABLE geodata_places (
+  id int PRIMARY KEY, name varchar NOT NULL, latitude float8 NOT NULL, longitude float8 NOT NULL,
+  "countryCode" char(2) NOT NULL, "admin1Name" varchar, "admin2Name" varchar, "alternateNames" varchar
+);
+"""
+
+# Immich's geodata (GeoNames cities500): name, lat, lon, cc, admin1, admin2, alternates.
+_PLACES = [
+    ("Warsaw", 52.2298, 21.0118, "PL", "Mazovia", "Warszawa", "Varsovie,Warszawa"),
+    ("Mokotów", 52.1934, 21.0346, "PL", "Mazovia", "Warszawa", None),
+    ("Bielany", 52.2924, 20.9353, "PL", "Mazovia", "Warszawa", None),
+    ("Bielany", 52.3417, 22.2493, "PL", "Mazovia", "Powiat sokołowski", None),
+    ("Murcia", 37.9870, -1.1300, "ES", "Murcia", "Murcia", None),
+    ("Santiago de la Ribera", 37.7967, -0.8085, "ES", "Murcia", "Murcia", None),
+    ("London", 51.5085, -0.1257, "GB", "England", "Greater London", None),
+    ("City of London", 51.5128, -0.0918, "GB", "England", "City of London", "London"),
+    ("Highbury", 51.5520, -0.0970, "GB", "England", "Greater London", None),
+    ("Kyiv", 50.4547, 30.5238, "UA", "Kyiv City", None, "Kiev"),
+    ("Zhulyany", 50.4017, 30.4469, "UA", "Kyiv City", None, None),
+]
+
+
+def test_city_parents_rolls_districts_up_and_leaves_towns_alone(conn) -> None:
+    conn.execute(_GEO)
+    for i, row in enumerate(_PLACES):
+        conn.execute('INSERT INTO geodata_places VALUES (%s, %s, %s, %s, %s, %s, %s, %s)', (i, *row))
+    d = date(2025, 3, 1)
+    b = [T.PlaceCount(d, "Poland", "Mokotów", 52.19, 21.03, 5),
+         T.PlaceCount(d, "Poland", "Bielany", 52.29, 20.94, 5),       # the Warsaw one
+         T.PlaceCount(d, "Spain", "Santiago de la Ribera", 37.80, -0.81, 5),
+         T.PlaceCount(d, "United Kingdom", "Highbury", 51.55, -0.10, 5),
+         T.PlaceCount(d, "Ukraine", "Zhulyany", 50.40, 30.45, 5),
+         T.PlaceCount(d, "Poland", "Warsaw", 52.23, 21.01, 5)]
+    got = {k[:2]: v for k, v in T.city_parents(conn, b).items()}
+    assert got == {
+        ("PL", "Mokotów"): "Warsaw", ("PL", "Bielany"): "Warsaw",
+        ("GB", "Highbury"): "London",                   # not "City of London"
+        ("UA", "Zhulyany"): "Kyiv",                     # "Kyiv City"
+    }                                                   # Santiago: 40 km, a town
+    # Both Bielanys in one library: only the Warsaw one rolls up.
+    far = T.PlaceCount(d, "Poland", "Bielany", 52.34, 22.25, 50)
+    rolled = T.roll_up_cities(b + [far], T.city_parents(conn, b + [far]))
+    assert [x.city for x in rolled if x.country == "Poland"] == ["Warsaw", "Warsaw", "Warsaw", "Bielany"]

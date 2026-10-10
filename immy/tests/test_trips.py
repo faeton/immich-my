@@ -295,6 +295,10 @@ class _Cursor:
                 if (a, v) not in TAGGED:
                     TAGGED.add((a, v))
                     self._rows.append((a, v))
+        elif sql is T.CITY_PARENTS_SQL:
+            self._rows = [(i + 1, PARENTS[(c, n)])
+                          for i, (n, c) in enumerate(zip(params["names"], params["codes"]))
+                          if (c, n) in PARENTS]
         elif sql is T.LINKS_BY_VALUE_SQL:
             self._rows = [(a, v) for a, v in TAGGED
                           if a in params["assets"] and v in params["values"]]
@@ -322,6 +326,7 @@ class _Cursor:
 
 USERS: list[tuple[str, str]] = [("u1", "me@example.com")]
 ASSET_OWNER: dict[str, str] = {}   # asset → owner id; default u1
+PARENTS: dict[tuple[str, str], str] = {}   # (country code, district) → city
 LINKS: list[tuple] = []
 TAGGED: set[tuple[str, str]] = set()   # (asset, tag value) currently linked
 
@@ -357,8 +362,11 @@ class _Immich:
         self.albums[aid] = {"name": name, "description": description, "assets": set(asset_ids)}
         return aid
 
-    def update_album(self, album_id, *, description):
-        self.albums[album_id]["description"] = description
+    def update_album(self, album_id, *, description=None, name=None):
+        if description is not None:
+            self.albums[album_id]["description"] = description
+        if name is not None:
+            self.albums[album_id]["name"] = name
 
     def add_assets_to_album(self, album_id, ids):
         have = self.albums[album_id]["assets"]
@@ -397,6 +405,7 @@ def _setup(monkeypatch, tmp_path, buckets, assets):
     LINKS.clear()
     TAGGED.clear()
     ASSET_OWNER.clear()
+    PARENTS.clear()
     USERS[:] = [("u1", "me@example.com")]
     monkeypatch.setattr(cli, "ImmichClient", _Immich)
     return cfg
@@ -1015,3 +1024,98 @@ def test_a_day_split_between_two_names_of_one_country_votes_as_one() -> None:
         T.PlaceCount(d, "Belgium", "Brussels", 50.85, 4.35, 6),
     ])
     assert days[0].code == "NL" and days[0].n == 8 and days[0].city == "Amsterdam"
+
+
+
+# --- districts, small trips -------------------------------------------------
+
+MOKOTOW = (52.19, 21.02, "Poland", "Mokotów")
+WOLA = (52.24, 20.96, "Poland", "Wola")
+
+
+def test_districts_roll_up_to_their_city() -> None:
+    b = [T.PlaceCount(D0, "Poland", "Mokotów", 52.19, 21.02, 3),
+         T.PlaceCount(D0, "Poland", "Kraków", 50.06, 19.94, 1)]
+    out = T.roll_up_cities(b, {T._place_key(b[0]): "Warsaw"})
+    assert [x.city for x in out] == ["Warsaw", "Kraków"]
+
+
+def test_district_named_albums_follow_the_city_unless_renamed(monkeypatch, tmp_path) -> None:
+    # Two Warsaw trips named after districts; the user renames one album.
+    spec = [(0, LISBON), (1, MOKOTOW), (2, MOKOTOW), (3, LISBON), (8, LISBON),
+            (9, WOLA), (10, WOLA), (11, LISBON)]
+    assets = [(f"a{i}", D0 + timedelta(days=i)) for i in (1, 2, 9, 10)]
+    cfg = _setup(monkeypatch, tmp_path, _rows(spec), assets)
+    _run(cfg, "--tags")
+    names = sorted(a["name"] for a in _Immich.albums.values())
+    assert names == ["2025-03 Poland · Mokotów", "2025-03 Poland · Wola"]
+    mine = next(a for a in _Immich.albums.values() if a["name"].endswith("Wola"))
+    mine["name"] = "Warsaw with Ola"
+    PARENTS.update({("PL", "Mokotów"): "Warsaw", ("PL", "Wola"): "Warsaw"})
+    res = _run(cfg, "--tags", "--prune")
+    assert "renamed" in res.output
+    assert sorted(a["name"] for a in _Immich.albums.values()) == [
+        "2025-03 Poland · Warsaw", "Warsaw with Ola"]
+    # Tags follow the trip name; the district tags are gone.
+    assert {v for _, v in TAGGED} == {"Trips/2025/2025-03 Poland · Warsaw"}
+    # Once immy's own name is tracked, a later run doesn't touch either.
+    _run(cfg, "--tags")
+    assert sorted(a["name"] for a in _Immich.albums.values()) == [
+        "2025-03 Poland · Warsaw", "Warsaw with Ola"]
+
+
+def test_small_trips_are_tagged_without_an_album(monkeypatch, tmp_path) -> None:
+    spec = [(0, LISBON), (1, PARIS), (2, LISBON), (5, MADRID), (6, MADRID), (7, LISBON)]
+    assets = [("p", D0 + timedelta(days=1)),                      # 1 asset: small
+              ("m1", D0 + timedelta(days=5)), ("m2", D0 + timedelta(days=6))]
+    cfg = _setup(monkeypatch, tmp_path, _rows(spec), assets)
+    res = _run(cfg, "--tags")
+    assert "tags only" in " ".join(res.output.split())
+    assert [a["name"] for a in _Immich.albums.values()] == ["2025-03 Spain · Madrid"]
+    assert ("p", "Trips/2025/2025-03 France · Paris") in TAGGED
+    entry = _ledger(tmp_path)[T.stable_key("FR", D0 + timedelta(days=1))]
+    assert entry["tag_only"] and entry["album_id"] is None
+    # Re-running is stable: no album appears, nothing retired.
+    res = _run(cfg, "--tags", "--prune")
+    assert "retired" not in res.output and len(_Immich.albums) == 1
+    assert ("p", "Trips/2025/2025-03 France · Paris") in TAGGED
+
+
+def test_a_name_you_chose_is_never_taken_for_immys(monkeypatch, tmp_path) -> None:
+    spec = [(0, LISBON), (1, MOKOTOW), (2, MOKOTOW), (3, LISBON)]
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, _rows(spec), assets)
+    _run(cfg)
+    (album,) = _Immich.albums.values()
+    album["name"] = "2025-03 Poland · Warsaw"            # you, before immy's roll-up
+    PARENTS[("PL", "Mokotów")] = "Warsaw"
+    _run(cfg)                                            # generated now equals yours
+    (entry,) = _ledger(tmp_path).values()
+    assert entry["name"] == "2025-03 Poland · Mokotów"    # still immy's, not yours
+    PARENTS.clear()                                      # generated name changes back
+    _run(cfg)
+    assert album["name"] == "2025-03 Poland · Warsaw"    # yours stays
+
+
+def test_an_album_another_entry_owns_is_not_taken_by_its_stale_marker(monkeypatch, tmp_path) -> None:
+    spec = [(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)]
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, _rows(spec), assets)
+    _run(cfg)
+    path = tmp_path / "state" / T.LEDGER_FILENAME
+    ledger = _ledger(tmp_path)
+    ((key, entry),) = ledger.items()
+    # The entry moved on (a small trip, years away) but kept the album, whose
+    # marker still says `key`.
+    ledger = {"elsewhere": {**entry, "start": "2019-01-01", "end": "2019-01-02",
+                            "tag_only": True}}
+    T.save_ledger(path, ledger, "u1")
+    _run(cfg)
+    assert len(_Immich.albums) == 2                      # a new album, not the owned one
+    assert _ledger(tmp_path)["elsewhere"]["album_id"] == entry["album_id"]
+
+
+def test_same_named_places_far_apart_are_resolved_separately() -> None:
+    near = T.PlaceCount(D0, "Poland", "Bielany", 52.26, 21.0, 1)
+    far = T.PlaceCount(D0, "Poland", "Bielany", 52.65, 21.0, 1)
+    assert T._place_key(near) != T._place_key(far)

@@ -48,7 +48,8 @@ gives thousands of albums; trips give a few hundred.
    one country split by a one-day hop rejoin.
 6. **Membership.** Every live timeline asset whose local date falls inside a
    trip's first..last day joins it, geotagged or not. Trips never overlap.
-7. Trips under `min_assets` get no album.
+7. Trips under `min_assets` get no album. With `--tags` they are still
+   tagged, so the tag tree lists every trip, small ones included.
 
 ### Regions
 
@@ -110,6 +111,14 @@ order:
 2025-02 Southeast Asia · Vietnam, Cambodia, Thailand
 ```
 
+The city is a city, not a district. Immich names a place after the nearest
+GeoNames populated place, which in big cities is often a neighbourhood
+(Mokotów, Bang Na, Alvalade). Before the vote, a place rolls up to the city its
+own admin area is named after, if that city is within 25 km: Mokotów, Wola and
+Ursynów count as Warsaw, Highbury as London, Zhulyany as Kyiv. A town that only
+shares a province with its capital stays itself, e.g. Santiago de la Ribera,
+40 km from Murcia.
+
 A country that was only a one-day stopover stays out of the name. It is still
 in the description, which also carries the itinerary for a multi-country trip,
 one **leg** per line:
@@ -131,7 +140,9 @@ included, is in exactly one leg. A one-day hop over a border and back doesn't
 split a leg, and territories count as their country.
 
 The marker line is the album's identity. Rename the album or edit the
-description freely. The ledger remembers the description immy last wrote:
+description freely. While an album keeps the name immy gave it, the name
+follows the trip (a new city roll-up, a leg added). Once you rename it, it's
+yours. The ledger remembers the description immy last wrote:
 while the album still shows exactly that, it follows the trip (a leg's dates
 shift, the trip grows). Once you edit it, it's yours and is never overwritten.
 `--refresh-descriptions` forces the update anyway, keeping every line that
@@ -199,7 +210,8 @@ tracked yet get them from the database first, with or without `--tags`.
 - **Relabelled legs:** a leg whose dates changed gets a new tag. The old one is
   unlinked, and Immich's TagCleanup removes it once empty.
 - **Disappeared trips:** a trip that no longer exists (a new home, merged into
-  a neighbour, under `min_assets`) is retired. Its claimed links and tags go;
+  a neighbour) is retired. One that only dropped under `min_assets` isn't: it
+  keeps its tags, and immy leaves its album as it is. Its claimed links and tags go;
   the album stays, with anything you added. A dry run lists these first.
   `--since`/`--until` limit this to that range. A trip whose start moved out
   of the range still exists, so it is left alone, not retired.

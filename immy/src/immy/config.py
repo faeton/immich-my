@@ -60,7 +60,7 @@ Shape:
           country: ES                # alpha-2 or Immich's English name
       max_gap_days: 3                # empty days a trip may bridge
       transit_days: 1                # runs this short fold into a neighbour
-      min_assets: 20                 # smaller trips get no album
+      min_assets: 20                 # smaller trips get tags only, no album
       placeholder_min: 10            # on-the-hour time shared by this many
                                      # assets = fallback date, ignored
       tag_root: Trips                # `--tags` → Trips/<year>/<album name>

@@ -4,6 +4,26 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-10 — trips: city names, tag-only small trips
+
+### Changed
+
+- **Districts roll up to their city.** Immich names a place after the nearest
+  GeoNames place, often a neighbourhood: Mokotów, Bang Na, Alvalade. Before the
+  day vote, a place now becomes the city its admin area is named after, when
+  that city is within 25 km. `trips.city_parents` does this with one read-only
+  query on Immich's `geodata_places`. "Greater London", "Kyiv City" and "Mumbai
+  Suburban" count as London, Kyiv and Mumbai, and an exact name beats an
+  alternate name. Towns that merely share a province with its capital stay
+  themselves. On the live library this renames 89 trips (e.g. "Poland ·
+  Mokotów" → "Poland · Warsaw"), and many country-only names gain a city.
+- **Albums follow immy's names.** While an album still has the name immy gave
+  it, the name follows the trip. The ledger records that name; a renamed album
+  is never touched. Trip tags follow too, and with `--prune` the old tags go.
+- **Small trips are tagged, not dropped.** Trips under `min_assets` get no
+  album but are tagged with `--tags`, and stay in the ledger. The CSV gains a
+  `has_album` column.
+
 ## 2026-10-10 — Immich 3.3.1
 
 The live install moved from 3.0.2 to 3.3.1. Every Postgres query immy

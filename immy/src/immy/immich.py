@@ -305,12 +305,16 @@ class ImmichClient:
         album_id: str,
         *,
         description: str | None = None,
+        name: str | None = None,
     ) -> None:
-        """Patch album fields. Today: description only (album name is the
-        identity key — renaming isn't part of the promote flow)."""
+        """Patch album fields: description and/or name. (Promote never
+        renames: there the album name is the identity key. Trips do, while
+        the name is still the one immy generated.)"""
         body: dict = {}
         if description is not None:
             body["description"] = description
+        if name is not None:
+            body["albumName"] = name
         if not body:
             return
         self._request("PATCH", f"/api/albums/{album_id}", body=body)
