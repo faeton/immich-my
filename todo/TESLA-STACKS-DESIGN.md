@@ -37,7 +37,7 @@ disagreed, the choice and the reason are written down.
 
 | | Pros | Cons |
 |---|---|---|
-| **A. Mosaic primary + front child (default), other angles opt-in** — *recommended* | 1 tile, 2 assets per event (≈280 for 141 events). Plates from the front. Repeater/pillar angles added only where the incident is on that side. | Needs a render. Other angles not in Immich unless chosen. |
+| **A. Mosaic primary + the cameras chosen per event as children** — *chosen* | 1 tile per event. The viewer's camera checklist decides which full-res angles ride along (all present cameras are checked by default; untick the ones that show nothing). Plates from the front, the incident side from its repeater. | Needs a render. Asset count depends on how much you untick (280–1000). |
 | B. Mosaic + all cameras as children | Everything one flip away. | 700–1000 assets, each with thumbs/CLIP/faces; stack flipping through 6 near-identical clips is slow on the phone. |
 | C. Front-only primary + other angles | No render, keeps SEI in the primary. | You can't see the side that had the incident without flipping; search/thumbs are road only. |
 | D. Mosaic only | Smallest. | No full-res plates. |
@@ -102,20 +102,24 @@ immy faces purge --tag Source/Tesla                                      (option
   segments, truncated files, SEI present).
 - **Time**: trigger = `creation_time` (UTC) of the trigger segment.
   Offset chain: timezonefinder on the GPS fix → folder-clock minus UTC rounded
-  to **15 min**, accepted if |offset| ≤ 14 h → configured home zone for Sentry
-  inside the home radius → none (asset stays UTC, tag `Tesla/TzUnknown`).
+  to **15 min**, accepted if |offset| ≤ 14 h → none (asset stays UTC, tag
+  `Tesla/TzUnknown`).
 - **GPS** chain: median valid SEI fix in the trigger segment → `event.json`
   coordinates (non-zero) → last fix of the previous drive in the same dump if
   under 6 h old → none. Record source + confidence. City from `event.json`
   is a cross-check only; reverse-geocoding is Immich's job.
 - `review`: the existing viewer + server moved into the package
   (`teslacam/viewer/`), reading `events.json`, writing **`decisions.json`**
-  atomically. Seeded once from the old `tags.json`.
+  atomically. Seeded once from the old `tags.json`. Per event: `keep`
+  (unreviewed | keep | drop), `cameras` (checklist, all present cameras
+  ticked by default), `in_sec`/`out_sec` (default `[trigger−180, trigger+30]`
+  clipped to the event; drives default to the whole chapter), `precise`,
+  `tags`, `note`, `archive`.
 - `render`: pure function of `events.json` + `decisions.json` + renderer
   version. Per kept event:
   - `mosaic.mp4`: exact in/out, xstack, black tile + label for a missing
     camera, `fps=30`, H.264 VideoToolbox proxy as above.
-  - `front.mp4` (+ any other chosen camera): lossless `-c copy` concat of the
+  - `<camera>.mp4` for every camera ticked in the viewer: lossless `-c copy` concat of the
     **whole segments** covering the range (so it is up to 60 s longer at each
     end than the mosaic; the viewer shows the snapped range). Wall-clock
     `mov_text` subtitle track with the `>>> EVENT <<<` marker. Opt-in
@@ -129,8 +133,9 @@ immy faces purge --tag Source/Tesla                                      (option
     `Keys:Description` = `Tesla dashcam · <reason> · <city> · <trigger local time>` +
     tags/note. All members share the same `CreationDate` so the stack never
     splits across days.
-  - Home-zone Sentry: **dropped by default**; if kept, GPS stripped
-    everywhere (including the GPX), tag `Tesla/Home`, archived after promote.
+  - GPS is **never stripped** (owner's call). No home-radius logic. An event
+    can be marked `archive: true` in the viewer, which `immy stacks apply`
+    applies after promote.
   - Grouped confirmation per dump (count, GB, minutes); render never deletes.
     Re-render only when the decision hash changes.
 - Writes `stacks.json` at the folder root (see manifest).
@@ -182,6 +187,7 @@ unless a camera was added or removed (then `--restack`).
 
 ### What is deliberately not done
 
+- Home-zone privacy handling: none, by decision (GPS stays).
 - Faces: Immich runs face detection on everything it scans. After promote,
   `immy faces purge --tag Source/Tesla` deletes the faces on those assets
   (new small command; needed anyway for other sources). Not a per-tag ML
@@ -200,17 +206,22 @@ pin; change the in/out and re-run: asset ids unchanged, stack intact. Check
 the thumbnail: if it is the start of the clip and not the incident, use the
 default window (below) rather than the whole event.
 
-## Open decisions (owner)
+## Decisions taken 2026-10-11 (owner)
 
-1. **Default window for Saved events.** Whole event (up to 10 min, thumbnail
-   = road ten minutes before the honk) vs default `[trigger−180 s, trigger+30 s]`
-   that you widen per event in the viewer. Recommendation: the default
-   window; whole-event is one drag away.
-2. **Which children by default**: front only (recommended) vs front + back.
-3. **Home-zone Sentry**: drop by default (recommended) vs keep archived + no GPS.
-4. **Car model(s)** for `Gear/Camera/Tesla <model>`: is the 4-cam 2022–24 car
-   the same car as the 6-cam 2025+ one?
-5. **RecentClips drives**: presented in the viewer as `unreviewed` and kept
-   only when you say so (recommended), or kept by default when they carry a
-   SEI route.
-6. **Layout**: equal tiles vs front-emphasis. Decide on the phone in the pilot.
+1. **Window**: Saved events default to `[trigger−180 s, trigger+30 s]`, widened
+   per event in the viewer. Sentry: `[trigger−60 s, trigger+60 s]`. Drives: the
+   whole chapter.
+2. **Children**: whatever cameras are ticked per event in the viewer; all
+   present cameras ticked by default. No fixed front-only rule: "sometimes it
+   varies, cannot be front-only."
+3. **GPS is never stripped**, no home-radius logic.
+4. **RecentClips drives**: scanned and shown as `unreviewed`; rendered only
+   when marked Keep.
+
+## Still open (settle in the pilot)
+
+- Car model(s) for `Gear/Camera/Tesla <model>`: is the 4-cam 2022–24 car the
+  same car as the 6-cam 2025+ one?
+- Mosaic layout: equal tiles vs front-emphasis. Look at both on the phone.
+- Whether Immich keeps the asset id when a file changes in place at the same
+  path (re-trim flow). If not, re-trims become new assets + `--restack`.
