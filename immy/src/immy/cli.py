@@ -5247,7 +5247,9 @@ def sidecars_check(
         selected = [p for p in selected if p not in cross]
     unchanged = len(members) - outside - len(selected) - len(cross)
     console.print(f"[bold]sidecars check[/bold] — {len(members)} sidecar(s) on {len(rows)} asset(s); "
-                  f"{len(selected)} to check" + (f", {unchanged} unchanged since the last check" if unchanged else "")
+                  f"{len(selected)} to check"
+                  + (f", {unchanged} " + ("not selected" if asset else "unchanged since the last check")
+                     if unchanged else "")
                   + (f", {outside} outside {root} skipped" if outside else "")
                   + (f", {len(cross)} shared with another user's assets skipped" if cross else ""))
 
