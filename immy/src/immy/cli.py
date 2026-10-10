@@ -5315,8 +5315,11 @@ def sidecars_check(
     zone_facts = [(a, o, shown, sc.file_facts(exif.get(str(local(o)), {}), str(local(o))))
                   for a, o, shown, _ in zone_rows]
     want.update({a: f.utc for a, _, _, f in zone_facts if f.utc is not None and f.local is None})
-    # Sidecars checked in this run aren't verified yet: they don't vote.
-    unverified = [a for side in selected for a, _, _ in members[side]]
+    # Only verified sidecars vote: any whose sidecar isn't stamped as checked
+    # for its current state (whatever this run selected), and any repaired
+    # but not refreshed yet (Immich still holds the old values).
+    unverified = [a for side, ms in members.items() for a, o, _ in ms
+                  if seen.get(a) != fingerprint(side, o)] + list(pending)
     hint = sc.hints(conn, owner_id, want, exclude=unverified)
     zone_fixes = []                           # (asset, original, patch)
     for a, o, shown, f in zone_facts:
@@ -5409,10 +5412,28 @@ def sidecars_check(
     # finished exactly by the next run.
     intent_path = state_path.with_name("sidecar-check-splits.jsonl")
     staging = state_path.with_name("sidecar-split-staging")
-    try:
-        intents = [_json.loads(ln) for ln in intent_path.read_text().splitlines() if ln.strip()]
-    except OSError:
-        intents = []
+    def read_intents() -> list[dict]:
+        try:
+            lines = intent_path.read_text().splitlines()
+        except OSError:
+            return []
+        out = []
+        for ln in lines:
+            try:
+                out.append(_json.loads(ln))
+            except ValueError:
+                continue                    # a record cut off mid-write: never acted on
+        return out
+
+    def write_intents(items: list[dict]) -> None:
+        tmp = intent_path.with_suffix(f".{os.getpid()}.tmp")
+        with open(tmp, "w") as fh:
+            fh.write("".join(_json.dumps(it, default=str) + "\n" for it in items))
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, intent_path)
+
+    intents = read_intents()
 
     def place(it) -> bool:
         """Staged sidecar → its target (atomically) → registered."""
@@ -5433,7 +5454,7 @@ def sidecars_check(
         if it not in unfinished:
             Path(it["staged"]).unlink(missing_ok=True)
     if intents:
-        intent_path.write_text("".join(_json.dumps(it) + "\n" for it in unfinished))
+        write_intents(unfinished)
     with open(log_path, "x") as log, open(pending_path, "a") as pend:
         for side, patch, reasons, ids, text, _ in repairs:
             # The previous text is on disk before the sidecar changes.
@@ -5493,10 +5514,7 @@ def sidecars_check(
             os.fsync(log.fileno())
             pend.flush()
             os.fsync(pend.fileno())
-            with open(intent_path, "a") as ifh:
-                ifh.write("".join(_json.dumps(it, default=str) + "\n" for it in its))
-                ifh.flush()
-                os.fsync(ifh.fileno())
+            write_intents(read_intents() + its)
             # 3. Move into place and register, member by member.
             for it, (a, o, _, _, new_immich) in zip(its, targets):
                 place(it)
@@ -5504,9 +5522,7 @@ def sidecars_check(
             split_done += 1
             # Done: these intents and their staged copies go.
             done = {it["asset"] for it in its}
-            remaining = [ln for ln in intent_path.read_text().splitlines()
-                         if ln.strip() and _json.loads(ln)["asset"] not in done]
-            intent_path.write_text("".join(ln + "\n" for ln in remaining))
+            write_intents([it for it in read_intents() if it["asset"] not in done])
             for it in its:
                 Path(it["staged"]).unlink(missing_ok=True)
         dated = 0

@@ -588,3 +588,11 @@ def test_cli_ignores_zone_stamps_from_the_old_format(lib) -> None:
         {"seen": {"zone:x7": f"{st.st_size}:{st.st_mtime_ns}"}}))      # an old, pre-fix stamp
     res = CliRunner().invoke(cli.app, args + ["--apply"])
     assert "1 video(s) dated" in " ".join(res.output.split())
+
+
+def test_cli_a_torn_split_journal_line_doesnt_block(lib) -> None:
+    args, db, writes, tmp = lib
+    (tmp / "state").mkdir(exist_ok=True)
+    (tmp / "state" / "sidecar-check-splits.jsonl").write_text('{"asset": "x", "staged": "/nowhere"')  # cut off
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output

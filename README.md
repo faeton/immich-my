@@ -32,7 +32,7 @@ The main operational interface is `immy`:
 - `trips` finds trips in the library's day-by-day geography (homes, regions, stopovers, flipped-GPS repair, districts rolled up to their city) and keeps one dated album per trip, plus optional `Trips/<year>/…` tags for nesting (small trips: tags only); see `docs/TRIPS.md`
 - `sidecars check` repairs registered XMP sidecars that contradict their originals (a GPS hemisphere lost, a video's UTC clock read as local), dates no-GPS videos Immich shows on the UTC clock from the shots around them, and splits stem-shared sidecars per file; the last stage of the ingest, see `docs/SIDECARS.md`
 - `srt` harvests DJI `.SRT` telemetry → GPX/JSON tracks, durable GPS, reverse-geocode
-- `tags sync` pushes a trip's notes tags (gear/camera, event, source) to Immich's native Tag API — the only channel that reaches video assets, which never read XMP
+- `tags sync` pushes a trip's notes tags (gear/camera, event, source) into Immich's native tags: created through the API, linked by SQL with the tag list locked (the tag-assign API wipes them again on read-only originals)
 - `tags camera` backfills the blank "Camera" field for DJI MP4s from the notes gear tag
 - `snapshot` dumps the Immich library index to a portable SQLite file
 - `similar <photo>` finds the library assets that look like a photo (image→image search

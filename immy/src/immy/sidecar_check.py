@@ -451,20 +451,17 @@ LEFT JOIN LATERAL (
 LEFT JOIN LATERAL (
   -- A shot votes when its zone is evidence: placed by its own GPS (so a
   -- UTC there is real, Lisbon in winter), or an offset from its own file.
-  -- A bare UTC on a shot with no position only means "unknown". Shots with
-  -- a sidecar vote once it has been checked; `exclude` holds the ones not
-  -- verified yet (a mirrored GPS would vote for the mirror's zone).
-  SELECT json_agg(json_build_array(v.tz, v.n)) AS votes
-  FROM (
-    SELECT e."timeZone" AS tz, count(*) AS n
+  -- A bare UTC on a shot with no position only means "unknown". Each vote
+  -- carries its asset id: `hints()` drops the ones not verified yet (a
+  -- mirrored GPS would vote for the mirror's zone).
+  SELECT json_agg(json_build_array(e."timeZone", a.id)) AS votes
     FROM asset a JOIN asset_exif e ON e."assetId" = a.id
     WHERE a."ownerId" = %(owner)s AND a."deletedAt" IS NULL AND a.id <> q.id
       AND a."fileCreatedAt" BETWEEN q.t - interval '3 hours' AND q.t + interval '3 hours'
       AND e."timeZone" IS NOT NULL
       AND ((e.latitude IS NOT NULL AND NOT (abs(e.latitude) < 0.001 AND abs(e.longitude) < 0.001))
-           OR e."timeZone" NOT IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00'))
-      AND NOT (a.id = ANY(%(exclude)s::uuid[]))
-    GROUP BY 1) v) z ON true
+           OR e."timeZone" NOT IN ('UTC', 'UTC+0', 'Etc/UTC', 'UTC+00:00')))
+  z ON true
 """
 
 
@@ -477,11 +474,17 @@ def hints(conn, owner_id: str, wanted: dict[str, datetime],
         return {}
     ids = sorted(wanted)
     with conn.cursor() as cur:
-        cur.execute(HINTS_SQL, {"owner": owner_id, "ids": ids, "ts": [wanted[i] for i in ids],
-                                "exclude": sorted(set(exclude))})
+        cur.execute(HINTS_SQL, {"owner": owner_id, "ids": ids, "ts": [wanted[i] for i in ids]})
         rows = cur.fetchall()
-    return {str(a): Hint(_num(la), _num(lo), _vote(votes, wanted[str(a)]))
-            for a, la, lo, votes in rows}
+    skip = {str(x) for x in exclude}
+    out = {}
+    for a, la, lo, votes in rows:
+        counts: dict[str, int] = {}
+        for tz, voter in (votes or []):
+            if str(voter) not in skip:
+                counts[tz] = counts.get(tz, 0) + 1
+        out[str(a)] = Hint(_num(la), _num(lo), _vote(list(counts.items()), wanted[str(a)]))
+    return out
 
 
 def _vote(votes, at: datetime):

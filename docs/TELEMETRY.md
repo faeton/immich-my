@@ -14,7 +14,7 @@ durably.
 | `immy srt geotag <trip> [--write] [--relock]` | Write the first valid fix (takeoff point) to `asset_exif.latitude/longitude` **with a lock**, then reverse-geocode country/state/city. Dry-run by default. `--relock` additionally repairs clips that already carry a DB coord but were never locked/geocoded (see below). |
 | `immy srt geocode <trip>|--prefix P [--write]` | Backfill country/state/city for already-located clips, purely from DB coords (no files needed). Only touches rows already carrying our lock token. |
 | `immy srt verify-channel <asset>` | One-off probe: prove which DB write survives an Immich metadata refresh for a video. Non-destructive (restores the asset). |
-| `immy tags sync <trip> [--write]` | Push the trip's notes `tags:` to every asset via Immich's **native Tag API** — the video-safe channel for tags XMP can't reach. See [Tags for videos](#tags-for-videos-immy-tags-sync) below. |
+| `immy tags sync <trip> [--write]` | Push the trip's notes `tags:` into Immich's **native tags** (created via the API, linked by SQL, list locked) for every asset, videos included. See [Tags for videos](#tags-for-videos-immy-tags-sync) below. |
 | `immy tags camera <trip> [--write]` | Backfill the Details panel's blank "Camera" row (`asset_exif.make`/`model`) for files whose container carries neither — the DJI-MP4 case — from the trip's notes `Gear/Camera/<make> <model>` tag. See [Camera model for videos](#camera-model-for-videos-immy-tags-camera) below. |
 
 Sidecars are written through `WritablePaths` (see [SIDECAR.md](SIDECAR.md)) — on
@@ -105,8 +105,11 @@ forward: any row it can't confidently repair it leaves alone.
 
 The same video/XMP blind spot documented above for GPS applies to tags. The
 `trip-tags-from-notes` audit rule writes the trip's notes `tags:`
-(`Gear/Camera/*`, `Events/*`, `Source/*`, …) to each file's `.xmp` sidecar —
-Immich reads that back for photos on its own library scan, never for videos.
+(`Gear/Camera/*`, `Events/*`, `Source/*`, …) to each file's `.xmp` sidecar.
+Immich 2.x read that back for photos only, never for videos. Immich 3.x reads
+a *registered* sidecar for videos too: `immy sidecars check` relies on it for
+video dates. But a tag only takes once the sidecar is registered and
+re-extracted, and stays only while the list is locked.
 So a DJI/Insta360/GoPro clip's device tag never reaches Immich's UI or search
 unless pushed into Immich's native tags directly: created with `PUT /api/tags`,
 linked by SQL. The same path `promote --tag` uses for one-off merge markers

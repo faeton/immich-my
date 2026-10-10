@@ -24,8 +24,8 @@ without an album, per-user ledger; see `docs/TRIPS.md`) · `sidecars check` (rep
 sidecars that contradict their originals — lost GPS signs, UTC clocks —, date no-GPS videos on
 the UTC clock, split stem-shared sidecars per file with `--split`; last ingest stage; see `docs/SIDECARS.md`) · `srt` (DJI .SRT telemetry → GPX/JSON tracks, durable locked GPS,
 reverse-geocode from Immich's geodata; see `docs/TELEMETRY.md`) ·
-`tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — to Immich's native
-Tag API; the only channel that reaches video assets, which never read XMP; see `docs/TELEMETRY.md`) ·
+`tags sync` (push notes `tags:` — Gear/Camera/drone model, event, source — into Immich's native
+tags: created via the API, linked by SQL with `asset_exif.tags` locked; see `docs/TELEMETRY.md`) ·
 `tags camera` (backfill the blank Camera field for DJI MP4s from the notes gear tag; see `docs/TELEMETRY.md`) ·
 `photos diff` (read-only: Photos.app assets missing from Immich → UUID list
 for `osxphotos export`; no iCloud login) · `photos pull` (export those UUIDs via
