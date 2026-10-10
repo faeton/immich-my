@@ -76,9 +76,13 @@ First run after upgrade has no ledger and prunes nothing.
 
 ### Tesla Dashcam Ingest
 
-Plan: [TESLA-PLAN.md](TESLA-PLAN.md) (design only, not built). One mosaic
-video per event with baked-in GPS/date, SEI telemetry → GPX, grouped-confirm
-retention for EncryptedClips / RecentClips / raw Sentry.
+Built 2026-10-11 (branch `tesla-dashcam`): the standalone `teslacam/` tool
+(scan → review viewer → render: mosaic proxy as stack primary + per-camera
+lossless concats as children, baked date/GPS/description, SEI → GPX) and
+`immy stacks apply` for the manifest-driven stacks. Design and decisions:
+`todo/TESLA-STACKS-DESIGN.md`; data inventory and retention rules still in
+[TESLA-PLAN.md](TESLA-PLAN.md). Pending: the live pilot on n5 (asset-id
+survival of an in-place re-trim), faces purge on `Source/Tesla`, retention.
 
 ### Apple Photos Bridge
 

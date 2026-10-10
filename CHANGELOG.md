@@ -4,6 +4,68 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-11 — Tesla dashcam: `teslacam` + `immy stacks apply`
+
+Branch `tesla-dashcam`. Design and the owner's decisions in
+`todo/TESLA-STACKS-DESIGN.md` (two outside reviews, Codex and Grok, agreed
+on the shape; where they differed the doc says why).
+
+### Added
+
+- **`teslacam/`**, a standalone `uv` project (kept out of immy: it re-encodes,
+  parses protobuf and serves a web UI). `scan` indexes every dump layout seen
+  so far (Saved/Sentry folders, the flat 2024 `ts__city__reason` folders,
+  RecentClips grouped into drives), reads durations and UTC clocks once
+  (cached), takes GPS from the H.264 SEI telemetry (median fix of the trigger
+  segment, corrected field map: 5 = accelerator, 14–16 = linear accel),
+  falls back to `event.json` and to the previous located drive (< 6 h),
+  resolves the offset from GPS (`timezonefinder`) or from the car's clock
+  minus the file's UTC clock (15-min steps, ≤ 14 h), and fills missing cities
+  from Nominatim (cached, seeded from the old `_tools/geocache.json`).
+  Duplicate event folders across dumps are skipped. `review` serves the
+  moderation viewer (ported from the throwaway catalogue, English, Range
+  requests): keep/drop, per-camera ticks, one in/out per event applied to
+  every camera, precise/archive toggles, tags, notes, review budget;
+  decisions live in `_review/decisions-<dump>.json`. `render` writes one
+  promote-able folder per year: `mosaic.mp4` (all cameras tiled, exact
+  window, H.264 at 720 rows so Immich never transcodes it), a lossless
+  `-c copy` concat per ticked camera (whole segments, wall-clock subtitle
+  track with the event marker; `precise` re-encodes), `track.gpx/json` from
+  SEI, baked `Keys:CreationDate`+offset / UTC `CreateDate` / Make / Model /
+  description (GPS on the mosaic only), a `render.json` receipt (digest of
+  segments + decision + renderer version → idempotent) and `stacks.json`.
+  Default window: Saved `[trigger−180 s, +30 s]`, Sentry `±60 s`, drives
+  whole. Folder names are `<kind>-<car folder stamp>`: in an external
+  library the path is the identity, so a later city/zone fix must not move
+  the file. 41 tests (synthetic SEI NALs, lavfi clips, exiftool read-back).
+- **`immy stacks apply <folder> [--write] [--restack]`**
+  (`stack_manifest.py`): resolves a shipped folder's `stacks.json` to assets
+  with one Postgres query, creates missing stacks through `POST /api/stacks`
+  (never SQL), links tags by SQL with `asset_exif.tags` locked, archives with
+  `visibility: "archive"` (3.3.1 dropped `isArchived` from the bulk update).
+  Statuses `create | ok | differs | restack | missing | id-changed`; the
+  receipt `.audit/stacks-applied.json` records the asset ids, so a
+  re-rendered file that became a new asset is reported instead of stacked
+  twice. `ImmichClient.delete_stack`, `update_assets`. 40 tests.
+
+### Measured
+
+- Tesla clips carry a keyframe every 0.5 s (2022, 2026) or 0.75 s (2024);
+  every 60 s segment starts on one. The 2024 dump is already 2896×1876 but
+  4 cameras at 24 fps.
+- Pilot (6-cam Saved event, Sep15 dump): scan 29 events in 66 s; render of
+  the default 180 s window + six lossless children in 26 s on the M3 Max;
+  mosaic 1668×720 at 3.5 Mbps (79 MB), children 124–251 MB each.
+- exiftool's `-api QuickTimeUTC` shifts a written `CreateDate` through the
+  Mac's zone; write the UTC string without it.
+
+### Pending
+
+- Live pilot on n5: promote one year folder, `stacks apply --write`, check
+  one tile / flip / date / map pin on web and phone, then re-trim once and
+  confirm the asset id survives (else re-trims go to a new revision folder
+  and `--restack`). Faces purge on `Source/Tesla`. Raw retention unchanged.
+
 ## 2026-10-10 — sidecars check: review fixes (zones, splits)
 
 Codex reviewed `--zones` and the per-file split. Fixed, and applied to the

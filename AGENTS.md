@@ -10,6 +10,9 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 ## Where things live
 - `immy/` — the tool. Code in `immy/src/immy/`, tests in `immy/tests/`. Python, `uv`, hatchling.
 - `immy/deploy/n5/` — running immy as a container on the N5 NAS (Immich's docker network).
+- `teslacam/` — standalone Tesla dashcam tool (own `uv` project): scan dumps → review viewer →
+  render folder + `stacks.json`; `immy promote` ships it, `immy stacks apply` stacks it. Kept out
+  of immy because it re-encodes and serves a web UI. Design in `todo/TESLA-STACKS-DESIGN.md`.
 - `docs/` — published design/ops docs (ARCHITECTURE, DEPLOY, CAPTIONS, TRANSCRIPTS, OFFLINE-RUNBOOK…).
 - `raw/` — personal specs + hardware notes. **gitignored** (CONSOLIDATION-PIPELINE, IMMY-ON-N5, PRIMARY-SWAP…).
 - `README.md` — human overview. `CHANGELOG.md` — dated findings + changes, newest first.
@@ -34,7 +37,9 @@ incomplete assets fall back to Photos.app AppleScript originals export) ·
 `similar` (image→image search on Immich's CLIP index: find the library shot a re-shared
 photo came from) · `status <trip>` (marker/journal/offline/derivatives/heartbeat summary) ·
 `doctor` (read-only preflight: binaries, paths, Immich API, Postgres
-schema, CLIP dim) · `snapshot` / `find-duplicates` / `repair-thumbs`.
+schema, CLIP dim) · `stacks apply <folder>` (manifest-driven Immich stacks via the API + SQL tag
+links + `id-changed` receipt; consumes `teslacam render` output) ·
+`snapshot` / `find-duplicates` / `repair-thumbs`.
 
 Two run targets: the **Mac** (MLX, default) and the **N5 NAS** (HTTP backends — Ollama captions,
 Qwen-ASR, Immich's own CLIP). The same code runs both; backend is config-selected.

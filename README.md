@@ -42,6 +42,14 @@ The main operational interface is `immy`:
 - `photos pull` exports those UUIDs with osxphotos, re-exports anything incomplete through
   Photos.app AppleScript (iCloud-only originals, e.g. a Live Photo's video), and delivers
   batches to n5 `staging/photos/ready/` with a per-UUID retry ledger
+- `stacks apply <folder>` turns a shipped folder's `stacks.json` manifest (primary + children +
+  tags + archive flag per group) into Immich stacks through the API, links the tags by SQL,
+  and keeps a receipt so a re-rendered file that became a new asset is reported as `id-changed`
+
+Tesla dashcam footage has its own standalone tool, [`teslacam/`](teslacam/README.md): scan the
+USB dumps, moderate them in a local viewer (keep/drop, cameras, one in/out per event), and render
+a mosaic preview + per-camera lossless concats into a folder that `promote` ships and
+`stacks apply` stacks. Design: `todo/TESLA-STACKS-DESIGN.md`.
 
 Typical development commands:
 

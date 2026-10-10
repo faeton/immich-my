@@ -1,6 +1,13 @@
 # Tesla dashcam → Immich: stacked, viewable, moderated
 
-Status: **brainstorm / draft design**, 2026-10-11, branch `tesla-dashcam`.
+Status: **built 2026-10-11** on branch `tesla-dashcam` (`teslacam/` +
+`immy stacks apply`), local pilot rendered; **live pilot on n5 pending**.
+Implementation notes that differ from the draft: the render folder name is
+`<kind>-<car folder stamp>` (not city/reason, so a later metadata fix can't
+move the asset's path); `stacks apply` keeps a receipt and reports
+`id-changed` when an in-place re-render became a new asset; `scan --geocode`
+fills cities from Nominatim (cached) because the Sep15 dump has no
+`event.json`; Immich 3.3.1 archives via `visibility: "archive"`.
 Supersedes the asset-shape section of [docs/TESLA-PLAN.md](../docs/TESLA-PLAN.md);
 the data inventory and retention rules there still hold. Inputs: the plan doc,
 the ad-hoc tools in `~/Media/inbox/TeslaDumps/`, measurements on the real
