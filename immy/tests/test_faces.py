@@ -88,7 +88,7 @@ class _FaceTable:
     def execute(self, sql, params=None):
         text = " ".join(sql.split())
         aid = (params or {}).get("asset_id")
-        if text.startswith("SELECT") and '"personId" IS NOT NULL' in text:
+        if text.startswith("SELECT") and '"personGroupId" IS NOT NULL' in text:
             self._result = [
                 (r["x1"], r["y1"], r["x2"], r["y2"], r["w"], r["h"])
                 for r in self.rows
@@ -96,7 +96,7 @@ class _FaceTable:
             ]
         elif text.startswith("DELETE FROM asset_face"):
             assert "\"sourceType\" = 'machine-learning'" in text
-            only_unassigned = '"personId" IS NULL' in text
+            only_unassigned = '"personGroupId" IS NULL' in text
             self.rows = [
                 r for r in self.rows
                 if not (r["asset"] == aid and r["source"] == "machine-learning"

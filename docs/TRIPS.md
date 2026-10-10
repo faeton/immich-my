@@ -166,7 +166,12 @@ of trip tags gone within minutes. Instead, tags are created through the API
 (`PUT /api/tags`, no per-asset jobs), and links go in by SQL together with the
 tag list and a `tags` lock. A later extraction keeps the locked list and
 rebuilds the links from it. The trade-off: those assets no longer pick up tag
-changes from their files (photo `HierarchicalSubject`).
+changes from their files (photo `HierarchicalSubject`). And since no API call
+assigns them, Immich's tag workflows (3.2+) don't fire for trip tags.
+
+Country names in albums and tags come from the country code (immy's short
+names, else GeoNames'), not from Immich's stored string. Immich 3.3 renamed
+32 countries in place; trips and tags kept their names.
 
 Each asset gets only the most specific tag: its leg, or the trip for a
 one-country trip. Immich resolves a parent tag through its closure table, so

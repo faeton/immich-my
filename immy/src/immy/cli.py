@@ -2647,6 +2647,8 @@ def trips(
     except Exception as e:
         console.print(f"[red]pg connect failed:[/red] {e}")
         raise typer.Exit(code=2)
+    if not dry_run:
+        _require_live_schema(conn)
 
     # `localDateTime` is the shot's wall-clock time stored as if it were UTC,
     # so reading it back in UTC yields the local calendar day.
@@ -2834,7 +2836,7 @@ def trips(
     # end, minus any another surviving trip still owns (tag values repeat
     # across trips), and kept in the ledger until then.
     release: dict[str, set[tuple[str, str]]] = {}
-    created = updated = linked = removed_total = tagged = untagged = 0
+    created = updated = linked = removed_total = tagged = new_tagged = untagged = 0
     # Links trips outside the scope want: not touched this run, so not
     # claimed yet, but not to be removed either. Handed to the entry of the
     # trip that wants them, if it has one.
@@ -2930,6 +2932,7 @@ def trips(
                 # a crash in between is settled on the next run (confirm_pending).
                 new_links = trips_mod.link_tags(tconn(), links, report=True, commit=False)
                 tagged += len(links)
+                new_tagged += len(new_links)
         new_links -= claimed
         stale = owned_tags - wanted
         if prune and stale:
@@ -3013,7 +3016,7 @@ def trips(
     console.print(
         f"\n[green]✓[/green] {created} album(s) created, {updated} updated, "
         f"{linked} asset-link(s) added" + (f", {removed_total} pruned" if prune else "")
-        + (f", {tagged} asset(s) tagged (locked)" if tags else "")
+        + (f", {new_tagged} new tag link(s) ({tagged} checked, all locked)" if tags else "")
         + (f", {untagged} stale tag(s) removed" if untagged else "")
     )
 
@@ -3587,6 +3590,10 @@ def apple_people(
         False, "--yes",
         help="Skip the confirmation prompt before writing (for non-interactive use).",
     ),
+    owner: str = typer.Option(
+        None, "--owner",
+        help="Immich user email whose people to name. Required when the server has more than one user.",
+    ),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
     """Preview (or, with `--apply`, write) Apple Photos face-tagging into Immich.
@@ -3689,8 +3696,15 @@ def apple_people(
         raise typer.Exit(code=2)
 
     try:
+        users = pconn.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL').fetchall()
+        match_u = [u for u in users if u[1] == owner] if owner else users
+        if len(match_u) != 1:
+            console.print(f"[red]no Immich user {owner!r}[/red]" if owner else
+                          f"[red]{len(users)} Immich users[/red] — pass --owner <email>.")
+            raise typer.Exit(code=2)
+        owner_id = str(match_u[0][0])
         asset_ids = sorted({m.immich_asset_id for ms in matches.values() for m in ms})
-        raw_faces = pg_mod.fetch_existing_faces(pconn, asset_ids)
+        raw_faces = pg_mod.fetch_existing_faces(pconn, asset_ids, owner_id)
         existing_faces_by_asset = {
             asset_id: [apple_photos_mod.ExistingFace(*row) for row in rows]
             for asset_id, rows in raw_faces.items()
@@ -3745,12 +3759,20 @@ def apple_people(
                 console.print("[yellow]aborted, no changes made.[/yellow]")
                 return
 
+        _require_live_schema(pconn)
         named = 0
         attached = 0
         for p in actionable:
-            if pg_mod.name_person(pconn, p.target_person_id, p.full_name):
-                named += 1
-            attached += pg_mod.attach_orphan_faces(pconn, p.orphan_face_ids, p.target_person_id)
+            outcome = pg_mod.name_person(pconn, p.target_person_id, p.full_name, owner_id)
+            if outcome is None:
+                # Renamed or gone since the preview: leave its faces alone.
+                console.print(f"  [yellow]skipped[/yellow] {p.full_name}: that person "
+                              "changed since the preview")
+                continue
+            named += outcome == "named"
+            attached += pg_mod.attach_orphan_faces(
+                pconn, p.orphan_face_ids, p.target_person_id,
+                owner_id=owner_id, name=p.full_name)
         pconn.commit()
         console.print(
             f"\n[green]applied:[/green] named {named} person cluster(s), "
@@ -4799,6 +4821,8 @@ def takeout_redate(
     index = tr.manifest_index(rows)
 
     conn = pg_mod.connect(config.pg)
+    if not dry_run:
+        _require_live_schema(conn)
     cur = conn.cursor()
     cur.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL')
     users = cur.fetchall()

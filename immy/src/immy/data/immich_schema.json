@@ -1,8 +1,102 @@
 {
-  "immich_version": "3.0.2",
-  "latest_migration": "1782414436633-AddPluginMethodAllowedHosts",
+  "immich_version": "3.3.1",
+  "latest_migration": "1790693088454-AddPersonUserTableSharedBySharedWithConstraint",
   "generated_by": "immy/scripts/regen_immich_schema.py",
   "tables": {
+    "album": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "albumName": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "'Untitled Album'::character varying"
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "albumThumbnailAssetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "description": {
+        "data_type": "text",
+        "udt_name": "text",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "deletedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "isActivityEnabled": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "true"
+      },
+      "order": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "'desc'::character varying"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      }
+    },
+    "album_asset": {
+      "albumId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "assetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      }
+    },
     "asset": {
       "id": {
         "data_type": "uuid",
@@ -380,7 +474,7 @@
         "is_nullable": false,
         "column_default": null
       },
-      "personId": {
+      "personGroupId": {
         "data_type": "uuid",
         "udt_name": "uuid",
         "is_nullable": true,
@@ -535,13 +629,107 @@
         "column_default": null
       }
     },
-    "person": {
+    "geodata_places": {
       "id": {
-        "data_type": "uuid",
-        "udt_name": "uuid",
+        "data_type": "integer",
+        "udt_name": "int4",
         "is_nullable": false,
-        "column_default": "uuid_generate_v4()"
+        "column_default": null
       },
+      "name": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "longitude": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "latitude": {
+        "data_type": "double precision",
+        "udt_name": "float8",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "countryCode": {
+        "data_type": "character",
+        "udt_name": "bpchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "admin1Code": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "admin2Code": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "modificationDate": {
+        "data_type": "date",
+        "udt_name": "date",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "admin1Name": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "admin2Name": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "alternateNames": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      }
+    },
+    "naturalearth_countries": {
+      "id": {
+        "data_type": "integer",
+        "udt_name": "int4",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "admin": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "admin_a3": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "type": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "coordinates": {
+        "data_type": "polygon",
+        "udt_name": "polygon",
+        "is_nullable": false,
+        "column_default": null
+      }
+    },
+    "person": {
       "createdAt": {
         "data_type": "timestamp with time zone",
         "udt_name": "timestamptz",
@@ -607,6 +795,12 @@
         "udt_name": "uuid",
         "is_nullable": false,
         "column_default": "immich_uuid_v7()"
+      },
+      "personGroupId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
       }
     },
     "smart_search": {
@@ -623,6 +817,94 @@
         "column_default": null
       }
     },
+    "stack": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "primaryAssetId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "ownerId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      }
+    },
+    "tag": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "userId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "value": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "color": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "parentId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      }
+    },
     "tag_asset": {
       "assetId": {
         "data_type": "uuid",
@@ -631,6 +913,128 @@
         "column_default": null
       },
       "tagId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": null
+      }
+    },
+    "user": {
+      "id": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "uuid_generate_v4()"
+      },
+      "email": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": null
+      },
+      "password": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "createdAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "profileImagePath": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "''::character varying"
+      },
+      "isAdmin": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "false"
+      },
+      "shouldChangePassword": {
+        "data_type": "boolean",
+        "udt_name": "bool",
+        "is_nullable": false,
+        "column_default": "true"
+      },
+      "deletedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "oauthId": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "updatedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "storageLabel": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "name": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "''::character varying"
+      },
+      "quotaSizeInBytes": {
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "quotaUsageInBytes": {
+        "data_type": "bigint",
+        "udt_name": "int8",
+        "is_nullable": false,
+        "column_default": "0"
+      },
+      "status": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": false,
+        "column_default": "'active'::character varying"
+      },
+      "profileChangedAt": {
+        "data_type": "timestamp with time zone",
+        "udt_name": "timestamptz",
+        "is_nullable": false,
+        "column_default": "now()"
+      },
+      "updateId": {
+        "data_type": "uuid",
+        "udt_name": "uuid",
+        "is_nullable": false,
+        "column_default": "immich_uuid_v7()"
+      },
+      "avatarColor": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "pinCode": {
+        "data_type": "character varying",
+        "udt_name": "varchar",
+        "is_nullable": true,
+        "column_default": null
+      },
+      "clusterGroupId": {
         "data_type": "uuid",
         "udt_name": "uuid",
         "is_nullable": false,

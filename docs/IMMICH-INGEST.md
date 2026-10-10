@@ -1,4 +1,4 @@
-# Immich Ingest Pipeline (schema as of v2.7.5; live 3.0.2) — Reference for Phase Y (Sidecar Pre-Ingest)
+# Immich Ingest Pipeline (schema as of v2.7.5; live 3.3.1) — Reference for Phase Y (Sidecar Pre-Ingest)
 
 > **Reference doc.** Exhaustive Immich DB schema (v2.7.5 reading, with 3.0.2 deltas in the note below) + ingest pipeline, used when implementing/maintaining direct-to-Postgres writes. Skip for onboarding — read [ARCHITECTURE.md](ARCHITECTURE.md) first.
 
@@ -17,6 +17,16 @@
 > the same check). Differences from the 2.7.5 tables below that matter to us:
 > `asset."deviceAssetId"` and `asset."deviceId"` are **gone**, and
 > `asset.duration` is **`integer` milliseconds** (was a `HH:MM:SS.sss` varchar).
+
+> **Immich 3.3.1 (2026-10).** People became shareable: `person.id` is gone.
+> Faces point at a `person_group` (`asset_face."personGroupId"`, was
+> `"personId"`), and each user who sees a person has a `person` row keyed by
+> `("ownerId", "personGroupId")` holding their name and feature face.
+> `asset_exif.country` now holds GeoNames names (`countryInfo.txt`): migration
+> `RenameGeoNamesCountries` renamed 32 in place ("Netherlands" → "The
+> Netherlands", "Lao People's Democratic Republic" → "Laos", …). The contract
+> now also lists the columns immy only reads (`READ_COLUMNS`), and `trips` /
+> `takeout redate` / `apple-people` check it before writing.
 
 ## Abstract — Path Forward
 

@@ -163,17 +163,20 @@ def check_postgres(config: Config, connect=None) -> list[Check]:
 
 
 def _check_columns(conn) -> list[Check]:
-    """Every table/column immy writes directly, against the live DB — the
-    same contract `process` / `promote` enforce before writing
-    (`schema_contract.WRITE_COLUMNS`)."""
+    """Every table/column immy writes or reads directly, against the live DB
+    — the same contract the writing commands enforce first
+    (`schema_contract.WRITE_COLUMNS`, `READ_COLUMNS`)."""
     from . import schema_contract
 
     checks = []
     for table, problems in schema_contract.live_schema_problems(conn).items():
-        wanted = len(schema_contract.WRITE_COLUMNS[table])
+        written = len(schema_contract.WRITE_COLUMNS.get(table, ()))
+        read = len(schema_contract.READ_COLUMNS.get(table, ()))
+        what = ", ".join(x for x in (f"{written} written" if written else "",
+                                     f"{read} read" if read else "") if x)
         checks.append(
             Check(f"table {table}", FAIL, "; ".join(problems)) if problems
-            else Check(f"table {table}", OK, f"{wanted} direct-write columns present")
+            else Check(f"table {table}", OK, f"columns present ({what})")
         )
     return checks
 

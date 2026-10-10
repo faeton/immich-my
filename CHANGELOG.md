@@ -4,6 +4,55 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-10 — Immich 3.3.1
+
+The live install moved from 3.0.2 to 3.3.1. Every Postgres query immy
+issues was prepared against the live 3.3.1 schema (read-only); all compile.
+
+### Changed
+
+- **People (3.3 made them shareable).** `person.id` is gone. Faces point at a
+  `person_group` (`asset_face."personGroupId"`, was `"personId"`), and each
+  user who sees a person has a `person` row keyed by `("ownerId",
+  "personGroupId")`. `apple-people` now:
+  - takes `--owner`;
+  - reads faces as that user sees them;
+  - names exactly that user's row;
+  - skips a person renamed since the preview;
+  - attaches orphan faces only to the person it just named, and only if that
+    person has a feature face.
+
+  `similar` joins names by asset owner.
+- **Country names.** 3.3 names countries from GeoNames' `countryInfo.txt` and
+  renamed 32 in place ("Netherlands" → "The Netherlands", "Lao People's
+  Democratic Republic" → "Laos", …). `geocode` (srtgeo) now writes the GeoNames
+  names, from a vendored `data/geonames_countries.json` (CC BY 4.0, GeoNames).
+  `trips`:
+  - reads both old and new names;
+  - votes a day's country by code, so a day split across both names isn't
+    lost to a smaller neighbour;
+  - takes display names from the code (immy's short names, else the pre-3.3
+    name), so existing albums and tags keep their names. Before this fix, 3
+    trips no longer matched their ledger entries after the upgrade.
+- **Schema contract covers reads.** `READ_COLUMNS` lists the columns immy
+  only reads or joins on. The snapshot includes those tables, `doctor` shows
+  them, and `trips`, `takeout redate` and `apple-people` check the live schema
+  before writing.
+- `trips`:
+  - re-linking an already-linked tag no longer rewrites its `asset_exif` row,
+    so re-runs don't bump `updateId` across ~100k assets;
+  - the summary reports new links separately from links checked.
+
+### Ops
+
+- `trips --apply --tags --prune` migrated the ledger to schema 2: 350 trips and
+  107,659 tag links, nothing changed in Immich.
+- Five 2016 iPhone videos with a corrupt QuickTime `CreateDate` (year
+  163833) had never been extracted. Each got a sidecar `DateTimeOriginal` from
+  its `MediaCreateDate` (UTC) in Kyiv time, matching the shots around it.
+- `mcp_video-20787_singular_display.MOV` is a truncated partial copy (first
+  120 MiB, no `moov` atom) of a video present twice in full beside it.
+
 ## 2026-10-09 — trips: per-user ledger, safer tag reconciliation
 
 Fixes from a second Codex review.

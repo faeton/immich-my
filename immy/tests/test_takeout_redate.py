@@ -10,6 +10,13 @@ import pytest
 
 from immy import takeout_redate as tr
 
+
+@pytest.fixture(autouse=True)
+def _no_live_schema(no_schema_guard):
+    """These CLI fakes can't answer the schema guard's information_schema
+    queries; the guard itself is tested in test_schema_contract.py."""
+
+
 PREFIX = "/staging/google-takeout"
 UTC = timezone.utc
 

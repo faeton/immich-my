@@ -135,7 +135,7 @@ def test_postgres_schema_and_clip_dim_ok():
     assert set(got.values()) == {doctor.OK}
     # Every table immy writes is covered, not a hand-picked subset.
     assert {n.removeprefix("table ") for n in got if n.startswith("table ")} \
-        == set(schema_contract.WRITE_COLUMNS)
+        == set(schema_contract.WRITE_COLUMNS) | set(schema_contract.READ_COLUMNS)
     assert fake.closed
 
 

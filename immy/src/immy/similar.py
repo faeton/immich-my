@@ -128,7 +128,7 @@ SELECT a.id, a."originalPath", a.type, a."localDateTime", p.name,
 FROM face_search fs
 JOIN asset_face af ON af.id = fs."faceId"
 JOIN asset a ON a.id = af."assetId"
-LEFT JOIN person p ON p.id = af."personId"
+LEFT JOIN person p ON p."personGroupId" = af."personGroupId" AND p."ownerId" = a."ownerId"
 WHERE a."deletedAt" IS NULL AND af."deletedAt" IS NULL
   AND (%(videos)s OR a.type = 'IMAGE')
 ORDER BY fs.embedding <=> %(v)s::vector

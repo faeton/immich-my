@@ -14,6 +14,13 @@ from immy.config import load as load_config
 
 D0 = date(2025, 3, 1)
 
+
+@pytest.fixture(autouse=True)
+def _no_live_schema(no_schema_guard):
+    """These CLI fakes can't answer the schema guard's information_schema
+    queries; the guard itself is tested in test_schema_contract.py."""
+
+
 # Rough city centres, enough for radius checks.
 LISBON = (38.72, -9.14, "Portugal", "Lisbon")
 PORTO = (41.15, -8.61, "Portugal", "Porto")
@@ -947,3 +954,64 @@ def test_links_whose_commit_was_lost_are_settled_on_the_next_run(monkeypatch, tm
     (entry,) = _ledger(tmp_path).values()
     assert "pending_tags" not in entry
     assert entry["tags"] == {PARIS_TAG: ["a1"]}
+
+
+@pytest.mark.parametrize("old,new,code", [
+    ("Netherlands", "The Netherlands", "NL"),
+    ("Lao People's Democratic Republic", "Laos", "LA"),
+    ("Holy See (Vatican City State)", "Vatican", "VA"),
+    ("State of Palestine", "Palestinian Territory", "PS"),
+    ("Moldova, Republic of", "Moldova", "MD"),
+    ("United States of America", "United States", "US"),
+    ("Czech Republic", "Czechia", "CZ"),
+])
+def test_country_names_before_and_after_immich_3_3(old, new, code) -> None:
+    assert T.country_code(old) == code
+    assert T.country_code(new) == code
+
+
+def test_every_immich_3_3_country_name_resolves() -> None:
+    import json
+    rows = json.loads((T._DATA / "geonames_countries.json").read_text())["countries"]
+    unresolved = [name for a2, _, name in rows if T.country_code(name) != a2]
+    assert unresolved == []
+
+
+def test_a_synonym_two_countries_share_resolves_to_neither() -> None:
+    assert T.country_code("Congo") is None
+    assert T.country_code("Republic of the Congo") == "CG"
+
+
+def test_display_names_follow_the_code_not_immichs_string() -> None:
+    assert T.short_country("NL", "The Netherlands") == "Netherlands"
+    assert T.short_country("TR", "Turkey") == "Türkiye"
+    assert T.short_country("FR", "anything") == "France"
+    assert T.short_country("CV", "Cabo Verde") == "Cape Verde"      # the pre-3.3 name
+    assert T.short_country("XK", "Kosovo") == "Kosovo"              # GeoNames only
+    assert T.short_country("ZZ", "Nowhere") == "Nowhere"
+
+
+def test_apply_refuses_to_write_on_a_drifted_schema(monkeypatch, tmp_path) -> None:
+    from immy import schema_contract
+    buckets = _rows([(0, LISBON), (1, PARIS), (2, PARIS), (3, LISBON)])
+    assets = [("a1", D0 + timedelta(days=1)), ("a2", D0 + timedelta(days=2))]
+    cfg = _setup(monkeypatch, tmp_path, buckets, assets)
+
+    def drifted(conn):
+        raise schema_contract.SchemaMismatch("person: missing read columns: personGroupId")
+    monkeypatch.setattr(schema_contract, "assert_live_schema", drifted)
+    res = CliRunner().invoke(cli.app, ["trips", "--config", str(cfg), "--apply", "--tags"])
+    assert res.exit_code == 2 and "personGroupId" in res.output
+    assert _Immich.albums == {} and TAGGED == set()
+    # A dry run only reads: still fine.
+    assert CliRunner().invoke(cli.app, ["trips", "--config", str(cfg)]).exit_code == 0
+
+
+def test_a_day_split_between_two_names_of_one_country_votes_as_one() -> None:
+    d = date(2025, 3, 1)
+    days = T.build_days([
+        T.PlaceCount(d, "Netherlands", "Amsterdam", 52.37, 4.9, 4),
+        T.PlaceCount(d, "The Netherlands", "Amsterdam", 52.37, 4.9, 4),
+        T.PlaceCount(d, "Belgium", "Brussels", 50.85, 4.35, 6),
+    ])
+    assert days[0].code == "NL" and days[0].n == 8 and days[0].city == "Amsterdam"

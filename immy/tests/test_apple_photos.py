@@ -523,3 +523,27 @@ def test_build_person_plans_no_detection() -> None:
     ]}
     plans = apple_photos.build_person_plans([person], matches, {})
     assert plans[0].no_detection == 2
+
+
+
+def test_build_person_plans_never_targets_another_users_person() -> None:
+    faces = [_face(f"U{i}") for i in range(3)]
+    person = _person(1, "Ivan", faces)
+    matches = {1: [apple_photos.FaceMatch(f, f"A{i}") for i, f in enumerate(faces)]}
+    # The group has no person row for this user: not "unnamed", not ours.
+    existing = {f"A{i}": [apple_photos.ExistingFace(
+        f"F{i}", "P1", None, 0.45, 0.45, 0.55, 0.55, has_person_row=False)] for i in range(3)}
+    plan = apple_photos.build_person_plans([person], matches, existing)[0]
+    assert plan.target_person_id is None
+
+
+def test_build_person_plans_no_orphans_for_a_target_without_a_feature_face() -> None:
+    faces = [_face(f"U{i}") for i in range(4)]
+    person = _person(1, "Ivan", faces)
+    matches = {1: [apple_photos.FaceMatch(f, f"A{i}") for i, f in enumerate(faces)]}
+    existing = {f"A{i}": [apple_photos.ExistingFace(
+        f"F{i}", "P1", "", 0.45, 0.45, 0.55, 0.55, has_feature_face=False)] for i in range(3)}
+    existing["A3"] = [_existing("F3", None, None)]
+    plan = apple_photos.build_person_plans([person], matches, existing)[0]
+    assert plan.target_person_id == "P1"           # still named
+    assert plan.orphan_face_ids == []              # but nothing attached

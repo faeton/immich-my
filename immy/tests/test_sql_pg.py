@@ -47,6 +47,21 @@ CREATE TABLE tag (id uuid PRIMARY KEY, "userId" uuid NOT NULL, value varchar NOT
 CREATE TABLE tag_asset (
   "assetId" uuid NOT NULL, "tagId" uuid NOT NULL, PRIMARY KEY ("assetId", "tagId")
 );
+-- Immich 3.3 people: faces point at a person group; each user who sees
+-- the person has a row keyed by (owner, group).
+CREATE TABLE person_group (id uuid PRIMARY KEY);
+CREATE TABLE asset_face (
+  id uuid PRIMARY KEY, "assetId" uuid NOT NULL REFERENCES asset(id),
+  "personGroupId" uuid REFERENCES person_group(id), "deletedAt" timestamptz,
+  "imageWidth" int NOT NULL DEFAULT 100, "imageHeight" int NOT NULL DEFAULT 100,
+  "boundingBoxX1" int NOT NULL DEFAULT 10, "boundingBoxY1" int NOT NULL DEFAULT 10,
+  "boundingBoxX2" int NOT NULL DEFAULT 20, "boundingBoxY2" int NOT NULL DEFAULT 20
+);
+CREATE TABLE person (
+  "ownerId" uuid NOT NULL, "personGroupId" uuid NOT NULL REFERENCES person_group(id),
+  name varchar NOT NULL DEFAULT '', "faceAssetId" uuid REFERENCES asset_face(id),
+  PRIMARY KEY ("ownerId", "personGroupId")
+);
 """
 
 
@@ -325,3 +340,85 @@ def test_confirm_pending_keeps_only_links_that_exist(conn) -> None:
     assert T.confirm_pending(conn, OWNER, entry)
     assert entry == {"tags": {v: [a]}}
     assert not T.confirm_pending(conn, OWNER, entry)
+
+
+def test_relinking_leaves_an_up_to_date_row_untouched(conn) -> None:
+    aid = add(conn, datetime(2025, 3, 2, 9), 48.86, 2.35, "France")
+    v = "Trips/x"
+    tid = _tag(conn, v)
+    T.link_tags(conn, [(aid, tid, v)])
+    xmin = conn.execute('SELECT xmin::text FROM asset_exif WHERE "assetId" = %s', (aid,)).fetchone()
+    T.link_tags(conn, [(aid, tid, v)])
+    assert conn.execute('SELECT xmin::text FROM asset_exif WHERE "assetId" = %s', (aid,)).fetchone() == xmin
+
+
+
+# --- people (Immich 3.3: person groups) ------------------------------------------
+
+
+def _face(conn, asset, group=None) -> str:
+    fid = str(uuid.uuid4())
+    conn.execute('INSERT INTO asset_face (id, "assetId", "personGroupId") VALUES (%s, %s, %s)',
+                 (fid, asset, group))
+    return fid
+
+
+def _group(conn, *owners, name="", feature=None) -> str:
+    gid = str(uuid.uuid4())
+    conn.execute("INSERT INTO person_group (id) VALUES (%s)", (gid,))
+    for o in owners:
+        conn.execute('INSERT INTO person ("ownerId", "personGroupId", name, "faceAssetId") '
+                     "VALUES (%s, %s, %s, %s)", (o, gid, name, feature))
+    return gid
+
+
+def _names(conn, gid):
+    return dict(conn.execute('SELECT "ownerId"::text, name FROM person WHERE "personGroupId" = %s',
+                             (gid,)).fetchall())
+
+
+def test_people_are_named_and_seen_per_owner(conn) -> None:
+    from immy import pg
+    a = add(conn, datetime(2025, 3, 2, 9))
+    gid = _group(conn, OWNER, OTHER)                 # shared: both users see it
+    f = _face(conn, a, gid)
+    conn.execute('UPDATE person SET "faceAssetId" = %s', (f,))
+    assert pg.name_person(conn, gid, "Anya", OWNER) == "named"
+    assert _names(conn, gid) == {OWNER: "Anya", OTHER: ""}   # only the owner's row
+    assert pg.name_person(conn, gid, "Anya", OWNER) == "already"
+    assert pg.name_person(conn, gid, "Bob", OWNER) is None   # never overwritten
+    faces = pg.fetch_existing_faces(conn, [a], OWNER)[a]
+    assert [(x[1], x[2], x[7], x[8]) for x in faces] == [(gid, "Anya", True, True)]
+    # The other user sees the same face as theirs, unnamed — but only their own
+    # assets are listed, and this asset is OWNER's.
+    assert pg.fetch_existing_faces(conn, [a], OTHER) == {}
+
+
+def test_a_group_without_the_owners_row_is_not_unnamed(conn) -> None:
+    from immy import pg
+    a = add(conn, datetime(2025, 3, 2, 9))
+    gid = _group(conn, OTHER)                         # only the other user has a row
+    _face(conn, a, gid)
+    (face,) = pg.fetch_existing_faces(conn, [a], OWNER)[a]
+    assert face[1] == gid and face[2] is None and face[7] is False
+    assert pg.name_person(conn, gid, "Anya", OWNER) is None
+    assert _names(conn, gid) == {OTHER: ""}
+
+
+def test_orphans_attach_only_to_the_named_person_with_a_feature_face(conn) -> None:
+    from immy import pg
+    a = add(conn, datetime(2025, 3, 2, 9))
+    gid = _group(conn, OWNER)
+    feat = _face(conn, a, gid)
+    orphan = _face(conn, a)
+    # No feature face yet: nothing attaches.
+    pg.name_person(conn, gid, "Anya", OWNER)
+    assert pg.attach_orphan_faces(conn, [orphan], gid, owner_id=OWNER, name="Anya") == 0
+    conn.execute('UPDATE person SET "faceAssetId" = %s', (feat,))
+    # Renamed since the preview: nothing attaches either.
+    assert pg.attach_orphan_faces(conn, [orphan], gid, owner_id=OWNER, name="Bob") == 0
+    assert pg.attach_orphan_faces(conn, [orphan], gid, owner_id=OWNER, name="Anya") == 1
+    # Another user's asset's face is never attached.
+    b = add(conn, datetime(2025, 3, 2, 9), owner=OTHER)
+    theirs = _face(conn, b)
+    assert pg.attach_orphan_faces(conn, [theirs], gid, owner_id=OWNER, name="Anya") == 0

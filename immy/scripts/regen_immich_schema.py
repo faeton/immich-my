@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Regenerate `src/immy/data/immich_schema.json` from a live Immich DB.
 
-Snapshots every table immy writes (`schema_contract.WRITE_COLUMNS`) from
+Snapshots every table immy writes or reads (`schema_contract.WRITE_COLUMNS`,
+`READ_COLUMNS`) from
 information_schema — no pg_dump needed. Read-only: the connection is put in
 read-only mode before the first query.
 
@@ -36,7 +37,7 @@ _MIGRATION_SQL = "SELECT name FROM kysely_migrations ORDER BY name DESC LIMIT 1"
 
 def snapshot(conn, immich_version: str) -> dict:
     tables: dict[str, dict] = {}
-    for table in sorted(schema_contract.WRITE_COLUMNS):
+    for table in sorted(set(schema_contract.WRITE_COLUMNS) | set(schema_contract.READ_COLUMNS)):
         rows = conn.execute(_COLUMNS_SQL, (table,)).fetchall()
         if not rows:
             raise SystemExit(f"table {table} not found — wrong database?")

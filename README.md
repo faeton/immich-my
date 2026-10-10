@@ -101,7 +101,8 @@ brew install exiftool ffmpeg vips
 
 ## What works today
 
-- Stock Immich 3.0.2 deployment on the n5 NAS (TrueNAS SCALE)
+- Stock Immich 3.3.1 deployment on the n5 NAS (TrueNAS SCALE); immy is tested
+  against 3.3.1 (see `immy/src/immy/data/immich_schema.json`)
 - Trip-folder metadata audit and XMP sidecar writes
 - GPS / timezone / tag inference for trips
 - Direct-to-Postgres ingest for curated trips
@@ -175,7 +176,7 @@ REST API. No forking. Upgrades stay clean.
 ## Hardware snapshot
 
 - **Storage + web + DB** → n5 (TrueNAS SCALE, ZFS): HDD pool `tank` for
-  originals, NVMe pool `flash` for immy state and derivatives. Immich 3.0.2 runs
+  originals, NVMe pool `flash` for immy state and derivatives. Immich 3.3.1 runs
   as the TrueNAS `ix-immich` app; immy's NAS runner lives under `/mnt/flash/immy`
   (see [immy/deploy/n5/README.md](immy/deploy/n5/README.md)). A Synology (vv)
   is the cold backup target, not the primary (it was the primary before the
@@ -214,7 +215,7 @@ Docs grouped by role:
 
 ## Status
 
-- **Phase 0 — Base stack**: done. Stock Immich (now 3.0.2) running on n5
+- **Phase 0 — Base stack**: done. Stock Immich (now 3.3.1) running on n5
   (TrueNAS SCALE, `ix-immich` app), reached over Tailscale. Originally built on a
   Synology DS923+ (docker project `${COMPOSE_PROJECT}`, data under
   `${DEPLOY_ROOT}`); that layout is kept in the DEPLOY.md history. Public docs use placeholders from

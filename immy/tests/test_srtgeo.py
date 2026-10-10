@@ -293,9 +293,11 @@ def test_is_uuid():
 def test_country_name_vendored_map():
     from immy import geocode
     assert geocode.country_name("PE") == "Peru"
-    assert geocode.country_name("BO") == "Bolivia"          # list → first
+    assert geocode.country_name("BO") == "Bolivia"
     assert geocode.country_name("BOL") == "Bolivia"         # alpha-3
-    assert geocode.country_name("US") == "United States of America"
+    assert geocode.country_name("US") == "United States"    # Immich ≥ 3.3 (GeoNames)
+    assert geocode.country_name("NL") == "The Netherlands"
+    assert geocode.country_name("LAO") == "Laos"
     assert geocode.country_name(None) is None
     assert geocode.country_name("ZZ") is None
 

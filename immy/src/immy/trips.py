@@ -77,15 +77,20 @@ def _region_table() -> dict:
 
 @lru_cache(maxsize=1)
 def _name_to_code() -> dict[str, str]:
-    """Immich's English country name → alpha-2. Immich writes
-    `asset_exif.country` with i18n-iso-countries' English names, the same
-    table `geocode.py` ships; synonyms (list values) all map back."""
+    """Immich's English country name → alpha-2. Immich ≥ 3.3 writes
+    `asset_exif.country` with GeoNames' names (`Laos`, `The Netherlands`);
+    earlier versions used i18n-iso-countries' (`Lao People's Democratic
+    Republic`, `Netherlands`). Both map back, so a library mid-upgrade or a
+    pre-3.3 server reads the same."""
     raw = json.loads((_DATA / "iso_countries_en.json").read_text())["countries"]
-    out: dict[str, str] = {}
+    codes: dict[str, set[str]] = {}
     for code, names in raw.items():
         for n in names if isinstance(names, list) else [names]:
-            out[n] = code
-    return out
+            codes.setdefault(n, set()).add(code)
+    for code, _, name in json.loads((_DATA / "geonames_countries.json").read_text())["countries"]:
+        codes.setdefault(name, set()).add(code)
+    # A synonym two countries share ("Congo") names neither.
+    return {n: next(iter(cs)) for n, cs in codes.items() if len(cs) == 1}
 
 
 def country_code(name: str | None) -> str | None:
@@ -97,8 +102,25 @@ def country_code(name: str | None) -> str | None:
     return _name_to_code().get(name)
 
 
+@lru_cache(maxsize=1)
+def _geonames_names() -> dict[str, str]:
+    rows = json.loads((_DATA / "geonames_countries.json").read_text())["countries"]
+    return {a2: name for a2, _, name in rows}
+
+
+@lru_cache(maxsize=1)
+def _iso_names() -> dict[str, str]:
+    raw = json.loads((_DATA / "iso_countries_en.json").read_text())["countries"]
+    return {k: (v[0] if isinstance(v, list) else v) for k, v in raw.items()}
+
+
 def short_country(code: str, fallback: str) -> str:
-    return _region_table()["short_names"].get(code, fallback)
+    """Display name for a country code: immy's short name, else the name
+    Immich used before 3.3 (i18n-iso-countries), else GeoNames'. Never the
+    stored `asset_exif.country` string unless the code is unknown, so
+    Immich's 3.3 renames (32 countries) don't rename albums and tags."""
+    return (_region_table()["short_names"].get(code) or _iso_names().get(code)
+            or _geonames_names().get(code, fallback))
 
 
 class Regions:
@@ -324,12 +346,21 @@ def build_days(buckets: list[PlaceCount]) -> list[Day]:
     days: list[Day] = []
     for d in sorted(by_day):
         rows = by_day[d]
+        # Votes by country code: the same country can carry two names (Immich
+        # 3.3 renamed 32, e.g. "Netherlands" → "The Netherlands").
         votes: Counter[str] = Counter()
+        label: dict[str, str] = {}
         for b in rows:
-            votes[b.country] += b.n
+            c = country_code(b.country)
+            votes[c] += b.n
+            label[c] = min(label.get(c, b.country), b.country)
         # Ties break on name so the result never depends on row order.
-        country = min(votes, key=lambda c: (-votes[c], c))
-        mine = [b for b in rows if b.country == country]
+        code = min(votes, key=lambda c: (-votes[c], label[c]))
+        mine = [b for b in rows if country_code(b.country) == code]
+        names: Counter[str] = Counter()
+        for b in mine:
+            names[b.country] += b.n
+        country = min(names, key=lambda c: (-names[c], c))
         cities: Counter[str] = Counter()
         for b in mine:
             if b.city:
@@ -337,7 +368,7 @@ def build_days(buckets: list[PlaceCount]) -> list[Day]:
         city = min(cities, key=lambda c: (-cities[c], c)) if cities else None
         n = sum(b.n for b in mine)
         days.append(Day(
-            day=d, country=country, code=country_code(country) or "",
+            day=d, country=country, code=code,
             city=city,
             lat=sum(b.lat * b.n for b in mine) / n,
             lon=_circular_mean_lon([(b.lon, b.n) for b in mine]),
@@ -691,6 +722,10 @@ UPDATE asset_exif SET
   "lockedProperties" = (SELECT array(SELECT DISTINCT unnest(
       coalesce("lockedProperties", '{}') || ARRAY['tags']::varchar[])))
 WHERE "assetId" = %(asset)s
+  -- Already there: leave the row alone, so a re-run doesn't bump its
+  -- updateId and make every client re-sync it.
+  AND NOT (%(value)s::varchar = ANY(coalesce(tags, '{}'))
+           AND 'tags' = ANY(coalesce("lockedProperties", '{}')))
 """
 
 LINK_TAG_SQL = """

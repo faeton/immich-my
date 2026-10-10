@@ -10,8 +10,8 @@ the same Postgres: nearest `geodata_places` row within
 `reverseGeocodeMaxDistance` (25 km, via the `earthdistance` extension), then
 a `naturalearth_countries` polygon fallback for country-only.
 
-`countryCode`/`admin_a3` → English country name via the vendored
-i18n-iso-countries 7.6.0 'en' dataset (`getName` = first entry of the list).
+`countryCode`/`admin_a3` → English country name via the vendored GeoNames
+`countryInfo.txt` names Immich ≥ 3.3 uses (`data/geonames_countries.json`).
 """
 
 from __future__ import annotations
@@ -41,28 +41,23 @@ class Place:
 
 
 @lru_cache(maxsize=1)
-def _country_names() -> dict[str, str]:
-    """alpha-2 → English name. i18n-iso-countries stores some values as a
-    list of synonyms; `getName` returns the first, so we do too."""
-    raw = json.loads((_DATA / "iso_countries_en.json").read_text())["countries"]
-    return {k: (v[0] if isinstance(v, list) else v) for k, v in raw.items()}
-
-
-@lru_cache(maxsize=1)
-def _alpha3_to_alpha2() -> dict[str, str]:
-    rows = json.loads((_DATA / "iso_country_codes.json").read_text())
-    return {r[1]: r[0] for r in rows if len(r) >= 2}
+def _country_names() -> tuple[dict[str, str], dict[str, str]]:
+    """(alpha-2 → name, alpha-3 → name) from GeoNames `countryInfo.txt`,
+    the table Immich ≥ 3.3 names countries from (`MapRepository
+    .readCountryNames`). Before 3.3 Immich used i18n-iso-countries'
+    names; its migration renamed those rows in place."""
+    rows = json.loads((_DATA / "geonames_countries.json").read_text())["countries"]
+    return {a2: n for a2, _, n in rows if a2}, {a3: n for _, a3, n in rows if a3}
 
 
 def country_name(code: str | None) -> str | None:
-    """ISO 3166-1 alpha-2 *or* alpha-3 code → English name (matches Immich's
-    `i18n-iso-countries getName(code, 'en')`)."""
+    """ISO 3166-1 alpha-2 *or* alpha-3 code → the English name Immich
+    writes for it."""
     if not code:
         return None
     code = code.upper()
-    if len(code) == 3:
-        code = _alpha3_to_alpha2().get(code, code)
-    return _country_names().get(code)
+    by_a2, by_a3 = _country_names()
+    return (by_a3 if len(code) == 3 else by_a2).get(code)
 
 
 # Nearest place within the box, ordered by true earth distance — verbatim port

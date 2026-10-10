@@ -244,9 +244,10 @@ UPDATE asset SET duration = %(duration)s WHERE id = %(id)s
 #
 # Every write also appends 'description' to `lockedProperties` — Immich
 # v2's metadata refresh overwrites every UNLOCKED field from file tags,
-# and for videos the extraction reads only container tags (sidecar XMP
-# is images-only), so the lock is the sole mechanism that makes a video
-# description durable. Harmless extra safety for images.
+# and for videos v2's extraction read only container tags (3.x also reads
+# a registered sidecar, but a read-only video rarely has one), so the lock
+# is what makes a video description durable. Harmless extra safety for
+# images.
 _LOCK_DESCRIPTION_SQL = """
     "lockedProperties" = CASE
       WHEN 'description' = ANY(coalesce("lockedProperties", '{}'))

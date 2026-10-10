@@ -345,6 +345,10 @@ class ExistingFace:
     y1: float
     x2: float
     y2: float
+    # The user has a `person` row for this group (else another user's
+    # person: not "unnamed", never a target), and it has a feature face.
+    has_person_row: bool = True
+    has_feature_face: bool = True
 
 
 # Two faces are "the same detection" if their box centers land within this
@@ -430,6 +434,7 @@ def build_person_plans(
         already_named = 0
         no_detection = 0
 
+        featured: dict[str, bool] = {}
         for fm in face_matches:
             apple_box = apple_bbox_norm(fm.face)
             if apple_box is None:
@@ -442,8 +447,11 @@ def build_person_plans(
                 continue
             if hit.person_id is None:
                 orphans.append(hit.face_id)
+            elif not hit.has_person_row:
+                no_detection += 1   # another user's person: not ours to name
             elif not hit.person_name:
                 votes[hit.person_id] = votes.get(hit.person_id, 0) + 1
+                featured[hit.person_id] = hit.has_feature_face
             elif hit.person_name == person.full_name:
                 already_named += 1
             else:
@@ -459,8 +467,10 @@ def build_person_plans(
                 target_person_id = best_id
                 target_votes = best_votes
 
-        # Orphan faces only get attached to a cluster we're actually naming.
-        orphan_face_ids = orphans if target_person_id is not None else []
+        # Orphan faces only get attached to a cluster we're actually naming,
+        # and only one with a feature face (see pg.attach_orphan_faces).
+        orphan_face_ids = (orphans if target_person_id is not None
+                           and featured.get(target_person_id) else [])
 
         plans.append(PersonPlan(
             apple_pk=person.apple_pk,

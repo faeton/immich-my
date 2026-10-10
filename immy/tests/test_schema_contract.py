@@ -390,3 +390,19 @@ def test_live_guard_ignores_new_required_columns_on_update_only_tables():
     live = _live_copy()
     live["person"]["mood"] = {"udt_name": "text", "is_nullable": False, "column_default": None}
     assert schema_contract.live_schema_problems(_FakeLivePg(live))["person"] == []
+
+
+def test_read_columns_exist_in_snapshot():
+    missing = {t: [c for c in cols if c not in SNAPSHOT.get(t, {})]
+               for t, cols in schema_contract.READ_COLUMNS.items()}
+    assert {t: c for t, c in missing.items() if c} == {}
+
+
+def test_live_guard_rejects_a_renamed_read_column():
+    # 3.3 renamed asset_face.personId → personGroupId; the reverse must fail.
+    live = _live_copy()
+    live["person"]["personId"] = live["person"].pop("personGroupId")
+    del live["stack"]
+    problems = schema_contract.live_schema_problems(_FakeLivePg(live))
+    assert problems["person"] == ["missing read columns: personGroupId"]
+    assert problems["stack"] == ["table missing"]

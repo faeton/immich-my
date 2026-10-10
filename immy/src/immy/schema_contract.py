@@ -49,7 +49,7 @@ WRITE_COLUMNS: dict[str, tuple[str, ...]] = {
         "assetId", "type", "path", "isEdited", "isProgressive", "isTransparent",
     ),
     "asset_face": (
-        "id", "assetId", "personId", "imageWidth", "imageHeight",
+        "id", "assetId", "personGroupId", "imageWidth", "imageHeight",
         "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
         "sourceType", "isVisible",
     ),
@@ -57,6 +57,29 @@ WRITE_COLUMNS: dict[str, tuple[str, ...]] = {
     "tag_asset": ("assetId", "tagId"),
     "smart_search": ("assetId", "embedding"),
     "person": ("name",),
+}
+
+# Columns immy reads, joins or filters on but never writes: a rename here
+# (3.3 turned `person.id`/`asset_face.personId` into `personGroupId`) breaks
+# a query without touching any write. Checked for presence only.
+READ_COLUMNS: dict[str, tuple[str, ...]] = {
+    "asset": ("id", "ownerId", "deletedAt", "localDateTime", "fileCreatedAt",
+              "originalPath", "originalFileName", "type", "visibility", "stackId",
+              "libraryId", "checksum"),
+    "asset_exif": ("assetId", "country", "city", "latitude", "longitude", "timeZone",
+                   "tags", "lockedProperties", "dateTimeOriginal"),
+    "asset_file": ("assetId", "type", "path", "isEdited"),
+    "asset_face": ("id", "assetId", "personGroupId", "deletedAt", "sourceType"),
+    "face_search": ("faceId", "embedding"),
+    "person": ("ownerId", "personGroupId", "name", "faceAssetId"),
+    "tag": ("id", "userId", "value"),
+    "tag_asset": ("assetId", "tagId"),
+    "stack": ("id", "primaryAssetId"),
+    "album": ("id", "albumName", "description", "deletedAt"),
+    "album_asset": ("albumId", "assetId"),
+    "user": ("id", "email", "deletedAt"),
+    "geodata_places": ("name", "admin1Name", "countryCode", "latitude", "longitude"),
+    "naturalearth_countries": ("admin_a3", "coordinates"),
 }
 
 # Tables immy INSERTs into. A NOT NULL column without a default that appears
@@ -107,8 +130,8 @@ def fetch_live_columns(conn, table: str) -> dict[str, dict]:
 
 def live_schema_problems(conn) -> dict[str, list[str]]:
     """Check the live DB against the contract. Returns `table → problems`
-    for every table in `WRITE_COLUMNS` (an empty list means the table is
-    fine). Read-only: one information_schema query per table."""
+    for every table in `WRITE_COLUMNS` and `READ_COLUMNS` (an empty list
+    means the table is fine). Read-only: information_schema queries only."""
     snapshot = load_snapshot()["tables"]
     out: dict[str, list[str]] = {}
     for table, written in WRITE_COLUMNS.items():
@@ -135,6 +158,17 @@ def live_schema_problems(conn) -> dict[str, list[str]]:
                     f"new NOT NULL columns without default: {', '.join(new_required)}"
                 )
         out[table] = problems
+    for table, read in READ_COLUMNS.items():
+        if out.get(table) == ["table missing"]:
+            continue
+        live = fetch_live_columns(conn, table)
+        problems = out.setdefault(table, [])
+        if not live:
+            problems.append("table missing")
+            continue
+        missing = [c for c in read if c not in live]
+        if missing:
+            problems.append(f"missing read columns: {', '.join(missing)}")
     return out
 
 

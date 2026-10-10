@@ -1,6 +1,6 @@
 # Deploy — Phase 0 Layout
 
-> **Current deployment (2026-10): n5, not the Synology.** Immich 3.0.2 runs on
+> **Current deployment (2026-10): n5, not the Synology.** Immich 3.3.1 runs on
 > **n5** (TrueNAS SCALE, ZFS) as the TrueNAS-managed `ix-immich` app. immy runs
 > beside it as a standalone compose project under `/mnt/flash/immy` joined to
 > `ix-immich_default` — see [`immy/deploy/n5/README.md`](../immy/deploy/n5/README.md);

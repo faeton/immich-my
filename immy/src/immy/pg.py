@@ -168,20 +168,21 @@ def upsert_smart_search(
 
 # --- asset_face + face_search (Y.4) --------------------------------------
 
-# Rows carrying a `personId` are Immich's face→person links (clustered or
+# Rows carrying a `personGroupId` (Immich ≥ 3.3; `personId` before) are
+# Immich's face→person links (clustered or
 # named by the user) — the bulk of ML faces in a live library. They are never
 # deleted; only unassigned ML detections are replaced.
 _SELECT_ASSIGNED_FACE_BOXES = """
 SELECT "boundingBoxX1", "boundingBoxY1", "boundingBoxX2", "boundingBoxY2",
        "imageWidth", "imageHeight"
 FROM asset_face
-WHERE "assetId" = %(asset_id)s AND "personId" IS NOT NULL
+WHERE "assetId" = %(asset_id)s AND "personGroupId" IS NOT NULL
 """
 
 _DELETE_UNASSIGNED_ML_FACES = """
 DELETE FROM asset_face
 WHERE "assetId" = %(asset_id)s AND "sourceType" = 'machine-learning'
-  AND "personId" IS NULL
+  AND "personGroupId" IS NULL
 """
 
 _INSERT_ASSET_FACE = """
@@ -237,9 +238,9 @@ def replace_asset_faces(
 ) -> int:
     """Replace the unassigned ML-detected faces for one asset.
 
-    Faces linked to a person (`personId` set — Immich's clustering or a
+    Faces linked to a person (`personGroupId` set — Immich's clustering or a
     user's naming) are never touched: deleting them would orphan the
-    person. Only `sourceType='machine-learning'` rows with no `personId` are
+    person. Only `sourceType='machine-learning'` rows with no `personGroupId` are
     deleted (CASCADE wipes their `face_search` too). Each face in `faces` is
     then inserted with its 512-dim ArcFace embedding — except one whose box
     overlaps a kept person-assigned face at IoU >= `SAME_FACE_IOU` (compared
@@ -300,68 +301,100 @@ def replace_asset_faces(
 # --- apple-people: naming Immich's existing (unnamed) face clusters ------
 
 _SELECT_EXISTING_FACES = """
-SELECT af.id, af."assetId", af."personId", p.name,
+SELECT af.id, af."assetId", af."personGroupId", p.name,
        af."boundingBoxX1"::float / af."imageWidth",
        af."boundingBoxY1"::float / af."imageHeight",
        af."boundingBoxX2"::float / af."imageWidth",
-       af."boundingBoxY2"::float / af."imageHeight"
+       af."boundingBoxY2"::float / af."imageHeight",
+       p."ownerId" IS NOT NULL, p."faceAssetId" IS NOT NULL
 FROM asset_face af
-LEFT JOIN person p ON p.id = af."personId"
-WHERE af."assetId" = ANY(%(asset_ids)s)
+JOIN asset a ON a.id = af."assetId"
+LEFT JOIN person p ON p."personGroupId" = af."personGroupId" AND p."ownerId" = %(owner)s
+WHERE af."assetId" = ANY(%(asset_ids)s) AND a."ownerId" = %(owner)s
+  AND af."deletedAt" IS NULL
   AND af."imageWidth" > 0 AND af."imageHeight" > 0
 """
 
 
 def fetch_existing_faces(
-    conn: psycopg.Connection, asset_ids: list[str],
-) -> dict[str, list[tuple[str, str | None, str | None, float, float, float, float]]]:
-    """Batch-fetch `asset_face` rows for the given assets, bbox normalized
-    to 0..1. Returns `assetId -> [(face_id, person_id, person_name, x1, y1,
-    x2, y2), ...]`. Caller (`apple_photos.build_person_plans`) does the
-    overlap logic — this is IO only.
+    conn: psycopg.Connection, asset_ids: list[str], owner_id: str,
+) -> dict[str, list[tuple]]:
+    """Batch-fetch `asset_face` rows on `owner_id`'s assets, bbox
+    normalized to 0..1, seen as that user sees them. Returns
+    `assetId -> [(face_id, person_id, person_name, x1, y1, x2, y2,
+    has_person_row, has_feature_face), ...]`. `person_id` is the person
+    group; `has_person_row` is False when the user has no `person` row for
+    it (a group only another user names), which is not the same as unnamed.
+    Caller (`apple_photos.build_person_plans`) does the overlap logic —
+    this is IO only.
     """
     out: dict[str, list[tuple]] = {}
     if not asset_ids:
         return out
-    rows = conn.execute(_SELECT_EXISTING_FACES, {"asset_ids": asset_ids}).fetchall()
-    for face_id, asset_id, person_id, name, x1, y1, x2, y2 in rows:
+    rows = conn.execute(_SELECT_EXISTING_FACES,
+                        {"asset_ids": asset_ids, "owner": owner_id}).fetchall()
+    for face_id, asset_id, person_id, name, x1, y1, x2, y2, has_row, has_feature in rows:
         out.setdefault(str(asset_id), []).append(
-            (str(face_id), str(person_id) if person_id else None, name, x1, y1, x2, y2)
+            (str(face_id), str(person_id) if person_id else None, name,
+             x1, y1, x2, y2, bool(has_row), bool(has_feature))
         )
     return out
 
 
+# Immich ≥ 3.3: a person is a `person_group` (what faces point at) plus one
+# `person` row per user who sees it (name, hidden, feature face …), keyed by
+# ("ownerId", "personGroupId"). immy's person id is the group id; every
+# write names exactly one user's row.
 _NAME_PERSON = """
 UPDATE person SET name = %(name)s
-WHERE id = %(person_id)s AND name = ''
+WHERE "personGroupId" = %(person_id)s AND "ownerId" = %(owner)s AND name = ''
+"""
+
+_PERSON_NAME = """
+SELECT name FROM person WHERE "personGroupId" = %(person_id)s AND "ownerId" = %(owner)s
 """
 
 
-def name_person(conn: psycopg.Connection, person_id: str, name: str) -> bool:
-    """Set a currently-unnamed person's name. Guarded by `name = ''` in the
-    WHERE clause so this never clobbers an existing name (e.g. a race with
-    the user naming it in the Immich UI between preview and apply).
-    Returns whether a row was actually updated.
-    """
+def name_person(conn: psycopg.Connection, person_id: str, name: str, owner_id: str) -> str | None:
+    """Name `owner_id`'s currently-unnamed person. Guarded by `name = ''`
+    so this never clobbers an existing name (e.g. the user naming it in the
+    Immich UI between preview and apply). Returns "named", "already" (it
+    already carries exactly this name), or None (no such row, or another
+    name): then nothing may be attached to it."""
+    params = {"person_id": person_id, "name": name, "owner": owner_id}
     with conn.cursor() as cur:
-        cur.execute(_NAME_PERSON, {"person_id": person_id, "name": name})
-        return cur.rowcount > 0
+        cur.execute(_NAME_PERSON, params)
+        if cur.rowcount > 0:
+            return "named"
+        cur.execute(_PERSON_NAME, params)
+        row = cur.fetchone()
+    return "already" if row and row[0] == name else None
 
 
+# Attach only to the person just named (re-checked in the same transaction)
+# and only one that already has a feature face: Immich sets that, and queues
+# its thumbnail, when a person gets its first face; immy doesn't replicate it.
 _ATTACH_ORPHAN_FACES = """
-UPDATE asset_face SET "personId" = %(person_id)s
-WHERE id = ANY(%(face_ids)s) AND "personId" IS NULL
+UPDATE asset_face SET "personGroupId" = %(person_id)s
+WHERE id = ANY(%(face_ids)s) AND "personGroupId" IS NULL
+  AND "assetId" IN (SELECT id FROM asset WHERE "ownerId" = %(owner)s)
+  AND EXISTS (SELECT 1 FROM person
+              WHERE "personGroupId" = %(person_id)s AND "ownerId" = %(owner)s
+                AND name = %(name)s AND "faceAssetId" IS NOT NULL)
 """
 
 
 def attach_orphan_faces(
-    conn: psycopg.Connection, face_ids: list[str], person_id: str,
+    conn: psycopg.Connection, face_ids: list[str], person_id: str, *,
+    owner_id: str, name: str,
 ) -> int:
-    """Attach unclustered `asset_face` rows to a person. Guarded by
-    `personId IS NULL` so an already-clustered face is never reassigned.
+    """Attach unclustered `asset_face` rows on `owner_id`'s assets to that
+    user's person named `name`. Guarded by `personGroupId IS NULL` so an
+    already-clustered face is never reassigned.
     """
     if not face_ids:
         return 0
     with conn.cursor() as cur:
-        cur.execute(_ATTACH_ORPHAN_FACES, {"face_ids": face_ids, "person_id": person_id})
+        cur.execute(_ATTACH_ORPHAN_FACES, {"face_ids": face_ids, "person_id": person_id,
+                                           "owner": owner_id, "name": name})
         return cur.rowcount
