@@ -328,13 +328,25 @@ def test_cli_repairs_a_shared_sidecar_only_when_every_asset_agrees(lib) -> None:
     assert ["fiji", "still", "vegas"] in _Api.refreshed          # the sibling is refreshed too
 
 
-def test_cli_leaves_a_shared_sidecar_whose_assets_disagree(lib) -> None:
+def test_cli_splits_a_sidecar_two_different_files_share(lib, monkeypatch) -> None:
     args, db, writes, tmp = lib
-    # The still says it was taken an hour later: the video's fix would make it wrong.
+    # IMG_3915.HEIC is another photo, an hour later: the stem-named sidecar
+    # was written for the video. Each gets a sidecar of its own.
     _share_vegas(db, db["root"], {"DateTimeOriginal": "2023:11:30 16:08:04", "OffsetTimeOriginal": "-08:00"})
+    from immy import sidecar as sidecar_mod
+    created = []
+    monkeypatch.setattr(sidecar_mod, "create_from",
+                        lambda media, xmp: (created.append(media.name), xmp.write_text("own"))[1])
     res = CliRunner().invoke(cli.app, args + ["--apply"])
-    assert "1 shared sidecar(s) whose assets disagree" in " ".join(res.output.split())
-    assert "IMG_3915.MOV" not in dict(writes)
+    assert res.exit_code == 0, res.output
+    assert "1 shared sidecar(s) split" in " ".join(res.output.split())
+    root = db["root"] / "v"
+    assert created == ["IMG_3915.HEIC"]                                   # the still: its own data
+    mov = sc.read_sidecar((root / "IMG_3915.MOV.xmp").read_text())        # the video: the copy, repaired
+    assert mov.dto == "2023:11:30 15:08:04-08:00" and mov.lon == pytest.approx(-115.1661, abs=1e-4)
+    assert sorted(db["registered"]) == [("still", "/lib/v/IMG_3915.HEIC.xmp"),
+                                        ("vegas", "/lib/v/IMG_3915.MOV.xmp")]
+    assert {"still", "vegas"} <= set(_Api.refreshed[-1])
 
 
 def test_cli_logs_before_it_writes(lib, monkeypatch) -> None:
@@ -457,3 +469,14 @@ def test_cli_dates_utc_clock_videos_with_a_sidecar_of_their_own(lib) -> None:
     assert (root / "v" / "mcp_video-20787.mov.xmp").exists()
     assert db["registered"] == [("mumbai", "/lib/v/mcp_video-20787.mov.xmp")]
     assert "mumbai" in _Api.refreshed[-1]
+
+
+def test_describes_and_split_roles() -> None:
+    side = sc.SidecarFacts("2023-11-30T23:08:04", 36.1322, 115.1661)      # the bug's form
+    assert sc.describes(VEGAS, side) is True                              # lost sign + UTC clock
+    other = sc.FileFacts(local=datetime.fromisoformat("2023-11-30T16:08:04-08:00"))
+    assert sc.describes(other, side) is False
+    assert sc.describes(sc.FileFacts(), side) is None                     # nothing to compare
+    assert sc.split_roles(side, [("v", VEGAS), ("h", other)]) == {"v": "copy", "h": "own"}
+    assert sc.split_roles(side, [("v", VEGAS), ("x", sc.FileFacts())]) is None
+    assert sc.split_roles(side, [("h", other)]) is None                   # nobody it describes

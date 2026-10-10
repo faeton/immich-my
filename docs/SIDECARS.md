@@ -54,6 +54,18 @@ cameras whose QuickTime clock is local (Insta360).
 Several assets can share one sidecar (a Live Photo's HEIC and MOV share
 `IMG_1234.xmp`). The repair must be right for every one of them, including a
 still that knows only its wall clock, or that sidecar is skipped and reported.
+
+Sometimes the files sharing a stem are not one moment: `IMG_5642.HEIC` is a
+photo taken ten hours after the clip `IMG_5642.MOV`, or DJI writes `.MOV` and
+`.mov` clips with one name. Then the stem-named sidecar is split per file:
+- **Each file it describes** (by its own date and GPS, allowing for the bugs
+  above) gets a copy as `name.ext.xmp`, repaired if needed.
+- **Each file it doesn't describe** gets a `name.ext.xmp` made from its own
+  metadata. Immich prefers a full-name sidecar over a stem match, so its own
+  data wins and the stem file never re-attaches.
+
+A file with no metadata to compare blocks the split. The old `name.xmp` stays
+on disk, unregistered.
 A date with an explicit offset is right for both. A sidecar that another
 user's assets also use is skipped.
 

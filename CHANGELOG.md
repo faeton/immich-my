@@ -53,6 +53,16 @@ continuously, so entries are dated rather than versioned.
     (`IMG_5642.HEIC`/`.MOV`, DJI `.MOV`/`.mov`); those are left for a split
     into per-file sidecars.
   - Trip tags intact.
+- **Per-file split of stem-shared sidecars.** When the files sharing a
+  `name.xmp` are different moments (`IMG_5642.HEIC` vs `.MOV`, DJI
+  `.MOV`/`.mov`), each gets its own `name.ext.xmp`:
+  - each file the sidecar describes gets a repaired copy;
+  - each file it doesn't gets one built from its own metadata
+    (`sidecar.create_from`).
+
+  Live: all 46 split (97 assets), and sign-flipped positions are down to zero.
+  The other 1,856 shared sidecars are right for every file sharing them (Live
+  Photo pairs).
 - `schema_contract.READ_COLUMNS` gains `library.importPaths`.
 
 ## 2026-10-10 — trips: city names, tag-only small trips

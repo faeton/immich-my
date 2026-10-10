@@ -299,6 +299,46 @@ def agrees(file: FileFacts, patch: dict[str, object]) -> bool:
     return True
 
 
+def describes(file: FileFacts, side: SidecarFacts) -> bool | None:
+    """Does this sidecar describe this file? True/False, or None when the
+    file says nothing to compare with. A date with an offset is compared as
+    an instant; one without, as the file's wall clock (or its UTC clock,
+    the old bug's form)."""
+    if not file.read:
+        return None
+    verdicts = []
+    dt = _parse_dt(side.dto) if side.dto else None
+    if dt is not None:
+        if dt.tzinfo is not None:
+            own = file.local or file.utc
+            if own is not None:
+                verdicts.append(abs((dt - own).total_seconds()) <= _CLOCK_SLACK_S)
+        else:
+            utc = file.utc or file.local
+            clocks = [c for c in (file.local.replace(tzinfo=None) if file.local else None, file.wall,
+                                  utc.astimezone(timezone.utc).replace(tzinfo=None) if utc else None)
+                      if c is not None]
+            if clocks:
+                verdicts.append(any(abs((dt - c).total_seconds()) <= _CLOCK_SLACK_S for c in clocks))
+    if side.lat is not None and file.lat is not None:
+        same = km(side.lat, side.lon, file.lat, file.lon) <= 1
+        lost = any(km(a, b, file.lat, file.lon) <= 1 for a, b in _lost_signs(side.lat, side.lon))
+        verdicts.append(same or lost)
+    return all(verdicts) if verdicts else None
+
+
+def split_roles(side: SidecarFacts, files: list[tuple[str, FileFacts]]) -> dict[str, str] | None:
+    """Assets sharing one sidecar by stem (`IMG_1.xmp` for both `IMG_1.HEIC`
+    and an unrelated `IMG_1.MOV`): `asset → "copy"` for each one the sidecar
+    describes (it gets its own copy), `"own"` for each it doesn't (it gets a
+    sidecar of its own metadata). None unless every asset gives a clear
+    answer and at least one is described."""
+    verdict = {a: describes(f, side) for a, f in files}
+    if any(v is None for v in verdict.values()) or not any(verdict.values()):
+        return None
+    return {a: "copy" if v else "own" for a, v in verdict.items()}
+
+
 def correct_patch(patch: dict[str, object], file: FileFacts) -> dict[str, object]:
     """Promote's guard: the sidecar `patch` it is about to write, run through
     the same rules against the original's own facts."""
@@ -427,6 +467,6 @@ def sidecar_text(path: Path) -> str | None:
 
 __all__ = [
     "FileFacts", "SidecarFacts", "Hint", "Repair", "file_facts", "read_sidecar",
-    "plan", "agrees", "correct_patch", "hints", "needs_hint", "sidecar_text", "km",
+    "plan", "agrees", "describes", "split_roles", "correct_patch", "hints", "needs_hint", "sidecar_text", "km",
     "SIDECARS_SQL", "SHARED_OWNERS_SQL", "HINTS_SQL", "UTC_CLOCK_SQL", "REGISTER_SIDECAR_SQL", "zone_fix", "VIDEO_EXTS", "MIRROR_FAR_KM", "MIRROR_NEAR_KM",
 ]

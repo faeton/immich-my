@@ -66,6 +66,22 @@ def write(
     return sidecar
 
 
+def create_from(media: Path, xmp_path: Path) -> Path:
+    """A new sidecar holding `media`'s own metadata (exiftool's standard
+    sidecar creation, `-o file.xmp`). Gives a file a sidecar that agrees
+    with it, so Immich never falls back to a stem-named one that belongs to
+    another file. Refuses to overwrite."""
+    if xmp_path.exists():
+        raise RuntimeError(f"{xmp_path} already exists")
+    result = subprocess.run([EXIFTOOL, "-q", "-q", "-o", str(xmp_path), str(media)],
+                            capture_output=True, text=True)
+    if result.returncode != 0 or not xmp_path.exists():
+        raise RuntimeError(
+            f"exiftool failed for {media.name}: {result.stderr.strip() or result.stdout.strip()}"
+        )
+    return xmp_path
+
+
 def read(media: Path) -> dict[str, str]:
     """Read the sidecar's XMP as a flat dict. Empty dict if no sidecar."""
     sidecar = _sidecar_path(media)

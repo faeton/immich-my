@@ -5319,7 +5319,15 @@ def sidecars_check(
 
     repairs = []                              # (sidecar, patch, reasons, [aid], text, SidecarFacts)
     conflicts: list[str] = []
+    splits = []                               # (sidecar, {asset: "copy"|"own"}, members, text, SidecarFacts)
     for side, (text, sf, fs) in facts.items():
+        # A stem-named sidecar two different files picked up (IMG_1.xmp for
+        # IMG_1.HEIC and an unrelated IMG_1.MOV): each gets its own.
+        if len(fs) > 1:
+            roles = sc.split_roles(sf, [(a, f) for a, _, f, _ in fs])
+            if roles and "own" in roles.values():
+                splits.append((side, roles, fs, text, sf))
+                continue
         plans = [(a, sc.plan(f, sf, hint.get(a))) for a, _, f, _ in fs]
         fixes = [fx for _, fx in plans if fx is not None]
         if not fixes:
@@ -5344,6 +5352,7 @@ def sidecars_check(
         counts[k] = counts.get(k, 0) + 1
     console.print("  " + (", ".join(f"{v} {k}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1]))
                           or "nothing to repair")
+                  + (f"; {len(splits)} shared sidecar(s) to split per file" if splits else "")
                   + (f"; {len(conflicts)} shared sidecar(s) whose assets disagree, left alone" if conflicts else "")
                   + (f"; {len(unreadable)} with an unreadable original, retried next run" if unreadable else "")
                   + (f"; {len(zone_fixes)} UTC-clock video(s) to date" if zone_fixes else ""))
@@ -5359,6 +5368,9 @@ def sidecars_check(
                             patch.get("GPSLatitude", ""), patch.get("GPSLongitude", "")])
             for side in conflicts:
                 w.writerow([side, " ".join(a for a, _, _ in members[side]), "conflict", "", "", "", "", "", ""])
+            for side, roles, fs, _, _ in splits:
+                for a, o, _, _ in fs:
+                    w.writerow([o + ".xmp", a, f"split:{roles[a]}", "", "", "", "", "", ""])
             for a, o, patch in zone_fixes:
                 w.writerow([o + ".xmp", a, "zone", "", patch["DateTimeOriginal"], "", "", "", ""])
         console.print(f"wrote {csv_path}")
@@ -5366,6 +5378,7 @@ def sidecars_check(
     if dry_run:
         conn.close()
         console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to repair {len(repairs)} sidecar(s)"
+                      + (f", split {len(splits)} shared one(s)" if splits else "")
                       + (f" and date {len(zone_fixes)} video(s)" if zone_fixes else "") + ".")
         return
 
@@ -5394,6 +5407,38 @@ def sidecars_check(
             pending.extend(ids)
             for a, o, _ in members[side]:
                 seen[a] = fingerprint(side, o)
+        split_done = 0
+        for side, roles, fs, text, sf in splits:
+            targets = [(a, o, f, local(o).with_name(local(o).name + ".xmp"), o + ".xmp") for a, o, f, _ in fs]
+            if any(t[3].exists() for t in targets):
+                console.print(f"  [yellow]not split[/yellow] {side}: a per-file sidecar already exists")
+                continue
+            for a, o, f, new_local, new_immich in targets:
+                fix = sc.plan(f, sf, hint.get(a)) if roles[a] == "copy" else None
+                log.write(_json.dumps({"action": "split", "role": roles[a], "assets": [a],
+                                       "sidecar": str(new_local), "before": None,
+                                       "registered_before": side, "registered_now": new_immich,
+                                       "patch": fix.patch if fix else None}, default=str) + "\n")
+                log.flush()
+                os.fsync(log.fileno())
+                pend.write(a + "\n")
+                pend.flush()
+                os.fsync(pend.fileno())
+                try:
+                    if roles[a] == "copy":
+                        new_local.write_text(text)
+                        if fix:
+                            sidecar_mod.write(local(o), fix.patch, xmp_path=new_local)
+                    else:
+                        sidecar_mod.create_from(local(o), new_local)
+                except (OSError, RuntimeError) as e:
+                    console.print(f"  [red]split failed[/red] {new_local}: {e}")
+                    continue
+                cur.execute(sc.REGISTER_SIDECAR_SQL, {"asset": a, "path": new_immich})
+                conn.commit()
+                pending.append(a)
+                seen[a] = fingerprint(new_immich, o)
+            split_done += 1
         dated = 0
         for a, o, patch in zone_fixes:
             # A sidecar of its own (`name.ext.xmp`): never shared by accident.
@@ -5428,6 +5473,7 @@ def sidecars_check(
     refreshed = len(set(pending))
     pending_path.unlink(missing_ok=True)
     console.print(f"[green]✓[/green] {written} sidecar(s) repaired"
+                  + (f", {split_done} shared sidecar(s) split" if splits else "")
                   + (f", {dated} video(s) dated" if zone_fixes else "") + ", metadata refresh queued for "
                   f"{refreshed} asset(s). Undo log: {log_path}")
 
