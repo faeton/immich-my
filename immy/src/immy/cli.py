@@ -5319,7 +5319,7 @@ def sidecars_check(
     # for its current state (whatever this run selected), and any repaired
     # but not refreshed yet (Immich still holds the old values).
     unverified = [a for side, ms in members.items() for a, o, _ in ms
-                  if seen.get(a) != fingerprint(side, o)] + list(pending)
+                  if (fp := fingerprint(side, o)) is None or seen.get(a) != fp] + list(pending)
     hint = sc.hints(conn, owner_id, want, exclude=unverified)
     zone_fixes = []                           # (asset, original, patch)
     for a, o, shown, f in zone_facts:

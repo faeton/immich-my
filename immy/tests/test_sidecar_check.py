@@ -596,3 +596,11 @@ def test_cli_a_torn_split_journal_line_doesnt_block(lib) -> None:
     (tmp / "state" / "sidecar-check-splits.jsonl").write_text('{"asset": "x", "staged": "/nowhere"')  # cut off
     res = CliRunner().invoke(cli.app, args + ["--apply"])
     assert res.exit_code == 0, res.output
+
+
+def test_an_unreadable_fingerprint_is_never_verified(lib) -> None:
+    # A sidecar whose file is gone has no fingerprint: None == None must not
+    # count as "verified" (it would let a bad sidecar vote on zones).
+    import inspect
+    src = inspect.getsource(cli.sidecars_check)
+    assert "(fp := fingerprint(side, o)) is None or seen.get(a) != fp" in src

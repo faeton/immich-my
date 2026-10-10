@@ -32,11 +32,15 @@ takeoff. The legacy first-fix `parse()` API is preserved (used by `dates`,
 
 ## Why GPS for videos needs a locked DB write — not XMP
 
-The audit rule `dji-gps-from-srt` writes GPS to an **XMP sidecar**, which works
-for photos but **not videos**: Immich's metadata extraction reads only container
-tags for videos (XMP is images-only), and immy's own `asset_exif` insert is
-`ON CONFLICT DO NOTHING`, so a drone video already in the library keeps its NULL
-coords.
+The audit rule `dji-gps-from-srt` writes GPS to an **XMP sidecar**. That worked
+for photos but **not videos** under Immich 2.x, whose metadata extraction read
+only container tags for videos (XMP was images-only). Immich 3.x reads a
+*registered* sidecar for videos too (`asset_file`, set by SidecarCheck or by
+immy; `sidecars check` relies on it for video dates). A sidecar only takes
+effect once it is registered and the asset re-extracted, and an unlocked
+field can still be clobbered by a later refresh. immy's own `asset_exif`
+insert is `ON CONFLICT DO NOTHING`, so a drone video already in the library
+keeps its NULL coords until one of those happens.
 
 `immy srt verify-channel` proved the durable channel empirically (run live on
 n5): for a video, a metadata refresh **clobbers an unlocked
