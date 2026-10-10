@@ -266,6 +266,25 @@ class ImmichClient:
         resp = self._request("POST", "/api/stacks", body=payload)
         return (resp or {}).get("id") if isinstance(resp, dict) else None
 
+    def delete_stack(self, stack_id: str) -> None:
+        """`DELETE /api/stacks/{id}` (204, no body): dissolves the stack,
+        the assets stay. Immich 3.3.1 `stack.controller.ts`."""
+        self._request("DELETE", f"/api/stacks/{stack_id}")
+
+    def update_assets(self, asset_ids: list[str], *, is_archived: bool) -> None:
+        """`PUT /api/assets` bulk update, archive on/off.
+
+        Since 1.133 the DTO has no `isArchived`; archiving is
+        `visibility: "archive"` and the timeline is `"timeline"` (3.3.1
+        `AssetBulkUpdateSchema` — an unknown key fails validation). 204."""
+        if not asset_ids:
+            return
+        visibility = "archive" if is_archived else "timeline"
+        for i in range(0, len(asset_ids), 1000):
+            self._request("PUT", "/api/assets", body={
+                "ids": asset_ids[i:i + 1000], "visibility": visibility,
+            })
+
     # --- albums ------------------------------------------------------------
 
     def find_album_by_name(self, name: str) -> dict | None:

@@ -63,6 +63,7 @@ similar_mod = _LazyModule("similar")
 snapshot_mod = _LazyModule("snapshot")
 srt_mod = _LazyModule("srt")
 srtgeo_mod = _LazyModule("srtgeo")
+stack_manifest_mod = _LazyModule("stack_manifest")
 tagsync_mod = _LazyModule("tagsync")
 track_mod = _LazyModule("track")
 transcripts_mod = _LazyModule("transcripts")
@@ -4772,6 +4773,123 @@ def pano_server(
 
 
 app.add_typer(triage_app, name="triage")
+
+
+stacks_app = typer.Typer(
+    help="Immich stacks, tags and archive flags from a folder's stacks.json.",
+    no_args_is_help=True,
+)
+
+
+@stacks_app.command("apply")
+def stacks_apply(
+    folder: Path = typer.Argument(
+        ..., exists=True, file_okay=False, resolve_path=True,
+        help="Local render folder holding stacks.json; its basename is the "
+        "trip folder under the library's originals root.",
+    ),
+    write: bool = typer.Option(False, "--write", help="Apply (default: dry-run report)."),
+    restack: bool = typer.Option(
+        False, "--restack",
+        help="Where a group's stack differs from the manifest, delete the "
+        "stack(s) its members sit in and create it again.",
+    ),
+    config_path: Path = typer.Option(None, "--config", help="immy config.yml (pg: + immich: blocks)."),
+) -> None:
+    """Make Immich match `<folder>/stacks.json` after `immy promote` shipped
+    the folder: one stack per group (create / ok / differs / restack /
+    missing), the group's tags linked to every member (SQL, locked — never
+    the tag-assign API), `archive: true` groups archived. Dry-run by
+    default; re-running is a no-op once everything is `ok`.
+
+    A `--write` leaves `<folder>/.audit/stacks-applied.json` (asset ids per
+    group). A later run whose primary asset id differs from the receipt
+    reports `id-changed` — a re-render at the same path became a new asset
+    instead of being re-read in place — and leaves the group alone;
+    `--restack` rebuilds it and updates the receipt."""
+    try:
+        manifest = stack_manifest_mod.load_manifest(folder / "stacks.json")
+        receipt = stack_manifest_mod.load_receipt(folder)
+    except stack_manifest_mod.ManifestError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(code=2)
+
+    config, conn, _library = _srt_pg_setup(config_path)
+    try:
+        assets = stack_manifest_mod.fetch_folder_assets(conn, folder.name)
+        plans = stack_manifest_mod.plan_groups(
+            manifest, assets, restack=restack, receipt=receipt,
+        )
+
+        table = Table(title=f"{folder.name}: {len(plans)} groups"
+                      + (f" · album {manifest.album!r}" if manifest.album else ""))
+        table.add_column("key")
+        table.add_column("primary")
+        table.add_column("children", justify="right")
+        table.add_column("status")
+        table.add_column("tags", justify="right")
+        table.add_column("archive")
+        table.add_column("note", style="dim")
+        colour = {"create": "green", "ok": "dim", "differs": "yellow",
+                  "restack": "yellow", "missing": "red", "id-changed": "red"}
+        for plan in plans:
+            note = plan.note
+            if plan.missing:
+                note = ("missing: " + ", ".join(plan.missing)) + (f" ({note})" if note else "")
+            table.add_row(
+                plan.group.key,
+                plan.group.primary.rsplit("/", 1)[-1],
+                str(len(plan.group.children)),
+                f"[{colour[plan.status]}]{plan.status}[/{colour[plan.status]}]",
+                str(plan.links),
+                "yes" if plan.group.archive else "",
+                note,
+            )
+        console.print(table)
+        counts = {s: sum(1 for p in plans if p.status == s)
+                  for s in ("create", "ok", "differs", "restack", "missing", "id-changed")}
+        archive_n = len(stack_manifest_mod.archive_ids(plans))
+        console.print(
+            " · ".join(f"{n} {s}" for s, n in counts.items() if n)
+            + f" · {sum(p.links for p in plans if p.resolved)} tag links"
+            + f" · {archive_n} to archive"
+        )
+        if counts["differs"]:
+            console.print("[yellow]differs: re-run with --restack to rebuild those stacks[/yellow]")
+        if counts["id-changed"]:
+            console.print(
+                "[red]id-changed: a re-rendered file became a NEW Immich asset "
+                "(receipt .audit/stacks-applied.json disagrees) — left untouched; "
+                "--restack rebuilds and re-records it[/red]"
+            )
+        if not write:
+            console.print("[yellow]dry-run[/yellow] — re-run with --write to apply")
+            return
+        schema_contract_mod.assert_live_schema(conn)
+        client = ImmichClient(
+            url=config.immich.url,
+            api_key=config.immich.api_key,
+            ssh_host=config.immich.ssh_host,
+        )
+        result = stack_manifest_mod.apply_plans(
+            client, conn, plans, log=lambda msg: console.print(f"[red]{msg}[/red]"),
+        )
+        receipt_file = stack_manifest_mod.write_receipt(
+            folder, stack_manifest_mod.receipts_after(plans, receipt),
+        )
+        console.print(f"receipt → {receipt_file}")
+        console.print(
+            f"[green]{result.created} stacks created · {result.restacked} restacked · "
+            f"{result.tags_linked} tag links · {result.archived} archived[/green]"
+            + (f" · [red]{result.failed} groups failed[/red]" if result.failed else "")
+        )
+        if result.failed:
+            raise typer.Exit(code=1)
+    finally:
+        conn.close()
+
+
+app.add_typer(stacks_app, name="stacks")
 
 
 takeout_app = typer.Typer(
