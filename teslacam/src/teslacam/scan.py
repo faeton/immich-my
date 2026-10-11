@@ -196,13 +196,7 @@ def offset_from_folder(local: datetime, utc: datetime) -> str | None:
     return _fmt_offset(timedelta(seconds=q))
 
 
-def _trigger_segment_sei(root: Path, ev_dir_rel: str, segs: list[Segment], trigger_s: float | None):
-    """SEI samples of the front file of the segment holding the trigger
-    (last segment for drives)."""
-    if not segs:
-        return []
-    t = segs[-1].start if trigger_s is None else trigger_s
-    seg = next((s for s in segs if t < s.end), segs[-1])
+def _front_sei(root: Path, ev_dir_rel: str, seg: Segment) -> list[dict]:
     fn = seg.f.get("front")
     if not fn:
         return []
@@ -210,6 +204,26 @@ def _trigger_segment_sei(root: Path, ev_dir_rel: str, segs: list[Segment], trigg
         return sei_mod.sei_track(root / ev_dir_rel / fn, max_samples=5000)
     except Exception:
         return []
+
+
+def _trigger_segment_sei(root: Path, ev_dir_rel: str, segs: list[Segment], trigger_s: float | None):
+    """SEI samples of the front file of the segment holding the trigger
+    (last segment for drives). When that segment has no valid fix — the car
+    writes no SEI at all while it has no GPS, so a drive that lost the
+    signal part-way ends blank — the nearest segment with a fix stands in,
+    so the event is still placed. A read costs ~20 ms per file."""
+    if not segs:
+        return []
+    t = segs[-1].start if trigger_s is None else trigger_s
+    i = next((k for k, s in enumerate(segs) if t < s.end), len(segs) - 1)
+    samples = _front_sei(root, ev_dir_rel, segs[i])
+    if sei_mod.median_fix(samples):
+        return samples
+    for k in sorted((k for k in range(len(segs)) if k != i), key=lambda k: (abs(k - i), k)):
+        other = _front_sei(root, ev_dir_rel, segs[k])
+        if sei_mod.median_fix(other):
+            return other
+    return samples
 
 
 # ---------- reverse geocode (opt-in, cached) ----------

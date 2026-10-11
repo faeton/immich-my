@@ -25,7 +25,8 @@ uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write
 - **scan** walks `<root>/<dump>/{SavedClips,SentryClips}/<event>/`, the flat
   2024 layout `<dump>/<ts>__city__reason/`, and `RecentClips` (grouped into
   drives on gaps > 120 s, chapters ≤ 15 min). Per event: segment map, ffprobe
-  durations/clocks (cached), SEI GPS (median fix of the trigger segment),
+  durations/clocks (cached), SEI GPS (median fix of the trigger segment, else
+  of the nearest segment that has one — the car writes no SEI without a fix),
   `event.json` fallback, previous-drive fallback (< 6 h), timezone from GPS
   (`timezonefinder`) or the car's clock minus the file's UTC clock, optional
   Nominatim city (cached, seeded from the old `_tools/geocache.json`),

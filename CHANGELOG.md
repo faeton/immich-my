@@ -108,7 +108,20 @@ on the shape; where they differed the doc says why).
   place, make/model, description, zone. Immich made a thumbnail and a
   preview per file and **no encoded video**: n5's transcode policy is
   `required` with H.264 accepted, so the 2.9K children are played as is.
-- Upload from the roaming Mac runs at ~28 Mbit/s: ~4 h for the 51 GB.
+- Upload from the roaming Mac runs at ~28 Mbit/s: ~4 h for the 51 GB. All
+  four year folders live by the evening: 2026 = 36 stacks, 1015 tag links,
+  252 assets in the album, zero transcodes queued.
+- `promote`'s album step can run before Immich's asynchronous scan has
+  registered the files ("0/0 new" on the 2026 folder); a second `promote`
+  run (rsync sends nothing) attached them. Check the album count after a
+  large promote.
+- Two drives came out without a location. The Marrakesh one (15 min) had
+  SEI fixes in its first two minutes only: the car writes **no SEI at all**
+  while it has no fix, and the scanner read only the last segment. It now
+  falls back to the nearest segment with a fix (test on the fixture drive;
+  a read is ~20 ms). The Scottish one has no telemetry in any segment; it
+  was placed with `teslacam locate` from the phone photos taken minutes
+  before and after it in Immich.
 
 - **In-place changes keep the asset id.** The GPS re-stamp rewrote every
   2022 file; after `promote` (rsync + library scan) Immich refreshed the

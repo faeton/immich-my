@@ -217,3 +217,27 @@ def test_cli_scan_and_dry_run(dumps):
     assert r.exit_code == 0, r.output
     assert "1 kept" in r.output and "2026-tesla-dashcam" in r.output
     assert not (dumps / "render").exists()
+
+
+def test_drive_gps_falls_back_to_the_nearest_segment_with_a_fix(dumps, monkeypatch):
+    """The Marrakesh drive case: the car had a fix only in its first minutes
+    and writes no SEI at all once it has none, so the last segment — the one
+    the scanner reads for drives — is empty → the nearest segment with a
+    valid fix places the event instead of leaving it blank."""
+    reads: list[str] = []
+
+    def fake_sei(path, max_samples=100_000):
+        reads.append(path.name)
+        if path.name == "2025-08-01_15-00-16-front.mp4":
+            return [{"lat": 31.622086, "lon": -8.001953, "speed_mps": 0.0}] * 3
+        return []
+    monkeypatch.setattr(scan_mod.sei_mod, "sei_track", fake_sei)
+    doc = _scan(dumps, exclude=("Dump3",))
+    by_id = {e["id"]: e for e in doc["events"]}
+    d = by_id["Dump1|RecentClips|2025-08-01_15-00-16"]
+    assert d["gps_source"] == "sei" and d["lat"] == pytest.approx(31.622086) and d["lon"] == pytest.approx(-8.001953)
+    assert d["offset_source"] == "gps" and d["sei"] is True
+    assert reads.index("2025-08-01_15-00-19-front.mp4") < reads.index("2025-08-01_15-00-16-front.mp4")
+    # the single-segment drive an hour later has nothing of its own and
+    # borrows the fix of this one (prev-drive)
+    assert by_id["Dump1|RecentClips|2025-08-01_16-00-00"]["gps_source"] == "prev-drive"

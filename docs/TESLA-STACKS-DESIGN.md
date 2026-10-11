@@ -111,7 +111,10 @@ immy faces purge --tag Source/Tesla                                      (option
   Offset chain: timezonefinder on the GPS fix → folder-clock minus UTC rounded
   to **15 min**, accepted if |offset| ≤ 14 h → none (asset stays UTC, tag
   `Tesla/TzUnknown`).
-- **GPS** chain: median valid SEI fix in the trigger segment → `event.json`
+- **GPS** chain: median valid SEI fix in the trigger segment → the nearest
+  segment of the event that has one (the car writes no SEI at all while it
+  has no fix, so a drive that lost GPS part-way has an empty last segment;
+  seen on a 15-min Marrakesh drive, 2026-10-11) → `event.json`
   coordinates (non-zero) → last fix of the previous drive in the same dump if
   under 6 h old → none. Record source + confidence. City from `event.json`
   is a cross-check only; reverse-geocoding is Immich's job.
