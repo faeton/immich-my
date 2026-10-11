@@ -29,8 +29,9 @@ on the shape; where they differed the doc says why).
   decisions live in `_review/decisions-<dump>.json`. `render` writes one
   promote-able folder per year: `mosaic.mp4` (all cameras tiled, exact
   window, H.264 at 720 rows so Immich never transcodes it), a lossless
-  `-c copy` concat per ticked camera (whole segments, wall-clock subtitle
-  track with the event marker; `precise` re-encodes), `track.gpx/json` from
+  `-c copy` cut per ticked camera (keyframe granularity, ≤ 0.75 s before the
+  in point; wall-clock subtitle track with the event marker; `precise`
+  re-encodes to the frame), `track.gpx/json` from
   SEI, baked `Keys:CreationDate`+offset / UTC `CreateDate` / Make / Model /
   description (GPS on the mosaic only), a `render.json` receipt (digest of
   segments + decision + renderer version → idempotent) and `stacks.json`.

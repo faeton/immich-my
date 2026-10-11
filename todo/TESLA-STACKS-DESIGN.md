@@ -126,11 +126,15 @@ immy faces purge --tag Source/Tesla                                      (option
   version. Per kept event:
   - `mosaic.mp4`: exact in/out, xstack, black tile + label for a missing
     camera, `fps=30`, H.264 VideoToolbox proxy as above.
-  - `<camera>.mp4` for every camera ticked in the viewer: lossless `-c copy` concat of the
-    **whole segments** covering the range (so it is up to 60 s longer at each
-    end than the mosaic; the viewer shows the snapped range). Wall-clock
-    `mov_text` subtitle track with the `>>> EVENT <<<` marker. Opt-in
-    `precise: true` per event re-encodes the children to the exact range.
+  - `<camera>.mp4` for every camera ticked in the viewer: lossless `-c copy` cut
+    of the range at **keyframe granularity** (concat demuxer `inpoint`/`outpoint`;
+    Tesla clips carry a keyframe every 0.5 s on the 2022/2026 cars and 0.75 s on
+    the 2024 car, so the child starts ≤ 0.75 s before the in point and ends at
+    the out point; measured on the Sep15 pilot: start 0.3 s early, end within
+    0.1 s, SEI intact). Wall-clock `mov_text` subtitle track with the
+    `>>> EVENT <<<` marker, built from the real keyframe start. Opt-in
+    `precise: true` per event re-encodes the children to the exact frame.
+    (First build copied whole 60 s segments; replaced before the live pilot.)
   - `track.gpx` + `track.json` from SEI, 1 Hz, real UTC timestamps
     (`immy.track` gains a `source=` and proper tz handling, or `teslacam`
     writes its own; decide at implementation).

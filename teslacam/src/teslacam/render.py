@@ -2,9 +2,10 @@
 
 Per event (relative to `<render_root>/<YYYY>-tesla-dashcam/<slug>/`):
   mosaic.mp4            all cameras tiled, exact [in,out], H.264 proxy ≤ 720 rows
-  <camera>.mp4          every ticked camera, lossless `-c copy` concat of the
-                        whole segments overlapping [in,out] (+ wall-clock
-                        subtitle track); `precise` re-encodes to the exact range
+  <camera>.mp4          every ticked camera, lossless `-c copy` cut of [in,out]
+                        at keyframe granularity (starts ≤ 0.75 s before `in`;
+                        + wall-clock subtitle track); `precise` re-encodes to
+                        the exact range
   track.gpx/.json       SEI GPS, 1 Hz, when present
   event.json            copy of the car's metadata
   render.json           receipt: inputs + decision hash → idempotent re-runs
@@ -33,7 +34,7 @@ from . import track as track_mod
 from .decisions import Decision, effective
 from .model import CAMERAS, Event, Segment
 
-RENDER_VERSION = "v1"
+RENDER_VERSION = "v2"   # v2: children cut at keyframes instead of whole segments
 MOSAIC_ROWS = 720
 MOSAIC_BITRATE = "4M"
 MOSAIC_FPS = 30
@@ -105,10 +106,11 @@ class Job:
         mosaic = int((self.b - self.a) * 4_000_000 / 8)
         children = 0
         for s in self.ev.overlapping(self.a, self.b):
+            span = min(s.end, self.b) - max(s.start, self.a)   # children follow the window now
             for c in self.cams:
                 if c in s.f:
                     br = s.bitrate or 5_500_000
-                    children += int(s.d * br / 8)
+                    children += int(max(0.0, span) * br / 8)
         return mosaic + children
 
     def est_seconds(self) -> float:
@@ -159,15 +161,46 @@ def plan(events: list[Event], decisions: dict[str, Decision], render_root: Path,
 
 # ---------- ffmpeg pieces ----------
 
-def _concat_list(root: Path, ev: Event, cam: str, segs: list[Segment], path: Path) -> bool:
+def _concat_list(root: Path, ev: Event, cam: str, segs: list[Segment], path: Path, *,
+                 inpoint: float | None = None, outpoint: float | None = None) -> bool:
+    """`inpoint` applies to the first file, `outpoint` to the last (seconds into that file)."""
     lines = []
-    for s in segs:
+    for i, s in enumerate(segs):
         fn = s.f.get(cam)
         if not fn:
             return False           # a hole would desync the camera → caller blacks the tile
         lines.append(f"file '{(root / ev.dir / fn).as_posix()}'")
+        if i == 0 and inpoint is not None and inpoint > 0:
+            lines.append(f"inpoint {inpoint:.3f}")
+        if i == len(segs) - 1 and outpoint is not None:
+            lines.append(f"outpoint {outpoint:.3f}")
     path.write_text("\n".join(lines) + "\n")
     return True
+
+
+def keyframes(path: Path) -> list[float]:
+    """Keyframe timestamps (s) from the packet list — no decoding, ~0.2 s per 60 s clip."""
+    try:
+        out = subprocess.run(["ffprobe", "-v", "error", "-select_streams", "v:0",
+                              "-show_entries", "packet=pts_time,flags", "-of", "csv=p=0", str(path)],
+                             capture_output=True, text=True, timeout=120)
+    except Exception:
+        return []
+    kfs = []
+    for line in out.stdout.splitlines():
+        parts = line.split(",")
+        if len(parts) >= 2 and "K" in parts[1]:
+            try:
+                kfs.append(float(parts[0]))
+            except ValueError:
+                pass
+    return sorted(kfs)
+
+
+def snap_to_keyframe(path: Path, t: float) -> float:
+    """The last keyframe at or before `t` — where a stream-copy cut really starts."""
+    before = [k for k in keyframes(path) if k <= t + 1e-3]
+    return max(before) if before else 0.0
 
 
 def _tile_size(ev: Event, rows: int) -> tuple[int, int]:
@@ -262,20 +295,33 @@ def _offset_td(offset: str | None) -> timedelta:
 def render_child(root: Path, job: Job, cam: str, out: Path, tmp: Path) -> tuple[float, float]:
     """Returns the (start, end) timeline seconds the file actually covers."""
     ev = job.ev
-    segs = ev.overlapping(job.a, job.b)
+    segs = [s for s in ev.overlapping(job.a, job.b) if cam in s.f]
+    if not segs:
+        raise RuntimeError(f"{cam}: no files in the window")
+    first, last = segs[0], segs[-1]
+    ta = max(0.0, job.a - first.start)
+    tb = min(job.b, last.end) - last.start
     lst = tmp / f"child-{cam}.txt"
-    if not _concat_list(root, ev, cam, segs, lst):
-        segs = [s for s in segs if cam in s.f]
-        if not segs or not _concat_list(root, ev, cam, segs, lst):
-            raise RuntimeError(f"{cam}: no files in the window")
-    sa, sb = segs[0].start, segs[-1].end
-    if job.decision.precise:
-        sa, sb = max(sa, job.a), min(sb, job.b)
     srt = tmp / f"child-{cam}.srt"
-    srt.write_text(_srt(ev, segs, sa, sb, ev.offset))
     part = out.with_name(out.name + ".part.mp4")
-    if job.decision.precise:
-        ta = sa - segs[0].start
+    if not job.decision.precise:
+        # Lossless: the concat demuxer's inpoint/outpoint with stream copy. The cut
+        # starts at the last keyframe before the in point (Tesla: every 0.5–0.75 s),
+        # so the file covers [keyframe, out] and the wall clock is built from there.
+        ka = snap_to_keyframe(root / ev.dir / first.f[cam], ta)
+        sa, sb = first.start + ka, last.start + tb
+        _concat_list(root, ev, cam, segs, lst, inpoint=ka,
+                     outpoint=tb if tb < last.d - 0.05 else None)
+        srt.write_text(_srt(ev, segs, sa, sb, ev.offset))
+        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
+               "-i", str(srt), "-map", "0:v", "-map", "1:s", "-c", "copy", "-c:s", "mov_text",
+               "-avoid_negative_ts", "make_zero",
+               "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=Wall clock",
+               "-disposition:s:0", "default", "-movflags", "+faststart", str(part)]
+    else:
+        sa, sb = first.start + ta, last.start + tb
+        _concat_list(root, ev, cam, segs, lst)
+        srt.write_text(_srt(ev, segs, sa, sb, ev.offset))
         br = str(segs[0].bitrate or 6_000_000)
         enc = ["-c:v", "h264_videotoolbox", "-b:v", br, "-profile:v", "high", "-allow_sw", "1"] \
             if "h264_videotoolbox" in " ".join(_h264_encoder()) else ["-c:v", "libx264", "-crf", "20"]
@@ -284,11 +330,6 @@ def render_child(root: Path, job: Job, cam: str, out: Path, tmp: Path) -> tuple[
                "-map", "[v]", "-map", "1:s", *enc, "-pix_fmt", "yuv420p", "-c:s", "mov_text",
                "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=Wall clock",
                "-movflags", "+faststart", str(part)]
-    else:
-        cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-               "-i", str(srt), "-map", "0:v", "-map", "1:s", "-c", "copy", "-c:s", "mov_text",
-               "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=Wall clock",
-               "-disposition:s:0", "default", "-movflags", "+faststart", str(part)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not part.exists() or part.stat().st_size == 0:
         part.unlink(missing_ok=True)

@@ -38,7 +38,8 @@ uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write
 - **render** writes `<out>/<YYYY>-tesla-dashcam/<kind>-<car folder stamp>/`:
   `mosaic.mp4` (all cameras tiled, exact window, H.264 proxy at 720 rows so
   Immich plays it without transcoding), one `<camera>.mp4` per ticked camera
-  (lossless `-c copy` concat of the whole segments overlapping the window,
+  (lossless `-c copy` cut of the window at keyframe granularity — it starts at
+  the last keyframe before the in point, ≤ 0.75 s early on Tesla clips —,
   wall-clock subtitle track with the `>>> EVENT <<<` marker; `precise`
   re-encodes to the exact range), `track.gpx`/`track.json` from SEI,
   `event.json`, and a `render.json` receipt. Metadata is baked into every mp4

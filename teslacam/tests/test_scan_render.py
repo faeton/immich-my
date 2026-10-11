@@ -82,9 +82,11 @@ def test_render_pilot(dumps):
     assert vids[0]["codec_name"] == "h264" and vids[0]["width"] == 960 and vids[0]["height"] == 720   # 2×2 of 480×360
     f = _probe(out / "front.mp4")
     assert {s["codec_type"] for s in f["streams"]} == {"video", "subtitle"}
-    # whole segments 1,2,3 snapped (1.0–5.0 touches all three 2 s segments)
-    assert float(f["format"]["duration"]) == pytest.approx(6.0, abs=0.6)
-    assert rec["covered"]["front"] == [0.0, pytest.approx(6.0, abs=0.3)]
+    # lossless cut follows the window at keyframe granularity (fixture: a keyframe
+    # every 0.5 s, so 1.0 is exact): 1.0–5.0 spans all three 2 s segments → 4 s
+    assert float(f["format"]["duration"]) == pytest.approx(4.0, abs=0.6)
+    assert rec["covered"]["front"] == [pytest.approx(1.0, abs=0.01), pytest.approx(5.0, abs=0.3)]
+    assert [s for s in f["streams"] if s["codec_type"] == "video"][0]["codec_name"] == "h264"
     # baked metadata
     tags = json.loads(subprocess.run(["exiftool", "-j", "-n", "-Keys:CreationDate", "-Keys:GPSCoordinates", "-Keys:Make",
                                       "-Keys:Model", "-Keys:Description", str(out / "mosaic.mp4")],
