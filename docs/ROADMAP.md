@@ -83,7 +83,7 @@ lossless concats as children, baked date/GPS/description, SEI → GPX) and
 `docs/TESLA-STACKS-DESIGN.md`; data inventory and retention rules still in
 [TESLA-PLAN.md](TESLA-PLAN.md). Live on n5 since 2026-10-11 (55 events,
 album "Tesla Dashcam"; no server-side transcode under the `required`
-policy). Pending: asset-id survival of an in-place re-trim, faces purge on
+policy; in-place re-renders keep the asset id). Pending: faces purge on
 `Source/Tesla`, retention.
 
 ### Apple Photos Bridge

@@ -1,7 +1,7 @@
 # Tesla dashcam → Immich: stacked, viewable, moderated
 
 Status: **built 2026-10-11** on branch `tesla-dashcam` (`teslacam/` +
-`immy stacks apply`), live on n5 since 2026-10-11 (55 events, album "Tesla Dashcam"; the in-place re-trim id check still pending). Review fixes of the same day are in CHANGELOG.md.
+`immy stacks apply`), live on n5 since 2026-10-11 (55 events, album "Tesla Dashcam"; in-place re-renders keep the asset id — verified with the GPS re-stamp). Review fixes of the same day are in CHANGELOG.md.
 Implementation notes that differ from the draft: the render folder name is
 `<kind>-<car folder stamp>` (not city/reason, so a later metadata fix can't
 move the asset's path); `stacks apply` keeps a receipt and reports

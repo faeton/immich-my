@@ -110,12 +110,15 @@ on the shape; where they differed the doc says why).
   `required` with H.264 accepted, so the 2.9K children are played as is.
 - Upload from the roaming Mac runs at ~28 Mbit/s: ~4 h for the 51 GB.
 
+- **In-place changes keep the asset id.** The GPS re-stamp rewrote every
+  2022 file; after `promote` (rsync + library scan) Immich refreshed the
+  same assets (new `updatedAt`, GPS and city now on the children) and
+  `stacks apply` reported both groups `ok` against the receipt. Re-trims
+  therefore render in place; no revision folders needed.
+
 ### Pending
 
-- Re-trim one event and confirm the asset id survives the in-place
-  re-render (`stacks apply` reports `id-changed` otherwise; then re-trims
-  go to a revision folder). Faces purge on `Source/Tesla`. Raw retention
-  unchanged.
+- Faces purge on `Source/Tesla`. Raw retention unchanged.
 
 ## 2026-10-10 — sidecars check: review fixes (zones, splits)
 
