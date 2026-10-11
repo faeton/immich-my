@@ -13,7 +13,8 @@ cd teslacam && uv sync
 uv run teslacam scan   --root ~/Media/inbox/TeslaDumps          # → <root>/_review/events.json (+thumbs, geocache)
 uv run teslacam seed   --root ~/Media/inbox/TeslaDumps --tags-json ~/Media/inbox/TeslaDumps/tags.json   # once
 uv run teslacam review --root ~/Media/inbox/TeslaDumps          # http://127.0.0.1:8777 — keep/drop, cameras, in/out
-uv run teslacam render --root ~/Media/inbox/TeslaDumps --out ~/Media/render --model "Model Y"
+uv run teslacam render --root ~/Media/inbox/TeslaDumps --out ~/Media/render \
+    --model "Model X" --model "TeslaDump2023=Model Y"   # default + per-dump; omit → plain "Tesla"
 # then, from immy/:
 uv run immy promote ~/Media/render/2026-tesla-dashcam --into-album "Tesla Dashcam"
 uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write

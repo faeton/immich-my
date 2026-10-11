@@ -111,6 +111,54 @@ def test_render_pilot(dumps):
     assert not (out / "back.mp4").exists() and (out / "front.mp4").exists()
 
 
+@pytest.mark.skipif(shutil.which("exiftool") is None, reason="exiftool missing")
+def test_restamp_changes_model_without_reencode(dumps):
+    _scan(dumps, exclude=("Dump3",))
+    rd = dumps / "_review"
+    eid = "Dump1|SavedClips|2026-09-09_19-08-30"
+    dec.update(rd, eid, {"keep": "keep", "cameras": ["front"], "in_s": 1.0, "out_s": 3.0})
+    root, events = scan_mod.load_events(rd)
+    job = render_mod.plan(events, dec.load_all(rd), dumps / "render")[0]
+    rec = render_mod.render_job(root, job, model="Model 3", log=lambda s: None)
+    assert rec["model"] == "Model 3" and render_mod.is_done(job, "Model 3") and not render_mod.is_done(job, "Model X")
+    first_render = rec["rendered_at"]
+    probe_before = _probe(job.out_dir / "mosaic.mp4")["format"]["duration"]
+    rec2 = render_mod.render_job(root, job, model="Model X", log=lambda s: None)
+    assert rec2["rendered_at"] == first_render and "restamped_at" in rec2
+    assert rec2["tags"][1] == "Gear/Camera/Tesla Model X" and render_mod.is_done(job, "Model X")
+    assert _probe(job.out_dir / "mosaic.mp4")["format"]["duration"] == probe_before
+    for name in ("mosaic.mp4", "front.mp4"):
+        t = json.loads(subprocess.run(["exiftool", "-j", "-Keys:Model", "-Keys:Make", str(job.out_dir / name)],
+                                      capture_output=True, text=True).stdout)[0]
+        assert t["Model"] == "Model X" and t["Make"] == "Tesla"
+    # unknown car: plain Tesla — no Model written, gear tag without a model
+    rec3 = render_mod.render_job(root, job, model="", log=lambda s: None)
+    assert rec3["tags"][1] == "Gear/Camera/Tesla"
+    t = json.loads(subprocess.run(["exiftool", "-j", "-Keys:Model", str(job.out_dir / "mosaic.mp4")],
+                                  capture_output=True, text=True).stdout)[0]
+    assert "Model" not in t
+
+
+def test_camera_without_footage_in_window_is_skipped(dumps):
+    (dumps / "Dump1" / "SavedClips" / "2026-09-09_19-08-30" / "2026-09-09_19-06-19-back.mp4").unlink()
+    _scan(dumps, exclude=("Dump3",))
+    rd = dumps / "_review"
+    eid = "Dump1|SavedClips|2026-09-09_19-08-30"
+    dec.update(rd, eid, {"keep": "keep", "cameras": ["front", "back"], "in_s": 0.2, "out_s": 1.6})
+    root, events = scan_mod.load_events(rd)
+    job = render_mod.plan(events, dec.load_all(rd), dumps / "render")[0]
+    logs: list[str] = []
+    rec = render_mod.render_job(root, job, model="", log=logs.append)
+    assert rec["children"] == [f"{job.slug}/front.mp4"] and not (job.out_dir / "back.mp4").exists()
+    assert any("skipped: back" in s for s in logs)
+
+
+def test_parse_models():
+    from teslacam.cli import _parse_models
+    assert _parse_models([]) == ("", {})
+    assert _parse_models(["Model X", "TeslaDump2023=Model Y"]) == ("Model X", {"TeslaDump2023": "Model Y"})
+
+
 def test_precise_child_reencodes(dumps):
     _scan(dumps, exclude=("Dump3",))
     rd = dumps / "_review"

@@ -84,7 +84,9 @@ def render(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
            out: Path = typer.Option(..., "--out", "-o", help="Render root; year folders are created under it."),
            event: list[str] = typer.Option([], "--event", "-e", help="Render only these event ids (even if not Keep)."),
            dump: list[str] = typer.Option([], "--dump", help="Only these dumps."),
-           model: str = typer.Option("", "--model", help="Car model for Gear/Camera/Tesla <model>."),
+           model: list[str] = typer.Option([], "--model",
+                                           help="Car model: 'Model X' for every dump, or 'DUMP=Model X' per dump "
+                                                "(repeatable). Unknown stays plain 'Tesla'."),
            album: str = typer.Option("Tesla Dashcam", "--album"),
            yes: bool = typer.Option(False, "--yes", "-y", help="Skip the per-dump confirmation."),
            dry_run: bool = typer.Option(False, "--dry-run"),
@@ -101,7 +103,9 @@ def render(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
     if not jobs:
         console.print("nothing to render (no events marked Keep)")
         raise typer.Exit(0)
-    todo = [j for j in jobs if force or not render_mod.is_done(j)]
+    model_default, model_by_dump = _parse_models(model)
+    model_for = lambda j: model_by_dump.get(j.ev.dump, model_default)  # noqa: E731
+    todo = [j for j in jobs if force or not render_mod.is_done(j, model_for(j))]
     by: dict[str, list[render_mod.Job]] = {}
     for j in todo:
         by.setdefault(j.ev.dump, []).append(j)
@@ -126,7 +130,7 @@ def render(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
     for j in accepted:
         console.print(f"[bold]{j.ev.id}[/bold] → {j.out_dir.relative_to(out)}")
         try:
-            render_mod.render_job(root, j, model=model, log=console.print)
+            render_mod.render_job(root, j, model=model_for(j), log=console.print)
             done += 1
             rendered.append(j.out_dir / "mosaic.mp4")
         except Exception as e:      # per-event isolation; the receipt is only written on success
@@ -152,6 +156,18 @@ def render(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
         subprocess.run(["open", *map(str, rendered[:3])])
     if failed:
         raise typer.Exit(1)
+
+
+def _parse_models(values: list[str]) -> tuple[str, dict[str, str]]:
+    """['Model X', 'TeslaDump2023=Model Y'] → ('Model X', {'TeslaDump2023': 'Model Y'})."""
+    default, by_dump = "", {}
+    for v in values:
+        if "=" in v:
+            d, m = v.split("=", 1)
+            by_dump[d.strip()] = m.strip()
+        else:
+            default = v.strip()
+    return default, by_dump
 
 
 if __name__ == "__main__":

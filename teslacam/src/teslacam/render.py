@@ -292,12 +292,17 @@ def _offset_td(offset: str | None) -> timedelta:
     return sign * timedelta(hours=int(hh), minutes=int(mm))
 
 
+class NoFootage(RuntimeError):
+    """A ticked camera has no segment inside the window (the car dropped that
+    camera for those minutes). The event still renders without that child."""
+
+
 def render_child(root: Path, job: Job, cam: str, out: Path, tmp: Path) -> tuple[float, float]:
     """Returns the (start, end) timeline seconds the file actually covers."""
     ev = job.ev
     segs = [s for s in ev.overlapping(job.a, job.b) if cam in s.f]
     if not segs:
-        raise RuntimeError(f"{cam}: no files in the window")
+        raise NoFootage(f"{cam}: no files in the window")
     first, last = segs[0], segs[-1]
     ta = max(0.0, job.a - first.start)
     tb = min(job.b, last.end) - last.start
@@ -382,6 +387,8 @@ def stamp(job: Job, path: Path, *, start_t: float, gps: bool, model: str) -> Non
         args += [f"-QuickTime:CreateDate={utc.strftime('%Y:%m:%d %H:%M:%S')}",
                  f"-QuickTime:ModifyDate={utc.strftime('%Y:%m:%d %H:%M:%S')}",
                  f"-Keys:CreationDate={local.strftime('%Y:%m:%d %H:%M:%S')}{off}"]
+    # Model is only written when known ("Tesla" alone is the make); an empty
+    # `-Keys:Model=` clears a value left by an earlier stamp.
     args += ["-Keys:Make=Tesla", f"-Keys:Model={model}", f"-Keys:Description={description(job)}",
              f"-Keys:Title={ev.reason_slug} · {ev.city or ''}".rstrip(" ·")]
     if gps and ev.lat is not None and ev.lon is not None:
@@ -437,21 +444,47 @@ def write_manifest(folder: Path, kept_ids: set[str], *, album: str) -> Path:
 
 # ---------- driver ----------
 
-def is_done(job: Job) -> bool:
+def _receipt(job: Job) -> dict | None:
     rec = job.out_dir / "render.json"
     if not rec.exists():
-        return False
+        return None
     try:
         r = json.loads(rec.read_text())
     except Exception:
-        return False
+        return None
     if r.get("digest") != job.digest:
+        return None
+    files = [r["primary"].split("/", 1)[1]] + [c.split("/", 1)[1] for c in r["children"]]
+    return r if all((job.out_dir / p).exists() for p in files) else None
+
+
+def is_done(job: Job, model: str | None = None) -> bool:
+    """Receipt matches the digest and every file is there; with `model`, the
+    stamped car must match too (a mismatch is fixed by a cheap re-stamp, not a
+    re-render — see `render_job`)."""
+    r = _receipt(job)
+    if r is None:
         return False
-    return all((job.out_dir / p).exists() for p in [r["primary"].split("/", 1)[1]]
-               + [c.split("/", 1)[1] for c in r["children"]])
+    return model is None or r.get("model", "") == model
+
+
+def restamp_job(job: Job, rec: dict, *, model: str) -> dict:
+    """Same media, new car name: rewrite the container metadata of every file in
+    the receipt and the receipt itself (tags carry the model). No re-encode."""
+    stamp(job, job.out_dir / rec["primary"].split("/", 1)[1], start_t=job.a, gps=True, model=model)
+    for c in rec["children"]:
+        stamp(job, job.out_dir / c.split("/", 1)[1], start_t=job.a, gps=False, model=model)
+    rec = {**rec, "model": model, "tags": tags_for(job, model),
+           "restamped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
+    (job.out_dir / "render.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1))
+    return rec
 
 
 def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) -> dict:
+    fresh = _receipt(job)
+    if fresh is not None and fresh.get("model", "") != model:
+        log(f"    re-stamp  model {fresh.get('model', '') or '—'!r} → {model or '—'!r}")
+        return restamp_job(job, fresh, model=model)
     job.out_dir.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="teslacam-", dir=str(job.folder)))
     try:
@@ -464,7 +497,12 @@ def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) 
         for cam in job.cams:
             out = job.out_dir / f"{cam}.mp4"
             log(f"    {cam}")
-            sa, sb = render_child(root, job, cam, out, tmp)
+            try:
+                sa, sb = render_child(root, job, cam, out, tmp)
+            except NoFootage as e:
+                log(f"    [yellow]skipped: {e}[/yellow]")
+                out.unlink(missing_ok=True)
+                continue
             # same CreationDate as the mosaic so the stack never splits across days
             stamp(job, out, start_t=job.a, gps=False, model=model)
             children.append(f"{job.slug}/{cam}.mp4")
@@ -481,7 +519,7 @@ def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) 
         rec = {"schema": 1, "version": RENDER_VERSION, "digest": job.digest, "key": job.ev.id,
                "event": job.ev.id, "slug": job.slug, "window": [job.a, job.b],
                "snapped": [job.snap_a, job.snap_b], "covered": covered, "precise": job.decision.precise,
-               "primary": f"{job.slug}/mosaic.mp4", "children": children,
+               "primary": f"{job.slug}/mosaic.mp4", "children": children, "model": model,
                "tags": tags_for(job, model), "archive": job.decision.archive, "track": has_track,
                "rendered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
         (job.out_dir / "render.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1))
