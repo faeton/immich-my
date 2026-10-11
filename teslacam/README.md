@@ -2,7 +2,7 @@
 
 Tesla dashcam dumps → reviewed, trimmed, stack-ready render folders that
 `immy promote` ships and `immy stacks apply` turns into Immich stacks.
-Design: [todo/TESLA-STACKS-DESIGN.md](../todo/TESLA-STACKS-DESIGN.md).
+Design: [docs/TESLA-STACKS-DESIGN.md](../docs/TESLA-STACKS-DESIGN.md).
 
 Standalone on purpose: it re-encodes, reads protobuf telemetry and runs a
 local web viewer, none of which belong next to immy's immutable-originals

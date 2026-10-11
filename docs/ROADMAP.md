@@ -80,9 +80,11 @@ Built 2026-10-11 (branch `tesla-dashcam`): the standalone `teslacam/` tool
 (scan → review viewer → render: mosaic proxy as stack primary + per-camera
 lossless concats as children, baked date/GPS/description, SEI → GPX) and
 `immy stacks apply` for the manifest-driven stacks. Design and decisions:
-`todo/TESLA-STACKS-DESIGN.md`; data inventory and retention rules still in
-[TESLA-PLAN.md](TESLA-PLAN.md). Pending: the live pilot on n5 (asset-id
-survival of an in-place re-trim), faces purge on `Source/Tesla`, retention.
+`docs/TESLA-STACKS-DESIGN.md`; data inventory and retention rules still in
+[TESLA-PLAN.md](TESLA-PLAN.md). Live on n5 since 2026-10-11 (55 events,
+album "Tesla Dashcam"; no server-side transcode under the `required`
+policy). Pending: asset-id survival of an in-place re-trim, faces purge on
+`Source/Tesla`, retention.
 
 ### Apple Photos Bridge
 

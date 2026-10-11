@@ -49,7 +49,7 @@ The main operational interface is `immy`:
 Tesla dashcam footage has its own standalone tool, [`teslacam/`](teslacam/README.md): scan the
 USB dumps, moderate them in a local viewer (keep/drop, cameras, one in/out per event), and render
 a mosaic preview + per-camera lossless concats into a folder that `promote` ships and
-`stacks apply` stacks. Design: `todo/TESLA-STACKS-DESIGN.md`.
+`stacks apply` stacks. Design: `docs/TESLA-STACKS-DESIGN.md`.
 
 Typical development commands:
 

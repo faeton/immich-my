@@ -7,7 +7,7 @@ continuously, so entries are dated rather than versioned.
 ## 2026-10-11 — Tesla dashcam: `teslacam` + `immy stacks apply`
 
 Branch `tesla-dashcam`. Design and the owner's decisions in
-`todo/TESLA-STACKS-DESIGN.md` (two outside reviews, Codex and Grok, agreed
+`docs/TESLA-STACKS-DESIGN.md` (two outside reviews, Codex and Grok, agreed
 on the shape; where they differed the doc says why).
 
 ### Added
@@ -47,7 +47,7 @@ on the shape; where they differed the doc says why).
   Statuses `create | ok | differs | restack | missing | id-changed`; the
   receipt `.audit/stacks-applied.json` records the asset ids, so a
   re-rendered file that became a new asset is reported instead of stacked
-  twice. `ImmichClient.delete_stack`, `update_assets`. 40 tests.
+  twice. `ImmichClient.delete_stack`, `update_assets`. 46 tests.
 
 ### Measured
 
@@ -60,12 +60,46 @@ on the shape; where they differed the doc says why).
 - exiftool's `-api QuickTimeUTC` shifts a written `CreateDate` through the
   Mac's zone; write the UTC string without it.
 
+### Fixed, same day (first real review session)
+
+- **Viewer stalled after a few events.** The viewer's venv is Python 3.12,
+  whose `TCPServer` listens with a backlog of 5; macOS resets connections
+  beyond it, and six `<video>` tags plus thumbnails open more than that in
+  one burst. Backlog 128 (regression test: 32 simultaneous connects).
+- **Black player after ~12 events.** Every event built fresh `<video>`
+  elements and discarded the old ones with `removeAttribute('src')`, which
+  does not release the media player; Chrome caps players per page. Now one
+  pooled element per camera slot, released with `load()`; the time readout
+  says "still loading — reload" when metadata never arrives.
+- **Camera children follow the trim.** They copied whole 60 s segments;
+  now a stream-copy cut at keyframe granularity (measured on the pilot:
+  start 0.3 s early, end within 0.1 s, SEI intact).
+- **Car model per dump, never in code**: `--model "Model X" --model
+  "TeslaDump2023=Model Y"`; unknown stays plain "Tesla". A model change
+  re-stamps the existing files (exiftool) instead of re-rendering.
+- A ticked camera with no footage inside the window is skipped, not fatal.
+- `stacks apply` after the Codex/Grok reviews: lookup bound to the
+  configured library and import root; `--restack` never deletes a stack
+  with members outside the group (superseded receipt assets excepted) and
+  also takes down the receipt's old stack; child asset ids compared;
+  single-file groups are tags-only; tags the API did not return fail the run.
+
+### Live pilot (n5, Immich 3.3.1)
+
+- 55 kept events rendered (54 GB, 35 with GPS tracks); `promote` into the
+  album "Tesla Dashcam" per year folder; 2022 verified end to end:
+  stacks, five tags per asset linked and locked, GPS + reverse-geocoded
+  place, make/model, description, zone. Immich made a thumbnail and a
+  preview per file and **no encoded video**: n5's transcode policy is
+  `required` with H.264 accepted, so the 2.9K children are played as is.
+- Upload from the roaming Mac runs at ~28 Mbit/s: ~4 h for the 51 GB.
+
 ### Pending
 
-- Live pilot on n5: promote one year folder, `stacks apply --write`, check
-  one tile / flip / date / map pin on web and phone, then re-trim once and
-  confirm the asset id survives (else re-trims go to a new revision folder
-  and `--restack`). Faces purge on `Source/Tesla`. Raw retention unchanged.
+- Re-trim one event and confirm the asset id survives the in-place
+  re-render (`stacks apply` reports `id-changed` otherwise; then re-trims
+  go to a revision folder). Faces purge on `Source/Tesla`. Raw retention
+  unchanged.
 
 ## 2026-10-10 — sidecars check: review fixes (zones, splits)
 

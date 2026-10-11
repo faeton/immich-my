@@ -12,7 +12,7 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 - `immy/deploy/n5/` — running immy as a container on the N5 NAS (Immich's docker network).
 - `teslacam/` — standalone Tesla dashcam tool (own `uv` project): scan dumps → review viewer →
   render folder + `stacks.json`; `immy promote` ships it, `immy stacks apply` stacks it. Kept out
-  of immy because it re-encodes and serves a web UI. Design in `todo/TESLA-STACKS-DESIGN.md`.
+  of immy because it re-encodes and serves a web UI. Design in `docs/TESLA-STACKS-DESIGN.md`.
 - `docs/` — published design/ops docs (ARCHITECTURE, DEPLOY, CAPTIONS, TRANSCRIPTS, OFFLINE-RUNBOOK…).
 - `raw/` — personal specs + hardware notes. **gitignored** (CONSOLIDATION-PIPELINE, IMMY-ON-N5, PRIMARY-SWAP…).
 - `README.md` — human overview. `CHANGELOG.md` — dated findings + changes, newest first.
