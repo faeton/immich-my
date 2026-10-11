@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
 import pytest
 from typer.testing import CliRunner
@@ -581,7 +580,6 @@ def test_cli_ignores_zone_stamps_from_the_old_format(lib) -> None:
                   datetime(2026, 5, 10, 4, 52, 29, tzinfo=UTC))]
     db["exif"].append({"SourceFile": str(root / "v" / "mcp_video-7.mov"), "CreationDate": "2026:05:10 04:52:29Z"})
     db["hints"]["x7"] = (None, None, "Asia/Kolkata")
-    import os
     st = (root / "v" / "mcp_video-7.mov").stat()
     (tmp / "state").mkdir(exist_ok=True)
     (tmp / "state" / "sidecar-check.json").write_text(json.dumps(

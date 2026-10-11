@@ -92,11 +92,20 @@ class TranscodePolicy:
     @classmethod
     def from_system_config(cls, config: dict) -> "TranscodePolicy":
         f = (config or {}).get("ffmpeg") or {}
+
+        def names(key: str, default: list[str]) -> tuple[str, ...]:
+            # a MISSING key means Immich's default; an EMPTY list is a real
+            # setting ("accept nothing") and must stay empty
+            value = f.get(key)
+            if value is None:
+                value = default
+            return tuple(str(c).lower() for c in value)
+
         return cls(
             transcode=str(f.get("transcode") or "required").lower(),
-            accepted_video_codecs=tuple(str(c).lower() for c in f.get("acceptedVideoCodecs") or ["h264"]),
-            accepted_audio_codecs=tuple(str(c).lower() for c in f.get("acceptedAudioCodecs") or ["aac", "mp3", "libopus"]),
-            accepted_containers=tuple(str(c).lower() for c in f.get("acceptedContainers") or ["mov", "ogg", "webm"]),
+            accepted_video_codecs=names("acceptedVideoCodecs", ["h264"]),
+            accepted_audio_codecs=names("acceptedAudioCodecs", ["aac", "mp3", "libopus"]),
+            accepted_containers=names("acceptedContainers", ["mov", "ogg", "webm"]),
             target_resolution=str(f.get("targetResolution") or "720"),
             max_bitrate_bps=_parse_bitrate_bps(f.get("maxBitrate")),
             target_video_codec=str(f.get("targetVideoCodec") or "h264").lower(),
@@ -111,18 +120,21 @@ class TranscodePolicy:
 
 
 def _parse_bitrate_bps(value: object) -> int:
-    """Immich's `parseBitrateToBps`: '0' = unlimited, '8M' / '8000k' / plain bps."""
-    text = str(value or "0").strip().lower()
-    if not text:
+    """Immich's `parseBitrateToBps`, including its JavaScript `parseInt`:
+    the leading integer is taken ('8.5M' → 8 → 8,000,000; '12abc' → 12),
+    NaN → 0, then a trailing k/M multiplies. '0' = unlimited."""
+    import re
+    text = str(value if value is not None else "0").strip()
+    m = re.match(r"^[-+]?\d+", text)
+    if not m:
         return 0
-    try:
-        if text.endswith("m"):
-            return int(float(text[:-1]) * 1_000_000)
-        if text.endswith("k"):
-            return int(float(text[:-1]) * 1_000)
-        return int(float(text))
-    except ValueError:
-        return 0
+    n = int(m.group(0))
+    low = text.lower()
+    if low.endswith("k"):
+        return n * 1_000
+    if low.endswith("m"):
+        return n * 1_000_000
+    return n
 
 
 def _immich_container(info: VideoInfo) -> str:
@@ -132,7 +144,7 @@ def _immich_container(info: VideoInfo) -> str:
     if info.format_long_name in mapping:
         return mapping[info.format_long_name]
     if info.format_name:
-        return info.format_name.split(",")[0].strip().lower()
+        return info.format_name.strip().lower()   # Immich compares the whole ffprobe string
     return info.container_ext.lstrip(".") or ""
 
 
@@ -239,18 +251,27 @@ def probe(path: Path) -> VideoInfo:
         duration_s = None
 
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
-    audio_codec = str(audio.get("codec_name") or "") if audio else ""
+    # "" means NO audio stream (the old contract). A stream whose codec ffprobe
+    # could not name is still a stream to Immich, and no accept list contains
+    # it — so it must not pass as silent.
+    audio_codec = (str(audio.get("codec_name") or "unknown") if audio else "")
+    video_codec = str(video.get("codec_name") or "")
+    if video_codec == "h265":
+        video_codec = "hevc"   # Immich's probe normalises it the same way
 
     fmt = data.get("format") or {}
+    # Immich reads the VIDEO STREAM's bit_rate and treats a missing one as 0
+    # (never the container's): a compatible file without a stream bitrate
+    # must not trip the 'bitrate' policy here either.
     try:
-        bitrate = int(video.get("bit_rate") or fmt.get("bit_rate") or 0)
+        bitrate = int(video.get("bit_rate") or 0)
     except (TypeError, ValueError):
         bitrate = 0
     return VideoInfo(
         width=width,
         height=height,
         duration_s=duration_s,
-        video_codec=str(video.get("codec_name") or ""),
+        video_codec=video_codec,
         audio_codec=audio_codec,
         container_ext=path.suffix.lower(),
         pix_fmt=str(video.get("pix_fmt") or ""),

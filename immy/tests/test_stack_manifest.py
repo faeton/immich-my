@@ -96,10 +96,15 @@ class _Conn:
 
     def execute(self, sql, params=None):
         self.calls.append((sql, params))
+        self._last_sql = sql
         return self
 
     def fetchall(self):
-        return self.rows
+        # the folder query answers with the canned asset rows; the stack
+        # membership query (`"stackId" = ANY`) with (stack id, asset id) pairs
+        if "= ANY(" in getattr(self, "_last_sql", ""):
+            return [r for r in self.rows if len(r) == 2]
+        return [r for r in self.rows if len(r) != 2]
 
     def cursor(self):
         return _Cursor(self)
@@ -260,6 +265,60 @@ def test_apply_deletes_a_shared_stale_stack_once():
     client, conn = _Client(), _Conn()
     sm.apply_plans(client, conn, plans, log=lambda m: None)
     assert [c for c in client.calls if c[0] == "delete"] == [("delete", "s1")]
+
+
+def test_restack_decides_by_live_membership_not_counts():
+    """Codex round 2: a count of superseded receipt ids could excuse two
+    strangers. With the stacks' live members known the check is exact."""
+    m = sm.parse_manifest(_manifest())
+    receipt = {"2026-09-09_19-16-35": sm.Receipt("OLD1", ("OLD2", "a3"), "s1", "2026-10-01T00:00:00+00:00")}
+    rows = [_row("mosaic.mp4", "a1"), _row("front.mp4", "a2"), _row("back.mp4", "a3", "s1", "OLD1", 3)]
+    # s1 = {a3, OLD1, OLD2}: everything is ours or superseded → restack allowed
+    (plan,) = sm.plan_groups(m, _assets(rows), receipt=receipt, restack=True,
+                             stack_members={"s1": {"a3", "OLD1", "OLD2"}})
+    assert plan.status == "restack" and plan.stale_stacks == ["s1"]
+    # s1 = {a3, OLD1, STRANGER}: same size, but one member is nobody's → refused
+    (plan,) = sm.plan_groups(m, _assets(rows), receipt=receipt, restack=True,
+                             stack_members={"s1": {"a3", "OLD1", "STRANGER"}})
+    assert plan.status == "id-changed" and "outside the group" in plan.note
+    # the receipt's old stack with no current member in it: dissolved only
+    # when it holds nothing but superseded assets
+    rows2 = [_row("mosaic.mp4", "a1"), _row("front.mp4", "a2"), _row("back.mp4", "a3")]
+    (plan,) = sm.plan_groups(m, _assets(rows2), receipt=receipt, restack=True,
+                             stack_members={"s1": {"OLD1", "OLD2"}})
+    assert plan.status == "restack" and plan.stale_stacks == ["s1"]
+    (plan,) = sm.plan_groups(m, _assets(rows2), receipt=receipt, restack=True,
+                             stack_members={"s1": {"OLD1", "SOMEONE"}})
+    assert plan.status == "id-changed"
+    # without membership (no conn): any member beyond the group's own count is foreign
+    (plan,) = sm.plan_groups(m, _assets(rows), receipt=receipt, restack=True)
+    assert plan.status == "id-changed"
+
+
+def test_single_file_restack_dissolves_without_creating():
+    """All cameras un-ticked after a first stacking: --restack removes the
+    old stack (it holds only this group's superseded children) and must NOT
+    post a one-asset stack."""
+    m = sm.parse_manifest(_manifest(children=[]))
+    receipt = {"2026-09-09_19-16-35": sm.Receipt("a1", ("a2", "a3"), "s1", "2026-10-01T00:00:00+00:00")}
+    rows = [_row("mosaic.mp4", "a1", "s1", "a1", 3)]
+    (plan,) = sm.plan_groups(m, _assets(rows), receipt=receipt, restack=True,
+                             stack_members={"s1": {"a1", "a2", "a3"}})
+    assert plan.status == "restack" and plan.stale_stacks == ["s1"]
+    client, conn = _Client(), _Conn()
+    result = sm.apply_plans(client, conn, [plan], log=lambda m: None)
+    assert [c[0] for c in client.calls if c[0] in ("delete", "create")] == ["delete"]
+    assert result.restacked == 1 and plan.applied and plan.applied_stack_id is None
+    assert sm.receipts_after([plan], receipt, now=_T)["2026-09-09_19-16-35"].stack_id is None
+
+
+def test_fetch_stack_members_sql_and_shape():
+    conn = _Conn([("s1", "a1"), ("s1", "a2"), ("s2", "b1")])
+    got = sm.fetch_stack_members(conn, {"s1", "s2", "s3"})
+    ((sql, params),) = conn.calls
+    assert '"stackId" = ANY(%s)' in sql and '"deletedAt" IS NULL' in sql and params == (["s1", "s2", "s3"],)
+    assert got == {"s1": {"a1", "a2"}, "s2": {"b1"}, "s3": set()}
+    assert sm.fetch_stack_members(_Conn(), set()) == {}
 
 
 def test_apply_counts_tags_the_api_did_not_return():
@@ -492,7 +551,9 @@ def test_plan_id_changed_with_restack_rebuilds_and_updates_receipt():
     receipt = {"2026-09-09_19-16-35": sm.Receipt("OLD", ("a2", "a3"), "s1", "2026-10-01T00:00:00+00:00")}
     rows = [_row("mosaic.mp4", "a1"), _row("front.mp4", "a2", "s1", "OLD", 3),
             _row("back.mp4", "a3", "s1", "OLD", 3)]
-    (plan,) = sm.plan_groups(m, _assets(rows), receipt=receipt, restack=True)
+    # s1 holds the superseded OLD primary plus our two children: ours to dissolve
+    (plan,) = sm.plan_groups(m, _assets(rows), receipt=receipt, restack=True,
+                             stack_members={"s1": {"OLD", "a2", "a3"}})
     assert plan.status == "restack" and plan.stale_stacks == ["s1"]
     client = _Client()
     sm.apply_plans(client, _Conn(), [plan], log=lambda m: None)

@@ -363,6 +363,7 @@ def _resolve(rel: str, assets: dict[str, list[Asset]]) -> Asset | None:
 def plan_groups(
     manifest: Manifest, assets: dict[str, list[Asset]], *, restack: bool = False,
     receipt: dict[str, Receipt] | None = None,
+    stack_members: dict[str, set[str]] | None = None,
 ) -> list[GroupPlan]:
     """One plan per group, in manifest order.
 
@@ -404,12 +405,14 @@ def plan_groups(
         in_group = Counter(m.stack_id for m in members if m.stack_id)
         superseded = (set(known.child_asset_ids) | {known.primary_asset_id}) - {m.id for m in members} \
             if known else set()
-        foreign = sorted({m.stack_id for m in members
-                          if m.stack_id and m.stack_size > in_group[m.stack_id] + len(superseded)})
+        candidates = set(stack_ids) | ({known.stack_id} if known and known.stack_id else set())
+        foreign = _foreign_stacks(candidates, {m.id for m in members} | superseded,
+                                  in_group, {m.stack_id: m.stack_size for m in members if m.stack_id},
+                                  stack_members)
         if replaced:
             plan.status = STATUS_RESTACK if restack and not foreign else STATUS_ID_CHANGED
             # the stack the receipt recorded may hold only superseded assets now
-            plan.stale_stacks = sorted(set(stack_ids) | ({known.stack_id} if known and known.stack_id else set()))
+            plan.stale_stacks = sorted(candidates)
             plan.note = replaced + f" since {known.applied_at[:10]}"  # type: ignore[union-attr]
             if restack and not foreign:
                 plan.note += f"; superseded asset(s) left unstacked: {', '.join(s[:8] + '…' for s in sorted(superseded))}"
@@ -439,6 +442,42 @@ def plan_groups(
             plan.note += "; a stack has members outside the group — not restacked"
         plans.append(plan)
     return plans
+
+
+def _foreign_stacks(candidates: set[str], allowed_ids: set[str], in_group: Counter,
+                    sizes: dict[str, int], stack_members: dict[str, set[str]] | None) -> list[str]:
+    """Stacks among `candidates` that hold a live asset outside `allowed_ids`
+    (this group's files + what its receipt recorded). With the stacks' live
+    membership known (`fetch_stack_members`) the check is exact; without it
+    any member beyond this group's own count is treated as foreign — the
+    safe reading, since a count cannot tell a superseded file from a
+    stranger."""
+    out = []
+    for sid in sorted(candidates):
+        if stack_members is not None:
+            if sid in stack_members and (stack_members[sid] - allowed_ids):
+                out.append(sid)
+            elif sid not in stack_members and sizes.get(sid, 0) > in_group.get(sid, 0):
+                out.append(sid)
+        elif sizes.get(sid, 0) > in_group.get(sid, 0) or sid not in sizes:
+            out.append(sid)
+    return out
+
+
+STACK_MEMBERS_SQL = """
+SELECT a."stackId", a.id FROM asset a
+WHERE a."stackId" = ANY(%s) AND a."deletedAt" IS NULL
+"""
+
+
+def fetch_stack_members(conn, stack_ids: set[str]) -> dict[str, set[str]]:
+    """Live member asset ids of each stack — what `--restack` would dissolve."""
+    if not stack_ids:
+        return {}
+    out: dict[str, set[str]] = {sid: set() for sid in stack_ids}
+    for stack_id, asset_id in conn.execute(STACK_MEMBERS_SQL, (sorted(stack_ids),)).fetchall():
+        out.setdefault(str(stack_id), set()).add(str(asset_id))
+    return out
 
 
 def _replaced_since(known: Receipt | None, primary: Asset, children: list[Asset]) -> str:
@@ -541,10 +580,13 @@ def apply_plans(client, conn, plans: list[GroupPlan], *, log) -> ApplyResult:
                         deleted.add(stack_id)
             if plan.status in (STATUS_CREATE, STATUS_RESTACK):
                 assert plan.primary is not None
-                plan.applied_stack_id = client.create_stack(
-                    primary_asset_id=plan.primary.id,
-                    other_asset_ids=[c.id for c in plan.children],
-                )
+                if plan.children:
+                    plan.applied_stack_id = client.create_stack(
+                        primary_asset_id=plan.primary.id,
+                        other_asset_ids=[c.id for c in plan.children],
+                    )
+                else:
+                    plan.applied_stack_id = None   # one file is not a stack; tags/archive still apply
                 if plan.status == STATUS_RESTACK:
                     result.restacked += 1
                 else:

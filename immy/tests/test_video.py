@@ -159,6 +159,47 @@ def test_transcode_policy_from_live_config_mirrors_immich():
     assert d.transcode == "required" and d.accepted_video_codecs == ("h264",)
 
 
+def test_transcode_policy_edge_cases_match_immich(monkeypatch, tmp_path):
+    # JavaScript parseInt semantics for maxBitrate: '8.5M' is 8 Mbit/s upstream
+    assert video_mod._parse_bitrate_bps("8.5M") == 8_000_000
+    assert video_mod._parse_bitrate_bps("8000k") == 8_000_000
+    assert video_mod._parse_bitrate_bps("12abc") == 12
+    assert video_mod._parse_bitrate_bps("abc") == 0 and video_mod._parse_bitrate_bps(None) == 0
+    assert video_mod._parse_bitrate_bps("0") == 0
+    # an EMPTY accept list is a real setting (accept nothing), not "use the default"
+    empty = video_mod.TranscodePolicy.from_system_config(_n5_config(acceptedVideoCodecs=[]))
+    assert empty.accepted_video_codecs == ()
+    assert video_mod.immich_transcode_reason(_info(), empty) == "video h264 not accepted"
+    no_audio = video_mod.TranscodePolicy.from_system_config(_n5_config(acceptedAudioCodecs=[]))
+    assert video_mod.immich_transcode_reason(_info(acodec="aac"), no_audio) == "audio aac not accepted"
+    assert video_mod.immich_transcode_reason(_info(acodec=""), no_audio) == ""    # silent: no audio decision
+    # the stream's bitrate only — a missing stream bit_rate is 0, never the container's
+    monkeypatch.setattr(video_mod, "_ffprobe_json", lambda p: {
+        "streams": [{"codec_type": "video", "codec_name": "h264", "width": 1280, "height": 720,
+                     "pix_fmt": "yuv420p"}],
+        "format": {"duration": "5.0", "bit_rate": "20000000", "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+                   "format_long_name": "QuickTime / MOV"},
+    })
+    info = video_mod.probe(tmp_path / "clip.mp4")
+    assert info.bitrate == 0 and info.pix_fmt == "yuv420p" and info.format_long_name == "QuickTime / MOV"
+    br = video_mod.TranscodePolicy.from_system_config(_n5_config(transcode="bitrate", maxBitrate="8M"))
+    assert video_mod.immich_transcode_reason(info, br) == ""
+    # Grok round 2: unmapped long names compare the WHOLE format_name; an audio
+    # stream ffprobe cannot name is a stream, not silence; h265 is hevc
+    monkeypatch.setattr(video_mod, "_ffprobe_json", lambda p: {
+        "streams": [{"codec_type": "video", "codec_name": "h265", "width": 1280, "height": 720},
+                    {"codec_type": "audio"}],
+        "format": {"duration": "5.0", "format_name": "avi", "format_long_name": "AVI (Audio Video Interleaved)"},
+    })
+    odd = video_mod.probe(tmp_path / "clip.avi")
+    assert odd.video_codec == "hevc" and odd.audio_codec == "unknown"
+    p = video_mod.TranscodePolicy.from_system_config(_n5_config())
+    assert video_mod.immich_transcode_reason(odd, p) == "audio unknown not accepted"
+    assert video_mod._immich_container(odd) == "avi"
+    assert "remuxed" in video_mod.immich_transcode_reason(_info(acodec="", fmt="avi", long="AVI (Audio Video Interleaved)"), p)
+    assert video_mod._immich_container(_info(fmt="mpegts,ts", long="MPEG-TS (MPEG-2 Transport Stream)")) == "mpegts,ts"
+
+
 def test_needs_transcode_matches_required_policy():
     make = lambda **kw: video_mod.VideoInfo(
         width=1280, height=720, duration_s=5.0,

@@ -4850,8 +4850,13 @@ def stacks_apply(
         assets = stack_manifest_mod.fetch_folder_assets(
             conn, folder.name, library_id=str(library.id), container_root=library.container_root,
         )
+        # live membership of every stack in play, so --restack can tell a
+        # superseded file of ours from someone else's asset
+        stack_ids = {a.stack_id for lst in assets.values() for a in lst if a.stack_id}
+        stack_ids |= {r.stack_id for r in receipt.values() if r.stack_id}
+        members = stack_manifest_mod.fetch_stack_members(conn, stack_ids)
         plans = stack_manifest_mod.plan_groups(
-            manifest, assets, restack=restack, receipt=receipt,
+            manifest, assets, restack=restack, receipt=receipt, stack_members=members,
         )
 
         table = Table(title=f"{folder.name}: {len(plans)} groups"
