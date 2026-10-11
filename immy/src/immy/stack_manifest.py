@@ -39,6 +39,7 @@ and updates the receipt. `.audit/` is already outside promote's rsync.
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -275,13 +276,26 @@ WHERE a."deletedAt" IS NULL AND a."originalPath" LIKE %s ESCAPE '\\'
 """
 
 
-def folder_pattern(folder_name: str) -> str:
-    """LIKE pattern for `…/<folder_name>/…` (wildcards in the name escaped)."""
+FOLDER_ASSETS_IN_LIBRARY_SQL = FOLDER_ASSETS_SQL.rstrip() + ' AND a."libraryId" = %s\n'
+
+
+def folder_pattern(folder_name: str, container_root: str | None = None) -> str:
+    """LIKE pattern for the folder's files: anchored at
+    `<container_root>/<folder_name>/` when the root is known, otherwise
+    `…/<folder_name>/…` (wildcards in the name escaped)."""
+    if container_root:
+        return like_prefix(f"{container_root.rstrip('/')}/{folder_name}/")
     return "%/" + like_prefix(folder_name)[:-1] + "/%"
 
 
-def fetch_folder_assets(conn, folder_name: str) -> dict[str, list[Asset]]:
+def fetch_folder_assets(conn, folder_name: str, *, library_id: str | None = None,
+                        container_root: str | None = None) -> dict[str, list[Asset]]:
     """Relative path (after `/<folder_name>/`) → assets ending in it.
+
+    With `library_id` / `container_root` (the configured external library,
+    as `promote` resolves it) only that library's assets under the promoted
+    root are candidates — a same-named folder in another library or user
+    can never be picked. Without them (tests, ad-hoc) any library matches.
 
     More than one asset for a relative path means the folder name recurs
     in the tree (`/x/2026-tesla/2026-tesla/a.mp4` yields both `a.mp4` and
@@ -289,7 +303,11 @@ def fetch_folder_assets(conn, folder_name: str) -> dict[str, list[Asset]]:
     to several assets as unresolvable rather than guessing."""
     marker = f"/{folder_name}/"
     out: dict[str, list[Asset]] = {}
-    rows = conn.execute(FOLDER_ASSETS_SQL, (folder_pattern(folder_name),)).fetchall()
+    pattern = folder_pattern(folder_name, container_root)
+    if library_id:
+        rows = conn.execute(FOLDER_ASSETS_IN_LIBRARY_SQL, (pattern, library_id)).fetchall()
+    else:
+        rows = conn.execute(FOLDER_ASSETS_SQL, (pattern,)).fetchall()
     for asset_id, path, stack_id, primary_id, size in rows:
         asset = Asset(
             id=str(asset_id), path=str(path),
@@ -378,16 +396,34 @@ def plan_groups(
         plan = GroupPlan(group=group, status=STATUS_CREATE, primary=primary,
                          children=list(children))  # type: ignore[arg-type]
         known = receipt.get(group.key)
-        if not children:
+        replaced = _replaced_since(known, primary, children)  # type: ignore[arg-type]
+        # A stack is ours to delete only when every live member of it is in
+        # this group — or is an asset the receipt recorded for this group (the
+        # superseded file of a re-render). One reaching further (a hand-made
+        # stack, another group's file) is never torn down, even with --restack.
+        in_group = Counter(m.stack_id for m in members if m.stack_id)
+        superseded = (set(known.child_asset_ids) | {known.primary_asset_id}) - {m.id for m in members} \
+            if known else set()
+        foreign = sorted({m.stack_id for m in members
+                          if m.stack_id and m.stack_size > in_group[m.stack_id] + len(superseded)})
+        if replaced:
+            plan.status = STATUS_RESTACK if restack and not foreign else STATUS_ID_CHANGED
+            # the stack the receipt recorded may hold only superseded assets now
+            plan.stale_stacks = sorted(set(stack_ids) | ({known.stack_id} if known and known.stack_id else set()))
+            plan.note = replaced + f" since {known.applied_at[:10]}"  # type: ignore[union-attr]
+            if restack and not foreign:
+                plan.note += f"; superseded asset(s) left unstacked: {', '.join(s[:8] + '…' for s in sorted(superseded))}"
+        elif not children:
             # One file is not a stack (Immich wants two members): tags and the
-            # archive flag still apply, the stack step is skipped.
-            plan.status = STATUS_OK
-            plan.note = "single file: tags only"
-        elif known is not None and known.primary_asset_id != primary.id:
-            plan.status = STATUS_RESTACK if restack else STATUS_ID_CHANGED
-            plan.stale_stacks = stack_ids
-            plan.note = (f"primary {known.primary_asset_id[:8]}… → {primary.id[:8]}… "
-                         f"since {known.applied_at[:10]}")
+            # archive flag still apply, the stack step is skipped — unless the
+            # file still sits in a stack from an earlier, wider camera choice.
+            if stack_ids:
+                plan.status = STATUS_RESTACK if restack and not foreign else STATUS_DIFFERS
+                plan.stale_stacks = stack_ids
+                plan.note = f"single file: still in a stack of {primary.stack_size}"
+            else:
+                plan.status = STATUS_OK
+                plan.note = "single file: tags only"
         elif not stack_ids:
             pass
         elif (len(stack_ids) == 1
@@ -396,11 +432,30 @@ def plan_groups(
               and primary.stack_size == len(members)):
             plan.status = STATUS_OK
         else:
-            plan.status = STATUS_RESTACK if restack else STATUS_DIFFERS
+            plan.status = STATUS_RESTACK if restack and not foreign else STATUS_DIFFERS
             plan.stale_stacks = stack_ids
             plan.note = _differs_note(members, stack_ids, primary)
+        if foreign and restack and plan.status in (STATUS_DIFFERS, STATUS_ID_CHANGED):
+            plan.note += "; a stack has members outside the group — not restacked"
         plans.append(plan)
     return plans
+
+
+def _replaced_since(known: Receipt | None, primary: Asset, children: list[Asset]) -> str:
+    """Why the group's files are no longer the assets the receipt recorded:
+    a re-render at the same path became a NEW asset. The primary is compared
+    by id; children by id when the camera set is unchanged (a different
+    count is a membership edit, handled as `differs`). '' when nothing
+    was replaced."""
+    if known is None:
+        return ""
+    if known.primary_asset_id != primary.id:
+        return f"primary {known.primary_asset_id[:8]}… → {primary.id[:8]}…"
+    if len(children) == len(known.child_asset_ids):
+        new = [c.id for c in children if c.id not in known.child_asset_ids]
+        if new:
+            return f"{len(new)} child asset id(s) changed ({new[0][:8]}…)"
+    return ""
 
 
 def _differs_note(members: list[Asset], stack_ids: list[str], primary: Asset) -> str:
@@ -447,6 +502,7 @@ class ApplyResult:
     restacked: int = 0
     failed: int = 0
     tags_linked: int = 0
+    tags_missing: int = 0     # wanted tags the API did not return: their links were skipped
     archived: int = 0
 
 
@@ -470,7 +526,9 @@ def apply_plans(client, conn, plans: list[GroupPlan], *, log) -> ApplyResult:
         for name in wanted:
             if name not in tag_ids:
                 log(f"tags: {name!r} not returned by upsert, skipped")
+                result.tags_missing += 1
 
+    deleted: set[str] = set()   # two groups can share a stale stack; delete it once
     for plan in plans:
         if not plan.resolved:
             continue
@@ -478,7 +536,9 @@ def apply_plans(client, conn, plans: list[GroupPlan], *, log) -> ApplyResult:
         try:
             if plan.status == STATUS_RESTACK:
                 for stack_id in plan.stale_stacks:
-                    client.delete_stack(stack_id)
+                    if stack_id not in deleted:
+                        client.delete_stack(stack_id)
+                        deleted.add(stack_id)
             if plan.status in (STATUS_CREATE, STATUS_RESTACK):
                 assert plan.primary is not None
                 plan.applied_stack_id = client.create_stack(

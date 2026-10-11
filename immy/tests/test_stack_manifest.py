@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -186,27 +187,97 @@ def test_plan_ok_when_stack_matches_exactly():
     assert plan.status == "ok" and plan.stale_stacks == []
 
 
-@pytest.mark.parametrize("rows, note", [
+@pytest.mark.parametrize("rows, note, restackable", [
     # other primary
     ([_row("mosaic.mp4", "a1", "s1", "a2", 3), _row("front.mp4", "a2", "s1", "a2", 3),
-      _row("back.mp4", "a3", "s1", "a2", 3)], "other primary"),
+      _row("back.mp4", "a3", "s1", "a2", 3)], "other primary", True),
     # partial: back.mp4 was added after the first stacking
     ([_row("mosaic.mp4", "a1", "s1", "a1", 2), _row("front.mp4", "a2", "s1", "a1", 2),
-      _row("back.mp4", "a3")], "some members unstacked"),
-    # stack reaches beyond the group (a 4th asset elsewhere)
+      _row("back.mp4", "a3")], "some members unstacked", True),
+    # stack reaches beyond the group (a 4th asset elsewhere): never torn down
     ([_row("mosaic.mp4", "a1", "s1", "a1", 4), _row("front.mp4", "a2", "s1", "a1", 4),
-      _row("back.mp4", "a3", "s1", "a1", 4)], "stack has 4 members, manifest 3"),
-    # two stacks
+      _row("back.mp4", "a3", "s1", "a1", 4)], "stack has 4 members, manifest 3", False),
+    # two stacks, both fully inside the group
     ([_row("mosaic.mp4", "a1", "s1", "a1", 2), _row("front.mp4", "a2", "s1", "a1", 2),
-      _row("back.mp4", "a3", "s2", "a3", 1)], "members span 2 stacks"),
+      _row("back.mp4", "a3", "s2", "a3", 1)], "members span 2 stacks", True),
 ])
-def test_plan_differs_and_restack(rows, note):
+def test_plan_differs_and_restack(rows, note, restackable):
     m = sm.parse_manifest(_manifest())
     (plan,) = sm.plan_groups(m, _assets(rows))
     assert plan.status == "differs" and plan.note == note
     (plan,) = sm.plan_groups(m, _assets(rows), restack=True)
-    assert plan.status == "restack"
-    assert plan.stale_stacks == sorted({r[2] for r in rows if r[2]})
+    if restackable:
+        assert plan.status == "restack"
+        assert plan.stale_stacks == sorted({r[2] for r in rows if r[2]})
+    else:
+        # a stack with members outside the group is someone else's grouping
+        assert plan.status == "differs" and "outside the group" in plan.note
+
+
+def test_plan_child_replacement_is_id_changed():
+    """Only the primary id used to be compared; a re-rendered child that came
+    back as a new asset must be flagged the same way (count unchanged)."""
+    m = sm.parse_manifest(_manifest())
+    receipt = {"2026-09-09_19-16-35": sm.Receipt("a1", ("a2", "OLD3"), "s1", "2026-10-01T00:00:00+00:00")}
+    (plan,) = sm.plan_groups(m, _assets([
+        _row("mosaic.mp4", "a1", "s1", "a1", 2), _row("front.mp4", "a2", "s1", "a1", 2), _row("back.mp4", "a3"),
+    ]), receipt=receipt)
+    assert plan.status == "id-changed" and "child asset id" in plan.note
+    # a different camera COUNT is a membership edit, not a replacement
+    m2 = sm.parse_manifest(_manifest(children=[f"{EVENT}/front.mp4"]))
+    (plan,) = sm.plan_groups(m2, _assets([
+        _row("mosaic.mp4", "a1", "s1", "a1", 3), _row("front.mp4", "a2", "s1", "a1", 3),
+    ]), receipt=receipt)
+    assert plan.status == "differs"
+
+
+def test_plan_single_file_still_stacked_differs():
+    """All cameras un-ticked later: the mosaic still sits in the old stack with
+    the (now unlisted) children — reported, torn down only with --restack and
+    only when the stack holds nothing but files of this group."""
+    m = sm.parse_manifest(_manifest(children=[]))
+    (plan,) = sm.plan_groups(m, _assets([_row("mosaic.mp4", "a1", "s1", "a1", 3)]))
+    assert plan.status == "differs" and plan.note == "single file: still in a stack of 3"
+    (plan,) = sm.plan_groups(m, _assets([_row("mosaic.mp4", "a1", "s1", "a1", 3)]), restack=True)
+    assert plan.status == "differs"   # the other 2 members are outside the group
+
+
+def test_apply_deletes_a_shared_stale_stack_once():
+    g1 = {**_manifest()["groups"][0], "key": "k1", "children": [f"{EVENT}/front.mp4"]}
+    g2 = {**_manifest()["groups"][0], "key": "k2", "primary": f"{EVENT}/back.mp4", "children": [f"{EVENT}/x.mp4"]}
+    m = sm.parse_manifest({"schema": 1, "album": None, "groups": [g1, g2]})
+    rows = [_row("mosaic.mp4", "a1", "s1", "a1", 4), _row("front.mp4", "a2", "s1", "a1", 4),
+            _row("back.mp4", "a3", "s1", "a1", 4), _row("x.mp4", "a4", "s1", "a1", 4)]
+    plans = sm.plan_groups(m, _assets(rows), restack=True)
+    # s1 holds exactly the four files of the two groups: each group sees two
+    # of them, so from either group's view the stack reaches outside it
+    assert [p.status for p in plans] == ["differs", "differs"]
+    # the same with both stacks fully inside their groups is restacked, and a
+    # stale stack shared by two groups is deleted once
+    plans = sm.plan_groups(m, _assets(rows), restack=True)
+    for p in plans:
+        p.status, p.stale_stacks = "restack", ["s1"]
+    client, conn = _Client(), _Conn()
+    sm.apply_plans(client, conn, plans, log=lambda m: None)
+    assert [c for c in client.calls if c[0] == "delete"] == [("delete", "s1")]
+
+
+def test_apply_counts_tags_the_api_did_not_return():
+    class _ShortClient(_Client):
+        def upsert_tags(self, names):
+            return {n: f"tag-{n}" for n in names if n != "Source/Tesla"}
+    m = sm.parse_manifest(_manifest())
+    (plan,) = sm.plan_groups(m, _assets([_row("mosaic.mp4", "a1"), _row("front.mp4", "a2"), _row("back.mp4", "a3")]))
+    result = sm.apply_plans(_ShortClient(), _Conn(), [plan], log=lambda m: None)
+    assert result.created == 1 and result.tags_missing == 1 and result.tags_linked == 3
+
+
+def test_fetch_folder_assets_scoped_to_library_and_root():
+    conn = _Conn([_row("mosaic.mp4", "a1")])
+    sm.fetch_folder_assets(conn, FOLDER, library_id="lib-1", container_root="/mnt/external/originals/")
+    ((sql, params),) = conn.calls
+    assert '"libraryId" = %s' in sql
+    assert params == (rf"/mnt/external/originals/{FOLDER}/%", "lib-1")
 
 
 def test_plan_missing_skips_group_and_names_paths():
@@ -480,7 +551,7 @@ def test_cli_dry_run_reports_and_writes_nothing(monkeypatch, tmp_path: Path):
         _row("mosaic.mp4", "a1"), _row("front.mp4", "a2"), _row("back.mp4", "a3"),
     ])
     monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: conn, raising=False)
-    monkeypatch.setattr(cli.pg_mod, "fetch_library_info", lambda c, lib: object(), raising=False)
+    monkeypatch.setattr(cli.pg_mod, "fetch_library_info", lambda c, lib: types.SimpleNamespace(id="lib-1", container_root="/mnt/external/originals"), raising=False)
     client = _Client()
     monkeypatch.setattr(cli, "ImmichClient", lambda **kw: client)
     result = runner.invoke(cli.app, ["stacks", "apply", str(folder), "--config", str(_cfg(tmp_path))])
@@ -496,7 +567,7 @@ def test_cli_write_applies(monkeypatch, tmp_path: Path, no_schema_guard):
         _row("mosaic.mp4", "a1"), _row("front.mp4", "a2"), _row("back.mp4", "a3"),
     ])
     monkeypatch.setattr(cli.pg_mod, "connect", lambda _cfg: conn, raising=False)
-    monkeypatch.setattr(cli.pg_mod, "fetch_library_info", lambda c, lib: object(), raising=False)
+    monkeypatch.setattr(cli.pg_mod, "fetch_library_info", lambda c, lib: types.SimpleNamespace(id="lib-1", container_root="/mnt/external/originals"), raising=False)
     client = _Client()
     monkeypatch.setattr(cli, "ImmichClient", lambda **kw: client)
     result = runner.invoke(cli.app, [

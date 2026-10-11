@@ -4814,9 +4814,13 @@ def stacks_apply(
         console.print(f"[red]{e}[/red]")
         raise typer.Exit(code=2)
 
-    config, conn, _library = _srt_pg_setup(config_path)
+    config, conn, library = _srt_pg_setup(config_path)
     try:
-        assets = stack_manifest_mod.fetch_folder_assets(conn, folder.name)
+        # only the configured library, anchored at its import root: a same-named
+        # folder elsewhere (another library, another user) is never a candidate
+        assets = stack_manifest_mod.fetch_folder_assets(
+            conn, folder.name, library_id=str(library.id), container_root=library.container_root,
+        )
         plans = stack_manifest_mod.plan_groups(
             manifest, assets, restack=restack, receipt=receipt,
         )
@@ -4882,8 +4886,10 @@ def stacks_apply(
             f"[green]{result.created} stacks created · {result.restacked} restacked · "
             f"{result.tags_linked} tag links · {result.archived} archived[/green]"
             + (f" · [red]{result.failed} groups failed[/red]" if result.failed else "")
+            + (f" · [red]{result.tags_missing} tag(s) not created — links skipped, re-run[/red]"
+               if result.tags_missing else "")
         )
-        if result.failed:
+        if result.failed or result.tags_missing:
             raise typer.Exit(code=1)
     finally:
         conn.close()
