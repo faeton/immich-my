@@ -31,7 +31,7 @@ from pathlib import Path
 from typing import Callable
 
 from . import track as track_mod
-from .decisions import Decision, effective
+from .decisions import Decision, effective, placed
 from .model import CAMERAS, Event, Segment
 
 RENDER_VERSION = "v2"   # v2: children cut at keyframes instead of whole segments
@@ -145,6 +145,7 @@ def plan(events: list[Event], decisions: dict[str, Decision], render_root: Path,
         d = decisions.get(ev.id) or Decision()
         if d.keep != "keep" and not (only_ids and ev.id in only_ids):
             continue
+        ev = placed(ev, d)   # a hand-set location is part of the digest: it re-renders
         a, b, cams = effective(ev, d)
         if b - a < 1.0:
             continue

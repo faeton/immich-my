@@ -258,6 +258,8 @@ kbd{background:var(--panel2);border:1px solid var(--line);border-bottom-width:2p
       <span class="cams" id="camList"></span>
       <label class="tog" data-k="precise" title="re-encode the per-camera files to the exact in/out range instead of whole segments"><input type="checkbox" id="preciseIn">precise cut</label>
       <label class="tog" data-k="archive" title="archive in Immich after import"><input type="checkbox" id="archiveIn">archive</label>
+      <input id="locIn" placeholder="lat, lon [; place] — set by hand" title="for an event the car could not place: decimal degrees, optional place label after a semicolon; empty clears" style="width:15em">
+      <span class="dim" id="locNote"></span>
       <span class="spacer"></span>
       <span class="est" id="est"></span>
     </div>
@@ -312,7 +314,13 @@ const STATES = {unreviewed:{label:'Unreviewed', c:'var(--unrev)'}, keep:{label:'
 const CAMS = {front:'Front', back:'Back', left_repeater:'Left repeater', right_repeater:'Right repeater',
   left_pillar:'Left pillar', right_pillar:'Right pillar'};
 const MOSAIC_MBPS = 4, CHILD_MBPS = 5.5;
-const DEFAULT_DEC = {keep:'unreviewed', cameras:null, in_s:null, out_s:null, precise:false, tags:[], note:'', archive:false, updated:null};
+const DEFAULT_DEC = {keep:'unreviewed', cameras:null, in_s:null, out_s:null, precise:false, tags:[], note:'', archive:false, lat:null, lon:null, city:'', updated:null};
+/* where the event is: a location set by hand in the review bar wins over the scan */
+function locOf(e){
+  const d=decOf(e);
+  if(d.lat!=null && d.lon!=null) return {lat:d.lat, lon:d.lon, city:d.city||e.city, src:'manual'};
+  return {lat:e.lat, lon:e.lon, city:e.city, src:e.gps_source};
+}
 
 const slugOf = e => REASONS[e.reason_slug] ? e.reason_slug : 'unknown';
 const colOf  = e => REASONS[slugOf(e)].c;
@@ -535,7 +543,9 @@ function card(e){
   d.onclick=()=>{ selIdx=shown.indexOf(e); openEvent(e); };
   const w=windowOf(e), cams=camsOf(e), tz=tzOf(e);
   const flags=[];
-  if(e.gps_source==='none' || e.lat==null || e.lon==null) flags.push('<span class="warn soft" style="margin:0">no GPS</span>');
+  const L=locOf(e);
+  if(L.lat==null || L.lon==null) flags.push('<span class="warn soft" style="margin:0">no GPS</span>');
+  if(L.src==='manual') flags.push('<span title="location set by hand">GPS by hand</span>');
   if(e.offset_source==='none') flags.push('<span class="warn soft" style="margin:0">tz?</span>');
   if(e.gps_source==='prev-drive') flags.push('<span title="GPS from the previous drive">GPS≈</span>');
   if(decOf(e).precise) flags.push('<span title="exact re-encode">precise</span>');
@@ -551,7 +561,7 @@ function card(e){
     </div>
     <div class="body">
       <div class="when">${fmtDate(e.ts)} <span class="tz">${tz||'tz?'}</span></div>
-      <div class="city">${esc(e.city||'—')}${e.gps_source==='sei'?' <span title="GPS from in-video telemetry" style="color:var(--dim2)">≈</span>':''}</div>
+      <div class="city">${esc(L.city||'—')}${L.src==='sei'?' <span title="GPS from in-video telemetry" style="color:var(--dim2)">≈</span>':''}</div>
       ${e.bad?`<div class="warn">${e.bad} unreadable file${e.bad>1?'s':''}</div>`:''}
       ${flags.length?`<div class="flags">${flags.join('')}</div>`:''}
       <div class="tags">${tagsOf(e).map(t=>`<span class="tag">#${esc(t)}</span>`).join('')}</div>
@@ -589,12 +599,13 @@ function drawMap(refit){
   layer=L.layerGroup().addTo(map);
   const pts=[];
   for(const e of shown){
-    if(e.lat==null||e.lon==null) continue;
-    pts.push([e.lat,e.lon]);
+    const loc=locOf(e);
+    if(loc.lat==null||loc.lon==null) continue;
+    pts.push([loc.lat,loc.lon]);
     const st=stateOf(e);
-    const m=L.circleMarker([e.lat,e.lon],{radius:st==='drop'?4:6,weight:2,color:st==='drop'?'#777':'#fff',opacity:.85,
+    const m=L.circleMarker([loc.lat,loc.lon],{radius:st==='drop'?4:6,weight:2,color:st==='drop'?'#777':'#fff',opacity:.85,
       fillColor:cssVar(STATES[st].c), fillOpacity:st==='drop'?.5:.92}).addTo(layer);
-    m.bindPopup(`<b>${esc(e.city)}</b>${fmtDate(e.ts)}<br>${labelOf(e)} · ${fmtDur(e.total)} · ${STATES[st].label}`);
+    m.bindPopup(`<b>${esc(loc.city)}</b>${fmtDate(e.ts)}<br>${labelOf(e)} · ${fmtDur(e.total)} · ${STATES[st].label}`);
     m.on('click',()=>openEvent(e));
   }
   if(refit && pts.length) map.fitBounds(L.latLngBounds(pts).pad(.15));
@@ -618,7 +629,7 @@ function openEvent(e){
      mainCam:cams.includes('front')?'front':cams[0], speed:P?P.speed:1, playing:false, pendingSeek:null};
   selIdx=shown.indexOf(e);
 
-  document.getElementById('pCity').textContent=e.city||'—';
+  document.getElementById('pCity').textContent=locOf(e).city||'—';
   document.getElementById('pWhen').textContent=fmtDate(e.ts)+(tzOf(e)?' '+tzOf(e):' (tz?)');
   const r=document.getElementById('pReason');
   r.textContent=`${labelOf(e)} · ${KINDS[e.kind]||e.kind}`; r.style.color=colOf(e);
@@ -654,6 +665,8 @@ function refreshReview(){
     cl.appendChild(l);
   });
   for(const k of ['precise','archive']){ const i=document.getElementById(k+'In'); i.checked=!!d[k]; i.parentElement.classList.toggle('on',!!d[k]); }
+  document.getElementById('locIn').value = d.lat!=null ? `${d.lat}, ${d.lon}${d.city?' ; '+d.city:''}` : '';
+  document.getElementById('locNote').textContent = d.lat!=null ? 'by hand' : (e.lat==null ? 'car gave no position' : '');
   // tags + note
   const box=document.getElementById('pTags'); box.innerHTML='';
   for(const t of tagsOf(e)){
@@ -683,6 +696,15 @@ function refreshReview(){
 document.querySelectorAll('#keepSeg button').forEach(b=>b.onclick=()=>P&&setKeep(b.dataset.v));
 function setKeep(v){ if(!P) return; save(P.ev,{keep:v}); toast(STATES[v].label); }
 for(const k of ['precise','archive']) document.getElementById(k+'In').onchange=ev=>P&&save(P.ev,{[k]:ev.target.checked});
+document.getElementById('locIn').onchange=ev=>{
+  if(!P) return;
+  const raw=ev.target.value.trim();
+  if(!raw){ save(P.ev,{lat:null,lon:null,city:''}); toast('location cleared'); return; }
+  const [coords,place='']=raw.split(';'); const m=coords.split(',').map(s=>parseFloat(s));
+  if(m.length!==2 || m.some(isNaN) || Math.abs(m[0])>90 || Math.abs(m[1])>180){ toast('expected "lat, lon [; place]"'); return; }
+  save(P.ev,{lat:m[0],lon:m[1],city:place.trim()}); toast('location set by hand');
+};
+document.getElementById('locIn').addEventListener('keydown',ev=>{ ev.stopPropagation(); if(ev.key==='Enter'||ev.key==='Escape'){ ev.preventDefault(); ev.target.blur(); } });
 document.getElementById('bReset').onclick=()=>P&&save(P.ev,{in_s:null,out_s:null});
 document.getElementById('bSetIn').onclick=()=>setMark('in');
 document.getElementById('bSetOut').onclick=()=>setMark('out');

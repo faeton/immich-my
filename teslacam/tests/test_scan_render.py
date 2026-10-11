@@ -157,6 +157,36 @@ def test_camera_without_footage_in_window_is_skipped(dumps):
     assert any("skipped: back" in s for s in logs)
 
 
+@pytest.mark.skipif(shutil.which("exiftool") is None, reason="exiftool missing")
+def test_manual_location_is_baked_and_changes_the_digest(dumps):
+    """The UK drive case: no SEI, no event.json, nothing nearby → placed by
+    hand through `locate`; the render bakes it and the digest changes."""
+    from typer.testing import CliRunner
+    from teslacam.cli import app
+    _scan(dumps, exclude=("Dump3",))
+    rd = dumps / "_review"
+    eid = "Dump1|RecentClips|2025-08-01_15-00-16"
+    dec.update(rd, eid, {"keep": "keep"})
+    root, events = scan_mod.load_events(rd)
+    before = render_mod.plan(events, dec.load_all(rd), dumps / "render")
+    job0 = next(j for j in before if j.ev.id == eid)
+    assert job0.ev.lat is None
+    r = CliRunner().invoke(app, ["locate", "--root", str(dumps), eid, "55.65, -3.19", "--city", "Peebles"])
+    assert r.exit_code == 0, r.output
+    after = render_mod.plan(events, dec.load_all(rd), dumps / "render")
+    job = next(j for j in after if j.ev.id == eid)
+    assert job.ev.gps_source == "manual" and job.digest != job0.digest
+    render_mod.render_job(root, job, model="", log=lambda s: None)
+    t = json.loads(subprocess.run(["exiftool", "-j", "-n", "-Keys:GPSCoordinates", "-Keys:Description",
+                                   str(job.out_dir / "front.mp4")], capture_output=True, text=True).stdout)[0]
+    assert t["GPSCoordinates"].startswith("55.65 -3.19") and "Peebles" in t["Description"]
+    r = CliRunner().invoke(app, ["locate", "--root", str(dumps), eid, "clear"])
+    assert r.exit_code == 0 and "cleared" in r.output
+    assert next(j for j in render_mod.plan(events, dec.load_all(rd), dumps / "render") if j.ev.id == eid).ev.lat is None
+    r = CliRunner().invoke(app, ["locate", "--root", str(dumps), "Dump1|nope", "1, 2"])
+    assert r.exit_code == 2
+
+
 def test_parse_models():
     from teslacam.cli import _parse_models
     assert _parse_models([]) == ("", {})

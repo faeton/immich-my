@@ -36,6 +36,10 @@ uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write
   (unreviewed|keep|drop), `cameras` (ticked subset), `in_s`/`out_s`,
   `precise`, `tags`, `note`, `archive`. Default window: Saved
   `[trigger−180 s, +30 s]`, Sentry `±60 s`, drives whole.
+- **locate** `EVENT 'lat, lon' [--city X]` places an event the car could not
+  (no telemetry, no `event.json`, no located drive nearby); the review bar
+  has the same field. Stored in the decision, part of the render digest, so
+  the next `render` bakes it into every file. `clear` drops it.
 - **render** writes `<out>/<YYYY>-tesla-dashcam/<kind>-<car folder stamp>/`:
   `mosaic.mp4` (all cameras tiled, exact window, H.264 proxy at 720 rows so
   Immich plays it without transcoding), one `<camera>.mp4` per ticked camera

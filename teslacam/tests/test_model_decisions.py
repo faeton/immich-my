@@ -57,6 +57,27 @@ def test_decision_roundtrip_and_validate(tmp_path):
         dec.validate({"updated": "x"})
 
 
+def test_manual_location_validates_and_overrides(tmp_path):
+    from teslacam import decisions as dec
+    from teslacam.model import Event
+    assert dec.validate({"lat": "55.9", "lon": -3.2, "city": " Peebles "}) == {"lat": 55.9, "lon": -3.2, "city": "Peebles"}
+    assert dec.validate({"lat": None, "lon": None, "city": "x"}) == {"lat": None, "lon": None, "city": ""}
+    for bad in ({"lat": 95, "lon": 0}, {"lat": 1}, {"lon": 2}, {"city": 3}):
+        with pytest.raises(ValueError):
+            dec.validate(bad)
+    ev = Event(id="D|RecentClips|2025-08-01_15-00-16", dump="D", kind="recent", dir="D/RecentClips", cams=["front"],
+               segs=[], total=60.0, trigger_s=60.0, ts="2025-08-01T15:00:16", offset="+01:00", offset_source="folder",
+               lat=None, lon=None, gps_source="none", city="", reason="drive", reason_slug="drive", sei=False,
+               bad=0, thumb="", speed_kmh=None, tz=None, flags=[])
+    assert dec.placed(ev, None) is ev and dec.placed(ev, dec.Decision()) is ev
+    d = dec.update(tmp_path, ev.id, {"lat": 55.65, "lon": -3.19, "city": "Peebles"})
+    p = dec.placed(ev, d)
+    assert (p.lat, p.lon, p.city, p.gps_source) == (55.65, -3.19, "Peebles", "manual")
+    assert ev.lat is None   # the scanned event is untouched
+    d = dec.update(tmp_path, ev.id, {"lat": None, "lon": None})
+    assert dec.placed(ev, d) is ev and d.city == ""
+
+
 def test_effective_cameras():
     ev = _ev()
     a, b, cams = dec.effective(ev, dec.Decision(cameras=["back", "nope"]))

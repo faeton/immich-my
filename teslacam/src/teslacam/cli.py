@@ -75,6 +75,39 @@ def seed(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
     console.print(f"seeded {n} events")
 
 
+@app.command()
+def locate(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
+           event: str = typer.Argument(..., help="Event id, e.g. 'TeslaDriveUK|RecentClips|2025-08-01_15-00-16'."),
+           where: str = typer.Argument(..., help="'lat, lon' by hand, or 'clear' to drop a hand-set location."),
+           city: str = typer.Option("", "--city", help="Place label for the description (default: reverse-geocode it)."),
+           geocode: bool = typer.Option(True, "--geocode/--no-geocode", help="Fill the city from Nominatim when not given.")):
+    """Place an event the car could not (no telemetry, no event.json, no drive nearby).
+    Stored in the decision; the next `render` bakes it into every file."""
+    root = root.expanduser().resolve()
+    rd = _review_dir(root, review_dir)
+    _, events = scan_mod.load_events(rd)
+    if event not in {e.id for e in events}:
+        console.print(f"[red]unknown event {event!r}[/red] — ids are in {rd / 'events.json'}")
+        raise typer.Exit(2)
+    if where.strip().lower() == "clear":
+        dec_mod.update(rd, event, {"lat": None, "lon": None, "city": ""})
+        console.print(f"{event}: hand-set location cleared")
+        return
+    try:
+        lat_s, lon_s = where.replace(";", ",").split(",")
+        lat, lon = float(lat_s), float(lon_s)
+    except ValueError:
+        console.print("[red]expected 'lat, lon' (decimal degrees) or 'clear'[/red]")
+        raise typer.Exit(2)
+    if not city and geocode:
+        cache = scan_mod.GeoCache(rd / "geocache.json", seed=root / "_tools" / "geocache.json")
+        city = cache.lookup(lat, lon) or ""
+        cache.flush()
+    dec_mod.update(rd, event, {"lat": lat, "lon": lon, "city": city})
+    console.print(f"{event}: placed at {lat:.5f}, {lon:.5f}" + (f" · {city}" if city else " · (no city)")
+                  + "\n  next: `teslacam render` re-renders it (the location is part of the digest), then `immy promote`")
+
+
 def _fmt_gb(b: int) -> str:
     return f"{b / 1e9:.1f} GB"
 

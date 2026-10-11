@@ -8,14 +8,15 @@ from __future__ import annotations
 
 import json
 import os
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field, asdict, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .model import Event, clamp_window
 
 KEEP_STATES = ("unreviewed", "keep", "drop")
-FIELDS = ("keep", "cameras", "in_s", "out_s", "precise", "tags", "note", "archive", "updated")
+FIELDS = ("keep", "cameras", "in_s", "out_s", "precise", "tags", "note", "archive",
+          "lat", "lon", "city", "updated")
 
 
 @dataclass
@@ -28,6 +29,12 @@ class Decision:
     tags: list[str] = field(default_factory=list)
     note: str = ""
     archive: bool = False
+    # A location set by hand for an event the car could not place (no SEI
+    # telemetry, no event.json, no located drive nearby). Overrides the
+    # scanned GPS; `city` is optional and only labels the description.
+    lat: float | None = None
+    lon: float | None = None
+    city: str = ""
     updated: str | None = None
 
     def to_dict(self) -> dict:
@@ -65,8 +72,30 @@ def validate(d: dict) -> dict:
         elif k == "note":
             if not isinstance(v, str):
                 raise ValueError("note must be a string")
+        elif k in ("lat", "lon"):
+            if v is not None:
+                v = float(v)
+                limit = 90.0 if k == "lat" else 180.0
+                if not -limit <= v <= limit:
+                    raise ValueError(f"{k} out of range")
+        elif k == "city":
+            if not isinstance(v, str):
+                raise ValueError("city must be a string")
+            v = v.strip()
         out[k] = v
+    if ("lat" in out) != ("lon" in out):
+        raise ValueError("lat and lon come together")
+    if "lat" in out and out["lat"] is None:
+        out["city"] = ""   # clearing the coordinates clears the hand-set label too
     return out
+
+
+def placed(ev: Event, d: Decision | None) -> Event:
+    """The event as the render sees it: a hand-set location overrides the
+    scanned one (source `manual`); nothing else changes."""
+    if d is None or d.lat is None or d.lon is None:
+        return ev
+    return replace(ev, lat=d.lat, lon=d.lon, gps_source="manual", city=d.city or ev.city)
 
 
 def decisions_path(review_dir: Path, dump: str) -> Path:
