@@ -605,8 +605,12 @@ const ov=document.getElementById('overlay');
 const vMain=document.getElementById('vMain');
 let P=null;   // {ev, cams, offs, total, seg, vids[], mainCam, speed}
 
+/* Removing the src attribute alone does NOT free the decoder: the element keeps
+   its media resource until load() runs the resource selection again. Chrome caps
+   media players per page (~75); leaked ones turn every later player black. */
+function release(v){ v.pause(); v.removeAttribute('src'); v.load(); }
 function openEvent(e){
-  if(P) { pauseAll(); for(const v of P.vids) v.removeAttribute('src'); }
+  if(P) { pauseAll(); for(const v of P.vids) release(v); }
   const cams=e.cams.slice();
   const offs=[]; let acc=0;
   for(const s of e.segs){ offs.push(acc); acc+=s.d; }
@@ -726,8 +730,21 @@ function setMark(k){
 })();
 
 /* ---- tiles ---- */
+/* One <video> per (slot, camera) for the life of the page. Tiles are rebuilt on
+   every camera swap, grid toggle and event; creating fresh elements each time
+   left the detached ones holding their decoders (see release()). */
+const VPOOL={side:{}, grid:{}};
+function pooled(slot, cam){
+  let v=VPOOL[slot][cam];
+  if(!v){
+    v=document.createElement('video'); v.muted=true; v.playsInline=true; v.preload='auto';
+    v.dataset.cam=cam; armRetry(v); VPOOL[slot][cam]=v;
+  }
+  return v;
+}
 function buildTiles(){
   const side=document.getElementById('side'), all=document.getElementById('allgrid');
+  for(const v of P.vids) if(v!==vMain) release(v);
   side.innerHTML=''; all.innerHTML='';
   P.mainVids=[vMain]; P.gridVids=[];
   const chosen=camsOf(P.ev);
@@ -735,15 +752,13 @@ function buildTiles(){
   P.cams.forEach((cam,i)=>{
     if(cam!==P.mainCam){
       const t=document.createElement('div'); t.className='tile'+(chosen.includes(cam)?'':' off'); t.dataset.cam=cam;
-      const v=document.createElement('video'); v.muted=true; v.playsInline=true; v.preload='auto';
-      v.dataset.cam=cam; t.appendChild(v); armRetry(v);
+      const v=pooled('side', cam); t.appendChild(v);
       t.insertAdjacentHTML('beforeend',`<span class="lbl"><kbd>${i+1}</kbd> ${camName(cam)}</span>`);
       t.onclick=()=>swapMain(cam);
       side.appendChild(t); P.mainVids.push(v);
     }
     const c=document.createElement('div'); c.className='cell'+(chosen.includes(cam)?'':' off'); c.dataset.cam=cam;
-    const gv=document.createElement('video'); gv.muted=true; gv.playsInline=true; gv.preload='auto';
-    gv.dataset.cam=cam; c.appendChild(gv); armRetry(gv);
+    const gv=pooled('grid', cam); c.appendChild(gv);
     c.insertAdjacentHTML('beforeend',`<span class="camlabel"><kbd>${i+1}</kbd>${camName(cam)}</span>`);
     all.appendChild(c); P.gridVids.push(gv);
   });
@@ -816,7 +831,7 @@ function loadSeg(i, at=0, autoplay=true){
   // A fresh src resets currentTime and readyState still reports the OLD media right
   // after load(), so the seek is deferred to the rAF loop, which applies it once every
   // track has metadata.
-  P.pendingSeek=at;
+  P.pendingSeek=at; P.loadedAt=performance.now();
   if(autoplay) playAll(); else updateBar();
 }
 const liveVids=()=>modeVids().filter(v=>v.getAttribute('src'));
@@ -867,8 +882,12 @@ function updateBar(){
   document.getElementById('played').style.width=p;
   document.getElementById('knob').style.left=p;
   const w=windowOf(P.ev);
+  // A player that never gets metadata is the "black player": say so instead of
+  // looking idle, and name the way out.
+  const lv=liveVids(), stuck=lv.length && lv.some(v=>v.readyState<1) && performance.now()-(P.loadedAt||0)>6000;
   document.getElementById('tPos').textContent=
-    `${fmtDur(t)} / ${fmtDur(P.total)} · seg ${P.seg+1}/${P.ev.segs.length}${t<w[0]||t>w[1]?' · outside window':''}`;
+    `${fmtDur(t)} / ${fmtDur(P.total)} · seg ${P.seg+1}/${P.ev.segs.length}${t<w[0]||t>w[1]?' · outside window':''}`
+    +(stuck?' · still loading — reload the page (⌘R) if this persists':'');
 }
 /* drift correction + segment chaining */
 function tick(){
@@ -926,7 +945,7 @@ function step(d){
 }
 function closePlayer(){
   pauseAll(); ov.classList.remove('show'); document.body.style.overflow='';
-  if(P) for(const v of P.vids) v.removeAttribute('src');
+  if(P) for(const v of P.vids) release(v);
   P=null; markSel(true);
 }
 function jumpTo(t){ if(t==null) return; seekGlobal(t); }
