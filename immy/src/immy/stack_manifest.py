@@ -378,7 +378,12 @@ def plan_groups(
         plan = GroupPlan(group=group, status=STATUS_CREATE, primary=primary,
                          children=list(children))  # type: ignore[arg-type]
         known = receipt.get(group.key)
-        if known is not None and known.primary_asset_id != primary.id:
+        if not children:
+            # One file is not a stack (Immich wants two members): tags and the
+            # archive flag still apply, the stack step is skipped.
+            plan.status = STATUS_OK
+            plan.note = "single file: tags only"
+        elif known is not None and known.primary_asset_id != primary.id:
             plan.status = STATUS_RESTACK if restack else STATUS_ID_CHANGED
             plan.stale_stacks = stack_ids
             plan.note = (f"primary {known.primary_asset_id[:8]}… → {primary.id[:8]}… "

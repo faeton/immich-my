@@ -167,6 +167,15 @@ def test_plan_create_when_nothing_stacked():
     assert plan.links == 3 * 2 and plan.resolved
 
 
+def test_plan_single_file_group_is_tags_only():
+    """A kept event whose only ticked camera had no footage in the window ships
+    just the mosaic: no stack (Immich wants two members), tags still linked."""
+    m = sm.parse_manifest(_manifest(children=[]))
+    (plan,) = sm.plan_groups(m, _assets([_row("mosaic.mp4", "a1")]))
+    assert plan.status == "ok" and plan.note == "single file: tags only"
+    assert plan.resolved and plan.links == 2 and plan.children == []
+
+
 def test_plan_ok_when_stack_matches_exactly():
     m = sm.parse_manifest(_manifest())
     (plan,) = sm.plan_groups(m, _assets([
