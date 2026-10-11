@@ -49,6 +49,9 @@ DEFAULT_DECISION: dict[str, Any] = {
     "tags": [],
     "note": "",
     "archive": False,
+    "lat": None,     # location set by hand (see decisions.Decision)
+    "lon": None,
+    "city": "",
     "updated": None,
 }
 _DECISION_KEYS = frozenset(DEFAULT_DECISION) - {"updated"}
@@ -226,6 +229,25 @@ def _validate_patch(req: dict[str, Any], event: dict[str, Any] | None) -> dict[s
             if not isinstance(val, str):
                 raise ApiError(400, "note must be a string")
             patch[key] = val.strip()
+        elif key in ("lat", "lon"):
+            # a location set by hand (decisions.Decision.lat/lon/city)
+            if val is None:
+                patch[key] = None
+            elif isinstance(val, (int, float)) and not isinstance(val, bool):
+                limit = 90.0 if key == "lat" else 180.0
+                if not -limit <= float(val) <= limit:
+                    raise ApiError(400, f"{key} out of range")
+                patch[key] = round(float(val), 6)
+            else:
+                raise ApiError(400, f"{key} must be null or a number")
+        elif key == "city":
+            if not isinstance(val, str):
+                raise ApiError(400, "city must be a string")
+            patch[key] = val.strip()
+    if ("lat" in patch) != ("lon" in patch):
+        raise ApiError(400, "lat and lon come together")
+    if "lat" in patch and patch["lat"] is None:
+        patch["city"] = ""
     return patch
 
 

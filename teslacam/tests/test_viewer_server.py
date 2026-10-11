@@ -239,6 +239,20 @@ def test_missing_events_file(tmp_path):
         srv.server_close()
 
 
+def test_hand_set_location_round_trips(site):
+    base = site["base"]
+    code, _, body = call(base, "/api/decisions", "POST", {"id": OTHER_ID, "lat": 55.65, "lon": -3.19, "city": " Peebles "})
+    assert code == 200 and json.loads(body)["lat"] == 55.65 and json.loads(body)["city"] == "Peebles"
+    code, _, body = call(base, "/api/decisions")
+    assert json.loads(body)[OTHER_ID]["lon"] == -3.19
+    code, _, body = call(base, "/api/decisions", "POST", {"id": OTHER_ID, "lat": 1.0})
+    assert code == 400 and "together" in json.loads(body)["error"]
+    code, _, body = call(base, "/api/decisions", "POST", {"id": OTHER_ID, "lat": 91.0, "lon": 0.0})
+    assert code == 400
+    code, _, body = call(base, "/api/decisions", "POST", {"id": OTHER_ID, "lat": None, "lon": None})
+    assert code == 200 and json.loads(body)["lat"] is None and json.loads(body)["city"] == ""
+
+
 def test_connection_burst_all_accepted(site):
     """Six <video> tags plus thumbnails connect in one burst. With Python's default
     backlog of 5 (< 3.13) macOS resets the overflow, and a reset media request leaves
