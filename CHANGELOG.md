@@ -84,6 +84,22 @@ on the shape; where they differed the doc says why).
   also takes down the receipt's old stack; child asset ids compared;
   single-file groups are tags-only; tags the API did not return fail the run.
 
+### Added, same day — immy mirrors Immich's transcode policy
+
+- `immy process` reads the server's live `ffmpeg` block
+  (`GET /api/system-config`) and pre-encodes exactly the videos Immich
+  would otherwise transcode: codec/audio/pixel-format/container under
+  `required`, plus size under `optimal`, plus bitrate under `bitrate`
+  (`video.TranscodePolicy`, `immich_transcode_reason`, mirrors
+  media.service.ts v3.3.1). n5 accepts h264/hevc/av1, so a 2.9K H.264
+  dashcam file or an AV1 drone re-encode is left alone where the old
+  built-in rule (h264 ≤ 720p only) would have re-encoded it. Offline or
+  unreachable → the old rule, byte-identical. `immy doctor` prints the
+  policy and warns when the server accepts more than the offline rule.
+- Camera children carry GPS too (immy's audit flags a video without GPS as
+  HIGH; the owner wants every file placed). `STAMP_VERSION` in the receipt:
+  a bump re-stamps with exiftool instead of re-rendering.
+
 ### Live pilot (n5, Immich 3.3.1)
 
 - 55 kept events rendered (54 GB, 35 with GPS tracks); `promote` into the

@@ -36,7 +36,7 @@ Photos.app → rsync batches to n5 `staging/photos/ready/`, per-UUID retry ledge
 incomplete assets fall back to Photos.app AppleScript originals export) ·
 `similar` (image→image search on Immich's CLIP index: find the library shot a re-shared
 photo came from) · `status <trip>` (marker/journal/offline/derivatives/heartbeat summary) ·
-`doctor` (read-only preflight: binaries, paths, Immich API, Postgres
+`doctor` (read-only preflight: binaries, paths, Immich API + its live transcode policy, Postgres
 schema, CLIP dim) · `stacks apply <folder>` (manifest-driven Immich stacks via the API + SQL tag
 links + `id-changed` receipt; consumes `teslacam render` output) ·
 `snapshot` / `find-duplicates` / `repair-thumbs`.
