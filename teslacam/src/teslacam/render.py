@@ -12,7 +12,7 @@ Per event (relative to `<render_root>/<YYYY>-tesla-dashcam/<slug>/`):
 Folder root: stacks.json manifest for `immy stacks apply`.
 
 Metadata is baked into every mp4 with exiftool (date+offset, Make/Model,
-description; GPS on the mosaic only) so Immich reads it from the container.
+description, GPS on every file) so Immich reads it from the container.
 """
 
 from __future__ import annotations
@@ -35,6 +35,7 @@ from .decisions import Decision, effective
 from .model import CAMERAS, Event, Segment
 
 RENDER_VERSION = "v2"   # v2: children cut at keyframes instead of whole segments
+STAMP_VERSION = 2       # 2: GPS on every file, not only the mosaic (a bump re-stamps, no re-encode)
 MOSAIC_ROWS = 720
 MOSAIC_BITRATE = "4M"
 MOSAIC_FPS = 30
@@ -465,7 +466,7 @@ def is_done(job: Job, model: str | None = None) -> bool:
     r = _receipt(job)
     if r is None:
         return False
-    return model is None or r.get("model", "") == model
+    return r.get("stamp") == STAMP_VERSION and (model is None or r.get("model", "") == model)
 
 
 def restamp_job(job: Job, rec: dict, *, model: str) -> dict:
@@ -473,8 +474,8 @@ def restamp_job(job: Job, rec: dict, *, model: str) -> dict:
     the receipt and the receipt itself (tags carry the model). No re-encode."""
     stamp(job, job.out_dir / rec["primary"].split("/", 1)[1], start_t=job.a, gps=True, model=model)
     for c in rec["children"]:
-        stamp(job, job.out_dir / c.split("/", 1)[1], start_t=job.a, gps=False, model=model)
-    rec = {**rec, "model": model, "tags": tags_for(job, model),
+        stamp(job, job.out_dir / c.split("/", 1)[1], start_t=job.a, gps=True, model=model)
+    rec = {**rec, "model": model, "stamp": STAMP_VERSION, "tags": tags_for(job, model),
            "restamped_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
     (job.out_dir / "render.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1))
     return rec
@@ -482,8 +483,9 @@ def restamp_job(job: Job, rec: dict, *, model: str) -> dict:
 
 def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) -> dict:
     fresh = _receipt(job)
-    if fresh is not None and fresh.get("model", "") != model:
-        log(f"    re-stamp  model {fresh.get('model', '') or '—'!r} → {model or '—'!r}")
+    if fresh is not None and (fresh.get("model", "") != model or fresh.get("stamp") != STAMP_VERSION):
+        log(f"    re-stamp  model {fresh.get('model', '') or '—'!r} → {model or '—'!r}, "
+            f"stamp v{fresh.get('stamp', 1)} → v{STAMP_VERSION}")
         return restamp_job(job, fresh, model=model)
     job.out_dir.mkdir(parents=True, exist_ok=True)
     tmp = Path(tempfile.mkdtemp(prefix="teslacam-", dir=str(job.folder)))
@@ -504,7 +506,7 @@ def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) 
                 out.unlink(missing_ok=True)
                 continue
             # same CreationDate as the mosaic so the stack never splits across days
-            stamp(job, out, start_t=job.a, gps=False, model=model)
+            stamp(job, out, start_t=job.a, gps=True, model=model)
             children.append(f"{job.slug}/{cam}.mp4")
             covered[cam] = [sa, sb]
         # stale outputs from a previous camera choice
@@ -519,7 +521,7 @@ def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) 
         rec = {"schema": 1, "version": RENDER_VERSION, "digest": job.digest, "key": job.ev.id,
                "event": job.ev.id, "slug": job.slug, "window": [job.a, job.b],
                "snapped": [job.snap_a, job.snap_b], "covered": covered, "precise": job.decision.precise,
-               "primary": f"{job.slug}/mosaic.mp4", "children": children, "model": model,
+               "primary": f"{job.slug}/mosaic.mp4", "children": children, "model": model, "stamp": STAMP_VERSION,
                "tags": tags_for(job, model), "archive": job.decision.archive, "track": has_track,
                "rendered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
         (job.out_dir / "render.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1))

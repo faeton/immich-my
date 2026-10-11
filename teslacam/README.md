@@ -45,7 +45,7 @@ uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write
   re-encodes to the exact range), `track.gpx`/`track.json` from SEI,
   `event.json`, and a `render.json` receipt. Metadata is baked into every mp4
   with exiftool: `Keys:CreationDate` local+offset, `QuickTime:CreateDate` UTC,
-  Make/Model, description; GPS on the mosaic only. The folder's `stacks.json`
+  Make/Model, description and GPS on every file. The folder's `stacks.json`
   lists primary, children, tags and the archive flag per event. Idempotent:
   the receipt's digest (segments + decision + renderer version) skips
   unchanged events; a dropped event's folder is reported and removed with

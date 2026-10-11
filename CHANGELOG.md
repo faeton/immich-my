@@ -33,7 +33,7 @@ on the shape; where they differed the doc says why).
   in point; wall-clock subtitle track with the event marker; `precise`
   re-encodes to the frame), `track.gpx/json` from
   SEI, baked `Keys:CreationDate`+offset / UTC `CreateDate` / Make / Model /
-  description (GPS on the mosaic only), a `render.json` receipt (digest of
+  description and GPS on every file, a `render.json` receipt (digest of
   segments + decision + renderer version → idempotent) and `stacks.json`.
   Default window: Saved `[trigger−180 s, +30 s]`, Sentry `±60 s`, drives
   whole. Folder names are `<kind>-<car folder stamp>`: in an external

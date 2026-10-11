@@ -96,7 +96,11 @@ def test_render_pilot(dumps):
     assert "37.17" in tags["GPSCoordinates"] and "#crash" in tags["Description"] and "pilot" in tags["Description"]
     child_tags = json.loads(subprocess.run(["exiftool", "-j", "-n", "-Keys:GPSCoordinates", "-Keys:CreationDate",
                                             str(out / "front.mp4")], capture_output=True, text=True).stdout)[0]
-    assert "GPSCoordinates" not in child_tags and child_tags["CreationDate"] == tags["CreationDate"]
+    # children carry the same date AND the same GPS: immy's audit treats a
+    # video without GPS as a HIGH finding, and the owner wants every file placed
+    assert child_tags["GPSCoordinates"] == tags["GPSCoordinates"]
+    assert child_tags["CreationDate"] == tags["CreationDate"]
+    assert rec["stamp"] == render_mod.STAMP_VERSION
     # manifest + idempotency
     man = json.loads(render_mod.write_manifest(job.folder, {eid}, album="Tesla Dashcam").read_text())
     g = man["groups"][0]
