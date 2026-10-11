@@ -437,6 +437,10 @@ class RangeHandler(http.server.BaseHTTPRequestHandler):
 class _Server(http.server.ThreadingHTTPServer):
     allow_reuse_address = True
     daemon_threads = True
+    # Python < 3.13 listens with a backlog of 5; macOS RESETS connections beyond it
+    # instead of queueing them. Six <video> tags plus thumbnails open more than that in
+    # one burst, and a reset media request leaves the player stalled.
+    request_queue_size = 128
 
     def handle_error(self, request, client_address):  # keep the terminal quiet on dropped sockets
         exc = sys.exc_info()[1]

@@ -736,14 +736,14 @@ function buildTiles(){
     if(cam!==P.mainCam){
       const t=document.createElement('div'); t.className='tile'+(chosen.includes(cam)?'':' off'); t.dataset.cam=cam;
       const v=document.createElement('video'); v.muted=true; v.playsInline=true; v.preload='auto';
-      v.dataset.cam=cam; t.appendChild(v);
+      v.dataset.cam=cam; t.appendChild(v); armRetry(v);
       t.insertAdjacentHTML('beforeend',`<span class="lbl"><kbd>${i+1}</kbd> ${camName(cam)}</span>`);
       t.onclick=()=>swapMain(cam);
       side.appendChild(t); P.mainVids.push(v);
     }
     const c=document.createElement('div'); c.className='cell'+(chosen.includes(cam)?'':' off'); c.dataset.cam=cam;
     const gv=document.createElement('video'); gv.muted=true; gv.playsInline=true; gv.preload='auto';
-    gv.dataset.cam=cam; c.appendChild(gv);
+    gv.dataset.cam=cam; c.appendChild(gv); armRetry(gv);
     c.insertAdjacentHTML('beforeend',`<span class="camlabel"><kbd>${i+1}</kbd>${camName(cam)}</span>`);
     all.appendChild(c); P.gridVids.push(gv);
   });
@@ -807,7 +807,7 @@ function loadSeg(i, at=0, autoplay=true){
   for(const v of P.vids){
     const cam=v.dataset.cam, fn=seg.f[cam];
     if(fn && act.includes(v)){
-      v.style.visibility='visible'; v.src=mediaUrl(base+'/'+fn); v.playbackRate=P.speed; v.load();
+      v.style.visibility='visible'; v._retries=0; v.src=mediaUrl(base+'/'+fn); v.playbackRate=P.speed; v.load();
     } else {
       v.pause(); v.removeAttribute('src'); v.load();
       v.style.visibility = fn ? 'visible' : 'hidden';
@@ -820,6 +820,21 @@ function loadSeg(i, at=0, autoplay=true){
   if(autoplay) playAll(); else updateBar();
 }
 const liveVids=()=>modeVids().filter(v=>v.getAttribute('src'));
+/* A media request that dies mid-flight (connection reset, sleep/wake) errors the
+   element for good; reload the same src at the same position, twice at most. */
+function armRetry(v){
+  v.addEventListener('error',()=>{
+    const src=v.getAttribute('src'); if(!src) return;
+    const n=v._retries||0; if(n>=2) return; v._retries=n+1;
+    const at=v.currentTime;
+    setTimeout(()=>{
+      if(v.getAttribute('src')!==src) return;
+      v.addEventListener('loadedmetadata',()=>{ try{v.currentTime=at;}catch(_){} if(P&&P.playing) v.play().catch(()=>{}); },{once:true});
+      v.src=src; v.load();
+    },400);
+  });
+}
+armRetry(vMain);
 function playAll(){ P.playing=true; document.getElementById('bPlay').textContent='❚❚';
   liveVids().forEach(v=>v.play().catch(()=>{})); }
 function pauseAll(){ if(!P) return; P.playing=false; document.getElementById('bPlay').textContent='▶';
@@ -871,8 +886,11 @@ function tick(){
       for(let i=1;i<vs.length;i++){
         const d=vs[i].currentTime-m.currentTime;
         if(Math.abs(d)>.28 && !vs[i].seeking){ try{vs[i].currentTime=m.currentTime;}catch(_){} }
-        if(P.playing && vs[i].paused) vs[i].play().catch(()=>{});
       }
+      // A video the browser paused on its own (hidden tab, media key, a dropped
+      // request) is restarted while the page still says "playing" — the master too,
+      // otherwise the clock freezes and the button lies. Ended ones stay ended.
+      if(P.playing) for(const v of vs){ if(v.paused && !v.ended) v.play().catch(()=>{}); }
       if(P.playing && m.ended){
         if(P.seg+1<P.ev.segs.length) loadSeg(P.seg+1,0,true); else pauseAll();
       }

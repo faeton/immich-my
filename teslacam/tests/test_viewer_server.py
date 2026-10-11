@@ -237,3 +237,36 @@ def test_missing_events_file(tmp_path):
     finally:
         srv.shutdown()
         srv.server_close()
+
+
+def test_connection_burst_all_accepted(site):
+    """Six <video> tags plus thumbnails connect in one burst. With Python's default
+    backlog of 5 (< 3.13) macOS resets the overflow, and a reset media request leaves
+    the player stalled — the listen queue must be deep enough for a burst."""
+    import socket
+    from urllib.parse import urlsplit
+
+    port = urlsplit(site["base"]).port
+    results: list[str] = []
+    go = threading.Event()
+
+    def one():
+        s = socket.socket()
+        s.settimeout(5)
+        go.wait()
+        try:
+            s.connect(("127.0.0.1", port))
+            s.sendall(b"GET /api/decisions HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+            results.append("ok" if s.recv(64).startswith(b"HTTP/1.1 200") else "bad")
+        except OSError as e:
+            results.append(type(e).__name__)
+        finally:
+            s.close()
+
+    threads = [threading.Thread(target=one) for _ in range(32)]
+    for t in threads:
+        t.start()
+    go.set()
+    for t in threads:
+        t.join()
+    assert results.count("ok") == 32, results
