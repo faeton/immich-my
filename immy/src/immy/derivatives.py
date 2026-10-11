@@ -320,6 +320,7 @@ def _video_stills_and_transcode(
     *, transcode: bool,
     derivative_source: Path | None = None,
     preproc_vf: str | None = None,
+    policy: "video_mod.TranscodePolicy | None" = None,
 ) -> tuple[list[DerivativeFile], int, int, int | None]:
     """VIDEO branch: ffprobe → poster → two stills via pyvips (+ optional
     transcode). Returns (files, width, height, duration).
@@ -377,7 +378,7 @@ def _video_stills_and_transcode(
         ),
     ]
 
-    if transcode and video_mod.needs_transcode(info):
+    if transcode and video_mod.needs_transcode(info, policy):
         rel = relative_path_for(asset_id, owner_id, "encoded_video")
         dst = base / rel
         video_mod.transcode(ffmpeg_source, dst, preproc_vf=preproc_vf)
@@ -442,6 +443,7 @@ def compute_for_asset(
     preproc_vf: str | None = None,
     mirror_from: DerivativeResult | None = None,
     staging_dir: Path | None = None,
+    transcode_policy: "video_mod.TranscodePolicy | None" = None,
 ) -> DerivativeResult:
     """Stage thumbnail + preview (and for videos, optional encoded_video)
     for one asset.
@@ -482,6 +484,7 @@ def compute_for_asset(
             transcode=transcode_videos,
             derivative_source=derivative_source,
             preproc_vf=preproc_vf,
+            policy=transcode_policy,
         )
         return DerivativeResult(files=files, width=w, height=h, duration=dur)
 

@@ -469,7 +469,6 @@ def hints(conn, owner_id: str, wanted: dict[str, datetime],
           exclude: list[str] | tuple = ()) -> dict[str, Hint]:
     """`asset id → Hint` for the assets in `wanted` (id → true instant).
     `exclude`: assets whose zone isn't evidence yet (unverified sidecars)."""
-    from .takeout_redate import parse_zone
     if not wanted:
         return {}
     ids = sorted(wanted)

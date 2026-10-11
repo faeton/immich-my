@@ -66,6 +66,102 @@ class VideoInfo:
     video_codec: str
     audio_codec: str  # "" when no audio stream
     container_ext: str  # lowercased suffix incl. dot, e.g. ".mp4"
+    # What Immich's own transcode decision looks at (defaults keep older
+    # callers and tests unchanged):
+    pix_fmt: str = ""            # Immich re-encodes anything not *420p
+    bitrate: int = 0             # video stream bit/s, else the container's
+    format_name: str = ""        # ffprobe format_name, e.g. "mov,mp4,m4a,3gp,3g2,mj2"
+    format_long_name: str = ""   # e.g. "QuickTime / MOV", "Matroska / WebM"
+
+
+@dataclass(frozen=True)
+class TranscodePolicy:
+    """Immich's `ffmpeg` system config, the part that decides whether the
+    server transcodes a video (media.service.ts, v3.3.1:
+    `isVideoTranscodeRequired` / `isAudioTranscodeRequired` /
+    `isRemuxRequired`). Read live with `ImmichClient.get_system_config()`."""
+
+    transcode: str                       # disabled | all | required | optimal | bitrate
+    accepted_video_codecs: tuple[str, ...]
+    accepted_audio_codecs: tuple[str, ...]
+    accepted_containers: tuple[str, ...]
+    target_resolution: str               # "720", "1080", … or "original"
+    max_bitrate_bps: int                 # 0 = unlimited
+    target_video_codec: str = "h264"
+
+    @classmethod
+    def from_system_config(cls, config: dict) -> "TranscodePolicy":
+        f = (config or {}).get("ffmpeg") or {}
+        return cls(
+            transcode=str(f.get("transcode") or "required").lower(),
+            accepted_video_codecs=tuple(str(c).lower() for c in f.get("acceptedVideoCodecs") or ["h264"]),
+            accepted_audio_codecs=tuple(str(c).lower() for c in f.get("acceptedAudioCodecs") or ["aac", "mp3", "libopus"]),
+            accepted_containers=tuple(str(c).lower() for c in f.get("acceptedContainers") or ["mov", "ogg", "webm"]),
+            target_resolution=str(f.get("targetResolution") or "720"),
+            max_bitrate_bps=_parse_bitrate_bps(f.get("maxBitrate")),
+            target_video_codec=str(f.get("targetVideoCodec") or "h264").lower(),
+        )
+
+    def describe(self) -> str:
+        res = "original size" if self.target_resolution == "original" else f"{self.target_resolution}p"
+        return (f"{self.transcode}; accepts {'/'.join(self.accepted_video_codecs)} video, "
+                f"{'/'.join(self.accepted_audio_codecs)} audio, mp4/{'/'.join(self.accepted_containers)}; "
+                f"target {self.target_video_codec} {res}"
+                + (f", max {self.max_bitrate_bps // 1000} kbit/s" if self.max_bitrate_bps else ""))
+
+
+def _parse_bitrate_bps(value: object) -> int:
+    """Immich's `parseBitrateToBps`: '0' = unlimited, '8M' / '8000k' / plain bps."""
+    text = str(value or "0").strip().lower()
+    if not text:
+        return 0
+    try:
+        if text.endswith("m"):
+            return int(float(text[:-1]) * 1_000_000)
+        if text.endswith("k"):
+            return int(float(text[:-1]) * 1_000)
+        return int(float(text))
+    except ValueError:
+        return 0
+
+
+def _immich_container(info: VideoInfo) -> str:
+    """How media.service.ts names the container: the long name for mov/webm,
+    else the first ffprobe format name; 'mp4' is always accepted."""
+    mapping = {"QuickTime / MOV": "mov", "Matroska / WebM": "webm"}
+    if info.format_long_name in mapping:
+        return mapping[info.format_long_name]
+    if info.format_name:
+        return info.format_name.split(",")[0].strip().lower()
+    return info.container_ext.lstrip(".") or ""
+
+
+def immich_transcode_reason(info: VideoInfo, policy: TranscodePolicy) -> str:
+    """Why Immich (this policy) would transcode or remux the file; '' when it
+    would serve the original as is. Mirrors v3.3.1 media.service.ts."""
+    if policy.transcode == "disabled":
+        return ""
+    if policy.transcode == "all":
+        return "policy 'all'"
+    if info.audio_codec and info.audio_codec.lower() not in policy.accepted_audio_codecs:
+        return f"audio {info.audio_codec} not accepted"
+    if info.video_codec.lower() not in policy.accepted_video_codecs:
+        return f"video {info.video_codec} not accepted"
+    if info.pix_fmt and not info.pix_fmt.endswith("420p"):
+        return f"pixel format {info.pix_fmt} (not 4:2:0)"
+    if policy.transcode == "optimal" and policy.target_resolution != "original":
+        try:
+            target = int(policy.target_resolution)
+        except ValueError:
+            target = 0
+        if target and min(info.width, info.height) > target:
+            return f"{info.width}×{info.height} above {target}p"
+    if policy.transcode == "bitrate" and policy.max_bitrate_bps and info.bitrate > policy.max_bitrate_bps:
+        return f"bitrate {info.bitrate // 1000} kbit/s above the limit"
+    container = _immich_container(info)
+    if container and container != "mp4" and container not in policy.accepted_containers:
+        return f"container {container} would be remuxed"
+    return ""
 
 
 def _ffprobe_json(path: Path) -> dict:
@@ -145,6 +241,11 @@ def probe(path: Path) -> VideoInfo:
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
     audio_codec = str(audio.get("codec_name") or "") if audio else ""
 
+    fmt = data.get("format") or {}
+    try:
+        bitrate = int(video.get("bit_rate") or fmt.get("bit_rate") or 0)
+    except (TypeError, ValueError):
+        bitrate = 0
     return VideoInfo(
         width=width,
         height=height,
@@ -152,6 +253,10 @@ def probe(path: Path) -> VideoInfo:
         video_codec=str(video.get("codec_name") or ""),
         audio_codec=audio_codec,
         container_ext=path.suffix.lower(),
+        pix_fmt=str(video.get("pix_fmt") or ""),
+        bitrate=bitrate,
+        format_name=str(fmt.get("format_name") or ""),
+        format_long_name=str(fmt.get("format_long_name") or ""),
     )
 
 
@@ -184,14 +289,18 @@ def normalize_duration_ms(raw: Any) -> int | None:
         return None
 
 
-def needs_transcode(info: VideoInfo) -> bool:
-    """Match Immich's default `TranscodePolicy=Required` behaviour.
+def needs_transcode(info: VideoInfo, policy: TranscodePolicy | None = None) -> bool:
+    """Would Immich transcode this file? With `policy` (the server's live
+    `ffmpeg` config) the answer mirrors Immich's own decision, so `process`
+    pre-encodes exactly what the server would otherwise re-encode — and
+    leaves alone what it accepts (an AV1 or HEVC source on a server that
+    accepts those codecs, a 4K H.264 under the 'required' policy).
 
-    Skip transcode only when every axis of the source is already web-
-    playable: H.264 video, AAC-or-silent audio, mp4/mov container, and
-    not taller than our 720 px preview target. Anything else gets a
-    fresh h264/aac mp4 so the browser's `<video>` element can play it
-    without fetch+demux weirdness."""
+    Without a policy (offline, no `immich:` config) the conservative
+    built-in rule stands, unchanged: skip only when the source is H.264,
+    AAC-or-silent, mp4/mov, and not taller than 720 px."""
+    if policy is not None:
+        return bool(immich_transcode_reason(info, policy))
     if info.video_codec not in _WEB_VIDEO_CODECS:
         return True
     if info.audio_codec not in _WEB_AUDIO_CODECS:

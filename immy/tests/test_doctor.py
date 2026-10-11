@@ -65,15 +65,38 @@ def test_immich_reachable_with_import_paths():
     client = _FakeClient({
         "/api/server/about": {"version": "2.1.0"},
         "/api/libraries/L": {"name": "ext", "importPaths": ["/originals"]},
+        "/api/system-config": {"ffmpeg": {"transcode": "required", "acceptedVideoCodecs": ["h264"]}},
     })
     got = _statuses(doctor.check_immich(_immich_cfg(), client_factory=lambda: client))
-    assert got == {"immich api": doctor.OK, "immich library": doctor.OK}
+    assert got == {"immich api": doctor.OK, "immich library": doctor.OK, "immich transcode": doctor.OK}
+
+
+def test_immich_transcode_policy_wider_than_offline_rule_warns():
+    """n5 accepts hevc/av1 too: `process` reads that live, but the offline
+    fallback would still re-encode them — say so, don't fail."""
+    client = _FakeClient({
+        "/api/server/about": {"version": "3.3.1"},
+        "/api/libraries/L": {"name": "ext", "importPaths": ["/originals"]},
+        "/api/system-config": {"ffmpeg": {"transcode": "required", "targetResolution": "720",
+                                          "acceptedVideoCodecs": ["h264", "hevc", "av1"]}},
+    })
+    checks = doctor.check_immich(_immich_cfg(), client_factory=lambda: client)
+    t = next(c for c in checks if c.name == "immich transcode")
+    assert t.status == doctor.WARN and "av1/hevc" in t.detail and "resolution does not trigger" in t.detail
+    unreadable = _FakeClient({
+        "/api/server/about": {"version": "3.3.1"},
+        "/api/libraries/L": {"name": "ext", "importPaths": ["/originals"]},
+        "/api/system-config": ImmichError("403"),
+    })
+    t = next(c for c in doctor.check_immich(_immich_cfg(), client_factory=lambda: unreadable) if c.name == "immich transcode")
+    assert t.status == doctor.WARN and "unreadable" in t.detail
 
 
 def test_immich_library_without_import_paths_fails():
     client = _FakeClient({
         "/api/server/about": {"version": "2.1.0"},
         "/api/libraries/L": {"name": "ext", "importPaths": []},
+        "/api/system-config": {},
     })
     got = _statuses(doctor.check_immich(_immich_cfg(), client_factory=lambda: client))
     assert got["immich library"] == doctor.FAIL

@@ -135,7 +135,29 @@ def check_immich(config: Config, client_factory=None) -> list[Check]:
         Check("immich library", OK, f"{library.get('name', '?')} — {', '.join(paths)}") if paths
         else Check("immich library", FAIL, "library has no import paths")
     )
+    checks.append(check_transcode_policy(client))
     return checks
+
+
+def check_transcode_policy(client) -> Check:
+    """What the server would transcode, next to what immy pre-encodes.
+    `process` reads this live, so the two agree; the WARN only means the
+    offline fallback rule (h264 ≤ 720p passes) is narrower than the server's."""
+    from .immich import ImmichError
+    from .video import TranscodePolicy
+    try:
+        policy = TranscodePolicy.from_system_config(client._request("GET", "/api/system-config") or {})
+    except ImmichError as exc:
+        return Check("immich transcode", WARN, f"system-config unreadable: {str(exc)[:120]}")
+    wider = sorted(set(policy.accepted_video_codecs) - {"h264"})
+    note = policy.describe()
+    if policy.transcode in ("required", "bitrate") or policy.transcode == "disabled":
+        note += "; resolution does not trigger a transcode"
+    if wider:
+        return Check("immich transcode", WARN,
+                     note + f" — the server also accepts {'/'.join(wider)}; `process` reads this live, "
+                     "the offline rule would still re-encode them")
+    return Check("immich transcode", OK, note)
 
 
 def check_postgres(config: Config, connect=None) -> list[Check]:

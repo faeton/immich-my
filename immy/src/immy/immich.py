@@ -177,6 +177,13 @@ class ImmichClient:
         """Fire-and-forget. Immich returns 204 and scans async in the background."""
         self._request("POST", f"/api/libraries/{library_id}/scan", body={})
 
+    def get_system_config(self) -> dict[str, Any]:
+        """`GET /api/system-config` — the live server settings. immy reads the
+        `ffmpeg` block (transcode policy, accepted codecs/containers, target
+        resolution, max bitrate) so `process` pre-encodes exactly the videos
+        Immich would otherwise transcode itself, and nothing else."""
+        return self._request("GET", "/api/system-config") or {}
+
     def get_jobs(self) -> dict[str, Any]:
         """`GET /api/jobs` → per-queue stats. Read before triggering a re-embed
         so the summary can show what was pending: each value has `jobCounts`

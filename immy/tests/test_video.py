@@ -108,6 +108,57 @@ def test_normalize_duration_ms_accepts_legacy_strings(raw, expected):
     assert video_mod.normalize_duration_ms(raw) == expected
 
 
+def _n5_config(**ffmpeg):
+    base = {"transcode": "required", "targetResolution": "720",
+            "acceptedVideoCodecs": ["h264", "hevc", "av1"], "acceptedAudioCodecs": ["aac", "mp3", "libopus"],
+            "acceptedContainers": ["mov", "ogg", "webm"], "targetVideoCodec": "h264", "maxBitrate": "0"}
+    base.update(ffmpeg)
+    return {"ffmpeg": base}
+
+
+def _info(w=2896, h=1876, vcodec="h264", acodec="", ext=".mp4", pix="yuv420p", bitrate=20_000_000,
+          fmt="mov,mp4,m4a,3gp,3g2,mj2", long="QuickTime / MOV"):
+    return video_mod.VideoInfo(w, h, 60.0, vcodec, acodec, ext, pix_fmt=pix, bitrate=bitrate,
+                               format_name=fmt, format_long_name=long)
+
+
+def test_transcode_policy_from_live_config_mirrors_immich():
+    """The Tesla case that motivated this: n5 runs 'required' with h264/hevc/av1
+    accepted, so a 2.9K H.264 camera file and an AV1 drone file are served as
+    is — immy must not pre-encode them. The built-in rule (no policy) would."""
+    p = video_mod.TranscodePolicy.from_system_config(_n5_config())
+    assert p.transcode == "required" and p.accepted_video_codecs == ("h264", "hevc", "av1")
+    assert p.max_bitrate_bps == 0 and "720p" in p.describe()
+    assert video_mod.needs_transcode(_info(), p) is False
+    assert video_mod.needs_transcode(_info()) is True                       # built-in rule: taller than 720
+    assert video_mod.needs_transcode(_info(vcodec="av1"), p) is False
+    assert video_mod.needs_transcode(_info(vcodec="av1")) is True
+    # what Immich WOULD still transcode under 'required'
+    assert video_mod.immich_transcode_reason(_info(vcodec="mpeg4"), p) == "video mpeg4 not accepted"
+    assert video_mod.immich_transcode_reason(_info(pix="yuv422p10le"), p).startswith("pixel format")
+    assert video_mod.immich_transcode_reason(_info(acodec="pcm_s16le"), p) == "audio pcm_s16le not accepted"
+    assert "remuxed" in video_mod.immich_transcode_reason(
+        _info(ext=".mkv", fmt="matroska,webm", long="Matroska / WebM"),
+        video_mod.TranscodePolicy.from_system_config(_n5_config(acceptedContainers=["mov"])))
+    # the other policies
+    opt = video_mod.TranscodePolicy.from_system_config(_n5_config(transcode="optimal"))
+    assert video_mod.immich_transcode_reason(_info(), opt) == "2896×1876 above 720p"
+    assert video_mod.immich_transcode_reason(_info(w=1280, h=720), opt) == ""
+    assert video_mod.immich_transcode_reason(_info(w=1920, h=1080), video_mod.TranscodePolicy.from_system_config(
+        _n5_config(transcode="optimal", targetResolution="original"))) == ""
+    br = video_mod.TranscodePolicy.from_system_config(_n5_config(transcode="bitrate", maxBitrate="8M"))
+    assert br.max_bitrate_bps == 8_000_000
+    assert "bitrate" in video_mod.immich_transcode_reason(_info(bitrate=20_000_000), br)
+    assert video_mod.immich_transcode_reason(_info(bitrate=5_000_000), br) == ""
+    assert video_mod.immich_transcode_reason(_info(), video_mod.TranscodePolicy.from_system_config(
+        _n5_config(transcode="all"))) == "policy 'all'"
+    assert video_mod.immich_transcode_reason(_info(vcodec="mpeg4"), video_mod.TranscodePolicy.from_system_config(
+        _n5_config(transcode="disabled"))) == ""
+    # defaults when the server answers nothing useful
+    d = video_mod.TranscodePolicy.from_system_config({})
+    assert d.transcode == "required" and d.accepted_video_codecs == ("h264",)
+
+
 def test_needs_transcode_matches_required_policy():
     make = lambda **kw: video_mod.VideoInfo(
         width=1280, height=720, duration_s=5.0,

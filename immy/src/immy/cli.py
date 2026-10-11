@@ -1486,6 +1486,26 @@ def _resolve_offline_library(
     return None, False
 
 
+def _fetch_transcode_policy(config):
+    """Immich's live `ffmpeg` block as a `video.TranscodePolicy`, or None (with
+    a note) when the API is not reachable — then `needs_transcode` falls back
+    to its built-in rule."""
+    from . import video as video_mod
+    if config.immich is None:
+        return None
+    try:
+        client = ImmichClient(
+            url=config.immich.url, api_key=config.immich.api_key, ssh_host=config.immich.ssh_host,
+        )
+        policy = video_mod.TranscodePolicy.from_system_config(client.get_system_config())
+    except Exception as exc:  # noqa: BLE001 — any API failure means "use the built-in rule"
+        console.print(f"  [yellow]immich transcode policy unavailable ({str(exc)[:80]}); "
+                      "using the built-in rule (h264 ≤ 720p passes)[/yellow]")
+        return None
+    console.print(f"  immich transcode policy: {policy.describe()}")
+    return policy
+
+
 def _run_one_trip(
     folder: Path,
     *,
@@ -1505,6 +1525,7 @@ def _run_one_trip(
     captioner_config,
     caption_workers: int,
     clip_model: str,
+    transcode_policy=None,
     clip_backend: str = "mlx",
     allow_mlx_clip: bool = False,
     clip_endpoint: str | None = None,
@@ -1611,6 +1632,7 @@ def _run_one_trip(
             captioner_config=captioner_config,
             caption_workers=caption_workers,
             transcode_videos=transcode_videos,
+            transcode_policy=transcode_policy,
             clip_model=clip_model,
             clip_backend=clip_backend,
             clip_endpoint=clip_endpoint,
@@ -1786,6 +1808,12 @@ def process(
 
     # Phase flags — identical across trips in the batch.
     compute = with_derivatives and config.media is not None
+    # Pre-encode exactly what the server would transcode itself: read its live
+    # ffmpeg policy (accepted codecs, target size). Offline or unreachable →
+    # the built-in conservative rule, unchanged.
+    transcode_policy = None
+    if compute and transcode_videos and not offline:
+        transcode_policy = _fetch_transcode_policy(config)
     if with_derivatives and config.media is None:
         console.print(
             "[yellow]note:[/yellow] `media:` block missing from config — "
@@ -1968,6 +1996,7 @@ def process(
                 recaption=recaption,
                 caption_fill_missing_only=captions_fill_missing,
                 transcode_videos=transcode_videos,
+                transcode_policy=transcode_policy,
                 captioner_config=captioner_config,
                 caption_workers=caption_workers,
                 clip_model=clip_model,
@@ -4963,7 +4992,7 @@ def takeout_redate(
     import json
     import sqlite3
     from collections import Counter
-    from datetime import datetime as _dt, timedelta as _td
+    from datetime import datetime as _dt
 
     from . import sidecar as sidecar_mod
     from . import takeout_redate as tr

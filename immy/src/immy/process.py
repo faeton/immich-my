@@ -522,6 +522,7 @@ def process_trip(
     captioner_config: captions_mod.CaptionerConfig | None = None,
     caption_workers: int = 1,
     transcode_videos: bool = True,
+    transcode_policy=None,   # video.TranscodePolicy from the live server, else the built-in rule
     clip_model: str = clip_mod.DEFAULT_MODEL,
     clip_backend: str = "mlx",
     clip_endpoint: str | None = None,
@@ -1000,6 +1001,7 @@ def process_trip(
                             asset_type=asset.asset_type,
                             trip_folder=trip_folder,
                             transcode_videos=transcode_videos,
+                            transcode_policy=transcode_policy,
                             derivative_source=proxy,
                             preproc_vf=dewarp,
                             mirror_from=mirror,
