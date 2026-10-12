@@ -33,6 +33,7 @@ uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write
   trigger-frame thumbnails. Duplicate event folders across dumps are skipped.
   `--exclude TeslaCam` is the default (the still-encrypted USB originals).
 - **review** serves the viewer (stdlib HTTP server with Range requests).
+  `--host tailscale` binds the tailnet address instead of loopback.
   Decisions go to `<review>/decisions-<dump>.json`: `keep`
   (unreviewed|keep|drop), `cameras` (ticked subset), `in_s`/`out_s`,
   `precise`, `tags`, `note`, `archive`. Default window: Saved

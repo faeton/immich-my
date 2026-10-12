@@ -13,6 +13,9 @@ are curated into trips and enriched (metadata, derivatives, CLIP, captions, tran
 - `teslacam/` — standalone Tesla dashcam tool (own `uv` project): scan dumps → review viewer →
   render folder + `stacks.json`; `immy promote` ships it, `immy stacks apply` stacks it. Kept out
   of immy because it re-encodes and serves a web UI. Design in `docs/TESLA-STACKS-DESIGN.md`.
+- `cull/` — review tool for any import candidates (own `uv` project): scan sources → keep/drop +
+  trip in a browser → `stage` hardlinks keepers into `trips/<trip>/<src>/…`. Holds `cull.core`
+  (HTTP/Range server, `--host tailscale`, geocache) that teslacam imports.
 - `docs/` — published design/ops docs (ARCHITECTURE, DEPLOY, CAPTIONS, TRANSCRIPTS, OFFLINE-RUNBOOK…).
 - `raw/` — personal specs + hardware notes. **gitignored** (CONSOLIDATION-PIPELINE, IMMY-ON-N5, PRIMARY-SWAP…).
 - `README.md` — human overview. `CHANGELOG.md` — dated findings + changes, newest first.

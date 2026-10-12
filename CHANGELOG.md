@@ -4,6 +4,23 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-12 — cull: review any import candidates, stage keepers into trips
+
+### Found
+
+The teslacam viewer only knows dashcam events; the gdrive leftovers (DJI
+Cine/audiq7/La Manga masters, phone videos) needed the same look-before-import
+step.
+
+### Changed
+
+- New `cull/` tool: `scan` (items = file + companions, approximate
+  time/place, proxies, Immich hints), `review` (grid by day/session, keep/drop,
+  trip, tags, note; `--host tailscale`), `stage` (hardlinks per trip with a
+  receipt, every check first), `report`.
+- teslacam's viewer server now runs on `cull.core` and gains `--host` and the
+  POST guard.
+
 ## 2026-10-12 — teslacam: cameras that stop before the minute ends
 
 ### Found
