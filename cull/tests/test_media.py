@@ -9,9 +9,10 @@ def test_probe_and_playable(tmp_path, media_tools):
     p = media.ffprobe(h264)
     assert p.codec == "h264" and (p.width, p.height) == (320, 240) and abs(p.duration - 2.0) < 0.2
     assert media.playable(p.codec, p.width, p.height, h264)
-    assert not media.playable("hevc", 320, 240, h264)
-    assert not media.playable("h264", 3840, 2160, h264)
-    assert media.playable("h264", 1080, 1920, h264)          # portrait 1080p
+    assert media.playable("hevc", 3840, 2160, h264)          # Safari / Chrome on macOS
+    assert media.playable("h264", 3840, 2160, h264)          # 4K plays as is, by byte range
+    assert not media.playable("prores", 3840, 2160, h264)
+    assert not media.playable("mpeg4", 320, 240, h264)
     assert not media.playable("h264", 320, 240, Path("a.avi"))
     assert media.ffprobe(tmp_path / "missing.mp4") is None
 

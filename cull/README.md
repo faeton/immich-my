@@ -22,8 +22,9 @@ uv run cull report --work W --dropped                                        # p
   the real capture time.
 - **Scan** reverse-geocodes GPS positions through Nominatim (network, about
   1 request/s, results cached in `_cull/geocache.json`; failed lookups are
-  retried next scan; `--no-geocode` skips it). Videos a browser cannot play
-  get an H.264 proxy; `--no-proxies` skips making them. A `--src` that is not
+  retried next scan; `--no-geocode` skips it). H.264 and HEVC masters (any
+  size) play straight from the source by byte range; only codecs a browser
+  cannot decode get an H.264 proxy; `--no-proxies` skips making them. A `--src` that is not
   an existing directory is refused (sources registered earlier that go missing
   only warn). The viewer serves `.mov` and `.lrf` as `video/mp4` (Firefox
   will not play `video/quicktime`).

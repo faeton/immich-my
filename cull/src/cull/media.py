@@ -42,10 +42,14 @@ def ffprobe(path: Path) -> Probe | None:
     return Probe(d, st.get("width"), st.get("height"), st.get("codec_name"))
 
 
+PLAYABLE_CODECS = frozenset({"h264", "hevc"})
+
+
 def playable(codec: str | None, width: int | None, height: int | None, path: Path) -> bool:
-    """H.264 up to 1080p (shorter side) in an MP4/MOV plays in every browser."""
-    return (codec == "h264" and min(width or 0, height or 0) <= 1080
-            and Path(path).suffix.lower() in PLAYABLE_EXTS)
+    """H.264 at any size, and HEVC (Safari, Chrome on macOS), in an MP4/MOV play
+    straight from the master — streamed by byte range, so review needs no proxy.
+    Proxies are only for codecs a browser cannot decode (ProRes, MPEG-4 part 2…)."""
+    return codec in PLAYABLE_CODECS and Path(path).suffix.lower() in PLAYABLE_EXTS
 
 
 def _staged(out: Path) -> Path:
