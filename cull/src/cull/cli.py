@@ -60,3 +60,22 @@ def scan(work: Path = WORK_OPT,
                   f"{sum(i['size'] for i in its) / 1e9:.1f}", str(sum(bool(i["immich"]) for i in its)),
                   str(sum(bool(i["flags"]) for i in its)), str(sum(o["src"] == name for o in doc["orphans"])))
     console.print(t)
+
+
+@app.command()
+def review(work: Path = WORK_OPT,
+           trips: Path | None = typer.Option(None, "--trips", help="Trips root, for trip-name suggestions."),
+           host: str = typer.Option("127.0.0.1", "--host", help="127.0.0.1, tailscale, or one address."),
+           port: int = typer.Option(8778, "--port")):
+    """Serve the review viewer (keep/drop, trip, tags, note)."""
+    from .core.host import HostError, resolve_host
+    from .viewer import server
+    work = work.expanduser().resolve()
+    if not (work / "_cull" / "items.json").exists():
+        raise typer.BadParameter(f"{work / '_cull' / 'items.json'} missing — run `cull scan` first")
+    try:
+        bind = resolve_host(host)
+    except HostError as e:
+        console.print(f"[red]{escape(str(e))}[/red]")
+        raise typer.Exit(2)
+    server.serve(work, trips.expanduser().resolve() if trips else None, port=port, host=bind)
