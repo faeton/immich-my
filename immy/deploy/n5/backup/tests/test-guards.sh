@@ -45,6 +45,28 @@ if grep -nE "exclude=?'?\.audit" "$HERE/../nightly-mirror.sh" >/dev/null; then
   echo "FAIL mirror-no-global-audit-exclude"; echo x >> "$FAILF"
 else echo "ok   mirror-no-global-audit-exclude"; fi
 
+# Shared scope: rsync (vv) and rclone (Drive) must select the same files.
+F="$T/scope"
+mkdir -p "$F/2024/06/.rsync-partial" "$F/2024-03-antarctica/.audit" "$F/20245"
+touch "$F/2024/06/IMG.HEIC" "$F/2024/06/IMG.HEIC.xmp" "$F/2024/06/VID.MOV" "$F/2024/06/clip.mp4" \
+      "$F/2024/06/pano.360" "$F/2024/06/.rsync-partial/p" "$F/2024/x.LRF" \
+      "$F/2024-03-antarctica/DJI.MP4" "$F/2024-03-antarctica/a.insv" "$F/2024-03-antarctica/a.LRV" \
+      "$F/2024-03-antarctica/.audit/j.yml" "$F/20245/vid.mp4"
+want="2024-03-antarctica/DJI.MP4 2024-03-antarctica/a.insv 2024/06/IMG.HEIC 2024/06/IMG.HEIC.xmp 20245/vid.mp4"
+mapfile -t rs_args < <(scope_rsync_excludes 1; for d in $(mirror_exclude_dirs originals); do printf -- '--exclude=%s/\n' "$d"; done)
+o=$(rsync -r --dry-run --out-format='%n' "${rs_args[@]}" "$F/" "$T/scope-dst/" | grep -v '/$' | sort | tr '\n' ' ' | sed 's/ $//')
+check scope-rsync 0 "$want" $? "$o"
+if command -v rclone >/dev/null; then
+  scope_rclone_filter originals 1 > "$T/scope.filter"
+  o=$(rclone lsf -R --files-only --filter-from "$T/scope.filter" "$F" 2>/dev/null | sort | tr '\n' ' ' | sed 's/ $//')
+  check scope-rclone 0 "$want" $? "$o"
+  scope_rclone_filter originals 0 > "$T/scope0.filter"
+  n=$(rclone lsf -R --files-only --filter-from "$T/scope0.filter" "$F" 2>/dev/null | wc -l | tr -d ' ')
+  check scope-rclone-full 0 8 $? "$n"
+else echo "skip scope-rclone (no rclone)"; fi
+o=$(scope_patterns x 2>/dev/null); check scope-bad-flag nz "" $? "$o"
+o=$(ci_glob 3gp); check ci-glob 0 "3[Gg][Pp]" $? "$o"
+
 SSH_CMD=ssh REMOTE=vv
 ( ssh() { return 255; }; o=$(remote_state /x 2>/dev/null); check ssh-255 nz "" $? "$o" )
 ( ssh() { echo garbage; return 0; }; o=$(remote_state /x 2>/dev/null); check ssh-garbage nz "" $? "$o" )

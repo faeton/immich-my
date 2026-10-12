@@ -30,6 +30,7 @@ build/
 *.log
 .env
 mirror.env
+gdrive.env
 .immy/
 
 # Personal notes, scratch scripts, TODO drafts. Not for publication.

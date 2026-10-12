@@ -476,7 +476,7 @@ def test_push_derivatives_rsyncs_and_inserts(no_schema_guard, tmp_path: Path, mo
     plan = promote_mod.Plan(
         folder=trip, target=Path("/tmp/out"), pairs=[], pending_high=0,
     )
-    cfg = _cfg("/volume1/faeton-immi/library")
+    cfg = _cfg("/volume1/media-catalog/library")
 
     summary = promote_mod._push_derivatives(plan, cfg)
 
@@ -485,7 +485,7 @@ def test_push_derivatives_rsyncs_and_inserts(no_schema_guard, tmp_path: Path, mo
     assert summary["rows_written"] == 2
     # Rsync source points at `.audit/derivatives/`, dst at host_root.
     assert any("derivatives" in a for a in rsync_calls[0])
-    assert rsync_calls[0][-1].startswith("/volume1/faeton-immi/library")
+    assert rsync_calls[0][-1].startswith("/volume1/media-catalog/library")
     # Two asset_file INSERTs with the expected container_root prefix.
     assert cur.execute.call_count == 2
     params = [c.args[1] for c in cur.execute.call_args_list]

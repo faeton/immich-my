@@ -42,11 +42,13 @@ _CLI_DRY_RUN="${DRY_RUN:-}"
 [ -n "$_CLI_DRY_RUN" ] && DRY_RUN="$_CLI_DRY_RUN"
 
 HC_URL="${HC_URL:-}"                                   # Healthchecks ping URL (empty = no pings)
+HC_CURL_OPTS="${HC_CURL_OPTS:-}"                       # extra curl flags for hc() (e.g. --resolve / --cacert)
+RID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"  # per-run id pairs /start with success//fail
 SSH_HOST="${SSH_HOST:-vv}"                             # ssh alias or host for the Synology
-SSH_PORT="${SSH_PORT:-2033}"
+SSH_PORT="${SSH_PORT:-22}"
 SSH_USER="${SSH_USER:-faeton}"
 SSH_KEY="${SSH_KEY:-}"                                 # optional explicit identity file
-VV_ROOT="${VV_ROOT:-/volume1/faeton-immi}"            # backup tree root on vv
+VV_ROOT="${VV_ROOT:-/volume1/immich-backup}"          # backup tree root on vv
 
 ORIGINALS="${ORIGINALS:-/mnt/tank/immich/originals}"   # external-library originals (we own these)
 MEDIA="${MEDIA:-/mnt/tank/immich/media}"               # /data root: library/profile/upload/...
@@ -76,6 +78,16 @@ MAX_DELETE="${MAX_DELETE:-200}"                        # fat-finger guard on rsy
 MIN_DUMP_BYTES="${MIN_DUMP_BYTES:-1000000}"           # sanity floor (~1 MB) for a real dump
 DRY_RUN="${DRY_RUN:-0}"
 
+# vv is space-poor (shared with another household; it filled to 100% on
+# 2026-07-13 when a post-dedup push landed ~900G of video). Mirror scope since
+# 2026-07-14: everything IRREPLACEABLE — all photos/RAW plus the named trip dirs
+# (YYYY-MM-name/, immy's drone/i360 masters) in full — but NO video under the
+# dated YYYY/ tree, which is phone video that also lives in iCloud / Google
+# Photos. SKIP_DATED_VIDEO=0 restores the full mirror — check vv capacity first.
+SKIP_DATED_VIDEO="${SKIP_DATED_VIDEO:-1}"
+BWLIMIT="${BWLIMIT:-50m}"                              # rsync --bwlimit (50 MB/s ≈ a 400 Mbps uplink)
+MIN_VV_FREE_GB="${MIN_VV_FREE_GB:-50}"                 # abort before writing if vv has less free
+
 LOCKFILE="${LOCKFILE:-$SELF_DIR/.mirror.lock}"   # beside the script (install dir must be faeton-writable)
 LOG_DIR="${LOG_DIR:-$SELF_DIR/logs}"
 KEEP_LOG_DAYS="${KEEP_LOG_DAYS:-30}"
@@ -97,7 +109,10 @@ log() { echo "[$(date +%H:%M:%S)] $*"; }
 # --- Healthchecks heartbeat -------------------------------------------------
 hc() {  # hc <path-suffix> [extra curl args...]
   [ -n "$HC_URL" ] || return 0
-  curl -fsS -m 10 --retry 3 "${HC_URL}${1}" "${@:2}" >/dev/null 2>&1 || true
+  local url="${HC_URL}${1}"
+  if [ -n "$RID" ]; then case "$1" in *\?*) url="${url}&rid=${RID}";; *) url="${url}?rid=${RID}";; esac; fi
+  # shellcheck disable=SC2086 # HC_CURL_OPTS is intentionally word-split into separate curl args
+  curl -fsS -m 10 --retry 3 ${HC_CURL_OPTS} "${url}" "${@:2}" >/dev/null 2>&1 || true
 }
 
 # --- snapshots are created mid-run; always tear them down on exit -----------
@@ -124,6 +139,9 @@ on_exit() {
   find "$LOG_DIR" -name 'mirror-*.log' -type f -mtime "+$KEEP_LOG_DAYS" -delete 2>/dev/null || true
 }
 trap on_exit EXIT
+# Without these a SIGTERM can reach the EXIT trap with $? = 0 and ping success.
+trap 'exit 143' TERM
+trap 'exit 130' INT
 
 hc /start
 log "mirror start (DRY_RUN=$DRY_RUN) -> ${SSH_USER}@${SSH_HOST}:${VV_ROOT}"
@@ -148,8 +166,13 @@ done
 # vv reachable and target dirs writable by the ssh user
 $SSH_CMD "$REMOTE" "test -w '$VV_ROOT/originals' && test -w '$VV_ROOT/media' && test -w '$VV_ROOT/db'" \
   || { log "ERROR: vv unreachable or $VV_ROOT/{originals,media,db} not writable by $SSH_USER"; exit 1; }
+# never fill vv (it hosts someone else's data too); a stopped mirror alerts via
+# HC, a full vv breaks every vv-bound backup at once (learned 2026-07-13)
+vv_free_gb=$($SSH_CMD "$REMOTE" "df -Pk '$VV_ROOT' | awk 'NR==2{print int(\$4/1048576)}'" || echo 0)
+[ "${vv_free_gb:-0}" -ge "$MIN_VV_FREE_GB" ] \
+  || { log "ERROR: vv has only ${vv_free_gb}GB free (< ${MIN_VV_FREE_GB}GB floor); refusing to fill vv"; exit 1; }
 sudo install -d -o "${OWNER%%:*}" -g "${OWNER##*:}" "$DUMP_DIR"
-log "preflight OK"
+log "preflight OK (vv free: ${vv_free_gb}GB)"
 
 # === 1. perm self-heal: n5 originals only (fix mismatches only) =============
 log "perm-normalize $ORIGINALS -> $OWNER 755/644 ..."
@@ -164,11 +187,14 @@ log "perm-normalize: chowned $n_own, dirs->755 $n_dir, files->644 $n_file"
 # === 2. pg_dump FIRST (local), verify, write recipe, prune ==================
 DUMP="$DUMP_DIR/immich-$TS.sql.gz"
 log "pg_dumpall -> $DUMP ..."
-sudo docker exec "$PG_CONTAINER" pg_dumpall --clean --if-exists -U postgres | gzip -c > "$DUMP"
-gzip -t "$DUMP" || { log "ERROR: dump failed gzip integrity test"; exit 1; }
-dump_bytes=$(stat -c %s "$DUMP")
+# Written under a .partial name and renamed only once verified, so a reader of
+# immich-*.sql.gz (gdrive-mirror.sh) never picks up a half-written dump.
+sudo docker exec "$PG_CONTAINER" pg_dumpall --clean --if-exists -U postgres | gzip -c > "$DUMP.partial"
+gzip -t "$DUMP.partial" || { log "ERROR: dump failed gzip integrity test"; rm -f "$DUMP.partial"; exit 1; }
+dump_bytes=$(stat -c %s "$DUMP.partial")
 [ "$dump_bytes" -ge "$MIN_DUMP_BYTES" ] \
-  || { log "ERROR: dump only $dump_bytes bytes (< $MIN_DUMP_BYTES); refusing"; exit 1; }
+  || { log "ERROR: dump only $dump_bytes bytes (< $MIN_DUMP_BYTES); refusing"; rm -f "$DUMP.partial"; exit 1; }
+mv -f "$DUMP.partial" "$DUMP"
 log "dump OK ($dump_bytes bytes)"
 
 RECIPE="$DUMP_DIR/RESTORE-RECIPE.txt"
@@ -214,6 +240,10 @@ log "sqlite3 .backup $MANIFEST_DB -> $MANIFEST_COPY ..."
 # -readonly: never let this job (re)create or modify the source DB.
 sudo sqlite3 -readonly "$MANIFEST_DB" ".backup '$MANIFEST_COPY.tmp'"
 sudo chown "$OWNER" "$MANIFEST_COPY.tmp"
+# The copy inherits WAL mode; make it one self-contained file (no -wal/-shm
+# siblings left behind in the stage dir or shipped half-way).
+[ "$(sqlite3 "$MANIFEST_COPY.tmp" 'PRAGMA journal_mode=DELETE;')" = "delete" ] \
+  || { log "ERROR: could not switch manifest copy to journal_mode=DELETE"; exit 1; }
 [ "$(sqlite3 "$MANIFEST_COPY.tmp" 'PRAGMA integrity_check;')" = "ok" ] \
   || { log "ERROR: manifest backup failed integrity_check"; exit 1; }
 # An empty-but-valid DB passes integrity_check, so also require the expected
@@ -235,7 +265,7 @@ sudo zfs snapshot "$MEDIA_DS@$SNAP"
 sudo zfs snapshot "$FLASH_DS@$SNAP"
 
 RSYNC_OPTS=(-aH --delete "--max-delete=$MAX_DELETE" --partial-dir=.rsync-partial
-            --stats --human-readable -e "$SSH_CMD")
+            "--bwlimit=$BWLIMIT" --stats --human-readable -e "$SSH_CMD")
 [ "$DRY_RUN" = 1 ] && RSYNC_OPTS+=(--dry-run)
 # Per-tree excludes come from guards-lib's mirror_exclude_dirs, which the
 # empty-source guard below also counts with. `.audit/` is excluded from the
@@ -252,6 +282,15 @@ ORIG_RSYNC_OPTS=("${RSYNC_OPTS[@]}"); MEDIA_RSYNC_OPTS=("${RSYNC_OPTS[@]}"); STA
 while IFS= read -r a; do ORIG_RSYNC_OPTS+=("$a"); done < <(rsync_excludes "${EXCL_ORIGINALS[@]}")
 while IFS= read -r a; do MEDIA_RSYNC_OPTS+=("$a"); done < <(rsync_excludes "${EXCL_MEDIA[@]}")
 while IFS= read -r a; do STATE_RSYNC_OPTS+=("$a"); done < <(rsync_excludes "${EXCL_STATE[@]}")
+# Scope (guards-lib scope_patterns, shared with gdrive-mirror.sh): .lrv/.lrf
+# proxies never ship; with SKIP_DATED_VIDEO=1 neither does video under the
+# dated YYYY/ tree. Named trip dirs ship in full. --delete-excluded evicts
+# anything out of scope that ever landed on vv. media/library (uploaded phone
+# assets, small and irreplaceable) is mirrored in full regardless.
+SCOPE_ARGS="$(scope_rsync_excludes "$SKIP_DATED_VIDEO")" \
+  || { log "ERROR: could not build scope excludes (SKIP_DATED_VIDEO=$SKIP_DATED_VIDEO)"; exit 1; }
+while IFS= read -r a; do ORIG_RSYNC_OPTS+=("$a"); done <<< "$SCOPE_ARGS"
+ORIG_RSYNC_OPTS+=(--delete-excluded)
 # NOTE: deliberately NO --numeric-ids — pushing as ${SSH_USER}@vv (non-root) makes
 # files land owned by vv's own faeton, which is exactly the perm story vv wants.
 
@@ -288,7 +327,7 @@ for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
   fi
 done
 
-log "rsync originals -> vv ..."
+log "rsync originals -> vv (SKIP_DATED_VIDEO=$SKIP_DATED_VIDEO) ..."
 rsync "${ORIG_RSYNC_OPTS[@]}" "$ORIG_VIEW/" "$REMOTE:$VV_ROOT/originals/"
 
 # library = uploaded-asset originals (irreplaceable). profile + upload are small.
@@ -319,7 +358,7 @@ done
 
 # === 4. push dump + recipe to vv (AFTER files) ==============================
 log "rsync dump + recipe -> vv:db ..."
-DUMP_OPTS=(-aH --partial --stats --human-readable -e "$SSH_CMD")
+DUMP_OPTS=(-aH --partial "--bwlimit=$BWLIMIT" --stats --human-readable -e "$SSH_CMD")
 [ "$DRY_RUN" = 1 ] && DUMP_OPTS+=(--dry-run)
 rsync "${DUMP_OPTS[@]}" "$DUMP" "$RECIPE" "$REMOTE:$VV_ROOT/db/"
 

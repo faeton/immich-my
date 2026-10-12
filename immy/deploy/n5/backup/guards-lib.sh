@@ -64,3 +64,54 @@ remote_state() {
     *) echo "remote_state: unexpected reply '$out' for $dir" >&2; return 1 ;;
   esac
 }
+
+# --- mirror scope (shared by nightly-mirror.sh -> vv and gdrive-mirror.sh -> Drive)
+# One list, rendered as rsync --exclude args and as an rclone filter file, so
+# the two offsite copies cannot drift apart. Video under the dated YYYY/ tree is
+# phone video that also lives in iCloud / Google Photos; .lrv/.lrf proxies are
+# derivable from their masters. Named trip dirs (YYYY-MM-name/) ship in full.
+SCOPE_DATED_VIDEO_EXTS=(insv lrv lrf mp4 mov m4v avi mkv mts webm wmv mpg mpeg 3gp 360)
+SCOPE_PROXY_EXTS=(lrv lrf)
+
+# ci_glob EXT -> case-insensitive glob for one extension: mp4 -> [Mm][Pp]4
+ci_glob() {
+  local ext="$1" out="" c
+  local i
+  for ((i = 0; i < ${#ext}; i++)); do
+    c="${ext:i:1}"
+    if [[ "$c" =~ [a-zA-Z] ]]; then out+="[${c^^}${c,,}]"; else out+="$c"; fi
+  done
+  printf '%s' "$out"
+}
+
+# scope_patterns SKIP_DATED_VIDEO -> one exclude glob per line (rsync and rclone
+# share the glob syntax used here: leading / anchors at the tree root, ** spans dirs).
+scope_patterns() {
+  local skip="${1:-}" e
+  case "$skip" in 0|1) ;; *) echo "scope_patterns: SKIP_DATED_VIDEO must be 0 or 1, got '$skip'" >&2; return 2 ;; esac
+  for e in "${SCOPE_PROXY_EXTS[@]}"; do printf '*.%s\n' "$(ci_glob "$e")"; done
+  if [ "$skip" = 1 ]; then
+    for e in "${SCOPE_DATED_VIDEO_EXTS[@]}"; do printf '/[0-9][0-9][0-9][0-9]/**.%s\n' "$(ci_glob "$e")"; done
+  fi
+}
+
+# scope_rsync_excludes SKIP_DATED_VIDEO -> rsync args, one per line
+scope_rsync_excludes() {
+  local p out
+  out="$(scope_patterns "$1")" || return 2
+  while IFS= read -r p; do printf -- '--exclude=%s\n' "$p"; done <<< "$out"
+}
+
+# scope_rclone_filter KIND SKIP_DATED_VIDEO -> rclone --filter-from content for
+# one tree: its directory excludes (mirror_exclude_dirs), then the scope globs
+# (originals only), then an explicit include-all.
+scope_rclone_filter() {
+  local kind="$1" skip="${2:-}" d p dirs pats
+  dirs="$(mirror_exclude_dirs "$kind")" || return 2
+  while IFS= read -r d; do [ -n "$d" ] && printf -- '- %s/**\n' "$d"; done <<< "$dirs"
+  if [ "$kind" = originals ]; then
+    pats="$(scope_patterns "$skip")" || return 2
+    while IFS= read -r p; do printf -- '- %s\n' "$p"; done <<< "$pats"
+  fi
+  printf '+ **\n'
+}

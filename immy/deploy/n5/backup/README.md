@@ -88,6 +88,14 @@ sudo midclt call cronjob.query   # verify; also visible in the SCALE UI
 | `/mnt/tank/media/state/manifest.sqlite` | `sqlite3 .backup` -> staging -> rsync | `immy/manifest/` |
 | pg_dumpall + recipe | gzip, verified | `db/` |
 
+**Scope** (`SKIP_DATED_VIDEO=1`, default since 2026-07-14): vv got full once
+and is shared, so video under the dated `YYYY/` tree — phone video that also
+lives in iCloud / Google Photos — is not mirrored, and `.lrv`/`.lrf` proxies
+never are. Photos/RAW everywhere and the named trip dirs (`YYYY-MM-name/`) ship
+in full. The list lives in `guards-lib.sh` (`scope_patterns`) and is shared with
+the Drive mirror below, so both offsite copies hold the same set; a preflight
+also refuses to run when vv has less than `MIN_VV_FREE_GB` free.
+
 Upgrading an existing install: the script now needs `sudo zfs snapshot` rights
 on `flash` too, and `sqlite3` on PATH (preflight checks both). New vv dirs under
 `immy/` are created by the first live run; a `DRY_RUN=1` run reports "would
@@ -137,3 +145,50 @@ restore the latest `db/immich-*.sql.gz` into a fresh postgres (per
 Phase 2 acceptance checklist (`raw/PRIMARY-SWAP.md`), promote one tiny trip. Keep
 vv's compose tracking n5's Immich version after each upgrade so a failback never
 loads a newer dump into an older binary.
+
+## Google Drive mirror — `gdrive-mirror.sh`
+A second offsite copy of the same scope, on Google Drive, browseable in Finder
+through Google Drive for Desktop. Design: `docs/superpowers/specs/2026-10-12-gdrive-mirror-design.md`.
+
+| On Drive (`$DRIVE_ROOT`) | What | Form |
+|---|---|---|
+| `originals/` | same scope as vv | plain |
+| `media/{library,profile,upload}/` | uploaded-asset originals | plain |
+| `_private/db/` | newest `KEEP_DUMPS` dumps + `RESTORE-RECIPE.txt` | rclone crypt |
+| `_private/immy/` | `state/`, `sidecars/`, `manifest/manifest.sqlite` | rclone crypt |
+| `_history/<run>/` | whatever a sync replaced or deleted, `HISTORY_DAYS` | plain |
+| `MIRROR-STATUS.txt` | last run, result, scope | plain |
+
+It reuses the 05:00 job's dump and manifest copy (refusing a dump older than
+`MAX_DUMP_AGE_H`), so schedule it after `nightly-mirror.sh`. Google caps uploads
+at 750 GB/day: one run sends at most `MAX_TRANSFER`, and a run stopped by that
+cap is logged `SEEDING` and pinged as success; the next run resumes. The first
+seed (~2 TiB) takes 3–4 runs.
+
+Setup (on n5, as faeton):
+```sh
+# 1. a drive remote (ideally with your own Google Cloud OAuth client_id)
+rclone config                       # -> e.g. "gdrive", type drive, scope drive
+# 2. the crypt remote over <drive remote><DRIVE_ROOT>/_private
+rclone config create gdrive-dr-crypt crypt remote=gdrive:Immich-DR/_private \
+  filename_encryption=standard directory_name_encryption=true \
+  password="$(openssl rand -base64 30)" password2="$(openssl rand -base64 30)" --obscure
+#    store both passwords OUTSIDE n5 too:  rclone config show gdrive-dr-crypt
+#    (the values are obscured, not encrypted; `rclone reveal <value>` prints them)
+# 3. install beside nightly-mirror.sh (shares guards-lib.sh and logs/)
+DIR=/mnt/tank/scripts/immich-mirror
+install -m755 gdrive-mirror.sh "$DIR/"; install -m644 guards-lib.sh "$DIR/"
+cp gdrive.env.example "$DIR/gdrive.env"; $EDITOR "$DIR/gdrive.env"
+DRY_RUN=1 "$DIR/gdrive-mirror.sh"
+# 4. cron: daily 08:00, plus a monthly VERIFY run
+sudo midclt call cronjob.create '{"command": "/mnt/tank/scripts/immich-mirror/gdrive-mirror.sh",
+  "description": "Immich DR mirror n5->Google Drive", "enabled": true, "stdout": false,
+  "stderr": false, "user": "faeton", "schedule": {"minute":"0","hour":"8","dom":"*","month":"*","dow":"*"}}'
+```
+`VERIFY=1` runs `rclone check --one-way` (Drive MD5 vs a local hash of the whole
+scope — hours of disk reads) after the sync; do it monthly, not nightly.
+
+On the Mac, install Google Drive for Desktop only after a clean `VERIFY=1` run.
+Use streaming mode, never mark `Immich-DR` "available offline", and never save
+into it: n5 is the only writer (a Finder deletion is undone by the next sync,
+and the old copy is in `_history/`). Quick Look on a video downloads all of it.
