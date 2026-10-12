@@ -135,7 +135,9 @@ def scan(work: Path, srcs=(), *, immich=None, geocode: bool = True, proxies: boo
     present = {g.id for g, _ in groups}
     missing = {n for n, r in sources.items() if not Path(r).is_dir()}
     write_json_atomic(cd / "probe-cache.json",
-                      {k: v for k, v in cache.items() if k in present or k.split("/", 1)[0] in missing})
+                      {k: v for k, v in cache.items()
+                       if "unreadable" not in v["data"]["flags"]  # re-probed every scan: may be a transient failure
+                       and (k in present or k.split("/", 1)[0] in missing)})
     geo = GeoCache(cd / "geocache.json", agent=AGENT) if geocode else None
     out = [_item(g, root, fps[g.id], cache[g.id]["data"], cd, geo, proxies, log, n, len(groups))
            for n, (g, root) in enumerate(groups, 1)]

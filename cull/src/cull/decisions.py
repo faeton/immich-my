@@ -69,7 +69,7 @@ def _check(patch: dict, existing_trips: set[str]) -> dict:
     if "trip" in patch:
         t = patch["trip"]
         if t is not None:
-            if not isinstance(t, str) or not (t in existing_trips or TRIP_RE.match(t)):
+            if not isinstance(t, str) or not (t in existing_trips or TRIP_RE.fullmatch(t)):
                 raise ValueError("trip must be an existing trip folder or look like YYYY-MM-place")
         out["trip"] = t
     if "tags" in patch:

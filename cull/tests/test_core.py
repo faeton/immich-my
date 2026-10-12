@@ -43,6 +43,7 @@ def site(tmp_path):
     base.mkdir()
     (base / "clip.mp4").write_bytes(BLOB)
     (base / "x.LRF").write_bytes(BLOB)
+    (base / "x.MOV").write_bytes(BLOB)
     (tmp_path / "outside.txt").write_text("no")
     srv = QuietServer(("127.0.0.1", 0), functools.partial(EchoHandler, base=base))
     threading.Thread(target=srv.serve_forever, daemon=True).start()
@@ -174,3 +175,23 @@ def test_interfaces_parses_macos_ifconfig(monkeypatch):
     monkeypatch.setattr(host_mod.shutil, "which", lambda n: None)
     monkeypatch.setattr(host_mod, "_run", lambda cmd: out)
     assert host_mod.interfaces() == [("lo0", "127.0.0.1"), ("utun4", "100.80.1.2")]
+
+
+def test_mov_is_served_as_mp4(site):
+    code, hdr, _ = call(site + "/x.MOV")
+    assert code == 200 and hdr["Content-Type"] == "video/mp4"
+
+
+def test_geo_failure_is_not_cached_and_still_sleeps(tmp_path, monkeypatch):
+    import urllib.request
+
+    from cull.core import geo
+    slept = []
+    monkeypatch.setattr("time.sleep", slept.append)
+
+    def boom(*a, **k):
+        raise OSError("down")
+    monkeypatch.setattr(urllib.request, "urlopen", boom)
+    g = geo.GeoCache(tmp_path / "g.json")
+    assert g.lookup(50.0, 30.0) is None
+    assert g.data == {} and not g.dirty and slept == [1.1]

@@ -1,4 +1,4 @@
-"""Reverse geocoding: one polite Nominatim lookup per ~1 km cell, cached."""
+"""Reverse geocoding: one polite Nominatim lookup per ~110 m cell, cached."""
 
 from __future__ import annotations
 
@@ -31,7 +31,10 @@ class GeoCache:
         key = self.key(lat, lon)
         if key in self.data:
             return self.data[key]
-        city = nominatim_city(lat, lon, agent=self.agent)
+        try:
+            city = _fetch_city(lat, lon, self.agent)
+        except Exception:  # network/parse failure: leave the cell uncached so a later scan retries
+            return None
         self.data[key] = city
         self.dirty = True
         return city
@@ -45,8 +48,8 @@ class GeoCache:
             self.dirty = False
 
 
-def nominatim_city(lat: float, lon: float, *, agent: str = DEFAULT_AGENT) -> str | None:
-    """One polite Nominatim reverse lookup (1 req/s, personal use)."""
+def _fetch_city(lat: float, lon: float, agent: str) -> str | None:
+    """One Nominatim reverse lookup (1 req/s: sleeps after the call, success or not)."""
     import time
     import urllib.parse
     import urllib.request
@@ -56,9 +59,15 @@ def nominatim_city(lat: float, lon: float, *, agent: str = DEFAULT_AGENT) -> str
         req = urllib.request.Request(url, headers={"User-Agent": agent})
         j = json.loads(urllib.request.urlopen(req, timeout=15).read())
         a = j.get("address", {})
-        city = (a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
+        return (a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
                 or a.get("county") or j.get("name"))
+    finally:
         time.sleep(1.1)
-        return city
+
+
+def nominatim_city(lat: float, lon: float, *, agent: str = DEFAULT_AGENT) -> str | None:
+    """One polite Nominatim reverse lookup (1 req/s, personal use); None on any failure."""
+    try:
+        return _fetch_city(lat, lon, agent)
     except Exception:
         return None

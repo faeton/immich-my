@@ -120,7 +120,7 @@ function render(){
   const reviewed=items.filter(i=>dec[i.id].keep!=='unreviewed').length;
   const kept=items.filter(i=>dec[i.id].keep==='keep');
   $('count').textContent=`${reviewed}/${items.length} reviewed · ${kept.length} kept (${(kept.reduce((n,i)=>n+i.size,0)/1e9).toFixed(1)} GB) · ${sel.size} selected`;
-  if(curLost){
+  if(curLost&&!busy){
     if(cur!==null)show(cur);
     else{$('viewer').innerHTML='';$('info').innerHTML=''}
   }
@@ -130,8 +130,8 @@ function suggest(){
   const its=targets().map(x=>byId[x]).filter(i=>i&&i.time);
   if(!its.length)return '';
   const ym=its.map(i=>i.time.slice(0,7)).sort()[0];
-  const ex=trips.find(t=>t.startsWith(ym));
-  if(ex)return ex;
+  const ex=trips.filter(t=>t.startsWith(ym));
+  if(ex.length===1)return ex[0];
   const cnt={};
   for(const i of its)if(i.place)cnt[i.place]=(cnt[i.place]||0)+1;
   const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
@@ -164,7 +164,9 @@ function show(id){
 async function post(patch){
   const ids=targets();
   if(!ids.length)return false;
-  const r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,patch})});
+  let r;
+  try{r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,patch})})}
+  catch(_){$('err').textContent='network error — not saved';return false}
   let j=null;
   try{j=await r.json()}catch(_){}
   if(!r.ok){$('err').textContent=(j&&j.error)||`HTTP ${r.status}`;return false}
@@ -179,11 +181,12 @@ async function mark(keep){
   busy=true;
   try{
     const k=order.indexOf(cur),many=sel.size>1;
+    const fwd=order[k+1],next=fwd??order[k-1];
     if(!await post({keep}))return;
     render();
-    if(many){show(cur);return}
-    const id=order[Math.min(order.includes(cur)?k+1:k,order.length-1)];
-    if(id)pick(id);else show(cur);
+    if(many){if(cur!==null)show(cur);return}
+    const id=order.includes(fwd)?fwd:order.includes(cur)?cur:order.includes(next)?next:order[Math.min(k,order.length-1)];
+    if(id)pick(id);else{cur=null;sel=new Set();$('viewer').innerHTML='';$('info').innerHTML=''}
   }finally{busy=false}
 }
 function step(n){

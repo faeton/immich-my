@@ -253,3 +253,12 @@ def test_kept_but_missing_from_items(tmp_path):
     assert st.plan(work, trips).missing == [gone]
     r = CliRunner().invoke(app, ["stage", "--work", str(work), "--trips", str(trips)], env={"COLUMNS": "200"})
     assert r.exit_code == 1 and "no longer scanned" in r.output
+
+
+def test_cli_trips_must_be_a_directory(tmp_path):
+    work, trips, src, items = setup(tmp_path)
+    nope = tmp_path / "nope"
+    r = CliRunner().invoke(app, ["stage", "--work", str(work), "--trips", str(nope)])
+    assert r.exit_code == 2 and "not a directory" in r.output
+    r = CliRunner().invoke(app, ["review", "--work", str(work), "--trips", str(nope)])
+    assert r.exit_code == 2 and "not a directory" in r.output

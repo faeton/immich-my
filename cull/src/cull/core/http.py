@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+mimetypes.add_type("video/mp4", ".mov")  # Firefox will not play video/quicktime
 mimetypes.add_type("video/mp4", ".lrf")  # DJI proxy: an MP4 under another name
 mimetypes.add_type("text/plain", ".srt")
 

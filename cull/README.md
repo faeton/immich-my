@@ -20,6 +20,13 @@ uv run cull report --work W --dropped                                        # p
 - **Times** are approximate (SRT wall clock, EXIF, QuickTime as immy reads
   it, else mtime — flagged); they sort, group and name trips. immy audit owns
   the real capture time.
+- **Scan** reverse-geocodes GPS positions through Nominatim (network, about
+  1 request/s, results cached in `_cull/geocache.json`; failed lookups are
+  retried next scan; `--no-geocode` skips it). Videos a browser cannot play
+  get an H.264 proxy; `--no-proxies` skips making them. A `--src` that is not
+  an existing directory is refused (sources registered earlier that go missing
+  only warn). The viewer serves `.mov` and `.lrf` as `video/mp4` (Firefox
+  will not play `video/quicktime`).
 - **In Immich?** is a hint (time + duration or size); external-library
   checksums are path hashes, so contents cannot be compared. An Immich DB that
   fails mid-scan only produces a warning.

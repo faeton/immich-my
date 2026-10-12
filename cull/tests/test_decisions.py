@@ -75,3 +75,9 @@ def test_list_trips(tmp_path):
     (tmp_path / "file.txt").write_text("x")
     assert dec.list_trips(tmp_path) == ["2023-08-croatia"]
     assert dec.list_trips(None) == [] and dec.list_trips(tmp_path / "nope") == []
+
+
+def test_trip_name_must_fullmatch(tmp_path):
+    with pytest.raises(ValueError):
+        dec.apply(tmp_path, ITEMS, ["S/a.MP4"], {"trip": "2024-12-prague\n"}, set())
+    dec.apply(tmp_path, ITEMS, ["S/a.MP4"], {"trip": "2024-12-prague"}, set())

@@ -71,6 +71,8 @@ def review(work: Path = WORK_OPT,
     from .core.host import HostError, resolve_host
     from .viewer import server
     work = work.expanduser().resolve()
+    if trips is not None and not trips.expanduser().is_dir():
+        raise typer.BadParameter(f"--trips is not a directory: {trips}")
     if not (work / "_cull" / "items.json").exists():
         raise typer.BadParameter(f"{work / '_cull' / 'items.json'} missing — run `cull scan` first")
     try:
@@ -92,6 +94,8 @@ def stage(work: Path = WORK_OPT,
     """Hardlink kept items into <trips>/<trip>/<src>/<rel> (per trip, all checks first)."""
     from . import stage as stage_mod
     work, trips = work.expanduser().resolve(), trips.expanduser().resolve()
+    if not trips.is_dir():
+        raise typer.BadParameter(f"--trips is not a directory: {trips}")
     im = _immich(immich_config) if immich else None
     p = stage_mod.plan(work, trips, existing_paths=im.existing_paths if im else None, immich_prefix=immich_prefix)
     t = Table(title=escape(f"stage plan → {trips}"))

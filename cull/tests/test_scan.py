@@ -1,4 +1,7 @@
 import json
+import os
+
+import pytest
 
 from typer.testing import CliRunner
 
@@ -147,3 +150,35 @@ def test_geocode_uses_cache(tmp_path, media_tools):
     (work / "_cull" / "geocache.json").write_text(json.dumps({"50.236,30.463": "Kyiv"}))
     doc = _scan(work, [src], geocode=True)
     assert {i["id"]: i["place"] for i in doc["items"]}["Cine/30Jan-Gvo/DJI_0054.MP4"] == "Kyiv"
+
+
+def test_bad_src_is_refused_and_nothing_registered(tmp_path, media_tools):
+    src = build(tmp_path, media_tools)
+    work = tmp_path / "w"
+    _scan(work, [src])
+    before = (work / "_cull" / "items.json").read_text()
+    with pytest.raises(ValueError, match="nosuch"):
+        _scan(work, [tmp_path / "nosuch"])
+    afile = tmp_path / "f.txt"
+    afile.write_text("x")
+    with pytest.raises(ValueError, match="f.txt"):
+        _scan(work, [src, afile])
+    assert (work / "_cull" / "items.json").read_text() == before
+    r = CliRunner().invoke(app, ["scan", "--work", str(work), "--src", str(tmp_path / "nosuch"), "--no-geocode"])
+    assert r.exit_code != 0 and "nosuch" in r.output
+    assert json.loads((work / "_cull" / "items.json").read_text())["sources"] == {"Cine": str(src.resolve())}
+
+
+def test_unreadable_is_not_cached_and_recovers(tmp_path, media_tools):
+    src = tmp_path / "s"
+    src.mkdir()
+    bad = src / "a.MP4"
+    bad.write_bytes(b"nope")
+    work = tmp_path / "w"
+    assert "unreadable" in _scan(work, [src])["items"][0]["flags"]
+    assert json.loads((work / "_cull" / "probe-cache.json").read_text()) == {}
+    st = bad.stat()
+    bad.unlink()
+    media_tools["clip"](bad)
+    os.utime(bad, ns=(st.st_atime_ns, st.st_mtime_ns))
+    assert "unreadable" not in _scan(work, [])["items"][0]["flags"]

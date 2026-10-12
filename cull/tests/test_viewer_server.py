@@ -56,7 +56,7 @@ def test_index_items_trips(site):
 def test_odd_names_round_trip_through_media_urls(site):
     url = media_url("audiq7", ODD)
     code, hdr, body = call(site["base"], url, headers={"Range": "bytes=2-4"})
-    assert code == 206 and body == b"234" and hdr["Content-Type"] == "video/quicktime"
+    assert code == 206 and body == b"234" and hdr["Content-Type"] == "video/mp4"
 
 
 def test_media_and_work_escapes(site):

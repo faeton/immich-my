@@ -45,6 +45,8 @@ def register_sources(existing: dict[str, str], srcs: list[Path]) -> dict[str, st
         p = str(Path(s).expanduser().resolve())
         if p in by_path:
             continue
+        if not Path(p).is_dir():
+            raise ValueError(f"--src is not a directory: {s}")
         base = Path(p).name
         name, i = base, 2
         while name in out:
