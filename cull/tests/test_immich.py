@@ -52,6 +52,28 @@ def test_guessed_times_are_not_matched():
     assert c.calls == []
 
 
+def test_wall_clock_prefilter_is_a_date_range_so_midnight_matches_are_kept():
+    c = FakeConn([])
+    Immich(c).candidates({"kind": "video", "time": "2023-07-01T23:59:58", "time_kind": "wall", "duration": 2.0})
+    sql, _ = c.calls[0]
+    assert "between" in sql and "::date" in sql
+
+
+def test_video_without_duration_is_not_queried():
+    for dur in (None, 0):
+        c = FakeConn(["x"])
+        assert Immich(c).candidates({"kind": "video", "time": "2023-07-01T10:00:00", "time_kind": "wall",
+                                     "duration": dur}) == []
+        assert c.calls == []
+
+
+def test_instant_without_utc_is_not_queried():
+    c = FakeConn(["x"])
+    assert Immich(c).candidates({"kind": "photo", "time": "2023-07-01T12:00:00", "time_kind": "instant",
+                                 "utc": None, "primary_size": 1}) == []
+    assert c.calls == []
+
+
 def test_existing_paths():
     c = FakeConn(["/a"])
     assert Immich(c).existing_paths(["/a", "/b"]) == {"/a"}

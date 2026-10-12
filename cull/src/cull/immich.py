@@ -9,7 +9,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
-WALL = ('(a."localDateTime" at time zone \'UTC\')::date = %(t)s::date '
+WALL = ('(a."localDateTime" at time zone \'UTC\')::date between '
+        '(%(t)s::timestamp - make_interval(secs => %(w)s))::date and (%(t)s::timestamp + make_interval(secs => %(w)s))::date '
         'and abs(extract(epoch from (a."localDateTime" at time zone \'UTC\') - %(t)s::timestamp)) <= %(w)s')
 INSTANT = ('a."fileCreatedAt" between %(t)s::timestamptz - make_interval(secs => %(w)s) '
            'and %(t)s::timestamptz + make_interval(secs => %(w)s)')
@@ -25,7 +26,8 @@ class Immich:
         import yaml
         c = yaml.safe_load(Path(config).read_text())["pg"]
         return cls(psycopg.connect(host=c["host"], port=c["port"], user=c["user"], password=c["password"],
-                                   dbname=c["database"], connect_timeout=5, autocommit=True))
+                                   dbname=c["database"], connect_timeout=5, autocommit=True,
+                                   options="-c default_transaction_read_only=on"))
 
     def _q(self, sql: str, args: dict) -> list[str]:
         with self.conn.cursor() as cur:
@@ -37,10 +39,14 @@ class Immich:
         if kind not in ("wall", "instant") or not item.get("time"):
             return []
         video = item["kind"] == "video"
+        if kind == "instant" and not item.get("utc"):
+            return []
+        if video and not item.get("duration"):
+            return []
         when = WALL if kind == "wall" else INSTANT
         args = {"t": item["time"] if kind == "wall" else item["utc"], "w": 5 if video else 2}
         if video:
-            args["d"] = int(round((item.get("duration") or 0) * 1000))
+            args["d"] = int(round(item["duration"] * 1000))
             sql = (f'select a."originalPath" from asset a where a."deletedAt" is null and a.type = \'VIDEO\' '
                    f'and {when} and abs(coalesce(a.duration, 0) - %(d)s) <= 1000 order by 1')
         else:
