@@ -2,79 +2,203 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>cull</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>cull — review</title>
 <style>
-:root{--bg:#111;--fg:#ddd;--mut:#888;--keep:#2e7d32;--drop:#b71c1c;--sel:#ffb300;--card:#1c1c1c}
+:root{
+  --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --line:#262d3a;
+  --fg:#e6edf3; --dim:#8b98a9; --dim2:#8593a6; --accent:#58a6ff;
+  --keep:#3fb950; --drop:#f4544c; --unrev:#f0a02a; --im:#8b7ff5;
+}
 *{box-sizing:border-box}
-body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;display:grid;grid-template-columns:1fr minmax(320px,560px);height:100vh}
-#left{overflow:auto;padding:0 12px 12px}
-#right{border-left:1px solid #333;padding:10px;overflow:auto}
-header{position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:2;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
-h2{font-size:14px;margin:14px 0 4px;cursor:pointer}
-h3{font-size:12px;color:var(--mut);margin:6px 0 4px;cursor:pointer}
-.grid{display:flex;flex-wrap:wrap;gap:6px}
-.t{width:168px;background:var(--card);border:2px solid transparent;border-radius:4px;cursor:pointer}
-.t img{width:100%;height:95px;object-fit:cover;display:block;background:#000}
-.t .m{padding:2px 4px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.t.keep{border-color:var(--keep)}
-.t.drop{opacity:.35;border-color:var(--drop)}
-.t.sel{outline:2px solid var(--sel)}
-.t.cur{outline:3px solid #fff}
-.chip{display:inline-block;padding:0 4px;border-radius:3px;background:#333;margin-right:3px;font-size:10px}
-.chip.im{background:#0d47a1}.chip.warn{background:#e65100}
-#viewer video,#viewer img{width:100%;max-height:60vh;background:#000;display:block}
-button,input,select{background:#222;color:var(--fg);border:1px solid #444;border-radius:3px;padding:3px 6px;font:inherit}
-.files{font-family:ui-monospace,monospace;font-size:11px;color:var(--mut);word-break:break-all}
-.help{color:var(--mut)}
-#err{color:#ef5350}
-@media (max-width:800px){body{grid-template-columns:1fr;grid-template-rows:55vh 45vh}#right{border-left:0;border-top:1px solid #333}}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--fg);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,sans-serif}
+kbd{font:11px ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--panel2);border:1px solid var(--line);
+  border-bottom-width:2px;border-radius:4px;padding:0 4px;color:var(--dim)}
+
+header{position:sticky;top:0;z-index:50;background:rgba(14,17,22,.94);backdrop-filter:blur(12px);border-bottom:1px solid var(--line)}
+.hwrap{max-width:1700px;margin:0 auto;padding:12px 20px}
+.titlerow{display:flex;align-items:baseline;gap:14px;flex-wrap:wrap}
+h1{font-size:17px;margin:0;font-weight:650}
+.sub{color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums}
+.sub b{color:var(--fg);font-weight:600}
+.sub .k{color:var(--keep)}.sub .d{color:var(--drop)}.sub .u{color:var(--unrev)}
+.filters{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-top:10px}
+.chip{border:1px solid var(--line);background:var(--panel);color:var(--dim);padding:4px 11px;border-radius:999px;
+  cursor:pointer;font-size:12.5px;display:inline-flex;align-items:center;gap:6px;user-select:none}
+.chip:hover{border-color:var(--dim2);color:var(--fg)}
+.chip.on{background:var(--panel2);color:var(--fg);border-color:var(--dim2)}
+.sep{width:1px;height:22px;background:var(--line);margin:0 3px}
+select,input[type=text]{background:var(--panel);border:1px solid var(--line);color:var(--fg);padding:6px 10px;
+  border-radius:8px;font:12.5px inherit;font-family:inherit;outline:none}
+select:focus,input[type=text]:focus{border-color:var(--accent)}
+.btn{border:1px solid var(--line);background:var(--panel);color:var(--dim);padding:6px 12px;border-radius:8px;
+  cursor:pointer;font-size:12.5px;font-family:inherit;white-space:nowrap}
+.btn:hover{color:var(--fg);border-color:var(--dim2)}
+.btn.keep{color:var(--keep);border-color:rgba(63,185,80,.45)}.btn.keep.on{background:var(--keep);color:#0e1116}
+.btn.drop{color:var(--drop);border-color:rgba(244,84,76,.45)}.btn.drop.on{background:var(--drop);color:#0e1116}
+.btn.unrev.on{background:var(--panel2);color:var(--fg)}
+.spacer{flex:1}
+.help{color:var(--dim2);font-size:12px}
+#err{color:var(--drop);font-size:12.5px}
+
+main{max-width:1700px;margin:0 auto;padding:16px 20px 90px}
+.dayhead{display:flex;align-items:center;gap:12px;margin:24px 0 10px;padding-bottom:7px;border-bottom:1px solid var(--line);cursor:pointer}
+.dayhead:first-child{margin-top:2px}
+.dayhead h2{font-size:14px;margin:0;font-weight:600}
+.dayhead .meta{color:var(--dim);font-size:12px}
+.sesshead{color:var(--dim);font-size:12px;margin:12px 0 8px;cursor:pointer}
+.dayhead:hover h2,.sesshead:hover{color:var(--accent)}
+.grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:12px}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;overflow:hidden;cursor:pointer;position:relative;transition:.12s}
+.card:hover{border-color:var(--dim2)}
+.card.cur{border-color:var(--fg)}
+.card.sel{border-color:var(--accent);box-shadow:0 0 0 2px rgba(88,166,255,.4)}
+.card .th{position:relative;aspect-ratio:4/3;background:#000}
+.card .th img{width:100%;height:100%;object-fit:cover;display:block}
+.card .st{position:absolute;top:0;left:0;right:0;height:3px;z-index:1}
+.card.keep .st{background:var(--keep)}.card.drop .st{background:var(--drop)}
+.card.unreviewed .th::after{content:'';position:absolute;inset:0;box-shadow:inset 0 0 0 2px rgba(240,160,42,.5);pointer-events:none}
+.card.drop{opacity:.45}.card.drop:hover{opacity:.85}
+.card .tl{position:absolute;top:8px;left:8px;display:flex;gap:4px}
+.card .play{position:absolute;left:50%;top:50%;width:52px;height:52px;margin:-26px 0 0 -26px;border-radius:50%;
+  background:rgba(0,0,0,.55);border:2px solid rgba(255,255,255,.85);pointer-events:none}
+.card .play::after{content:'';position:absolute;left:19px;top:13px;border-style:solid;border-width:12px 0 12px 19px;
+  border-color:transparent transparent transparent #fff}
+.card:hover .play{background:rgba(88,166,255,.75)}
+.pill.vid{background:rgba(88,166,255,.9);color:#0e1116;font-weight:600}
+.card .tr{position:absolute;top:8px;right:8px}
+.card .br{position:absolute;bottom:8px;right:8px}
+.pill{background:rgba(0,0,0,.72);padding:1px 7px;border-radius:5px;font-size:11px;color:#dfe6ee;font-variant-numeric:tabular-nums}
+.pill.im{background:var(--im);color:#0e1116;font-weight:600}
+.pill.warn{background:var(--unrev);color:#0e1116;font-weight:600}
+.card .body{padding:8px 10px 10px}
+.card .when{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+.card .what{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
+.tag{background:var(--panel2);border:1px solid var(--line);font-size:11px;padding:0 7px;border-radius:999px;white-space:nowrap}
+.tag.trip{border-color:var(--accent);color:var(--accent)}
+.empty{color:var(--dim);text-align:center;padding:70px 0}
+
+#selbar{position:fixed;left:50%;bottom:16px;transform:translateX(-50%);z-index:60;display:none;gap:8px;align-items:center;
+  background:var(--panel2);border:1px solid var(--dim2);border-radius:12px;padding:8px 12px;box-shadow:0 8px 30px rgba(0,0,0,.5)}
+#selbar.show{display:flex}
+
+/* full-window viewer */
+#ov{position:fixed;inset:0;background:#06080c;z-index:100;display:none;flex-direction:column}
+#ov.show{display:flex}
+.pbar{display:flex;align-items:center;gap:14px;padding:8px 16px;border-bottom:1px solid var(--line);flex:none;min-width:0}
+.pbar .ttl{font-weight:600;font-size:14px;white-space:nowrap}
+.pbar .m{color:var(--dim);font-size:12.5px;font-variant-numeric:tabular-nums;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;min-width:0}
+.x{border:none;background:var(--panel);color:var(--fg);width:32px;height:32px;border-radius:8px;cursor:pointer;font-size:17px;flex:none}
+.x:hover{background:var(--panel2)}
+#stage{flex:1;min-height:0;position:relative;overflow:hidden;display:flex;align-items:center;justify-content:center;background:#000}
+#stage.zoom{overflow:auto;display:block;cursor:zoom-out}
+#stage img{max-width:100%;max-height:100%;object-fit:contain;cursor:zoom-in;display:block}
+#stage.zoom img{max-width:none;max-height:none;cursor:zoom-out}
+#stage video{width:100%;height:100%;object-fit:contain;background:#000}
+.nav{position:absolute;top:50%;transform:translateY(-50%);z-index:2;background:rgba(0,0,0,.45);border:none;color:#fff;
+  width:44px;height:72px;font-size:26px;cursor:pointer;border-radius:8px;opacity:.35}
+.nav:hover{opacity:.9}
+#prev{left:10px}#next{right:10px}
+#stage.zoom .nav{position:fixed}
+#info{position:absolute;top:10px;left:10px;z-index:3;max-width:min(560px,60%);background:rgba(14,17,22,.88);border:1px solid var(--line);
+  border-radius:10px;padding:10px 12px;font-size:12px;color:var(--dim);display:none}
+#info.show{display:block}
+#info b{color:var(--fg)}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;word-break:break-all;color:var(--dim)}
+.abar{display:flex;align-items:center;gap:8px;padding:9px 16px;border-top:1px solid var(--line);flex:none;flex-wrap:wrap}
+.abar input[type=text]{width:190px}
+.abar #note{width:260px}
 </style>
 </head>
 <body>
-<div id="left">
-  <header>
-    <select id="f">
+<header><div class="hwrap">
+  <div class="titlerow">
+    <h1>cull — review</h1>
+    <span class="sub" id="count"></span>
+    <span class="spacer"></span>
+    <span class="help">click opens · <kbd>⇧</kbd>/<kbd>⌘</kbd>-click selects · <kbd>?</kbd> keys</span>
+  </div>
+  <div class="filters">
+    <select id="f" title="filter">
       <option value="all">all</option><option value="unreviewed">unreviewed</option>
       <option value="keep">keep</option><option value="drop">drop</option>
       <option value="immich">possibly in Immich</option><option value="notrip">kept without trip</option>
       <option value="changed">changed</option><option value="flagged">flagged</option>
     </select>
+    <span class="sep"></span>
     <span id="srcs"></span>
-    <b id="count"></b> <span id="orph" class="help"></span>
-    <span class="help">k keep · d drop · u unreviewed · ←/→ · space play · j/l ±5 s · t trip · n note · shift-click range · click a day/session to select it</span>
-  </header>
-  <div id="list"></div>
+    <span class="sep"></span>
+    <span class="chip" id="kindv" data-k="video">videos</span>
+    <span class="chip" id="kindp" data-k="photo">photos</span>
+    <span class="spacer"></span>
+    <span id="orph" class="help"></span>
+    <span id="err"></span>
+  </div>
+</div></header>
+<main id="list"></main>
+
+<div id="selbar">
+  <b id="selcount"></b>
+  <button class="btn keep" id="selkeep">keep <kbd>k</kbd></button>
+  <button class="btn drop" id="seldrop">drop <kbd>d</kbd></button>
+  <input type="text" id="seltrip" list="tripnames" placeholder="trip, e.g. 2022-01-kyiv" autocomplete="off">
+  <button class="btn" id="seltripset">set trip</button>
+  <input type="text" id="seltags" placeholder="tags, comma separated">
+  <button class="btn" id="seltagadd">add tags</button>
+  <button class="btn" id="selclear">clear <kbd>esc</kbd></button>
 </div>
-<div id="right">
-  <div id="viewer"></div>
+
+<div id="ov">
+  <div class="pbar">
+    <span class="ttl" id="ovpos"></span>
+    <span class="m" id="ovmeta"></span>
+    <span class="spacer"></span>
+    <button class="btn" id="infobtn" title="details (i)">details <kbd>i</kbd></button>
+    <button class="btn" id="fsbtn" title="fullscreen (f)">fullscreen <kbd>f</kbd></button>
+    <button class="x" id="close" title="close (esc)">×</button>
+  </div>
+  <div id="stage"></div>
   <div id="info"></div>
-  <p><label>trip <input id="trip" size="28" list="tripnames" autocomplete="off"></label>
-     <button id="tripset">set</button> <button id="tripclear">clear</button></p>
-  <datalist id="tripnames"></datalist>
-  <p><label>tags <input id="tags" size="32" placeholder="comma separated"></label> <button id="tagadd">add</button></p>
-  <p><label>note <input id="note" size="40"></label> <button id="noteset">set</button></p>
-  <p id="err"></p>
+  <div class="abar">
+    <button class="btn keep" id="bkeep">keep <kbd>k</kbd></button>
+    <button class="btn drop" id="bdrop">drop <kbd>d</kbd></button>
+    <button class="btn unrev" id="bunrev">unreviewed <kbd>u</kbd></button>
+    <span class="sep"></span>
+    <input type="text" id="trip" list="tripnames" placeholder="trip" autocomplete="off">
+    <button class="btn" id="tripset">set trip <kbd>t</kbd></button>
+    <input type="text" id="tags" placeholder="add tags">
+    <button class="btn" id="tagadd">add</button>
+    <input type="text" id="note" placeholder="note">
+    <button class="btn" id="noteset">save note <kbd>n</kbd></button>
+    <span class="spacer"></span>
+    <span class="help" id="ovtags"></span>
+  </div>
 </div>
+<datalist id="tripnames"></datalist>
+
 <script>
-let items=[],dec={},trips=[],byId={},order=[],cur=null,sel=new Set(),anchor=null;
-const hidden=new Set();
+let items=[],dec={},trips=[],byId={},order=[],cur=null,sel=new Set(),anchor=null,ovOpen=false,showInfo=false,muted=true;
+const hidden=new Set(),kinds=new Set(['video','photo']);
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const dur=s=>{if(s==null)return'';s=Math.round(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
-const slug=s=>(s||'').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const slug=s=>(s||'').normalize('NFKD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const gb=n=>(n/1e9).toFixed(1)+' GB';
 
 async function load(){
   const [a,b,c]=await Promise.all(['/api/items','/api/decisions','/api/trips'].map(u=>fetch(u).then(r=>r.json())));
   items=a.items;dec=b;trips=c;byId=Object.fromEntries(items.map(i=>[i.id,i]));
   $('orph').textContent=a.orphans.length?`${a.orphans.length} orphan companion(s): cull report --orphans`:'';
-  $('srcs').innerHTML=Object.keys(a.sources).map(s=>`<label><input type="checkbox" checked data-src="${esc(s)}"> ${esc(s)}</label>`).join(' ');
+  $('srcs').innerHTML=Object.keys(a.sources).map(s=>`<span class="chip on" data-src="${esc(s)}">${esc(s)}</span>`).join(' ');
+  $('kindv').className=$('kindp').className='chip on';
   render();
-  if(order.length)pick(order[0]);
+  if(order.length)show(order[0]);
 }
 function visible(i){
   const d=dec[i.id],f=$('f').value;
-  if(hidden.has(i.src))return false;
+  if(hidden.has(i.src)||!kinds.has(i.kind))return false;
   if(f==='all')return true;
   if(f==='immich')return (i.immich||[]).length>0;
   if(f==='notrip')return d.keep==='keep'&&!d.trip;
@@ -82,24 +206,28 @@ function visible(i){
   if(f==='flagged')return i.flags.length>0;
   return d.keep===f;
 }
-function tile(id){
-  const i=byId[id],d=dec[id],ch=[];
-  if((i.immich||[]).length)ch.push('<span class="chip im">in Immich?</span>');
-  for(const f of i.flags)ch.push(`<span class="chip warn">${esc(f)}</span>`);
-  if(d.changed)ch.push('<span class="chip warn">changed</span>');
-  if(d.trip)ch.push(`<span class="chip">${esc(d.trip)}</span>`);
-  for(const t of d.tags)ch.push(`<span class="chip">#${esc(t)}</span>`);
-  return `<div class="t ${d.keep}${sel.has(id)?' sel':''}${id===cur?' cur':''}" data-id="${esc(id)}">`+
-    `<img loading="lazy" src="${esc(i.thumb||'')}" alt="">`+
-    `<div class="m">${esc((i.time||'').slice(11,16))} ${i.kind==='video'?dur(i.duration):'photo'} ${esc(i.model||'')}</div>`+
-    `<div class="m">${ch.join('')||'&nbsp;'}</div></div>`;
+function card(id){
+  const i=byId[id],d=dec[id];
+  const tl=[(i.immich||[]).length?'<span class="pill im">in Immich?</span>':'',d.changed?'<span class="pill warn">changed</span>':'',
+            ...i.flags.map(f=>`<span class="pill warn">${esc(f)}</span>`)].join('');
+  const tags=[d.trip?`<span class="tag trip">${esc(d.trip)}</span>`:'',...d.tags.map(t=>`<span class="tag">#${esc(t)}</span>`)].join('');
+  const name=i.files[0].split('/').pop();
+  return `<div class="card ${d.keep}${sel.has(id)?' sel':''}${id===cur?' cur':''}" data-id="${esc(id)}">`+
+    `<div class="th"><div class="st"></div><img loading="lazy" src="${esc(i.thumb||'')}" alt="">`+
+    (i.kind==='video'?'<div class="play"></div>':'')+
+    `<div class="tl">${tl}</div><div class="tr">${i.kind==='video'?`<span class="pill vid">VIDEO ${dur(i.duration)}</span>`:'<span class="pill">PHOTO</span>'}</div>`+
+    `<div class="br"><span class="pill">${esc(i.src)}</span></div></div>`+
+    `<div class="body"><div class="when">${esc((i.time||'?').slice(11,16))} · ${esc(i.place||i.model||'')}</div>`+
+    `<div class="what" title="${esc(i.id)}">${esc(name)}</div>`+
+    (tags||d.note?`<div class="tags">${tags}${d.note?`<span class="tag">✎ ${esc(d.note)}</span>`:''}</div>`:'')+
+    `</div></div>`;
 }
 function render(){
   const vis=items.filter(visible).sort((a,b)=>(a.time||'').localeCompare(b.time||'')||a.id.localeCompare(b.id));
   order=vis.map(i=>i.id);
   sel=new Set([...sel].filter(x=>order.includes(x)));
   const curLost=cur!==null&&!order.includes(cur);
-  if(curLost){cur=order[0]??null;if(cur===null)sel=new Set()}
+  if(curLost)cur=order[0]??null;
   const days=[];
   for(const i of vis){
     const d=(i.time||'unknown').slice(0,10);
@@ -111,23 +239,26 @@ function render(){
     S.ids.push(i.id);
     if(t!==null)S.t=t;
   }
-  $('list').innerHTML=days.map(D=>{
-    const all=D.s.flatMap(s=>s.ids);
-    return `<h2 data-ids="${esc(all.join('\n'))}">${esc(D.d)} · ${all.length}</h2>`+
-      D.s.map((S,k)=>(D.s.length>1?`<h3 data-ids="${esc(S.ids.join('\n'))}">session ${k+1} · ${S.ids.length}</h3>`:'')+
-        `<div class="grid">${S.ids.map(tile).join('')}</div>`).join('');
-  }).join('');
-  const reviewed=items.filter(i=>dec[i.id].keep!=='unreviewed').length;
-  const kept=items.filter(i=>dec[i.id].keep==='keep');
-  $('count').textContent=`${reviewed}/${items.length} reviewed · ${kept.length} kept (${(kept.reduce((n,i)=>n+i.size,0)/1e9).toFixed(1)} GB) · ${sel.size} selected`;
-  if(curLost&&!busy){
-    if(cur!==null)show(cur);
-    else{$('viewer').innerHTML='';$('info').innerHTML=''}
-  }
+  $('list').innerHTML=days.length?days.map(D=>{
+    const all=D.s.flatMap(s=>s.ids),size=all.reduce((n,x)=>n+byId[x].size,0);
+    const places=[...new Set(all.map(x=>byId[x].place).filter(Boolean))].join(', ');
+    return `<div class="dayhead" data-ids="${esc(all.join('\n'))}"><h2>${esc(D.d)}</h2>`+
+      `<span class="meta">${all.length} items · ${gb(size)}${places?' · '+esc(places):''}</span></div>`+
+      D.s.map((S,k)=>(D.s.length>1?`<div class="sesshead" data-ids="${esc(S.ids.join('\n'))}">session ${k+1} · `+
+        `${esc((byId[S.ids[0]].time||'').slice(11,16))}–${esc((byId[S.ids[S.ids.length-1]].time||'').slice(11,16))} · ${S.ids.length}</div>`:'')+
+        `<div class="grid">${S.ids.map(card).join('')}</div>`).join('');
+  }).join(''):'<div class="empty">nothing matches this filter</div>';
+  const n=s=>items.filter(i=>dec[i.id].keep===s);
+  const kept=n('keep');
+  $('count').innerHTML=`<b>${items.length}</b> items · <span class="k">${kept.length} keep (${gb(kept.reduce((a,i)=>a+i.size,0))})</span> · `+
+    `<span class="d">${n('drop').length} drop</span> · <span class="u">${n('unreviewed').length} unreviewed</span> · showing ${order.length}`;
+  $('selbar').className=sel.size&&!ovOpen?'show':'';
+  $('selcount').textContent=`${sel.size} selected`;
+  if(curLost&&!busy){if(cur===null)closeOv();else if(ovOpen)show(cur)}
 }
-function targets(){return sel.size?[...sel]:(cur?[cur]:[])}
-function suggest(){
-  const its=targets().map(x=>byId[x]).filter(i=>i&&i.time);
+function targets(){return ovOpen?(cur?[cur]:[]):(sel.size?[...sel]:(cur?[cur]:[]))}
+function suggest(ids){
+  const its=ids.map(x=>byId[x]).filter(i=>i&&i.time);
   if(!its.length)return '';
   const ym=its.map(i=>i.time.slice(0,7)).sort()[0];
   const ex=trips.filter(t=>t.startsWith(ym));
@@ -137,32 +268,62 @@ function suggest(){
   const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
   return ym+'-'+(slug(top&&top[0])||'trip');
 }
-function pick(id){sel=new Set([id]);anchor=id;show(id)}
+function fillTrips(ids){
+  $('tripnames').innerHTML=[...new Set([suggest(ids),...trips])].filter(Boolean).map(t=>`<option value="${esc(t)}">`).join('');
+}
+function pick(id){anchor=id;show(id)}
 function show(id){
   cur=id;
-  const i=byId[id],d=dec[id],v=$('viewer');
-  if(i.kind==='video')
-    v.innerHTML=i.play?`<video id="vid" src="${esc(i.play)}" controls autoplay muted playsinline></video>`
-                     :`<img src="${esc(i.thumb||'')}" alt=""><p>no proxy — run cull scan with --proxies</p>`;
-  else v.innerHTML=`<img src="${esc(i.image||i.thumb||'')}" alt="">`;
-  const where=[i.place,i.lat!=null?`${i.lat.toFixed(4)}, ${i.lon.toFixed(4)}`:''].filter(Boolean).join(' · ');
-  $('info').innerHTML=
-    `<p><b>${esc(i.id)}</b></p>`+
-    `<p>${esc(i.time||'?')} <span class="help">(${esc(i.time_src)}${i.zone?', '+esc(i.zone):''})</span> · `+
-    `${i.kind==='video'?dur(i.duration)+' · ':''}${i.width||'?'}×${i.height||'?'} ${esc(i.codec||'')} · ${(i.size/1e6).toFixed(0)} MB</p>`+
-    `<p>${esc([i.make,i.model].filter(Boolean).join(' '))} ${esc(where)}</p>`+
-    `<p>decision <b>${esc(d.keep)}</b>${d.trip?' → '+esc(d.trip):''}${d.changed?' <span class="chip warn">changed</span>':''}`+
-    `${d.tags.length?' · '+d.tags.map(t=>'#'+esc(t)).join(' '):''}${d.note?' · '+esc(d.note):''}</p>`+
-    ((i.immich||[]).length?`<p>possibly in Immich:</p><div class="files">${i.immich.map(esc).join('<br>')}</div>`:'')+
-    `<div class="files">${i.files.map(esc).join('<br>')}</div>`;
-  $('note').value=d.note||'';
-  $('trip').value=d.trip||suggest();
-  $('tripnames').innerHTML=[...new Set([suggest(),...trips])].filter(Boolean).map(t=>`<option value="${esc(t)}">`).join('');
+  if(ovOpen)paint();
   render();
-  document.querySelector('.t.cur')?.scrollIntoView({block:'nearest'});
+  document.querySelector('.card.cur')?.scrollIntoView?.({block:'nearest'});
 }
-async function post(patch){
-  const ids=targets();
+function openOv(id){ovOpen=true;$('ov').className='show';sel=new Set();cur=id;paint();render()}
+function closeOv(){
+  ovOpen=false;$('ov').className='';$('stage').innerHTML='';
+  if(document.fullscreenElement)document.exitFullscreen?.();
+  render();
+  document.querySelector('.card.cur')?.scrollIntoView?.({block:'center'});
+}
+function paint(){
+  const i=byId[cur],d=dec[cur],st=$('stage');
+  if(!i)return;
+  st.className='';
+  const nav='<button class="nav" id="prev">‹</button><button class="nav" id="next">›</button>';
+  if(i.kind==='video'&&i.play)
+    st.innerHTML=nav+`<video id="vid" src="${esc(i.play)}" controls autoplay playsinline${muted?' muted':''}></video>`;
+  else st.innerHTML=nav+`<img id="img" src="${esc(i.image||i.thumb||'')}" alt="">`;
+  const k=order.indexOf(cur);
+  $('ovpos').textContent=`${k+1} / ${order.length}`;
+  const where=[i.place,i.lat!=null?`${i.lat.toFixed(4)}, ${i.lon.toFixed(4)}`:''].filter(Boolean).join(' · ');
+  $('ovmeta').textContent=[i.files[0].split('/').pop(),i.time?i.time.replace('T',' '):'',i.kind==='video'?dur(i.duration):'',
+    `${i.width||'?'}×${i.height||'?'}`,[i.make,i.model].filter(Boolean).join(' '),where,i.src].filter(Boolean).join('  ·  ');
+  $('info').className=showInfo?'show':'';
+  $('info').innerHTML=`<div><b>${esc(i.id)}</b></div>`+
+    `<div>${esc(i.time||'?')} (${esc(i.time_src)}${i.zone?', '+esc(i.zone):''}) · ${esc(i.codec||'')} · ${(i.size/1e6).toFixed(0)} MB</div>`+
+    ((i.immich||[]).length?`<div style="margin-top:6px;color:var(--im)">possibly in Immich:</div><div class="mono">${i.immich.map(esc).join('<br>')}</div>`:'')+
+    `<div style="margin-top:6px">files:</div><div class="mono">${i.files.map(esc).join('<br>')}</div>`;
+  for(const [b,s] of [['bkeep','keep'],['bdrop','drop'],['bunrev','unreviewed']])
+    $(b).className=`btn ${s==='unreviewed'?'unrev':s}${d.keep===s?' on':''}`;
+  $('trip').value=d.trip||suggest([cur]);
+  $('note').value=d.note||'';
+  fillTrips([cur]);
+  $('ovtags').innerHTML=[d.trip?`trip <b>${esc(d.trip)}</b>`:'',d.tags.map(t=>'#'+esc(t)).join(' '),d.changed?'<span style="color:var(--unrev)">changed since review</span>':''].filter(Boolean).join(' · ');
+  if($('prev'))$('prev').onclick=e=>{e.stopPropagation();step(-1)};
+  if($('next'))$('next').onclick=e=>{e.stopPropagation();step(1)};
+  if(typeof Image!=='undefined')for(const n of [order[k+1],order[k-1]]){const x=byId[n];if(x&&x.kind==='photo'&&x.image)new Image().src=x.image}
+}
+function toggleZoom(e){
+  const st=$('stage'),img=$('img');
+  if(!img)return;
+  if(st.className==='zoom'){st.className='';return}
+  const r=img.getBoundingClientRect(),fx=(e?e.clientX-r.left:r.width/2)/r.width,fy=(e?e.clientY-r.top:r.height/2)/r.height;
+  st.className='zoom';
+  st.scrollLeft=img.naturalWidth*fx-st.clientWidth/2;
+  st.scrollTop=img.naturalHeight*fy-st.clientHeight/2;
+}
+async function post(patch,ids){
+  ids=ids||targets();
   if(!ids.length)return false;
   let r;
   try{r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,patch})})}
@@ -180,13 +341,14 @@ async function mark(keep){
   if(busy)return;
   busy=true;
   try{
-    const k=order.indexOf(cur),many=sel.size>1;
+    const many=!ovOpen&&sel.size>0;
+    const k=order.indexOf(cur);
     const fwd=order[k+1],next=fwd??order[k-1];
     if(!await post({keep}))return;
     render();
-    if(many){if(cur!==null)show(cur);return}
-    const id=order.includes(fwd)?fwd:order.includes(cur)?cur:order.includes(next)?next:order[Math.min(k,order.length-1)];
-    if(id)pick(id);else{cur=null;sel=new Set();$('viewer').innerHTML='';$('info').innerHTML=''}
+    if(many)return;
+    const id=order.includes(fwd)?fwd:order.includes(cur)&&!fwd?cur:order.includes(next)?next:order[Math.min(k,order.length-1)];
+    if(id)pick(id);else{cur=null;closeOv()}
   }finally{busy=false}
 }
 function step(n){
@@ -194,41 +356,70 @@ function step(n){
   const k=Math.max(0,Math.min(order.length-1,order.indexOf(cur)+n));
   pick(order[k]);
 }
+async function saveTrip(ids,val){if(await post({trip:val.trim()||null},ids)){ovOpen?paint():0;render()}}
+
 $('f').onchange=e=>{render();e.target.blur()};
-$('srcs').onchange=e=>{const s=e.target.dataset.src;e.target.checked?hidden.delete(s):hidden.add(s);render();e.target.blur()};
+$('srcs').onclick=e=>{const c=e.target.closest?.('[data-src]');if(!c)return;const s=c.dataset.src;
+  hidden.has(s)?hidden.delete(s):hidden.add(s);c.className='chip'+(hidden.has(s)?'':' on');render()};
+for(const id of ['kindv','kindp'])$(id).onclick=e=>{const k=e.target.dataset.k;
+  kinds.has(k)?kinds.delete(k):kinds.add(k);e.target.className='chip'+(kinds.has(k)?' on':'');render()};
 $('list').onclick=e=>{
-  const h=e.target.closest('h2,h3');
-  if(h){sel=new Set(h.dataset.ids.split('\n'));anchor=null;show(h.dataset.ids.split('\n')[0]);return}
-  const t=e.target.closest('.t');
-  if(!t)return;
-  const id=t.dataset.id;
+  const h=e.target.closest('.dayhead,.sesshead');
+  if(h){const ids=h.dataset.ids.split('\n');const all=ids.every(x=>sel.has(x));
+    for(const x of ids)all?sel.delete(x):sel.add(x);anchor=ids[0];render();return}
+  const c=e.target.closest('.card');
+  if(!c)return;
+  const id=c.dataset.id;
   if(e.shiftKey&&anchor&&order.includes(anchor)){
     const a=order.indexOf(anchor),b=order.indexOf(id);
-    sel=new Set(order.slice(Math.min(a,b),Math.max(a,b)+1));
-  }else if(e.metaKey||e.ctrlKey){sel.has(id)?sel.delete(id):sel.add(id);anchor=id}
-  else{sel=new Set([id]);anchor=id}
-  show(id);
+    for(const x of order.slice(Math.min(a,b),Math.max(a,b)+1))sel.add(x);
+    cur=id;render();
+  }else if(e.metaKey||e.ctrlKey){sel.has(id)?sel.delete(id):sel.add(id);anchor=id;cur=id;render()}
+  else if(sel.size){sel.has(id)?sel.delete(id):sel.add(id);anchor=id;cur=id;render()}
+  else{anchor=id;openOv(id)}
 };
-$('tripset').onclick=async()=>{if(await post({trip:$('trip').value.trim()||null}))show(cur)};
-$('tripclear').onclick=async()=>{if(await post({trip:null}))show(cur)};
-$('tagadd').onclick=async()=>{if(await post({add_tags:$('tags').value.split(',')})){$('tags').value='';show(cur)}};
-$('noteset').onclick=async()=>{if(await post({note:$('note').value}))show(cur)};
-for(const [inp,btn] of [['trip','tripset'],['tags','tagadd'],['note','noteset']])
-  $(inp).onkeydown=e=>{if(e.key==='Enter'){$(btn).click();e.target.blur()}else if(e.key==='Escape')e.target.blur()};
+$('selkeep').onclick=()=>mark('keep');
+$('seldrop').onclick=()=>mark('drop');
+$('selclear').onclick=()=>{sel=new Set();render()};
+$('seltrip').onfocus=()=>{fillTrips([...sel]);if(!$('seltrip').value)$('seltrip').value=suggest([...sel])};
+$('seltripset').onclick=()=>saveTrip([...sel],$('seltrip').value);
+$('seltagadd').onclick=async()=>{if(await post({add_tags:$('seltags').value.split(',')},[...sel])){$('seltags').value='';render()}};
+$('close').onclick=closeOv;
+$('infobtn').onclick=()=>{showInfo=!showInfo;$('info').className=showInfo?'show':''};
+$('fsbtn').onclick=()=>document.fullscreenElement?document.exitFullscreen?.():document.documentElement.requestFullscreen?.();
+$('stage').onclick=e=>{if(e.target.id==='img')toggleZoom(e);else if(e.target.id==='stage'&&$('stage').className==='zoom')toggleZoom()};
+$('bkeep').onclick=()=>mark('keep');
+$('bdrop').onclick=()=>mark('drop');
+$('bunrev').onclick=()=>mark('unreviewed');
+$('tripset').onclick=()=>saveTrip([cur],$('trip').value);
+$('tagadd').onclick=async()=>{if(await post({add_tags:$('tags').value.split(',')},[cur])){$('tags').value='';paint();render()}};
+$('noteset').onclick=async()=>{if(await post({note:$('note').value},[cur])){paint();render()}};
+for(const [inp,btn] of [['trip','tripset'],['tags','tagadd'],['note','noteset'],['seltrip','seltripset'],['seltags','seltagadd']])
+  $(inp).onkeydown=e=>{if(e.key==='Enter'){$(btn).click();e.target.blur()}else if(e.key==='Escape')e.target.blur();e.stopPropagation?.()};
+const KEYS='keys: k keep · d drop · u unreviewed · ←/→ previous/next · enter open · esc close/clear · f fullscreen · z or click zoom · i details · space play/pause · j/l ±5 s · m sound · t trip · n note · a select all shown';
 document.onkeydown=e=>{
-  if(e.target.matches('input,select'))return;
+  if(e.target.matches?.('input,select'))return;
   if(e.ctrlKey||e.metaKey||e.altKey)return;
   const v=$('vid');
-  if(e.key==='k')mark('keep');
-  else if(e.key==='d')mark('drop');
-  else if(e.key==='u')mark('unreviewed');
-  else if(e.key==='ArrowRight'){step(1);e.preventDefault()}
-  else if(e.key==='ArrowLeft'){step(-1);e.preventDefault()}
-  else if(e.key===' '&&v){v.paused?v.play():v.pause();e.preventDefault()}
-  else if(e.key==='j'&&v)v.currentTime=Math.max(0,v.currentTime-5);
-  else if(e.key==='l'&&v)v.currentTime+=5;
-  else if(e.key==='t'){$('trip').focus();$('trip').select();e.preventDefault()}
-  else if(e.key==='n'){$('note').focus();e.preventDefault()}
+  const key=e.key;
+  if(key==='k')mark('keep');
+  else if(key==='d')mark('drop');
+  else if(key==='u')mark('unreviewed');
+  else if(key==='ArrowRight'){step(1);e.preventDefault()}
+  else if(key==='ArrowLeft'){step(-1);e.preventDefault()}
+  else if(key==='Enter'&&!ovOpen&&cur){openOv(cur);e.preventDefault()}
+  else if(key==='Escape'){if(ovOpen)closeOv();else{sel=new Set();render()}}
+  else if(key==='f'&&ovOpen)$('fsbtn').click();
+  else if((key==='z')&&ovOpen)toggleZoom();
+  else if(key==='i'&&ovOpen)$('infobtn').click();
+  else if(key===' '&&v){v.paused?v.play():v.pause();e.preventDefault()}
+  else if(key==='j'&&v)v.currentTime=Math.max(0,v.currentTime-5);
+  else if(key==='l'&&v)v.currentTime+=5;
+  else if(key==='m'&&v){muted=!muted;v.muted=muted}
+  else if(key==='t'){(ovOpen?$('trip'):$('seltrip')).focus();e.preventDefault()}
+  else if(key==='n'&&ovOpen){$('note').focus();e.preventDefault()}
+  else if(key==='a'&&!ovOpen){sel=new Set(order);render()}
+  else if(key==='?')alert(KEYS);
 };
 load();
 </script>
