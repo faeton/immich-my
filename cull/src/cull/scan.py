@@ -121,7 +121,7 @@ def scan(work: Path, srcs=(), *, immich=None, geocode: bool = True, proxies: boo
     for name, root in sources.items():
         root = Path(root)
         if not root.is_dir():
-            log(f"[warn] source {name} is missing: {root} (its decisions are kept)")
+            log(f"warning: source {name} is missing: {root} (its decisions are kept)")
             continue
         g, o = items_mod.walk(name, root)
         groups += [(x, root) for x in g]
@@ -143,7 +143,11 @@ def scan(work: Path, srcs=(), *, immich=None, geocode: bool = True, proxies: boo
         geo.flush()
     if immich is not None:
         for it in out:
-            it["immich"] = immich.candidates(it)
+            try:
+                it["immich"] = immich.candidates(it)
+            except Exception as e:  # DB dropped mid-scan: keep the scan, skip the hints
+                log(f"warning: Immich check failed ({e}); no Immich hints for the rest of this scan")
+                break
     doc = {"schema": SCHEMA, "generated": now_iso(), "sources": sources, "items": out, "orphans": orphans}
     write_json_atomic(cd / "items.json", doc)
     return doc

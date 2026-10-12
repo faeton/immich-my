@@ -7,6 +7,7 @@ from pathlib import Path
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.table import Table
 
 from . import scan as scan_mod
@@ -24,7 +25,7 @@ def _immich(config: Path):
         from .immich import Immich
         return Immich.connect(config)
     except Exception as e:  # missing extra, unreachable DB, bad config: a warning, not a failure
-        console.print(f"[yellow]Immich DB not available ({e}); no Immich checks[/yellow]")
+        console.print(f"[yellow]Immich DB not available ({escape(str(e))}); no Immich checks[/yellow]")
         return None
 
 
@@ -43,13 +44,19 @@ def scan(work: Path = WORK_OPT,
     """Index the sources into <work>/_cull/items.json (sources are only read)."""
     work = work.expanduser().resolve()
     im = _immich(immich_config) if immich else None
-    doc = scan_mod.scan(work, src, immich=im, geocode=geocode, proxies=proxies, log=console.print)
-    t = Table(title=f"{len(doc['items'])} items → {work / '_cull' / 'items.json'}")
+    def log(msg: str) -> None:
+        console.print(f"[yellow]{escape(msg)}[/yellow]" if msg.startswith("warning:") else escape(msg))
+
+    try:
+        doc = scan_mod.scan(work, src, immich=im, geocode=geocode, proxies=proxies, log=log)
+    except ValueError as e:
+        raise typer.BadParameter(str(e)) from e
+    t = Table(title=escape(f"{len(doc['items'])} items → {work / '_cull' / 'items.json'}"))
     for col in ("source", "videos", "photos", "GB", "in Immich?", "flagged", "orphans"):
         t.add_column(col, justify="left" if col == "source" else "right")
     for name in doc["sources"]:
         its = [i for i in doc["items"] if i["src"] == name]
-        t.add_row(name, str(sum(i["kind"] == "video" for i in its)), str(sum(i["kind"] == "photo" for i in its)),
+        t.add_row(escape(name), str(sum(i["kind"] == "video" for i in its)), str(sum(i["kind"] == "photo" for i in its)),
                   f"{sum(i['size'] for i in its) / 1e9:.1f}", str(sum(bool(i["immich"]) for i in its)),
                   str(sum(bool(i["flags"]) for i in its)), str(sum(o["src"] == name for o in doc["orphans"])))
     console.print(t)
