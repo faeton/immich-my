@@ -78,12 +78,16 @@ def exif_batch(paths: list[Path]) -> dict[str, dict]:
         return {}
     if shutil.which("exiftool") is None:
         raise RuntimeError("exiftool not found on PATH (needed to read capture times)")
-    r = subprocess.run(["exiftool", "-j", "-n", "-fast", "-api", "LargeFileSupport=1", *EXIF_TAGS, "-@", "-"],
+    r = subprocess.run(["exiftool", "-j", "-n", "-fast", "-api", "LargeFileSupport=1", "-charset", "filename=utf8",
+                        *EXIF_TAGS, "-@", "-"],
                        input="\n".join(str(p) for p in paths), capture_output=True, text=True)
     try:
-        rows = json.loads(r.stdout or "[]")
+        rows = json.loads(r.stdout)
     except ValueError:
-        rows = []
+        rows = None
+    if not isinstance(rows, list):
+        # exit 1 with valid JSON means some files failed; only unparseable output is fatal
+        raise RuntimeError(f"exiftool failed (exit {r.returncode}): {r.stderr.strip()[:300]}")
     return {row["SourceFile"]: row for row in rows if "Error" not in row}
 
 

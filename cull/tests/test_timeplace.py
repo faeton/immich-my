@@ -111,3 +111,27 @@ def test_exif_batch_without_exiftool_fails_loudly(tmp_path, monkeypatch):
     monkeypatch.setattr(tp.shutil, "which", lambda n: None)
     with pytest.raises(RuntimeError, match="exiftool"):
         tp.exif_batch([tmp_path / "a.JPG"])
+
+
+def test_exif_batch_fails_when_exiftool_errors_without_json(tmp_path, monkeypatch):
+    import subprocess
+
+    fake = subprocess.CompletedProcess(args=["exiftool"], returncode=2, stdout="", stderr="boom")
+    monkeypatch.setattr(tp.subprocess, "run", lambda *a, **k: fake)
+    with pytest.raises(RuntimeError, match="boom"):
+        tp.exif_batch([tmp_path / "a.JPG"])
+
+
+def test_exif_batch_keeps_json_rows_when_exiftool_exits_nonzero(tmp_path, monkeypatch):
+    import subprocess
+
+    out = '[{"SourceFile": "/x/a.JPG", "Make": "DJI"}, {"SourceFile": "/x/b.JPG", "Error": "bad"}]'
+    fake = subprocess.CompletedProcess(args=["exiftool"], returncode=1, stdout=out, stderr="")
+    monkeypatch.setattr(tp.subprocess, "run", lambda *a, **k: fake)
+    assert tp.exif_batch([tmp_path / "a.JPG", tmp_path / "b.JPG"]) == {"/x/a.JPG": {"SourceFile": "/x/a.JPG", "Make": "DJI"}}
+
+
+def test_exif_batch_non_ascii_filename_round_trips(tmp_path, media_tools):
+    p = media_tools["jpeg"](tmp_path / "Мавік café.JPG")
+    rows = tp.exif_batch([p])
+    assert rows[str(p)]["Make"] == "DJI"
