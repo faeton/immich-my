@@ -53,8 +53,8 @@ CLI:
 ```sh
 uv run cull scan   --src DIR [--src DIR ...] --work DIR [--immich] [--no-proxies]
 uv run cull review --work DIR [--trips /mnt/tank/media/trips] [--host 127.0.0.1|tailscale|ADDR] [--port 8778]
-uv run cull stage  --work DIR --trips /mnt/tank/media/trips [--yes]
-uv run cull report --work DIR [--dropped|--kept|--unreviewed]
+uv run cull stage  --work DIR --trips /mnt/tank/media/trips [--immich] [--yes]
+uv run cull report --work DIR [--dropped|--kept|--unreviewed|--orphans]
 ```
 
 ### Host binding
@@ -63,7 +63,9 @@ uv run cull report --work DIR [--dropped|--kept|--unreviewed]
 Tailscale address: the IPv4 address in 100.64.0.0/10 on an interface named
 `tailscale*` (`tailscale0` 100.115.236.50 on n5; the host has no `tailscale`
 CLI, so the interfaces are read directly — Docker bridges or other VPNs in
-the same CGNAT range are not considered). Not exactly one such address →
+the same CGNAT range are not considered). On macOS, where the interface is
+a `utunN`, the `tailscale ip -4` CLI (on PATH or inside Tailscale.app) is
+asked instead. Not exactly one such address →
 exit with an error. `0.0.0.0` and `::` are refused; any other address is
 bound as given. The
 printed URL uses the bound address.
@@ -71,9 +73,11 @@ printed URL uses the bound address.
 The server has no login; on the Tailscale address every device on the
 tailnet can reach it, which is the trust boundary (the tailnet is the
 user's own devices). To keep a browser on another site from writing
-decisions, POSTs must carry `Content-Type: application/json`, and requests
-whose `Host` is not the bound address/port or whose `Origin` is present
-and different are rejected with 403. The same checks go into the core, so
+decisions, a POST without `Content-Type: application/json` gets 415 (a
+plain cross-site form cannot send it without a preflight the server never
+answers), and a POST whose `Origin` is present and does not match its
+`Host` gets 403. `Host` itself is not pinned: SSH tunnels and MagicDNS names
+(`http://n5:8778`) must keep working. The same checks go into the core, so
 teslacam gets them too, and `teslacam review` gains the same `--host`
 flag. Media responses use the right type for every file served, `.lrf` and
 proxies as `video/mp4`.
@@ -91,8 +95,8 @@ shoots both) or a HEIC/JPG+MOV live photo — are one item: one shot, one
 decision, all files staged; the JPG/HEIC is the preview and gives the
 metadata. A video and a still with the same stem are otherwise separate
 items. An `.lrf`/`.srt` with no master is reported as an orphan
-and not an item; orphans are listed in the grid (own filter) and in
-`cull report`. Symlinks are not followed and not staged. AppleDouble `._*` files and `.DS_Store` are ignored.
+and not an item; orphans are counted in the viewer header and listed by
+`cull report --orphans`. Symlinks are not followed and not staged. AppleDouble `._*` files and `.DS_Store` are ignored.
 
 **Sources and ids.** Each `--src` is registered once in `items.json` as
 `{name: absolute path}`; the name is the directory's basename (`-2`, `-3`
@@ -204,8 +208,11 @@ stage. Checks:
   that item;
 - a destination path that already exists must be the same inode as its
   source (then it is skipped), else stop with the conflict listed;
-- no destination path is already an Immich asset's `originalPath` (read-only
-  DB check, mapped to the container path; skipped with a warning if the DB
+- no destination is already an Immich asset: `promote` rsyncs a trip to
+  `<originals>/<trip>/`, so the destination's library path is
+  `<immich prefix>/<trip>/<path inside the trip>` (`--immich-prefix`,
+  default `/mnt/external/originals`), checked against `asset.originalPath`
+  (read-only DB check; skipped with a warning if the DB
   is down);
 - the trip's receipt (below) agrees with the decisions: an item it lists
   that is now dropped or assigned to another trip is reported as stale,
