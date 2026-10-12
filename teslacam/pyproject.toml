@@ -7,7 +7,11 @@ dependencies = [
     "typer>=0.12",
     "rich>=13.7",
     "timezonefinder>=6.5",
+    "cull",
 ]
+
+[tool.uv.sources]
+cull = { path = "../cull", editable = true }
 
 [project.scripts]
 teslacam = "teslacam.cli:app"

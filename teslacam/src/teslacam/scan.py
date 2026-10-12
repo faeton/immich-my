@@ -13,6 +13,9 @@ from pathlib import Path
 from typing import Callable
 from zoneinfo import ZoneInfo
 
+from cull.core.geo import GeoCache as _GeoCache
+from cull.core.geo import nominatim_city  # noqa: F401  (re-exported for callers of scan.nominatim_city)
+
 from . import sei as sei_mod
 from .model import (CAMERAS, DRIVE_CHAPTER_S, DRIVE_GAP_S, EVENT_DIR_RE, SEG_RE,
                     Event, Segment, parse_local, reason_slug)
@@ -236,60 +239,11 @@ def _trigger_segment_sei(root: Path, ev_dir_rel: str, segs: list[Segment], trigg
 
 # ---------- reverse geocode (opt-in, cached) ----------
 
-class GeoCache:
-    """`<review_dir>/geocache.json`: "lat,lon" (3 decimals) → city. Seeded
-    from the old `_tools/geocache.json` when present at the dumps root."""
+class GeoCache(_GeoCache):
+    """`<review_dir>/geocache.json`, seeded from the old `_tools/geocache.json`."""
 
     def __init__(self, path: Path, seed: Path | None = None):
-        self.path = path
-        self.data: dict[str, str | None] = {}
-        for p in (seed, path):
-            if p and p.exists():
-                try:
-                    self.data.update(json.loads(p.read_text()))
-                except Exception:
-                    pass
-        self.dirty = False
-
-    @staticmethod
-    def key(lat: float, lon: float) -> str:
-        return f"{lat:.3f},{lon:.3f}"
-
-    def lookup(self, lat: float, lon: float) -> str | None:
-        key = self.key(lat, lon)
-        if key in self.data:
-            return self.data[key]
-        city = nominatim_city(lat, lon)
-        self.data[key] = city
-        self.dirty = True
-        return city
-
-    def flush(self) -> None:
-        if self.dirty:
-            self.path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = self.path.with_suffix(".json.tmp")
-            tmp.write_text(json.dumps(self.data, ensure_ascii=False, indent=1))
-            tmp.replace(self.path)
-            self.dirty = False
-
-
-def nominatim_city(lat: float, lon: float) -> str | None:
-    """One polite Nominatim reverse lookup (1 req/s, personal use)."""
-    import time
-    import urllib.parse
-    import urllib.request
-    url = "https://nominatim.openstreetmap.org/reverse?" + urllib.parse.urlencode(
-        {"lat": lat, "lon": lon, "format": "json", "zoom": 10, "accept-language": "en"})
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "teslacam/0.1 (personal dashcam catalogue)"})
-        j = json.loads(urllib.request.urlopen(req, timeout=15).read())
-        a = j.get("address", {})
-        city = (a.get("city") or a.get("town") or a.get("village") or a.get("municipality")
-                or a.get("county") or j.get("name"))
-        time.sleep(1.1)
-        return city
-    except Exception:
-        return None
+        super().__init__(path, seed, agent="teslacam/0.1 (personal dashcam catalogue)")
 
 
 # ---------- thumbnails ----------

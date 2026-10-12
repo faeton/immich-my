@@ -55,14 +55,22 @@ def scan(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
 @app.command()
 def review(root: Path = ROOT_OPT, review_dir: Path | None = REVIEW_OPT,
            port: int = typer.Option(8777, "--port"),
+           host: str = typer.Option("127.0.0.1", "--host", help="127.0.0.1, tailscale, or one address."),
            open_browser: bool = typer.Option(True, "--open/--no-open")):
-    """Serve the moderation viewer (keep/drop, cameras, in/out, tags) on localhost."""
+    """Serve the moderation viewer (keep/drop, cameras, in/out, tags)."""
+    from cull.core.host import HostError, resolve_host
+
     from .viewer import server
     root = root.expanduser().resolve()
     rd = _review_dir(root, review_dir)
     if not (rd / "events.json").exists():
         raise typer.BadParameter(f"{rd / 'events.json'} missing — run `teslacam scan` first")
-    server.serve(root, rd, port=port, open_browser=open_browser)
+    try:
+        bind = resolve_host(host)
+    except HostError as e:
+        console.print(f"[red]{e}[/red]")
+        raise typer.Exit(2)
+    server.serve(root, rd, port=port, open_browser=open_browser and bind == "127.0.0.1", host=bind)
 
 
 @app.command()

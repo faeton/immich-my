@@ -284,3 +284,18 @@ def test_connection_burst_all_accepted(site):
     for t in threads:
         t.join()
     assert results.count("ok") == 32, results
+
+
+def test_post_requires_json_content_type(site):
+    req = urllib.request.Request(site["base"] + "/api/decisions", method="POST",
+                                 data=json.dumps({"id": EVENT_ID, "keep": "keep"}).encode(),
+                                 headers={"Content-Type": "text/plain"})
+    with pytest.raises(urllib.error.HTTPError) as ei:
+        urllib.request.urlopen(req, timeout=5)
+    assert ei.value.code == 415
+
+
+def test_post_cross_origin_refused(site):
+    code, _, _ = call(site["base"], "/api/decisions", "POST", {"id": EVENT_ID, "keep": "keep"},
+                      headers={"Origin": "http://evil.example"})
+    assert code == 403
