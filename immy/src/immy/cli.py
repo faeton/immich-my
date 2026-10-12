@@ -4758,10 +4758,10 @@ def triage_review_server(
     is the only thing that acts on verdicts. Foreground; Ctrl-C when done.
 
         sudo docker compose -f deploy/n5/compose.yaml run --rm \\
-          --name immy-triage-review --publish 100.115.236.50:8766:8766 \\
+          --name immy-triage-review --publish ${N5_TAILNET_IP}:8766:8766 \\
           immy triage review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 
-    then open http://n5.bee-ruffe.ts.net:8766 from anywhere on the tailnet.
+    then open http://n5.${TAILNET_DOMAIN}:8766 from anywhere on the tailnet.
     """
     from .triage import review as review_mod
 
@@ -4791,7 +4791,7 @@ def pano_server(
     in-camera previews (LRV) and full-res exports. Read-only.
 
         sudo docker compose -f deploy/n5/compose.yaml run --rm \\
-          --name immy-360-viewer --publish 100.115.236.50:8767:8767 \\
+          --name immy-360-viewer --publish ${N5_TAILNET_IP}:8767:8767 \\
           immy pano-server --host 0.0.0.0 --manifest /state/manifest.sqlite
     """
     from . import pano as pano_mod

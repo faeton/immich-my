@@ -14,16 +14,16 @@ decisions. The tool never moves, copies, or deletes a media file.
 
 Tailnet-exposed (chosen mode 2026-07-12 — reachable from any tailscale
 device, still invisible to the LAN; the publish binds only the tailscale0
-interface, `100.115.236.50`):
+interface, `${N5_TAILNET_IP}`):
 
 ```sh
 sudo docker compose -f /mnt/flash/immy/src-immy/deploy/n5/compose.yaml run --rm \
   -d --name immy-dedup-review \
-  --publish 100.115.236.50:8765:8765 \
+  --publish ${N5_TAILNET_IP}:8765:8765 \
   immy dedup review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 ```
 
-Open http://100.115.236.50:8765 (or http://n5:8765 with MagicDNS). Stop with
+Open http://${N5_TAILNET_IP}:8765 (or http://n5:8765 with MagicDNS). Stop with
 `sudo docker stop immy-dedup-review`. For the stricter localhost+ssh-tunnel
 mode, publish `127.0.0.1:8765:8765` instead and use
 `ssh -L 8765:localhost:8765 n5`.

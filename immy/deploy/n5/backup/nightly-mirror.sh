@@ -2,7 +2,7 @@
 # Nightly Immich backup mirror: n5 (TrueNAS, primary) -> vv (Synology, cold backup).
 #
 # Implements Phase 3 of raw/PRIMARY-SWAP.md. vv is a pure file+dump backup (its
-# Immich stack is down); vv<->n5 (~600 km) is the offsite leg of 3-2-1. A naive
+# Immich stack is down); vv<->n5 is the offsite leg of 3-2-1. A naive
 # rsync is not enough, so this job also:
 #   - self-heals the recurring perm disease on originals (faeton:faeton 755/644),
 #     so a faeton-run mirror never silently skips files Immich left root-locked;

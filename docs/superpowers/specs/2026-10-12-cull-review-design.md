@@ -61,7 +61,7 @@ uv run cull report --work DIR [--dropped|--kept|--unreviewed|--orphans]
 
 `--host` defaults to `127.0.0.1`. `--host tailscale` binds to this machine's
 Tailscale address: the IPv4 address in 100.64.0.0/10 on an interface named
-`tailscale*` (`tailscale0` 100.115.236.50 on n5; the host has no `tailscale`
+`tailscale*` (`tailscale0` ${N5_TAILNET_IP} on n5; the host has no `tailscale`
 CLI, so the interfaces are read directly — Docker bridges or other VPNs in
 the same CGNAT range are not considered). On macOS, where the interface is
 a `utunN`, the `tailscale ip -4` CLI (on PATH or inside Tailscale.app) is

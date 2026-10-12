@@ -134,12 +134,12 @@ def test_json_atomic(tmp_path):
     assert not list(p.parent.glob("*.tmp"))
 
 
-IFACES = [("lo", "127.0.0.1"), ("docker0", "100.70.0.1"), ("tailscale0", "100.115.236.50"),
-          ("enp196s0", "192.168.18.137")]
+IFACES = [("lo", "127.0.0.1"), ("docker0", "100.70.0.1"), ("tailscale0", "100.64.0.20"),
+          ("enp196s0", "192.168.1.20")]
 
 
 def test_host_tailscale_picks_the_tailscale_interface():
-    assert host_mod.resolve_host("tailscale", ifaces=IFACES, cli=lambda: None) == "100.115.236.50"
+    assert host_mod.resolve_host("tailscale", ifaces=IFACES, cli=lambda: None) == "100.64.0.20"
 
 
 def test_host_tailscale_errors():
@@ -163,10 +163,10 @@ def test_host_refuses_every_interface():
 
 def test_interfaces_parses_ip_output(monkeypatch):
     out = ("1: lo    inet 127.0.0.1/8 scope host lo\\       valid_lft forever\n"
-           "31: tailscale0    inet 100.115.236.50/32 scope global tailscale0\\       valid_lft forever\n")
+           "31: tailscale0    inet 100.64.0.20/32 scope global tailscale0\\       valid_lft forever\n")
     monkeypatch.setattr(host_mod.shutil, "which", lambda n: "/usr/sbin/ip" if n == "ip" else None)
     monkeypatch.setattr(host_mod, "_run", lambda cmd: out)
-    assert host_mod.interfaces() == [("lo", "127.0.0.1"), ("tailscale0", "100.115.236.50")]
+    assert host_mod.interfaces() == [("lo", "127.0.0.1"), ("tailscale0", "100.64.0.20")]
 
 
 def test_interfaces_parses_macos_ifconfig(monkeypatch):

@@ -90,11 +90,11 @@ On n5 (frames + manifest live in the standard container mounts):
 
 ```sh
 sudo docker compose -f deploy/n5/compose.yaml run --rm \
-  --name immy-triage-review --publish 100.115.236.50:8766:8766 \
+  --name immy-triage-review --publish ${N5_TAILNET_IP}:8766:8766 \
   immy triage review-server --host 0.0.0.0 --manifest /state/manifest.sqlite
 ```
 
-then open `http://n5.bee-ruffe.ts.net:8766` from anywhere on the tailnet
+then open `http://n5.${TAILNET_DOMAIN}:8766` from anywhere on the tailnet
 (port 8765 stays with the dedup review server).
 
 ## Suggestion rules (advisory, conservative)

@@ -1,7 +1,7 @@
 # Nightly backup mirror — n5 → vv
 
-Implements Phase 3 of `raw/PRIMARY-SWAP.md`: **n5** (TrueNAS, Spain) is the live
-Immich; **vv** (Synology, Portugal) is a cold file+dump backup, and vv↔n5 is the
+Implements Phase 3 of `raw/PRIMARY-SWAP.md`: **n5** (TrueNAS) is the live
+Immich; **vv** (Synology, offsite) is a cold file+dump backup, and vv↔n5 is the
 offsite leg of 3-2-1. `nightly-mirror.sh` keeps vv a byte-level standby.
 
 ## What it does, in order

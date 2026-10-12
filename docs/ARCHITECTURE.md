@@ -21,7 +21,7 @@ touches remote originals. Enrichment is idempotent and queue-based.
                        │    • captioner (LM Studio VLM)          │
                        │    • event clustering                   │
                        │    • gap-fill web UI                    │
-                       │    • osxphotos / icloudpd pullers       │
+                       │    • osxphotos / Photos.app puller      │
                        │    • VideoToolbox proxy gen             │
                        │                                        │
                        └──────────┬─────────────────────────────┘
@@ -69,7 +69,7 @@ One container module per source. Each owns its mount lifecycle.
 |---|---|---|
 | NAS / remote Mac | `mount_smbfs`, NFS, `sshfs` | `autofs` or systemd `.automount` so scanner doesn't hang offline |
 | Cloud (Drive, S3, Dropbox) | `rclone mount --vfs-cache-mode full` | Cache capped on tier-0 |
-| iPhone / iCloud | `icloudpd` | Scheduled sync, not a live mount |
+| iPhone / iCloud | via Apple Photos (row below) | The n5 `icloudpd` sync is disabled since 2026-09-29 (Apple Account lock); Photos.app pull replaced it |
 | Apple Photos | `immy photos diff` + `photos pull` (osxphotos, Photos.app AppleScript fallback) | Originals only, batches → n5 dedup; people/favorites applied after |
 | Offline drives | catalog-only | Ghost assets |
 
