@@ -62,7 +62,7 @@ const hidden=new Set();
 const $=id=>document.getElementById(id);
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 const dur=s=>{if(s==null)return'';s=Math.round(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
-const slug=s=>(s||'').normalize('NFKD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+const slug=s=>(s||'').normalize('NFKD').replace(/[\u0300-\u036f]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
 
 async function load(){
   const [a,b,c]=await Promise.all(['/api/items','/api/decisions','/api/trips'].map(u=>fetch(u).then(r=>r.json())));
@@ -97,6 +97,9 @@ function tile(id){
 function render(){
   const vis=items.filter(visible).sort((a,b)=>(a.time||'').localeCompare(b.time||'')||a.id.localeCompare(b.id));
   order=vis.map(i=>i.id);
+  sel=new Set([...sel].filter(x=>order.includes(x)));
+  const curLost=cur!==null&&!order.includes(cur);
+  if(curLost){cur=order[0]??null;if(cur===null)sel=new Set()}
   const days=[];
   for(const i of vis){
     const d=(i.time||'unknown').slice(0,10);
@@ -117,6 +120,10 @@ function render(){
   const reviewed=items.filter(i=>dec[i.id].keep!=='unreviewed').length;
   const kept=items.filter(i=>dec[i.id].keep==='keep');
   $('count').textContent=`${reviewed}/${items.length} reviewed · ${kept.length} kept (${(kept.reduce((n,i)=>n+i.size,0)/1e9).toFixed(1)} GB) · ${sel.size} selected`;
+  if(curLost){
+    if(cur!==null)show(cur);
+    else{$('viewer').innerHTML='';$('info').innerHTML=''}
+  }
 }
 function targets(){return sel.size?[...sel]:(cur?[cur]:[])}
 function suggest(){
@@ -158,27 +165,34 @@ async function post(patch){
   const ids=targets();
   if(!ids.length)return false;
   const r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,patch})});
-  const j=await r.json();
-  if(!r.ok){$('err').textContent=j.error;return false}
+  let j=null;
+  try{j=await r.json()}catch(_){}
+  if(!r.ok){$('err').textContent=(j&&j.error)||`HTTP ${r.status}`;return false}
+  if(!j){$('err').textContent=`HTTP ${r.status}`;return false}
   $('err').textContent='';
   Object.assign(dec,j.decisions);
   return true;
 }
+let busy=false;
 async function mark(keep){
-  const k=order.indexOf(cur),many=sel.size>1;
-  if(!await post({keep}))return;
-  render();
-  if(many){show(cur);return}
-  const id=order[Math.min(order.includes(cur)?k+1:k,order.length-1)];
-  if(id)pick(id);else show(cur);
+  if(busy)return;
+  busy=true;
+  try{
+    const k=order.indexOf(cur),many=sel.size>1;
+    if(!await post({keep}))return;
+    render();
+    if(many){show(cur);return}
+    const id=order[Math.min(order.includes(cur)?k+1:k,order.length-1)];
+    if(id)pick(id);else show(cur);
+  }finally{busy=false}
 }
 function step(n){
   if(!order.length)return;
   const k=Math.max(0,Math.min(order.length-1,order.indexOf(cur)+n));
   pick(order[k]);
 }
-$('f').onchange=()=>render();
-$('srcs').onchange=e=>{const s=e.target.dataset.src;e.target.checked?hidden.delete(s):hidden.add(s);render()};
+$('f').onchange=e=>{render();e.target.blur()};
+$('srcs').onchange=e=>{const s=e.target.dataset.src;e.target.checked?hidden.delete(s):hidden.add(s);render();e.target.blur()};
 $('list').onclick=e=>{
   const h=e.target.closest('h2,h3');
   if(h){sel=new Set(h.dataset.ids.split('\n'));anchor=null;show(h.dataset.ids.split('\n')[0]);return}
@@ -200,6 +214,7 @@ for(const [inp,btn] of [['trip','tripset'],['tags','tagadd'],['note','noteset']]
   $(inp).onkeydown=e=>{if(e.key==='Enter'){$(btn).click();e.target.blur()}else if(e.key==='Escape')e.target.blur()};
 document.onkeydown=e=>{
   if(e.target.matches('input,select'))return;
+  if(e.ctrlKey||e.metaKey||e.altKey)return;
   const v=$('vid');
   if(e.key==='k')mark('keep');
   else if(e.key==='d')mark('drop');
