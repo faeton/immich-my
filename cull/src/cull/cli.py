@@ -79,3 +79,68 @@ def review(work: Path = WORK_OPT,
         console.print(f"[red]{escape(str(e))}[/red]")
         raise typer.Exit(2)
     server.serve(work, trips.expanduser().resolve() if trips else None, port=port, host=bind)
+
+
+@app.command()
+def stage(work: Path = WORK_OPT,
+          trips: Path = typer.Option(..., "--trips", help="Trips root, e.g. /mnt/tank/media/trips."),
+          yes: bool = typer.Option(False, "--yes", help="Link; without it only the plan is shown."),
+          immich: bool = typer.Option(False, "--immich", help="Refuse destinations already in Immich."),
+          immich_config: Path = IMMICH_CFG_OPT,
+          immich_prefix: str = typer.Option("/mnt/external/originals", "--immich-prefix",
+                                            help="Where Immich sees the promoted trips.")):
+    """Hardlink kept items into <trips>/<trip>/<src>/<rel> (per trip, all checks first)."""
+    from . import stage as stage_mod
+    work, trips = work.expanduser().resolve(), trips.expanduser().resolve()
+    im = _immich(immich_config) if immich else None
+    p = stage_mod.plan(work, trips, existing_paths=im.existing_paths if im else None, immich_prefix=immich_prefix)
+    t = Table(title=escape(f"stage plan → {trips}"))
+    for col in ("trip", "items", "link", "skip", "GB", "status"):
+        t.add_column(col, justify="left" if col in ("trip", "status") else "right")
+    for tp in p.trips:
+        t.add_row(escape(tp.trip), str(len(tp.items)), str(sum(len(ip.links) for ip in tp.items)),
+                  str(sum(len(ip.skips) for ip in tp.items)), f"{tp.nbytes / 1e9:.1f}",
+                  "ok" if tp.ok else f"[red]{len(tp.problems) + len(tp.stale)} problem(s)[/red]")
+    console.print(t)
+    for tp in p.trips:
+        for x in tp.stale:
+            console.print(f"[red]stale[/red] {escape(tp.trip)}: {escape(x)}")
+        for x in tp.problems:
+            console.print(f"[red]problem[/red] {escape(tp.trip)}: {escape(x)}")
+    for iid in p.no_trip:
+        console.print(f"[yellow]kept without a trip[/yellow] {escape(iid)}")
+    if yes:
+        before = {tp.trip: len(tp.problems) for tp in p.trips}
+        n = stage_mod.execute(p, trips)
+        for tp in p.trips:
+            for x in tp.problems[before[tp.trip]:]:
+                console.print(f"[red]link failed[/red] {escape(tp.trip)}: {escape(x)}")
+        console.print(f"{n} links made")
+    else:
+        console.print("plan only — pass --yes to link")
+    if p.no_trip or any(not tp.ok for tp in p.trips):
+        raise typer.Exit(1)
+
+
+@app.command()
+def report(work: Path = WORK_OPT,
+           dropped: bool = typer.Option(False, "--dropped"), kept: bool = typer.Option(False, "--kept"),
+           unreviewed: bool = typer.Option(False, "--unreviewed"), orphans: bool = typer.Option(False, "--orphans")):
+    """Print source paths (one per line) of dropped (default), kept, unreviewed items or orphans."""
+    from . import decisions as dec_mod
+    work = work.expanduser().resolve()
+    doc = scan_mod.load_items(work)
+    roots = {k: Path(v) for k, v in doc["sources"].items()}
+    paths: list[Path] = []
+    if orphans:
+        paths = [roots[o["src"]] / o["rel"] for o in doc["orphans"]]
+    else:
+        want = "keep" if kept else "unreviewed" if unreviewed else "drop"
+        decs = dec_mod.load(work)
+        for it in doc["items"]:
+            if dec_mod.effective(it, decs.get(it["id"]))["keep"] == want:
+                paths += [roots[it["src"]] / f for f in it["files"]]
+    for p in paths:
+        print(p)
+    size = sum(p.stat().st_size for p in paths if p.exists())
+    Console(stderr=True).print(f"{len(paths)} files, {size / 1e9:.2f} GB")
