@@ -1,2 +1,218 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><title>cull</title></head>
-<body><p>cull viewer — UI lands in the next task. API: /api/items, /api/decisions.</p></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>cull</title>
+<style>
+:root{--bg:#111;--fg:#ddd;--mut:#888;--keep:#2e7d32;--drop:#b71c1c;--sel:#ffb300;--card:#1c1c1c}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--fg);font:13px system-ui,sans-serif;display:grid;grid-template-columns:1fr minmax(320px,560px);height:100vh}
+#left{overflow:auto;padding:0 12px 12px}
+#right{border-left:1px solid #333;padding:10px;overflow:auto}
+header{position:sticky;top:0;background:var(--bg);padding:8px 0;z-index:2;display:flex;gap:10px;flex-wrap:wrap;align-items:center}
+h2{font-size:14px;margin:14px 0 4px;cursor:pointer}
+h3{font-size:12px;color:var(--mut);margin:6px 0 4px;cursor:pointer}
+.grid{display:flex;flex-wrap:wrap;gap:6px}
+.t{width:168px;background:var(--card);border:2px solid transparent;border-radius:4px;cursor:pointer}
+.t img{width:100%;height:95px;object-fit:cover;display:block;background:#000}
+.t .m{padding:2px 4px;font-size:11px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.t.keep{border-color:var(--keep)}
+.t.drop{opacity:.35;border-color:var(--drop)}
+.t.sel{outline:2px solid var(--sel)}
+.t.cur{outline:3px solid #fff}
+.chip{display:inline-block;padding:0 4px;border-radius:3px;background:#333;margin-right:3px;font-size:10px}
+.chip.im{background:#0d47a1}.chip.warn{background:#e65100}
+#viewer video,#viewer img{width:100%;max-height:60vh;background:#000;display:block}
+button,input,select{background:#222;color:var(--fg);border:1px solid #444;border-radius:3px;padding:3px 6px;font:inherit}
+.files{font-family:ui-monospace,monospace;font-size:11px;color:var(--mut);word-break:break-all}
+.help{color:var(--mut)}
+#err{color:#ef5350}
+@media (max-width:800px){body{grid-template-columns:1fr;grid-template-rows:55vh 45vh}#right{border-left:0;border-top:1px solid #333}}
+</style>
+</head>
+<body>
+<div id="left">
+  <header>
+    <select id="f">
+      <option value="all">all</option><option value="unreviewed">unreviewed</option>
+      <option value="keep">keep</option><option value="drop">drop</option>
+      <option value="immich">possibly in Immich</option><option value="notrip">kept without trip</option>
+      <option value="changed">changed</option><option value="flagged">flagged</option>
+    </select>
+    <span id="srcs"></span>
+    <b id="count"></b> <span id="orph" class="help"></span>
+    <span class="help">k keep · d drop · u unreviewed · ←/→ · space play · j/l ±5 s · t trip · n note · shift-click range · click a day/session to select it</span>
+  </header>
+  <div id="list"></div>
+</div>
+<div id="right">
+  <div id="viewer"></div>
+  <div id="info"></div>
+  <p><label>trip <input id="trip" size="28" list="tripnames" autocomplete="off"></label>
+     <button id="tripset">set</button> <button id="tripclear">clear</button></p>
+  <datalist id="tripnames"></datalist>
+  <p><label>tags <input id="tags" size="32" placeholder="comma separated"></label> <button id="tagadd">add</button></p>
+  <p><label>note <input id="note" size="40"></label> <button id="noteset">set</button></p>
+  <p id="err"></p>
+</div>
+<script>
+let items=[],dec={},trips=[],byId={},order=[],cur=null,sel=new Set(),anchor=null;
+const hidden=new Set();
+const $=id=>document.getElementById(id);
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dur=s=>{if(s==null)return'';s=Math.round(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
+const slug=s=>(s||'').normalize('NFKD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
+
+async function load(){
+  const [a,b,c]=await Promise.all(['/api/items','/api/decisions','/api/trips'].map(u=>fetch(u).then(r=>r.json())));
+  items=a.items;dec=b;trips=c;byId=Object.fromEntries(items.map(i=>[i.id,i]));
+  $('orph').textContent=a.orphans.length?`${a.orphans.length} orphan companion(s): cull report --orphans`:'';
+  $('srcs').innerHTML=Object.keys(a.sources).map(s=>`<label><input type="checkbox" checked data-src="${esc(s)}"> ${esc(s)}</label>`).join(' ');
+  render();
+  if(order.length)pick(order[0]);
+}
+function visible(i){
+  const d=dec[i.id],f=$('f').value;
+  if(hidden.has(i.src))return false;
+  if(f==='all')return true;
+  if(f==='immich')return (i.immich||[]).length>0;
+  if(f==='notrip')return d.keep==='keep'&&!d.trip;
+  if(f==='changed')return d.changed;
+  if(f==='flagged')return i.flags.length>0;
+  return d.keep===f;
+}
+function tile(id){
+  const i=byId[id],d=dec[id],ch=[];
+  if((i.immich||[]).length)ch.push('<span class="chip im">in Immich?</span>');
+  for(const f of i.flags)ch.push(`<span class="chip warn">${esc(f)}</span>`);
+  if(d.changed)ch.push('<span class="chip warn">changed</span>');
+  if(d.trip)ch.push(`<span class="chip">${esc(d.trip)}</span>`);
+  for(const t of d.tags)ch.push(`<span class="chip">#${esc(t)}</span>`);
+  return `<div class="t ${d.keep}${sel.has(id)?' sel':''}${id===cur?' cur':''}" data-id="${esc(id)}">`+
+    `<img loading="lazy" src="${esc(i.thumb||'')}" alt="">`+
+    `<div class="m">${esc((i.time||'').slice(11,16))} ${i.kind==='video'?dur(i.duration):'photo'} ${esc(i.model||'')}</div>`+
+    `<div class="m">${ch.join('')||'&nbsp;'}</div></div>`;
+}
+function render(){
+  const vis=items.filter(visible).sort((a,b)=>(a.time||'').localeCompare(b.time||'')||a.id.localeCompare(b.id));
+  order=vis.map(i=>i.id);
+  const days=[];
+  for(const i of vis){
+    const d=(i.time||'unknown').slice(0,10);
+    let D=days[days.length-1];
+    if(!D||D.d!==d){D={d,s:[]};days.push(D)}
+    const t=i.time?Date.parse(i.time+'Z'):null;
+    let S=D.s[D.s.length-1];
+    if(!S||(t!==null&&S.t!==null&&t-S.t>2*3600e3)){S={ids:[],t};D.s.push(S)}
+    S.ids.push(i.id);
+    if(t!==null)S.t=t;
+  }
+  $('list').innerHTML=days.map(D=>{
+    const all=D.s.flatMap(s=>s.ids);
+    return `<h2 data-ids="${esc(all.join('\n'))}">${esc(D.d)} · ${all.length}</h2>`+
+      D.s.map((S,k)=>(D.s.length>1?`<h3 data-ids="${esc(S.ids.join('\n'))}">session ${k+1} · ${S.ids.length}</h3>`:'')+
+        `<div class="grid">${S.ids.map(tile).join('')}</div>`).join('');
+  }).join('');
+  const reviewed=items.filter(i=>dec[i.id].keep!=='unreviewed').length;
+  const kept=items.filter(i=>dec[i.id].keep==='keep');
+  $('count').textContent=`${reviewed}/${items.length} reviewed · ${kept.length} kept (${(kept.reduce((n,i)=>n+i.size,0)/1e9).toFixed(1)} GB) · ${sel.size} selected`;
+}
+function targets(){return sel.size?[...sel]:(cur?[cur]:[])}
+function suggest(){
+  const its=targets().map(x=>byId[x]).filter(i=>i&&i.time);
+  if(!its.length)return '';
+  const ym=its.map(i=>i.time.slice(0,7)).sort()[0];
+  const ex=trips.find(t=>t.startsWith(ym));
+  if(ex)return ex;
+  const cnt={};
+  for(const i of its)if(i.place)cnt[i.place]=(cnt[i.place]||0)+1;
+  const top=Object.entries(cnt).sort((a,b)=>b[1]-a[1])[0];
+  return ym+'-'+(slug(top&&top[0])||'trip');
+}
+function pick(id){sel=new Set([id]);anchor=id;show(id)}
+function show(id){
+  cur=id;
+  const i=byId[id],d=dec[id],v=$('viewer');
+  if(i.kind==='video')
+    v.innerHTML=i.play?`<video id="vid" src="${esc(i.play)}" controls autoplay muted playsinline></video>`
+                     :`<img src="${esc(i.thumb||'')}" alt=""><p>no proxy — run cull scan with --proxies</p>`;
+  else v.innerHTML=`<img src="${esc(i.image||i.thumb||'')}" alt="">`;
+  const where=[i.place,i.lat!=null?`${i.lat.toFixed(4)}, ${i.lon.toFixed(4)}`:''].filter(Boolean).join(' · ');
+  $('info').innerHTML=
+    `<p><b>${esc(i.id)}</b></p>`+
+    `<p>${esc(i.time||'?')} <span class="help">(${esc(i.time_src)}${i.zone?', '+esc(i.zone):''})</span> · `+
+    `${i.kind==='video'?dur(i.duration)+' · ':''}${i.width||'?'}×${i.height||'?'} ${esc(i.codec||'')} · ${(i.size/1e6).toFixed(0)} MB</p>`+
+    `<p>${esc([i.make,i.model].filter(Boolean).join(' '))} ${esc(where)}</p>`+
+    `<p>decision <b>${esc(d.keep)}</b>${d.trip?' → '+esc(d.trip):''}${d.changed?' <span class="chip warn">changed</span>':''}`+
+    `${d.tags.length?' · '+d.tags.map(t=>'#'+esc(t)).join(' '):''}${d.note?' · '+esc(d.note):''}</p>`+
+    ((i.immich||[]).length?`<p>possibly in Immich:</p><div class="files">${i.immich.map(esc).join('<br>')}</div>`:'')+
+    `<div class="files">${i.files.map(esc).join('<br>')}</div>`;
+  $('note').value=d.note||'';
+  $('trip').value=d.trip||suggest();
+  $('tripnames').innerHTML=[...new Set([suggest(),...trips])].filter(Boolean).map(t=>`<option value="${esc(t)}">`).join('');
+  render();
+  document.querySelector('.t.cur')?.scrollIntoView({block:'nearest'});
+}
+async function post(patch){
+  const ids=targets();
+  if(!ids.length)return false;
+  const r=await fetch('/api/decisions',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids,patch})});
+  const j=await r.json();
+  if(!r.ok){$('err').textContent=j.error;return false}
+  $('err').textContent='';
+  Object.assign(dec,j.decisions);
+  return true;
+}
+async function mark(keep){
+  const k=order.indexOf(cur),many=sel.size>1;
+  if(!await post({keep}))return;
+  render();
+  if(many){show(cur);return}
+  const id=order[Math.min(order.includes(cur)?k+1:k,order.length-1)];
+  if(id)pick(id);else show(cur);
+}
+function step(n){
+  if(!order.length)return;
+  const k=Math.max(0,Math.min(order.length-1,order.indexOf(cur)+n));
+  pick(order[k]);
+}
+$('f').onchange=()=>render();
+$('srcs').onchange=e=>{const s=e.target.dataset.src;e.target.checked?hidden.delete(s):hidden.add(s);render()};
+$('list').onclick=e=>{
+  const h=e.target.closest('h2,h3');
+  if(h){sel=new Set(h.dataset.ids.split('\n'));anchor=null;show(h.dataset.ids.split('\n')[0]);return}
+  const t=e.target.closest('.t');
+  if(!t)return;
+  const id=t.dataset.id;
+  if(e.shiftKey&&anchor&&order.includes(anchor)){
+    const a=order.indexOf(anchor),b=order.indexOf(id);
+    sel=new Set(order.slice(Math.min(a,b),Math.max(a,b)+1));
+  }else if(e.metaKey||e.ctrlKey){sel.has(id)?sel.delete(id):sel.add(id);anchor=id}
+  else{sel=new Set([id]);anchor=id}
+  show(id);
+};
+$('tripset').onclick=async()=>{if(await post({trip:$('trip').value.trim()||null}))show(cur)};
+$('tripclear').onclick=async()=>{if(await post({trip:null}))show(cur)};
+$('tagadd').onclick=async()=>{if(await post({add_tags:$('tags').value.split(',')})){$('tags').value='';show(cur)}};
+$('noteset').onclick=async()=>{if(await post({note:$('note').value}))show(cur)};
+for(const [inp,btn] of [['trip','tripset'],['tags','tagadd'],['note','noteset']])
+  $(inp).onkeydown=e=>{if(e.key==='Enter'){$(btn).click();e.target.blur()}else if(e.key==='Escape')e.target.blur()};
+document.onkeydown=e=>{
+  if(e.target.matches('input,select'))return;
+  const v=$('vid');
+  if(e.key==='k')mark('keep');
+  else if(e.key==='d')mark('drop');
+  else if(e.key==='u')mark('unreviewed');
+  else if(e.key==='ArrowRight'){step(1);e.preventDefault()}
+  else if(e.key==='ArrowLeft'){step(-1);e.preventDefault()}
+  else if(e.key===' '&&v){v.paused?v.play():v.pause();e.preventDefault()}
+  else if(e.key==='j'&&v)v.currentTime=Math.max(0,v.currentTime-5);
+  else if(e.key==='l'&&v)v.currentTime+=5;
+  else if(e.key==='t'){$('trip').focus();$('trip').select();e.preventDefault()}
+  else if(e.key==='n'){$('note').focus();e.preventDefault()}
+};
+load();
+</script>
+</body>
+</html>

@@ -78,3 +78,11 @@ def test_post_decisions(site):
     code, _, _ = call(site["base"], "/api/decisions", "POST", {"ids": [iid], "patch": {"keep": "drop"}},
                       headers={"Origin": "http://evil.example"})
     assert code == 403
+
+
+def test_viewer_page_wires_the_api(site):
+    code, hdr, body = call(site["base"], "/")
+    assert code == 200 and hdr["Content-Type"].startswith("text/html")
+    for needle in (b"/api/items", b"/api/decisions", b"/api/trips", b"'Content-Type':'application/json'",
+                   b"add_tags", b"possibly in Immich"):
+        assert needle in body, needle
