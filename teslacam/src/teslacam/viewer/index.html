@@ -549,6 +549,8 @@ function card(e){
   if(e.offset_source==='none') flags.push('<span class="warn soft" style="margin:0">tz?</span>');
   if(e.gps_source==='prev-drive') flags.push('<span title="GPS from the previous drive">GPS≈</span>');
   if(decOf(e).precise) flags.push('<span title="exact re-encode">precise</span>');
+  const sc=(e.flags||[]).filter(f=>f.startsWith('short-')).map(f=>f.slice(6));
+  if(sc.length) flags.push(`<span title="${esc(sc.join(', '))}: stops before the end of each minute (shown dimmed)">gaps</span>`);
   if(decOf(e).archive) flags.push('<span title="archived in Immich">archive</span>');
   d.innerHTML=`
     <div class="st"></div>
@@ -844,7 +846,7 @@ function loadSeg(i, at=0, autoplay=true){
   for(const v of P.vids){
     const cam=v.dataset.cam, fn=seg.f[cam];
     if(fn && act.includes(v)){
-      v.style.visibility='visible'; v._retries=0; v.src=mediaUrl(base+'/'+fn); v.playbackRate=P.speed; v.load();
+      v.style.visibility='visible'; v.style.opacity=''; v.title=''; v._retries=0; v.src=mediaUrl(base+'/'+fn); v.playbackRate=P.speed; v.load();
     } else {
       v.pause(); v.removeAttribute('src'); v.load();
       v.style.visibility = fn ? 'visible' : 'hidden';
@@ -873,11 +875,19 @@ function armRetry(v){
 }
 armRetry(vMain);
 function playAll(){ P.playing=true; document.getElementById('bPlay').textContent='❚❚';
-  liveVids().forEach(v=>v.play().catch(()=>{})); }
+  liveVids().forEach(v=>{ if(!v.style.opacity) v.play().catch(()=>{}); }); }
 function pauseAll(){ if(!P) return; P.playing=false; document.getElementById('bPlay').textContent='▶';
   liveVids().forEach(v=>v.pause()); }
 function togglePlay(){ P.playing?pauseAll():playAll(); }
-function masterV(){ return liveVids()[0]; }
+/* A camera can stop before its segment ends (2023 HW4 front: ~38 s of each minute,
+   then nothing): `seg.cd` holds its own length. The clock and the chaining follow the
+   camera that covers the most of the segment; a short one is never seeked into its hole. */
+function camD(v){ const s=P.ev.segs[P.seg]; return s ? ((s.cd||{})[v.dataset.cam] ?? s.d) : 0; }
+function masterV(){ const vs=liveVids(); let m=vs[0];
+  for(const v of vs) if(camD(v)>camD(m)+1) m=v; return m; }
+function seekCam(v,t){ const s=P.ev.segs[P.seg], d=camD(v), hole=!!s && d<s.d-1 && t>=d-.05;
+  v.style.opacity = hole ? .12 : ''; v.title = hole ? 'no footage from this camera here' : '';
+  try{ v.currentTime=Math.min(t, Math.max(0,d-.05)); }catch(_){} if(hole) v.pause(); }
 function globalTime(){
   if(P.seg<0) return 0;
   if(P.pendingSeek!=null) return P.offs[P.seg]+P.pendingSeek;
@@ -893,7 +903,7 @@ function seekGlobal(t, play){
   if(i!==P.seg) loadSeg(i, local, wantPlay);
   else {
     P.pendingSeek=null;
-    for(const v of liveVids()){ try{v.currentTime=local;}catch(_){} }
+    for(const v of liveVids()) seekCam(v,local);
     if(wantPlay && !P.playing) playAll();
     updateBar();
   }
@@ -914,24 +924,28 @@ function updateBar(){
 /* drift correction + segment chaining */
 function tick(){
   if(P && ov.classList.contains('show')){
-    const vs=liveVids(), m=vs[0];
+    const vs=liveVids(), m=vs.length?masterV():null;
     if(P.pendingSeek!=null){
       if(vs.length && vs.every(v=>v.readyState>=1)){
         const at=P.pendingSeek; P.pendingSeek=null;
-        for(const v of vs){ try{v.currentTime=at;}catch(_){} }
+        for(const v of vs) seekCam(v,at);
       }
       updateBar();
       return requestAnimationFrame(tick);
     }
     if(m){
-      for(let i=1;i<vs.length;i++){
-        const d=vs[i].currentTime-m.currentTime;
-        if(Math.abs(d)>.28 && !vs[i].seeking){ try{vs[i].currentTime=m.currentTime;}catch(_){} }
+      for(const v of vs){
+        if(v===m) continue;
+        const s=P.ev.segs[P.seg], inHole=!!s && camD(v)<s.d-1 && m.currentTime>=camD(v)-.05;
+        if(inHole){ if(v.style.opacity!=='0.12') seekCam(v,m.currentTime); continue; }
+        if(v.style.opacity){ v.style.opacity=''; v.title=''; }
+        const d=v.currentTime-m.currentTime;
+        if(Math.abs(d)>.28 && !v.seeking){ try{v.currentTime=m.currentTime;}catch(_){} if(P.playing) v.play().catch(()=>{}); }
       }
       // A video the browser paused on its own (hidden tab, media key, a dropped
       // request) is restarted while the page still says "playing" — the master too,
       // otherwise the clock freezes and the button lies. Ended ones stay ended.
-      if(P.playing) for(const v of vs){ if(v.paused && !v.ended) v.play().catch(()=>{}); }
+      if(P.playing) for(const v of vs){ if(v.paused && !v.ended && !v.style.opacity) v.play().catch(()=>{}); }
       if(P.playing && m.ended){
         if(P.seg+1<P.ev.segs.length) loadSeg(P.seg+1,0,true); else pauseAll();
       }

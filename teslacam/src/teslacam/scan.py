@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Callable
@@ -117,31 +118,38 @@ def _event_dirs(root: Path, dump: Path):
         yield ("sentry" if reason.startswith("sentry") else "saved"), ev
 
 
+SHORT_CAM_S = 1.0     # a camera this much shorter than the segment has a hole at its end
+
+
 def _build_segments(root: Path, rel_dir: str, segmap: dict[str, dict[str, str]],
                     cache: ProbeCache) -> tuple[list[Segment], int]:
+    """The segment lasts as long as its LONGEST camera file: one camera can stop
+    early (2023 HW4 front: ~38 s of each minute), never run long. Geometry, bitrate
+    and clock still come from the front file when it is readable (the mosaic tile
+    size and the precise re-encode use them)."""
     segs: list[Segment] = []
     bad = 0
     t = 0.0
     for ts in sorted(segmap):
         files = segmap[ts]
         ref_cam = "front" if "front" in files else next(iter(files))
-        info = cache.probe(root, f"{rel_dir}/{files[ref_cam]}")
-        d = (info or {}).get("d")
+        infos: dict[str, dict] = {}
         for cam, fn in files.items():
-            if cam == ref_cam:
-                if info is None or not d:
-                    bad += 1
-                continue
-            other = cache.probe(root, f"{rel_dir}/{fn}")
-            if other is None or not other.get("d"):
+            info = cache.probe(root, f"{rel_dir}/{fn}")
+            if info is None or not info.get("d"):
                 bad += 1
-            if not d and other and other.get("d"):
-                d = other["d"]
-                info = other
-        d = float(d or 0.0)
+                continue
+            infos[cam] = info
+        ref = infos.get(ref_cam) or next(iter(infos.values()), None)
+        longest = max((float(i["d"]) for i in infos.values()), default=0.0)
+        # The reference camera's length unless it is clearly short: unaffected events
+        # keep exactly the durations (and so the render digests) they had before.
+        d = float(ref["d"]) if ref and longest - float(ref["d"]) <= SHORT_CAM_S else longest
+        short = {cam: round(float(i["d"]), 3) for cam, i in infos.items() if d - float(i["d"]) > SHORT_CAM_S}
         segs.append(Segment(t=ts, d=round(d, 3), start=round(t, 3), f=dict(sorted(files.items())),
-                            utc=(info or {}).get("utc"), width=(info or {}).get("w"),
-                            height=(info or {}).get("h"), bitrate=(info or {}).get("br")))
+                            utc=(ref or {}).get("utc"), width=(ref or {}).get("w"),
+                            height=(ref or {}).get("h"), bitrate=(ref or {}).get("br"),
+                            cd=dict(sorted(short.items())) or None))
         t += d
     return segs, bad
 
@@ -292,8 +300,11 @@ def make_thumb(root: Path, ev: Event, out: Path) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     t = ev.total - 2.0 if ev.trigger_s is None else max(0.0, ev.trigger_s - 1.0)
     seg = ev.seg_at(t)
-    fn = seg.f.get("front") or next(iter(seg.f.values()))
-    at = max(0.0, min(t - seg.start, max(0.0, seg.d - 0.5)))
+    # front, unless the trigger falls in its hole: then the longest camera
+    cam = "front" if "front" in seg.f and t - seg.start < seg.cam_d("front") else \
+        max(seg.f, key=lambda c: (seg.cam_d(c), c == "back"))
+    fn = seg.f[cam]
+    at = max(0.0, min(t - seg.start, max(0.0, seg.cam_d(cam) - 0.5)))
     subprocess.run(["ffmpeg", "-v", "error", "-y", "-ss", f"{at:.2f}", "-i", str(root / ev.dir / fn),
                     "-frames:v", "1", "-vf", "scale=640:-2", "-q:v", "4", str(out)],
                    capture_output=True)
@@ -338,6 +349,7 @@ def build_event(root: Path, dump: str, kind: str, ev_dir: Path, cache: ProbeCach
     flags: list[str] = []
     if bad:
         flags.append("bad-files")
+    flags += [f"short-{c}" for c in sorted({c for s in segs for c in (s.cd or {})})]
 
     # GPS
     lat = lon = None
@@ -415,8 +427,7 @@ def build_drives(root: Path, dump: str, recent_dir: Path, cache: ProbeCache) -> 
         t = 0.0
         segs = []
         for s in g:
-            segs.append(Segment(t=s.t, d=s.d, start=round(t, 3), f=s.f, utc=s.utc, width=s.width,
-                                height=s.height, bitrate=s.bitrate))
+            segs.append(replace(s, start=round(t, 3)))
             t += s.d
         total = round(t, 3)
         eid = f"{dump}|RecentClips|{g[0].t}"

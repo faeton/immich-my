@@ -213,7 +213,8 @@ def test_cli_scan_and_dry_run(dumps):
     assert "Dump1" in r.output
     rd = dumps / "_review"
     dec.update(rd, "Dump1|SavedClips|2026-09-09_19-08-30", {"keep": "keep"})
-    r = CliRunner().invoke(app, ["render", "--root", str(dumps), "--out", str(dumps / "render"), "--dry-run"])
+    r = CliRunner().invoke(app, ["render", "--root", str(dumps), "--out", str(dumps / "render"), "--dry-run"],
+                           env={"COLUMNS": "300"})   # rich wraps the long tmp path otherwise
     assert r.exit_code == 0, r.output
     assert "1 kept" in r.output and "2026-tesla-dashcam" in r.output
     assert not (dumps / "render").exists()

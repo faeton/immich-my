@@ -124,6 +124,8 @@ def _digest(ev: Event, d: Decision, a: float, b: float, cams: list[str]) -> str:
     h.update(RENDER_VERSION.encode())
     for s in ev.segs:
         h.update(f"{s.t}|{s.d}|{sorted(s.f.items())}".encode())
+        if s.cd:      # only events with a short camera: the others keep their old digest
+            h.update(f"cd{sorted(s.cd.items())}".encode())
     h.update(json.dumps({"a": a, "b": b, "cams": cams, "precise": d.precise, "tags": d.tags,
                          "note": d.note, "archive": d.archive, "offset": ev.offset,
                          "lat": ev.lat, "lon": ev.lon, "city": ev.city, "reason": ev.reason}).encode())
@@ -164,20 +166,45 @@ def plan(events: list[Event], decisions: dict[str, Decision], render_root: Path,
 # ---------- ffmpeg pieces ----------
 
 def _concat_list(root: Path, ev: Event, cam: str, segs: list[Segment], path: Path, *,
-                 inpoint: float | None = None, outpoint: float | None = None) -> bool:
-    """`inpoint` applies to the first file, `outpoint` to the last (seconds into that file)."""
+                 inpoint: float | None = None, outpoint: float | None = None) -> Segment | None:
+    """Concat list of `cam`'s files over `segs`; returns the first segment that has
+    one (where the list's time 0 sits, before `inpoint`), None when none does.
+
+    Every file is declared to last until the next listed segment starts
+    (`duration`), so a camera that stops early (2023 HW4 front: ~38 s of each
+    minute) or a missing file leaves a timestamp gap instead of pulling the
+    following footage forward. `inpoint` applies to the first listed file,
+    `outpoint` to the last (seconds into that file)."""
+    present = [s for s in segs if s.f.get(cam)]
+    if not present:
+        return None
     lines = []
-    for i, s in enumerate(segs):
-        fn = s.f.get(cam)
-        if not fn:
-            return False           # a hole would desync the camera → caller blacks the tile
-        lines.append(f"file '{(root / ev.dir / fn).as_posix()}'")
+    for i, s in enumerate(present):
+        lines.append(f"file '{(root / ev.dir / s.f[cam]).as_posix()}'")
+        span = (present[i + 1].start - s.start) if i + 1 < len(present) else s.d
         if i == 0 and inpoint is not None and inpoint > 0:
             lines.append(f"inpoint {inpoint:.3f}")
-        if i == len(segs) - 1 and outpoint is not None:
+            span -= inpoint           # an explicit duration is not reduced by the in point
+        lines.append(f"duration {span:.3f}")
+        if i == len(present) - 1 and outpoint is not None:
             lines.append(f"outpoint {outpoint:.3f}")
     path.write_text("\n".join(lines) + "\n")
-    return True
+    return present[0]
+
+
+def holes(ev: Event, cam: str, a: float, b: float) -> list[tuple[float, float]]:
+    """Timeline intervals inside [a, b] where `cam` has no footage, relative to `a`:
+    a missing file, or the tail of a file shorter than its segment."""
+    out: list[tuple[float, float]] = []
+    for s in ev.overlapping(a, b):
+        start = s.start + (s.cam_d(cam) if s.f.get(cam) else 0.0)
+        lo, hi = max(a, start), min(b, s.end)
+        if hi - lo > 0.05:
+            if out and abs(out[-1][1] - (lo - a)) < 1e-6:
+                out[-1] = (out[-1][0], hi - a)
+            else:
+                out.append((lo - a, hi - a))
+    return out
 
 
 def keyframes(path: Path) -> list[float]:
@@ -219,8 +246,6 @@ def render_mosaic(root: Path, job: Job, out: Path, tmp: Path, log: Callable[[str
     cams = [c for row in layout for c in row]
     tw, th = _tile_size(ev, MOSAIC_ROWS)
     segs = ev.overlapping(job.a, job.b)
-    off0 = segs[0].start
-    ta, tb = job.a - off0, job.b - off0
     font = _font()
     inputs: list[str] = []
     filters: list[str] = []
@@ -228,12 +253,30 @@ def render_mosaic(root: Path, job: Job, out: Path, tmp: Path, log: Callable[[str
     n_in = 0
     for i, cam in enumerate(cams):
         lst = tmp / f"{cam}.txt"
-        if cam in ev.cams and _concat_list(root, ev, cam, segs, lst):
+        gaps = holes(ev, cam, job.a, job.b) if cam in ev.cams else []
+        if sum(y - x for x, y in gaps) >= job.b - job.a - 0.1:
+            first = None                 # only a hole here: a trim with no frames stalls xstack
+        else:
+            first = _concat_list(root, ev, cam, segs, lst) if cam in ev.cams else None
+        if first is not None:
             inputs += ["-f", "concat", "-safe", "0", "-i", str(lst)]
-            chain = (f"[{n_in}:v]trim=start={ta:.3f}:end={tb:.3f},setpts=PTS-STARTPTS,"
+            # Shift by the window's in point, not by the first kept frame: after a
+            # leading hole that frame is later than the window start.
+            ta, tb = job.a - first.start, job.b - first.start
+            chain = (f"[{n_in}:v]trim=start={max(0.0, ta):.3f}:end={tb:.3f},setpts=PTS-({ta:.3f}/TB),"
                      f"scale={tw}:{th}:force_original_aspect_ratio=decrease,"
-                     f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={MOSAIC_FPS}")
+                     f"pad={tw}:{th}:(ow-iw)/2:(oh-ih)/2:black,setsar=1,fps={MOSAIC_FPS}:start_time=0,"
+                     # fps fills gaps between frames, not after the last one: carry the
+                     # tile to the window end so a trailing hole gets masked too
+                     f"tpad=stop_mode=clone:stop_duration={job.b - job.a:.3f}")
             n_in += 1
+            if gaps:
+                # fps fills a hole by repeating a frame; black it out and say so
+                en = "+".join(f"between(t,{x:.3f},{y:.3f})" for x, y in gaps)
+                chain += f",drawbox=x=0:y=0:w=iw:h=ih:color=black:t=fill:enable='{en}'"
+                if font:
+                    chain += (f",drawtext=fontfile='{font}':text='NO FOOTAGE':x=(w-tw)/2:y=(h-th)/2:"
+                              f"fontsize=22:fontcolor=white@0.6:enable='{en}'")
         else:
             chain = f"color=c=black:s={tw}x{th}:r={MOSAIC_FPS}:d={job.b - job.a:.3f}"
         if font:
@@ -244,16 +287,15 @@ def render_mosaic(root: Path, job: Job, out: Path, tmp: Path, log: Callable[[str
     cols = len(layout[0])
     pos = "|".join(f"{(i % cols) * tw}_{(i // cols) * th}" for i in range(len(cams)))
     fc = ";".join(filters) + ";" + "".join(labels) + f"xstack=inputs={len(cams)}:layout={pos}:fill=black[out]"
-    part = out.with_name(out.name + ".part.mp4")
+    part = out
     cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", *inputs, "-filter_complex", fc, "-map", "[out]",
            "-an", *_h264_encoder(), "-pix_fmt", "yuv420p", "-t", f"{job.b - job.a:.3f}",
-           "-movflags", "+faststart", "-tag:v", "avc1", str(part)]
+           "-movflags", "+faststart", "-tag:v", "avc1", "-f", "mp4", str(part)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not part.exists() or part.stat().st_size == 0:
         part.unlink(missing_ok=True)
         raise RuntimeError("ffmpeg mosaic failed:\n" + r.stderr[-2000:])
-    _verify(part, job.b - job.a, tolerance=1.5)
-    os.replace(part, out)
+    _verify_or_discard(part, job.b - job.a, tolerance=1.5)
 
 
 def _srt(ev: Event, segs: list[Segment], a: float, b: float, offset: str | None) -> str:
@@ -300,60 +342,79 @@ class NoFootage(RuntimeError):
 
 
 def render_child(root: Path, job: Job, cam: str, out: Path, tmp: Path) -> tuple[float, float]:
-    """Returns the (start, end) timeline seconds the file actually covers."""
+    """Returns the (start, end) timeline seconds the file actually covers. A hole
+    inside the window (camera stopped early, file missing) stays a gap in the file's
+    timestamps; the file starts at the camera's first footage in the window and ends
+    at its last."""
     ev = job.ev
     segs = [s for s in ev.overlapping(job.a, job.b) if cam in s.f]
+    # footage of this camera that really lies inside the window
+    segs = [s for s in segs if s.start + s.cam_d(cam) > job.a + 0.05]
     if not segs:
         raise NoFootage(f"{cam}: no files in the window")
     first, last = segs[0], segs[-1]
     ta = max(0.0, job.a - first.start)
     tb = min(job.b, last.end) - last.start
+    tb_cam = min(tb, last.cam_d(cam))           # the window may end inside the hole
+    if last.start + tb_cam <= first.start + ta + 0.05:
+        raise NoFootage(f"{cam}: only a hole in the window")
     lst = tmp / f"child-{cam}.txt"
     srt = tmp / f"child-{cam}.srt"
-    part = out.with_name(out.name + ".part.mp4")
+    part = out
     if not job.decision.precise:
         # Lossless: the concat demuxer's inpoint/outpoint with stream copy. The cut
         # starts at the last keyframe before the in point (Tesla: every 0.5–0.75 s),
         # so the file covers [keyframe, out] and the wall clock is built from there.
         ka = snap_to_keyframe(root / ev.dir / first.f[cam], ta)
-        sa, sb = first.start + ka, last.start + tb
+        sa, sb = first.start + ka, last.start + tb_cam
         _concat_list(root, ev, cam, segs, lst, inpoint=ka,
-                     outpoint=tb if tb < last.d - 0.05 else None)
+                     outpoint=tb_cam if tb_cam < last.cam_d(cam) - 0.05 else None)
         srt.write_text(_srt(ev, segs, sa, sb, ev.offset))
         cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
                "-i", str(srt), "-map", "0:v", "-map", "1:s", "-c", "copy", "-c:s", "mov_text",
                "-avoid_negative_ts", "make_zero",
                "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=Wall clock",
-               "-disposition:s:0", "default", "-movflags", "+faststart", str(part)]
+               "-disposition:s:0", "default", "-movflags", "+faststart", "-f", "mp4", str(part)]
     else:
-        sa, sb = first.start + ta, last.start + tb
+        sa, sb = first.start + ta, last.start + tb_cam
         _concat_list(root, ev, cam, segs, lst)
         srt.write_text(_srt(ev, segs, sa, sb, ev.offset))
         br = str(segs[0].bitrate or 6_000_000)
         enc = ["-c:v", "h264_videotoolbox", "-b:v", br, "-profile:v", "high", "-allow_sw", "1"] \
             if "h264_videotoolbox" in " ".join(_h264_encoder()) else ["-c:v", "libx264", "-crf", "20"]
         cmd = ["ffmpeg", "-v", "error", "-nostdin", "-y", "-f", "concat", "-safe", "0", "-i", str(lst),
-               "-i", str(srt), "-filter_complex", f"[0:v]trim=start={ta:.3f}:end={ta + (sb - sa):.3f},setpts=PTS-STARTPTS[v]",
+               "-i", str(srt), "-filter_complex",
+               f"[0:v]trim=start={ta:.3f}:end={ta + (sb - sa):.3f},setpts=PTS-({ta:.3f}/TB)[v]",
                "-map", "[v]", "-map", "1:s", *enc, "-pix_fmt", "yuv420p", "-c:s", "mov_text",
                "-metadata:s:s:0", "language=eng", "-metadata:s:s:0", "title=Wall clock",
-               "-movflags", "+faststart", str(part)]
+               "-movflags", "+faststart", "-f", "mp4", str(part)]
     r = subprocess.run(cmd, capture_output=True, text=True)
     if r.returncode != 0 or not part.exists() or part.stat().st_size == 0:
         part.unlink(missing_ok=True)
         raise RuntimeError(f"ffmpeg {cam} failed:\n" + r.stderr[-2000:])
-    _verify(part, sb - sa, tolerance=3.0)
-    os.replace(part, out)
+    _verify_or_discard(part, sb - sa, tolerance=3.0)
     return sa, sb
 
 
+def _verify_or_discard(part: Path, expected_s: float, *, tolerance: float) -> None:
+    """`_verify`, removing the part file when it fails: a rejected render must not
+    sit in the output folder, which may be inside Immich's library."""
+    try:
+        _verify(part, expected_s, tolerance=tolerance)
+    except Exception:
+        part.unlink(missing_ok=True)
+        raise
+
+
 def _verify(path: Path, expected_s: float, *, tolerance: float) -> None:
-    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type",
+    out = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration:stream=codec_type,duration",
                           "-of", "json", str(path)], capture_output=True, text=True)
     j = json.loads(out.stdout or "{}")
-    dur = float((j.get("format") or {}).get("duration") or 0)
     vids = [s for s in j.get("streams") or [] if s.get("codec_type") == "video"]
     if len(vids) != 1:
         raise RuntimeError(f"{path.name}: expected 1 video stream, found {len(vids)}")
+    # the video's own length: a subtitle track can make the container look complete
+    dur = float(vids[0].get("duration") or (j.get("format") or {}).get("duration") or 0)
     if abs(dur - expected_s) > tolerance:
         raise RuntimeError(f"{path.name}: duration {dur:.1f}s, expected {expected_s:.1f}s")
 
@@ -482,6 +543,16 @@ def restamp_job(job: Job, rec: dict, *, model: str) -> dict:
     return rec
 
 
+# Files are rendered under a staged name and renamed into place only when the whole
+# event succeeded. `._*` is in Immich's default library exclusions (macOS resource
+# forks), so a render straight into the library never exposes a half-made event.
+STAGE = "._"
+
+
+def _staged(final: Path) -> Path:
+    return final.with_name(STAGE + final.name)
+
+
 def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) -> dict:
     fresh = _receipt(job)
     if fresh is not None and (fresh.get("model", "") != model or fresh.get("stamp") != STAMP_VERSION):
@@ -489,43 +560,65 @@ def render_job(root: Path, job: Job, *, model: str, log: Callable[[str], None]) 
             f"stamp v{fresh.get('stamp', 1)} → v{STAMP_VERSION}")
         return restamp_job(job, fresh, model=model)
     job.out_dir.mkdir(parents=True, exist_ok=True)
+    for p in [*job.out_dir.glob(f"{STAGE}*.mp4"), *job.out_dir.glob("*.part.mp4")]:
+        p.unlink()                      # left by an interrupted run
     tmp = Path(tempfile.mkdtemp(prefix="teslacam-", dir=str(job.folder)))
+    staged: dict[Path, Path] = {}       # staged file → final name
     try:
         mosaic = job.out_dir / "mosaic.mp4"
         log(f"    mosaic  [{job.a:.0f}–{job.b:.0f}s]")
-        render_mosaic(root, job, mosaic, tmp, log)
-        stamp(job, mosaic, start_t=job.a, gps=True, model=model)
+        st = _staged(mosaic)
+        staged[st] = mosaic
+        render_mosaic(root, job, st, tmp, log)
+        stamp(job, st, start_t=job.a, gps=True, model=model)
         children: list[str] = []
         covered: dict[str, list[float]] = {}
+        skipped: list[Path] = []
         for cam in job.cams:
             out = job.out_dir / f"{cam}.mp4"
             log(f"    {cam}")
+            st = _staged(out)
             try:
-                sa, sb = render_child(root, job, cam, out, tmp)
+                sa, sb = render_child(root, job, cam, st, tmp)
             except NoFootage as e:
                 log(f"    [yellow]skipped: {e}[/yellow]")
-                out.unlink(missing_ok=True)
+                st.unlink(missing_ok=True)
+                skipped.append(out)
                 continue
+            staged[st] = out
             # same CreationDate as the mosaic so the stack never splits across days
-            stamp(job, out, start_t=job.a, gps=True, model=model)
+            stamp(job, st, start_t=job.a, gps=True, model=model)
             children.append(f"{job.slug}/{cam}.mp4")
             covered[cam] = [sa, sb]
-        # stale outputs from a previous camera choice
-        for p in job.out_dir.glob("*.mp4"):
-            if p.name != "mosaic.mp4" and p.stem not in job.cams and p.stem in CAMERAS:
-                p.unlink()
         frames = track_mod.frames_for_window(root, job.ev, job.snap_a, job.snap_b)
+        # Side files first (Immich ignores them): a failure here publishes no media.
         has_track = track_mod.write_track(frames, job.out_dir, name=job.slug, event_id=job.ev.id)
         src_json = root / job.ev.dir / "event.json"
         if src_json.exists() and job.ev.kind != "recent":
             shutil.copyfile(src_json, job.out_dir / "event.json")
+        # Every file rendered: publish them together (same names → Immich keeps the asset ids).
+        for st, final in staged.items():
+            os.replace(st, final)
+        staged.clear()
+        for p in skipped:
+            p.unlink(missing_ok=True)
+        # stale outputs from a previous camera choice
+        for p in job.out_dir.glob("*.mp4"):
+            if p.name != "mosaic.mp4" and p.stem not in job.cams and p.stem in CAMERAS:
+                p.unlink()
         rec = {"schema": 1, "version": RENDER_VERSION, "digest": job.digest, "key": job.ev.id,
                "event": job.ev.id, "slug": job.slug, "window": [job.a, job.b],
                "snapped": [job.snap_a, job.snap_b], "covered": covered, "precise": job.decision.precise,
                "primary": f"{job.slug}/mosaic.mp4", "children": children, "model": model, "stamp": STAMP_VERSION,
                "tags": tags_for(job, model), "archive": job.decision.archive, "track": has_track,
                "rendered_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")}
-        (job.out_dir / "render.json").write_text(json.dumps(rec, ensure_ascii=False, indent=1))
+        # The receipt goes last and atomically: if anything above failed half-way,
+        # there is no matching receipt and the next run renders the event again.
+        tmp_rec = job.out_dir / "render.json.tmp"
+        tmp_rec.write_text(json.dumps(rec, ensure_ascii=False, indent=1))
+        os.replace(tmp_rec, job.out_dir / "render.json")
         return rec
     finally:
+        for st in staged:              # a failed event publishes nothing
+            st.unlink(missing_ok=True)
         shutil.rmtree(tmp, ignore_errors=True)

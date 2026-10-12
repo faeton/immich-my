@@ -67,10 +67,18 @@ class Segment:
     width: int | None = None
     height: int | None = None
     bitrate: int | None = None  # of the reference (front) file, bits/s
+    # Cameras whose file is shorter than the segment (camera → its own duration, s).
+    # The 2023 HW4 front camera records only the first ~38 s of each minute, in
+    # real time, then nothing until the next segment: a hole, not a slow clock.
+    cd: dict[str, float] | None = None
 
     @property
     def end(self) -> float:
         return self.start + self.d
+
+    def cam_d(self, cam: str) -> float:
+        """How many seconds of the segment this camera's file covers (from its start)."""
+        return (self.cd or {}).get(cam, self.d)
 
 
 @dataclass
@@ -101,6 +109,9 @@ class Event:
 
     def to_dict(self) -> dict:
         d = asdict(self)
+        for s in d["segs"]:
+            if not s.get("cd"):
+                s.pop("cd", None)      # only segments with a short camera carry it
         return d
 
     @classmethod

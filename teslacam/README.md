@@ -55,6 +55,18 @@ uv run immy stacks apply ~/Media/render/2026-tesla-dashcam --write
   the receipt's digest (segments + decision + renderer version) skips
   unchanged events; a dropped event's folder is reported and removed with
   `--prune`. One confirmation per dump (`--yes` skips, `--dry-run` plans).
+  An event's files are staged as `._<name>.mp4` (excluded by Immich's default
+  library patterns) and renamed into place only when the whole event
+  succeeded, so rendering straight into the library never exposes half an
+  event.
+
+**Short cameras.** A camera can stop before its segment ends — the 2023 HW4
+front records the first ~38 s of each minute, in real time, then nothing. The
+segment lasts as long as its longest camera, the short one is recorded per
+segment (`cd`, flag `short-front`), and the hole stays a hole: black
+"NO FOOTAGE" in the mosaic, a timestamp gap in the lossless child (players
+hold the last frame while the wall-clock subtitle runs on), dimmed in the
+viewer. Nothing is retimed.
 
 Folder names never carry the city or reason: in an Immich external library
 the path is the asset's identity, so a later city/timezone fix must not

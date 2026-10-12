@@ -22,7 +22,7 @@ def frames_for_window(root: Path, ev: Event, a: float, b: float, *, hz: float = 
         samples = sei_mod.sei_track(root / ev.dir / fn)
         if not samples:
             continue
-        fps = len(samples) / seg.d if seg.d else 36.0
+        fps = len(samples) / seg.cam_d("front") if seg.cam_d("front") else 36.0
         step = max(1, int(round(fps / hz)))
         base = datetime.fromisoformat(seg.utc) if seg.utc else None
         for i in range(0, len(samples), step):

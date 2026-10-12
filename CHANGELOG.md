@@ -4,6 +4,61 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-12 — teslacam: cameras that stop before the minute ends
+
+### Found
+
+- **The 2023 HW4 front camera records only the first ~38 s of each minute.**
+  Dump of Aug 2023 (Balkans, 1295 files): repeaters and rear ~59.7 s per
+  segment, front ~38 s from 2023-08-13 on (June–early-Aug files are a full
+  60 s; some runs ~57 s). Not a slow clock: ~1360 frames at a true 36 fps, and
+  on 2023-08-18 12:43:57 the front file's last frame still shows a truck ahead
+  that the right repeater shows passing at real 49 s. So the footage is real
+  time and then a hole until the next segment; nothing is retimed.
+- scan took each segment's length from the front file, so every segment of
+  that dump was ~38 s on the timeline: repeater/rear cuts came out 1.6× the
+  window (`_verify` caught one at 288 s for 180 s), the default trigger
+  window landed in the wrong place, the mosaic spliced 38 s of front against
+  60 s of the others.
+- A failed `_verify` left `<cam>.mp4.part.mp4` in the output folder — which
+  was Immich's library — and a failed event left its finished mosaic and
+  children behind without a receipt. Immich's nightly scan would have
+  imported both.
+
+### Changed
+
+- **Segment length = the longest camera's**, unless the front is within 1 s
+  of it (then the front's, as before: events without a short camera keep the
+  same durations, the same digest, and are not re-rendered). A shorter camera
+  is recorded per segment (`cd: {camera: seconds}`, only when present) and the
+  event gets a `short-<camera>` flag.
+- **Holes stay holes.** Each camera's concat list declares every file to last
+  until the next segment starts (`duration`, minus the first file's in
+  point), so a short file or a missing middle file leaves a timestamp gap
+  instead of pulling later footage forward. Mosaic: shifted by the window's in
+  point (not the first kept frame), `fps=…:start_time=0`, holes painted black
+  with "NO FOOTAGE"; a camera with only a hole in the window gets the plain
+  black tile. Children: lossless copy keeps the gap (the frame before a hole
+  is one long sample; video duration = real span; players hold that frame
+  while the wall-clock subtitle runs on); the child starts at the camera's
+  first footage in the window and ends at its last; a window wholly inside a
+  hole skips the camera. `_verify` checks the video stream's own duration.
+- **All-or-nothing publish.** Every file of an event is rendered as
+  `._<name>.mp4` (in Immich's default `**/._*` exclusions) and renamed into
+  place only after the whole event succeeded; a failure removes the staged
+  files and leaves any previous render untouched. Leftover `._*` /
+  `*.part.mp4` files are cleared at the next run.
+- SEI track spreads the samples over the front file's own length; the
+  thumbnail uses another camera when the trigger falls in the front's hole.
+- Viewer: the clock and segment chaining follow the camera that covers the
+  most of the segment (it was the first tile: front, which ended at 38 s and
+  dragged the others along); a camera in its hole is dimmed and paused, not
+  seeked past its end; "gaps" chip on affected events.
+- Tests: `tests/test_short_camera.py` (timeline, holes in child and mosaic,
+  in point inside a hole, window wholly in a hole, missing middle file, failed
+  event publishes nothing, unaffected events unchanged); the dry-run CLI test
+  no longer depends on terminal width.
+
 ## 2026-10-11 — Tesla dashcam: `teslacam` + `immy stacks apply`
 
 Branch `tesla-dashcam`. Design and the owner's decisions in
