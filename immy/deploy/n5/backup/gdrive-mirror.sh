@@ -42,6 +42,7 @@ _CLI_VERIFY="${VERIFY:-}"
 
 HC_URL="${HC_URL:-}"                                   # Healthchecks ping URL (empty = no pings)
 HC_CURL_OPTS="${HC_CURL_OPTS:-}"                       # extra curl flags for hc()
+NOTIFY_CMD="${NOTIFY_CMD:-}"                           # optional: run as `$NOTIFY_CMD "<message>"` on failure
 RID="$(cat /proc/sys/kernel/random/uuid 2>/dev/null || true)"
 
 RCLONE="${RCLONE:-rclone}"
@@ -128,6 +129,10 @@ on_exit() {
   else
     log "FAILED (exit $rc)"
     hc /fail --data-raw "$(tail -c 5000 "$LOG")"
+    if [ -n "$NOTIFY_CMD" ]; then
+      "$NOTIFY_CMD" "gdrive-mirror FAILED (exit $rc) on $(hostname): $(grep -m1 'ERROR' "$LOG" | cut -c1-300) — log: $LOG" \
+        >/dev/null 2>&1 || true
+    fi
   fi
   find "$LOG_DIR" -name 'gdrive-*.log' -type f -mtime "+$KEEP_LOG_DAYS" -delete 2>/dev/null || true
 }
