@@ -74,6 +74,7 @@ main{max-width:1700px;margin:0 auto;padding:16px 20px 90px}
 .pill.warn{background:var(--unrev);color:#0e1116;font-weight:600}
 .card .body{padding:8px 10px 10px}
 .card .when{font-size:12px;color:var(--dim);font-variant-numeric:tabular-nums}
+.card .when b{color:var(--fg);font-weight:600}
 .card .what{font-size:13px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .tags{display:flex;flex-wrap:wrap;gap:4px;margin-top:5px}
 .tag{background:var(--panel2);border:1px solid var(--line);font-size:11px;padding:0 7px;border-radius:999px;white-space:nowrap}
@@ -186,6 +187,9 @@ const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&
 const dur=s=>{if(s==null)return'';s=Math.round(s);return Math.floor(s/60)+':'+String(s%60).padStart(2,'0')};
 const slug=s=>(s||'').normalize('NFKD').replace(/[̀-ͯ]/g,'').toLowerCase().replace(/[^a-z0-9]+/g,'-').replace(/^-|-$/g,'');
 const gb=n=>(n/1e9).toFixed(1)+' GB';
+const size=n=>n>=1e9?(n/1e9).toFixed(1)+' GB':Math.max(1,Math.round(n/1e6))+' MB';
+const res=i=>{const w=i.width,h=i.height;if(!w||!h)return '';const s=Math.min(w,h);
+  return i.kind==='video'?(s>=2160?'4K':s>=1440?'2.7K':s>=1080?'1080p':s+'p'):(Math.round(w*h/1e5)/10)+' MP'};
 
 async function load(){
   const [a,b,c]=await Promise.all(['/api/items','/api/decisions','/api/trips'].map(u=>fetch(u).then(r=>r.json())));
@@ -217,7 +221,7 @@ function card(id){
     (i.kind==='video'?'<div class="play"></div>':'')+
     `<div class="tl">${tl}</div><div class="tr">${i.kind==='video'?`<span class="pill vid">VIDEO ${dur(i.duration)}</span>`:'<span class="pill">PHOTO</span>'}</div>`+
     `<div class="br"><span class="pill">${esc(i.src)}</span></div></div>`+
-    `<div class="body"><div class="when">${esc((i.time||'?').slice(11,16))} · ${esc(i.place||i.model||'')}</div>`+
+    `<div class="body"><div class="when">${esc((i.time||'?').slice(11,16))} · <b>${size(i.size)}</b>${res(i)?' · '+res(i):''} · ${esc(i.place||i.model||'')}</div>`+
     `<div class="what" title="${esc(i.id)}">${esc(name)}</div>`+
     (tags||d.note?`<div class="tags">${tags}${d.note?`<span class="tag">✎ ${esc(d.note)}</span>`:''}</div>`:'')+
     `</div></div>`;
