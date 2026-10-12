@@ -106,7 +106,8 @@ hc() {  # hc <path-suffix> [extra curl args...]
 }
 
 SNAP="gdrive-$TS"
-WORK="$(mktemp -d)"
+# Work dir on the dump's filesystem, so the handoff files can be pinned by hardlink.
+WORK="$(mktemp -d "$DUMP_DIR/.gdrive-work.XXXXXX")"
 cleanup() {
   local ds
   for ds in "$ORIGINALS_DS" "$MEDIA_DS" "$FLASH_DS"; do
@@ -185,6 +186,14 @@ prune_history() {
 free_gb=$(drive_free_gb)
 [ "$free_gb" -ge "$MIN_DRIVE_FREE_GB" ] \
   || { log "ERROR: Drive free ${free_gb}GB < ${MIN_DRIVE_FREE_GB}GB floor (or quota unreadable); refusing"; exit 1; }
+# Pin this run's handoff bundle: nightly-mirror.sh may replace the manifest,
+# recipe or newest dump while we upload (separate locks). Hardlinks keep the
+# exact inodes checked above; the recipe is tiny, so it is copied.
+mkdir -p "$WORK/handoff"
+ln "$DUMP" "$WORK/handoff/$(basename "$DUMP")" || { log "ERROR: cannot pin $DUMP"; exit 1; }
+ln "$MANIFEST_COPY" "$WORK/handoff/manifest.sqlite" || { log "ERROR: cannot pin $MANIFEST_COPY"; exit 1; }
+cp "$DUMP_DIR/RESTORE-RECIPE.txt" "$WORK/handoff/RESTORE-RECIPE.txt"
+DUMP="$WORK/handoff/$(basename "$DUMP")"
 log "preflight OK (Drive free: ${free_gb}GB, dump: $(basename "$DUMP"), ${dump_age_h}h old)"
 
 # --- snapshot + empty-source guards -----------------------------------------
@@ -317,16 +326,17 @@ for sub in library profile upload; do
 done
 
 # === 2. private (crypt), after the files it references =======================
+# Most valuable first: dump + recipe, then the manifest, then immy state.
+log "copy dump + recipe + manifest -> ${CRYPT_REMOTE} ..."
+run_rclone dump 0 copy "$DUMP" "${CRYPT_REMOTE}db"
+run_rclone recipe 0 copyto "$WORK/handoff/RESTORE-RECIPE.txt" "${CRYPT_REMOTE}db/RESTORE-RECIPE.txt"
+run_rclone manifest 0 copyto "$WORK/handoff/manifest.sqlite" "${CRYPT_REMOTE}immy/manifest/manifest.sqlite"
 for src in "$IMMY_STATE" "$IMMY_SIDECARS"; do
   name="$(basename "$src")"
   log "sync immy/$name -> ${CRYPT_REMOTE}immy/$name ..."
   run_rclone "immy-$name" 0 sync "$(flash_view "$src")/" "${CRYPT_REMOTE}immy/$name" \
     --filter-from "$WORK/state.filter" --max-delete "$MAX_DELETE"
 done
-log "copy manifest + dump + recipe -> ${CRYPT_REMOTE} ..."
-run_rclone manifest 0 copyto "$MANIFEST_COPY" "${CRYPT_REMOTE}immy/manifest/manifest.sqlite"
-run_rclone recipe 0 copyto "$DUMP_DIR/RESTORE-RECIPE.txt" "${CRYPT_REMOTE}db/RESTORE-RECIPE.txt"
-run_rclone dump 0 copy "$DUMP" "${CRYPT_REMOTE}db"
 
 # === 3. housekeeping (skipped in dry-run) ====================================
 if [ "$DRY_RUN" != 1 ]; then

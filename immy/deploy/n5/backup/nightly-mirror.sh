@@ -128,6 +128,8 @@ cleanup_snapshots() {
 on_exit() {
   local rc=$?
   cleanup_snapshots
+  # a dump that never got verified + renamed (pipeline failure, signal)
+  [ -n "${DUMP:-}" ] && rm -f "$DUMP.partial"
   if [ "$rc" -eq 0 ]; then
     log "SUCCESS"
     hc ""
@@ -200,7 +202,8 @@ log "dump OK ($dump_bytes bytes)"
 RECIPE="$DUMP_DIR/RESTORE-RECIPE.txt"
 immich_img=$(sudo docker inspect -f '{{.Config.Image}}' immich_server 2>/dev/null || echo '?')
 pg_img=$(sudo docker inspect -f '{{.Config.Image}}' "$PG_CONTAINER" 2>/dev/null || echo '?')
-cat > "$RECIPE" <<EOF
+# Written aside and renamed: gdrive-mirror.sh may be reading the published copy.
+cat > "$RECIPE.tmp" <<EOF
 Immich restore recipe — generated $TS by nightly-mirror.sh
 =========================================================
 immich-server image : $immich_img
@@ -222,6 +225,7 @@ Restore (on a host with the SAME image tags above):
   4. Start the full stack; run ANALYZE; if smart search misbehaves, REINDEX the
      VectorChord index. Run the Phase 2 acceptance checklist before trusting it.
 EOF
+mv -f "$RECIPE.tmp" "$RECIPE"
 log "recipe written: $RECIPE"
 
 # prune local dumps (keep newest KEEP_DUMPS)
@@ -235,7 +239,9 @@ done
 # The copy lands in a staging dir that step 4 rsyncs.
 sudo install -d -o "${OWNER%%:*}" -g "${OWNER##*:}" "$MANIFEST_STAGE"
 MANIFEST_COPY="$MANIFEST_STAGE/manifest.sqlite"
-rm -f "$MANIFEST_COPY" "$MANIFEST_COPY.tmp"
+# Only the temp copy is removed: the published one stays readable (for
+# gdrive-mirror.sh) until the verified new copy atomically replaces it below.
+rm -f "$MANIFEST_COPY.tmp" "$MANIFEST_COPY.tmp-wal" "$MANIFEST_COPY.tmp-shm"
 log "sqlite3 .backup $MANIFEST_DB -> $MANIFEST_COPY ..."
 # -readonly: never let this job (re)create or modify the source DB.
 sudo sqlite3 -readonly "$MANIFEST_DB" ".backup '$MANIFEST_COPY.tmp'"
