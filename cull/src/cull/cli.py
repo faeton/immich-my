@@ -109,6 +109,8 @@ def stage(work: Path = WORK_OPT,
             console.print(f"[red]problem[/red] {escape(tp.trip)}: {escape(x)}")
     for iid in p.no_trip:
         console.print(f"[yellow]kept without a trip[/yellow] {escape(iid)}")
+    for iid in p.missing:
+        console.print(f"[yellow]kept but no longer scanned[/yellow] {escape(iid)}")
     if yes:
         before = {tp.trip: len(tp.problems) for tp in p.trips}
         n = stage_mod.execute(p, trips)
@@ -118,7 +120,7 @@ def stage(work: Path = WORK_OPT,
         console.print(f"{n} links made")
     else:
         console.print("plan only — pass --yes to link")
-    if p.no_trip or any(not tp.ok for tp in p.trips):
+    if p.no_trip or p.missing or any(not tp.ok for tp in p.trips):
         raise typer.Exit(1)
 
 

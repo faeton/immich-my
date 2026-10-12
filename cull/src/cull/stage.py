@@ -51,6 +51,7 @@ class TripPlan:
 class Plan:
     trips: list[TripPlan]
     no_trip: list[str]
+    missing: list[str] = field(default_factory=list)
 
 
 def _live(entry: dict) -> bool:
@@ -66,6 +67,33 @@ def _receipts(trips_root: Path) -> dict[str, dict]:
     return out
 
 
+def _trip_name_problem(trip: str, trips_root: Path) -> str | None:
+    if not trip or "/" in trip or "\\" in trip or trip.startswith(".") or trip in ("..",):
+        return f"trip name {trip!r} is not allowed"
+    if not dec_mod.TRIP_RE.fullmatch(trip) and not (trips_root / trip).is_dir():
+        return f"trip name {trip!r} is neither a valid name nor an existing folder"
+    return None
+
+
+def _containment_problem(trips_root: Path, trip: str, dst: Path) -> str | None:
+    base = trips_root / trip
+    if base.is_symlink():
+        return f"{base} is a symlink"
+    cur = base
+    for part in dst.parent.relative_to(base).parts:
+        cur = cur / part
+        if cur.is_symlink():
+            return f"{cur} is a symlink"
+    anc = dst.parent
+    while not anc.exists() and not anc.is_symlink():
+        anc = anc.parent
+    if base.is_relative_to(anc):  # trip dir not created yet: anc is trips_root or above
+        return None
+    if not anc.resolve().is_relative_to(base.resolve()):
+        return f"{dst} would land outside {base}"
+    return None
+
+
 def plan(work: Path, trips_root: Path, *, existing_paths=None,
          immich_prefix: str = "/mnt/external/originals") -> Plan:
     doc = load_items(work)
@@ -76,15 +104,27 @@ def plan(work: Path, trips_root: Path, *, existing_paths=None,
     root_dev = trips_root.stat().st_dev
     by_trip: dict[str, TripPlan] = {}
     no_trip: list[str] = []
+    missing: list[str] = []
+    bad_trips: set[str] = set()
     kept = []
     for iid, d in sorted(decs.items()):
-        if d.get("keep") != "keep" or iid not in items:
+        if d.get("keep") != "keep":
+            continue
+        if iid not in items:
+            missing.append(iid)
             continue
         if not d.get("trip"):
             no_trip.append(iid)
             continue
-        by_trip.setdefault(d["trip"], TripPlan(d["trip"]))
-        kept.append((iid, d))
+        trip = d["trip"]
+        if trip not in by_trip:
+            by_trip[trip] = TripPlan(trip)
+            prob = _trip_name_problem(trip, trips_root) if isinstance(trip, str) else "trip name is not a string"
+            if prob:
+                by_trip[trip].problems.append(prob)
+                bad_trips.add(trip)
+        if trip not in bad_trips:
+            kept.append((iid, d))
 
     staged_in: dict[str, str] = {}
     for trip, r in _receipts(trips_root).items():
@@ -98,9 +138,13 @@ def plan(work: Path, trips_root: Path, *, existing_paths=None,
                 by_trip.setdefault(trip, TripPlan(trip)).stale.append(
                     f"{iid}: staged here, now {now}; remove {', '.join(entry['dst'])}")
 
-    claimed: dict[Path, Path] = {}
+    claimed: dict[str, tuple[Path, Path]] = {}
     for iid, d in kept:
         tp, it = by_trip[d["trip"]], items[iid]
+        if (trips_root / tp.trip).is_symlink():
+            if not any("symlink" in x for x in tp.problems):
+                tp.problems.append(f"{trips_root / tp.trip} is a symlink")
+            continue
         if iid in staged_in and staged_in[iid] != tp.trip:
             tp.problems.append(f"{iid}: still staged in {staged_in[iid]}")
             continue
@@ -125,10 +169,18 @@ def plan(work: Path, trips_root: Path, *, existing_paths=None,
             if sst.st_dev != root_dev:
                 tp.problems.append(f"{iid}: {s} is on another filesystem than {trips_root}")
                 continue
-            if claimed.get(dst, s) != s:
-                tp.problems.append(f"{iid}: {dst} is claimed by two sources")
+            bad = _containment_problem(trips_root, tp.trip, dst)
+            if bad:
+                tp.problems.append(f"{iid}: {bad}")
                 continue
-            claimed[dst] = s
+            key = str(dst).casefold()
+            if key in claimed:
+                if claimed[key] == (s, dst):
+                    tp.problems.append(f"{iid}: {dst} is listed by two items")
+                else:
+                    tp.problems.append(f"{iid}: {dst} is claimed by two sources")
+                continue
+            claimed[key] = (s, dst)
             if dst.exists() or dst.is_symlink():
                 dstat = dst.lstat()
                 if (dstat.st_dev, dstat.st_ino) == (sst.st_dev, sst.st_ino):
@@ -148,7 +200,7 @@ def plan(work: Path, trips_root: Path, *, existing_paths=None,
                    for ip in tp.items for lk in ip.links}
             for p in sorted(existing_paths(sorted(lib))):
                 tp.problems.append(f"{lib[p]} is already an Immich asset ({p})")
-    return Plan(sorted(by_trip.values(), key=lambda t: t.trip), sorted(no_trip))
+    return Plan(sorted(by_trip.values(), key=lambda t: t.trip), sorted(no_trip), sorted(missing))
 
 
 def execute(p: Plan, trips_root: Path) -> int:
@@ -176,6 +228,7 @@ def execute(p: Plan, trips_root: Path) -> int:
             made_total += len(made)
             prev = entries.get(ip.id, {})
             entries[ip.id] = {**ip.record, "staged": prev.get("staged") or now_iso()}
-        if entries != old.get("items"):
-            write_json_atomic(rpath, {"trip": tp.trip, "updated": now_iso(), "items": entries})
+            if entries != old.get("items"):
+                write_json_atomic(rpath, {"trip": tp.trip, "updated": now_iso(), "items": entries})
+                old = {"items": dict(entries)}
     return made_total

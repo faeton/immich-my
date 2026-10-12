@@ -166,3 +166,90 @@ def test_cli_stage_exit_code_when_something_is_not_staged(tmp_path):
     dec.apply(work, items, list(items), {"keep": "keep"}, set())
     r = CliRunner().invoke(app, ["stage", "--work", str(work), "--trips", str(trips), "--yes"])
     assert r.exit_code == 1 and "without a trip" in r.output
+
+
+
+
+def test_symlinked_trip_dir_refused(tmp_path):
+    work, trips, _, items = setup(tmp_path)
+    keep(work, items, list(items), "2022-01-kyiv")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (trips / "2022-01-kyiv").symlink_to(outside)
+    p = st.plan(work, trips)
+    assert not p.trips[0].ok
+    st.execute(p, trips)
+    assert not list(outside.iterdir())
+
+
+def test_symlinked_src_dir_refused(tmp_path):
+    work, trips, _, items = setup(tmp_path)
+    keep(work, items, list(items), "2022-01-kyiv")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (trips / "2022-01-kyiv").mkdir()
+    (trips / "2022-01-kyiv" / "Cine").symlink_to(outside)
+    p = st.plan(work, trips)
+    assert not p.trips[0].ok
+    st.execute(p, trips)
+    assert not list(outside.iterdir())
+
+
+def test_traversal_trip_name_refused(tmp_path):
+    work, trips, _, items = setup(tmp_path)
+    keep(work, items, list(items), "2022-01-kyiv")
+    path = work / "_cull" / "decisions.json"
+    text = path.read_text().replace("2022-01-kyiv", "../x")
+    path.write_text(text)
+    p = st.plan(work, trips)
+    assert p.trips and all(not t.ok for t in p.trips)
+    st.execute(p, trips)
+    assert not (tmp_path / "media" / "x").exists() and not list(trips.iterdir())
+
+
+def test_same_file_listed_by_two_items(tmp_path):
+    work, trips, _, items = setup(tmp_path)
+    doc = json.loads((work / "_cull" / "items.json").read_text())
+    dup = {**doc["items"][0], "id": "Cine/30Jan/DUP.MP4"}
+    doc["items"].append(dup)
+    write_json_atomic(work / "_cull" / "items.json", doc)
+    items[dup["id"]] = dup
+    keep(work, items, [doc["items"][0]["id"], dup["id"]], "2022-01-kyiv")
+    p = st.plan(work, trips)
+    assert not p.trips[0].ok and any("listed by two items" in x for x in p.trips[0].problems)
+
+
+def test_case_only_collision(tmp_path):
+    work, trips, src, items = setup(tmp_path)
+    (src / "30Jan" / "dji_0000.mp4").write_bytes(b"other")
+    doc = json.loads((work / "_cull" / "items.json").read_text())
+    extra = {"id": "Cine/30Jan/dji_0000.mp4", "src": "Cine", "kind": "video", "flags": [],
+             "files": ["30Jan/dji_0000.mp4"], "fp": "fpx"}
+    doc["items"].append(extra)
+    write_json_atomic(work / "_cull" / "items.json", doc)
+    items[extra["id"]] = extra
+    keep(work, items, [extra["id"], "Cine/30Jan/DJI_0000.MP4"], "2022-01-kyiv")
+    p = st.plan(work, trips)
+    assert not p.trips[0].ok and any("claimed by two sources" in x for x in p.trips[0].problems)
+
+
+def test_receipt_written_per_item(tmp_path, monkeypatch):
+    work, trips, _, items = setup(tmp_path)
+    keep(work, items, list(items), "2022-01-kyiv")
+    p = st.plan(work, trips)
+    writes = []
+    real = st.write_json_atomic
+    monkeypatch.setattr(st, "write_json_atomic", lambda path, doc: (writes.append(set(doc["items"])), real(path, doc)))
+    st.execute(p, trips)
+    assert len(writes) == 2 and len(writes[0]) == 1
+
+
+def test_kept_but_missing_from_items(tmp_path):
+    work, trips, _, items = setup(tmp_path)
+    keep(work, items, list(items), "2022-01-kyiv")
+    doc = json.loads((work / "_cull" / "items.json").read_text())
+    gone = doc["items"].pop()["id"]
+    write_json_atomic(work / "_cull" / "items.json", doc)
+    assert st.plan(work, trips).missing == [gone]
+    r = CliRunner().invoke(app, ["stage", "--work", str(work), "--trips", str(trips)], env={"COLUMNS": "200"})
+    assert r.exit_code == 1 and "no longer scanned" in r.output
