@@ -5492,7 +5492,18 @@ def sidecars_check(
     repairs = []                              # (sidecar, patch, reasons, [aid], text, SidecarFacts)
     conflicts: list[str] = []
     splits = []                               # (sidecar, {asset: "copy"|"own"}, members, text, SidecarFacts)
+    # One date written verbatim into the sidecars of shots the cameras say
+    # were taken at different moments: the old clock-drift rule's median
+    # (`sc.plan`'s clock-snap). Twins (dual-lens, LRV) share a moment, so a
+    # date; a clock shifted by a constant keeps their moments distinct.
+    clocks_by_date: dict[tuple[str, str], list] = {}
+    for side, (_, sf, fs) in facts.items():
+        if sf.dto:
+            clocks_by_date.setdefault((side.rsplit("/", 1)[0], sf.dto), []).extend(
+                f.clock for _, _, f, _ in fs if f.clock is not None)
     for side, (text, sf, fs) in facts.items():
+        clocks = clocks_by_date.get((side.rsplit("/", 1)[0], sf.dto), []) if sf.dto else []
+        shared = len(clocks) >= 2 and (max(clocks) - min(clocks)).total_seconds() > sc.SNAP_SPREAD_S
         # A stem-named sidecar two different files picked up (IMG_1.xmp for
         # IMG_1.HEIC and an unrelated IMG_1.MOV): each gets its own.
         if len(fs) > 1:
@@ -5503,7 +5514,7 @@ def sidecars_check(
                 else:
                     conflicts.append(side)      # reported; split with --split
                 continue
-        plans = [(a, sc.plan(f, sf, hint.get(a))) for a, _, f, _ in fs]
+        plans = [(a, sc.plan(f, sf, hint.get(a), shared=shared)) for a, _, f, _ in fs]
         fixes = [fx for _, fx in plans if fx is not None]
         if not fixes:
             for a, o, _, _ in fs:

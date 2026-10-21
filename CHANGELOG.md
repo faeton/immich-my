@@ -4,6 +4,29 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-22 — sidecars check: restore clocks the old clock-drift rule snapped
+
+### Found
+
+- **165 sidecars in 13 trips still carried one median timestamp each.** The
+  pre-2026-09-30 `clock-drift` rule (MEDIUM, applied with `--yes-medium`)
+  wrote the folder median into every file > 24 h from it; the rewrite stopped
+  new damage but never repaired old sidecars. Paphos FPV showed 18 May
+  instead of 29 May; Vietnam, La Manga, Tonga, pacific-au had 22–26 files on
+  one second; Peru had a phone (19 Feb) and a DJI (23 Feb) both on 22 Feb.
+- A full scan of identical sidecar dates (27,891 sidecars) found no other
+  trip groups beyond camera bursts, so plain-named files (`DJI_0532`) were not
+  missed: the camera clock comes from EXIF or `.SRT` before the filename.
+- `2024-03-argentina/DJI_0039`–`0046` are a San Francisco flight (Golden
+  Gate, Ocean Beach) that belongs to `2024-03-usa-sf-waymo`.
+
+### Changed
+
+- `sidecars check` adds `clock-snap` (docs/SIDECARS.md rule 3): a date shared
+  by shots whose own clocks differ, > 24 h from the file's clock, goes back to
+  the camera clock with the sidecar's offset. Applied on n5 to all 165
+  (backup `clock-snap-backup-20261022.tgz` + per-trip undo logs).
+
 ## 2026-10-12 — cull: review any import candidates, stage keepers into trips
 
 ### Found

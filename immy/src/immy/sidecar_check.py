@@ -35,6 +35,11 @@ from pathlib import Path
 _SAME_DEG = 1e-4
 # A sidecar date this close to the true local time is that time.
 _CLOCK_SLACK_S = 90
+# The old `clock-drift` rule only moved files more than 24 h from the median.
+SNAP_MIN_S = 24 * 3600
+# Shots sharing one sidecar date whose own clocks span more than this were
+# snapped together; twins of one moment (dual-lens, LRV) stay within it.
+SNAP_SPREAD_S = 5
 # Mirror test against the user's other shots: the stored point is far from
 # them and its mirror image is close.
 MIRROR_FAR_KM = 300
@@ -53,6 +58,7 @@ class FileFacts:
     video: bool = False
     read: bool = True               # False: exiftool couldn't read the file
     wall: datetime | None = None    # a still's DateTimeOriginal with no offset
+    clock: datetime | None = None   # the camera's own wall clock (EXIF > SRT > name)
 
 
 @dataclass(frozen=True)
@@ -138,7 +144,29 @@ def file_facts(exif: dict, path: str) -> FileFacts:
         ca = _parse_dt(exif.get("CreateDate"))
         if ca is not None and ca.year > 1970:
             utc = ca.replace(tzinfo=timezone.utc) if ca.tzinfo is None else ca
-    return FileFacts(lat, lon, local, utc, video, wall=wall)
+    return FileFacts(lat, lon, local, utc, video, wall=wall, clock=_camera_clock(local, wall, path))
+
+
+def _camera_clock(local: datetime | None, wall: datetime | None, path: str) -> datetime | None:
+    """What the camera's own clock read, as wall time: the still's tags, else
+    a DJI SRT's first frame, else the name it gave the file. Never QuickTime's
+    CreateDate (UTC on most cameras)."""
+    if local is not None:
+        return local.replace(tzinfo=None)
+    if wall is not None:
+        return wall
+    from .filenames import parse_date
+    from .srt import find_sibling, parse as parse_srt
+    srt = find_sibling(Path(path))
+    if srt is not None:
+        try:
+            dt = parse_srt(srt).datetime_original
+        except OSError:
+            dt = None
+        if dt is not None:
+            return dt
+    fn = parse_date(Path(path))
+    return fn.dt if fn is not None else None
 
 
 def _local_clock_camera(exif: dict, path: str) -> bool:
@@ -226,9 +254,11 @@ def _zone_at(lat, lon):
     return zone_at(lat, lon)
 
 
-def plan(file: FileFacts, side: SidecarFacts, hint: Hint | None = None) -> Repair | None:
+def plan(file: FileFacts, side: SidecarFacts, hint: Hint | None = None,
+         shared: bool = False) -> Repair | None:
     """What the sidecar should say instead, or None when it is right (or
-    when the original couldn't be read: no evidence, no change)."""
+    when the original couldn't be read: no evidence, no change). `shared`:
+    other sidecars in the same folder carry this exact date."""
     if not file.read:
         return None
     r = Repair()
@@ -272,6 +302,17 @@ def plan(file: FileFacts, side: SidecarFacts, hint: Hint | None = None) -> Repai
                 if local.utcoffset():
                     r.patch["DateTimeOriginal"] = _xmp_datetime(local)
                     r.reasons.append("clock-utc")
+    # Clock snapped to the folder median (old `clock-drift` audit rule): one
+    # date shared verbatim by several sidecars, each a day or more from its
+    # camera's own clock. The rule kept the offset and replaced the wall
+    # time, so the undo is the camera's clock with that same offset. A fix
+    # made in Photos never gives several files one identical second.
+    if (shared and dt is not None and file.clock is not None and "DateTimeOriginal" not in r.patch
+            and abs((dt.replace(tzinfo=None) - file.clock).total_seconds()) > SNAP_MIN_S):
+        clock = file.clock.replace(microsecond=0)
+        r.patch["DateTimeOriginal"] = (_xmp_datetime(clock.replace(tzinfo=dt.tzinfo)) if dt.tzinfo
+                                       else clock.strftime("%Y:%m:%d %H:%M:%S"))
+        r.reasons.append("clock-snap")
     return r if r.patch else None
 
 
@@ -285,8 +326,15 @@ def agrees(file: FileFacts, patch: dict[str, object]) -> bool:
     new = _parse_dt(patch["DateTimeOriginal"]) if "DateTimeOriginal" in patch else None
     if new is not None:
         own = file.local or file.utc
-        if new.tzinfo is None or (own is not None
-                                  and abs((new - own).total_seconds()) > _CLOCK_SLACK_S):
+        # The camera's clock reading, as the trip wrote it (a drone on home
+        # time: its UTC header can't confirm the trip's offset). A file that
+        # knows its own offset is held to its instant.
+        on_clock = file.local is None and file.clock is not None and abs(
+            (new.replace(tzinfo=None) - file.clock).total_seconds()) <= _CLOCK_SLACK_S
+        if new.tzinfo is None and not on_clock:
+            return False
+        if own is not None and new.tzinfo is not None and not on_clock and abs(
+                (new - own).total_seconds()) > _CLOCK_SLACK_S:
             return False
         # A still that only knows its wall clock: the new local time must
         # read the same.

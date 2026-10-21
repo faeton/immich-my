@@ -602,3 +602,98 @@ def test_an_unreadable_fingerprint_is_never_verified(lib) -> None:
     import inspect
     src = inspect.getsource(cli.sidecars_check)
     assert "(fp := fingerprint(side, o)) is None or seen.get(a) != fp" in src
+
+
+# --- clock-drift snap ------------------------------------------------------------
+# The pre-2026-09-30 `clock-drift` audit rule wrote the folder's median instant
+# into every file >24 h from it, keeping the sidecar's offset: a second
+# shooting day collapsed onto one second of the first.
+
+
+def test_file_facts_reads_the_cameras_own_clock(tmp_path) -> None:
+    jpg = sc.file_facts({"DateTimeOriginal": "2025:05:29 09:51:08"}, "DJI_20250529095108_0289_D.JPG")
+    assert jpg.clock == datetime(2025, 5, 29, 9, 51, 8)
+    # A DJI video: the SRT's wall clock, never QuickTime's UTC CreateDate.
+    mp4 = tmp_path / "DJI_20250227045943_0216_D.MP4"
+    mp4.write_bytes(b"")
+    mp4.with_suffix(".SRT").write_text(
+        "1\n00:00:00,000 --> 00:00:00,033\n<font size=\"28\">FrameCnt: 1, DiffTime: 33ms\n"
+        "2025-02-27 04:59:44.123\n[latitude: 10.1] [longitude: 106.2] [rel_alt: 1.0 abs_alt: 2.0]</font>\n\n")
+    v = sc.file_facts({"CreateDate": "2025:02:27 03:59:44"}, str(mp4))
+    assert v.clock.replace(microsecond=0) == datetime(2025, 2, 27, 4, 59, 44)
+    # No tags, no SRT: the name the camera gave it.
+    insv = sc.file_facts({"CreateDate": "2025:10:05 04:15:43"}, "VID_20251005_171553_00_001.insv")
+    assert insv.clock == datetime(2025, 10, 5, 17, 15, 53)
+
+
+PAPHOS = sc.FileFacts(34.84, 32.43, wall=datetime(2025, 5, 29, 9, 51, 8),
+                      clock=datetime(2025, 5, 29, 9, 51, 8))
+
+
+def test_a_snapped_clock_is_restored_with_the_sidecars_offset() -> None:
+    fix = sc.plan(PAPHOS, sc.SidecarFacts("2025-05-18T11:48:16+03:00"), shared=True)
+    assert fix.reasons == ["clock-snap"]
+    assert fix.patch == {"DateTimeOriginal": "2025:05:29 09:51:08+03:00"}
+    assert sc.agrees(PAPHOS, fix.patch)
+    # An offset-less sidecar gets an offset-less date back.
+    bare = sc.plan(PAPHOS, sc.SidecarFacts("2025-05-18T11:48:16"), shared=True)
+    assert bare.patch == {"DateTimeOriginal": "2025:05:29 09:51:08"}
+
+
+def test_a_snapped_drone_video_agrees_by_its_own_clock() -> None:
+    # Drone clock on home time, CreateDate UTC: the trip's convention is the
+    # drone's wall clock + the trip offset, which the UTC instant can't confirm.
+    clip = sc.FileFacts(utc=datetime(2025, 2, 27, 3, 59, 44, tzinfo=UTC), video=True,
+                        clock=datetime(2025, 2, 27, 4, 59, 44))
+    fix = sc.plan(clip, sc.SidecarFacts("2025-03-03T08:53:26+07:00"), shared=True)
+    assert fix.patch == {"DateTimeOriginal": "2025:02:27 04:59:44+07:00"}
+    assert sc.agrees(clip, fix.patch)
+
+
+def test_a_snap_needs_the_shared_value_and_a_day_apart() -> None:
+    side = sc.SidecarFacts("2025-05-18T11:48:16+03:00")
+    assert sc.plan(PAPHOS, side) is None                                   # one file: a deliberate fix
+    near = sc.FileFacts(wall=datetime(2025, 5, 19, 9, 0), clock=datetime(2025, 5, 19, 9, 0))
+    assert sc.plan(near, side, shared=True) is None                        # < 24 h: not the rule's work
+    assert sc.plan(sc.FileFacts(), side, shared=True) is None              # no clock: no evidence
+
+
+def test_cli_restores_a_snapped_folder(lib) -> None:
+    args, db, writes, tmp = lib
+    root = db["root"]
+    (root / "paphos").mkdir()
+    for aid, name, when in (("p1", "DJI_20250529095108_0289_D.JPG", "2025:05:29 09:51:08"),
+                            ("p2", "DJI_20250529095128_0290_D.JPG", "2025:05:29 09:51:28"),
+                            ("p3", "DJI_20250518114508_0272_D.JPG", "2025:05:18 11:45:08")):
+        (root / "paphos" / name).write_bytes(b"")
+        stem = name.rsplit(".", 1)[0]
+        dto = "2025-05-18T11:48:16+03:00" if aid != "p3" else "2025-05-18T11:45:08+03:00"
+        (root / "paphos" / f"{stem}.xmp").write_text(_xmp(dto))
+        db["sidecars"].append((aid, f"/lib/paphos/{name}", f"/lib/paphos/{stem}.xmp",
+                               datetime(2025, 1, 1, tzinfo=UTC)))
+        db["exif"].append({"SourceFile": str(root / "paphos" / name), "DateTimeOriginal": when})
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    got = dict(writes)
+    assert got["DJI_20250529095108_0289_D.JPG"] == {"DateTimeOriginal": "2025:05:29 09:51:08+03:00"}
+    assert got["DJI_20250529095128_0290_D.JPG"] == {"DateTimeOriginal": "2025:05:29 09:51:28+03:00"}
+    assert "DJI_20250518114508_0272_D.JPG" not in got                     # right already
+    assert "2 clock-snap" in " ".join(res.output.split())
+
+
+def test_cli_leaves_twins_with_a_shifted_clock_alone(lib) -> None:
+    # Insta360 dual-lens twins share one moment, so one sidecar date; a
+    # camera clock fixed by a constant shift is a deliberate correction.
+    args, db, writes, tmp = lib
+    root = db["root"]
+    (root / "peru").mkdir()
+    for aid, name in (("t0", "VID_20240211_125116_00_005.insv"), ("t1", "VID_20240211_125116_10_005.insv")):
+        (root / "peru" / name).write_bytes(b"")
+        stem = name.rsplit(".", 1)[0]
+        (root / "peru" / f"{stem}.xmp").write_text(_xmp("2024-02-15T18:21:39-04:00"))
+        db["sidecars"].append((aid, f"/lib/peru/{name}", f"/lib/peru/{stem}.xmp",
+                               datetime(2025, 1, 1, tzinfo=UTC)))
+        db["exif"].append({"SourceFile": str(root / "peru" / name), "CreateDate": "2024:02:11 12:51:16"})
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert not any(n.startswith("VID_20240211") for n, _ in writes)

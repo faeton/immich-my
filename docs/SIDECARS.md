@@ -35,7 +35,16 @@ local time with an offset in `CreationDate`. Both were flattened the same way.
    - else in the zone at the (corrected) position;
    - else in the zone most of your shots within 3 h carry;
    - else left alone.
-3. **Anything else is deliberate.** A location moved in Photos (km away, not a
+3. **Snapped clocks.** The old `clock-drift` audit rule (before 2026-09-30)
+   wrote the folder's median date into every file more than 24 h from it, so
+   a multi-day trip collapsed onto one second. When one sidecar date is shared
+   by shots whose own camera clocks (EXIF > DJI `.SRT` > filename, never
+   QuickTime `CreateDate`) span more than 5 s, and a file sits more than 24 h
+   from its own clock, its camera clock is restored with the sidecar's offset
+   (`clock-snap`). Twins of one moment (Insta360 dual-lens, LRV) share the
+   filename second, and constant-delta clock corrections keep distinct dates,
+   so neither matches.
+4. **Anything else is deliberate.** A location moved in Photos (km away, not a
    mirror) or a camera clock fixed by hours and minutes is never undone.
 
 ## Videos on the UTC clock with no sidecar
