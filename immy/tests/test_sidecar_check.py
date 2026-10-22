@@ -697,3 +697,15 @@ def test_cli_leaves_twins_with_a_shifted_clock_alone(lib) -> None:
     res = CliRunner().invoke(cli.app, args + ["--apply"])
     assert res.exit_code == 0, res.output
     assert not any(n.startswith("VID_20240211") for n, _ in writes)
+
+
+def test_an_insta360_x5_clock_is_read_as_utc() -> None:
+    # A zone (+4 h) away from the filename's clock: the X5's UTC CreateDate.
+    f = sc.file_facts({"CreateDate": "2026:06:25 14:07:44"}, "VID_20260625_180744_00_051.insv")
+    assert f.utc == datetime(2026, 6, 25, 14, 7, 44, tzinfo=timezone.utc)
+
+
+def test_a_known_x5_clock_is_utc_even_when_it_matches_the_name() -> None:
+    f = sc.file_facts({"CreateDate": "2026:06:25 14:07:44", "Model": "Insta360 X5"},
+                      "VID_20260625_140744_00_051.insv")
+    assert f.utc == datetime(2026, 6, 25, 14, 7, 44, tzinfo=timezone.utc)

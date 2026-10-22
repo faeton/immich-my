@@ -318,3 +318,13 @@ def test_apple_creation_date_with_offset_beats_create_date(tmp_path: Path):
     assert exif.date_time_original == datetime(2025, 7, 1, 10, 0, 5, tzinfo=UTC)
     assert asset.local_date_time == datetime(2025, 7, 1, 12, 0, 5, tzinfo=UTC)
     assert exif.time_zone == "UTC+2"
+
+
+def test_insta360_x5_create_date_is_utc(tmp_path: Path):
+    # The X5 records UTC; its filename carries the camera's clock, here still
+    # on Mauritius time (+4) in Corsica. Four hours apart → UTC, not local.
+    asset, exif = _build_media(tmp_path, "VID_20260625_180744_00_051.insv", {
+        "QuickTime:CreateDate": "2026:06:25 14:07:44",
+        "QuickTime:Make": "Insta360",
+    })
+    assert exif.date_time_original == datetime(2026, 6, 25, 14, 7, 44, tzinfo=UTC)

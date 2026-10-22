@@ -171,14 +171,17 @@ def _camera_clock(local: datetime | None, wall: datetime | None, path: str) -> d
 
 def _local_clock_camera(exif: dict, path: str) -> bool:
     """Cameras whose QuickTime `CreateDate` is local wall time, not UTC
-    (Insta360; `capture.QUICKTIME_LOCAL_CLOCK_MAKES`). Their sidecar dates
+    (older Insta360s; `capture.insta360_clock_is_local`). Their sidecar dates
     are never read as a UTC clock."""
     from . import insta360
-    from .capture import QUICKTIME_LOCAL_CLOCK_MAKES
+    from .capture import QUICKTIME_LOCAL_CLOCK_MAKES, insta360_clock_is_local
     make = exif.get("Make")
-    if isinstance(make, str) and make.lower().startswith(QUICKTIME_LOCAL_CLOCK_MAKES):
-        return True
-    return insta360.classify(Path(path)) is not None
+    if (isinstance(make, str) and make.lower().startswith(QUICKTIME_LOCAL_CLOCK_MAKES)) \
+            or insta360.classify(Path(path)) is not None:
+        model = exif.get("Model")
+        return insta360_clock_is_local(path, _parse_dt(exif.get("CreateDate")),
+                                       model if isinstance(model, str) else None)
+    return False
 
 
 _XMP_DTO = re.compile(r"<exif:DateTimeOriginal>([^<]+)<|exif:DateTimeOriginal=['\"]([^'\"]+)['\"]")

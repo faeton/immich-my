@@ -18,6 +18,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone, tzinfo
+from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -119,14 +120,48 @@ def _immich_time_zone(off: timezone) -> str:
 # GoPro were checked and DO write UTC. Unknown makers stay UTC.
 QUICKTIME_LOCAL_CLOCK_MAKES = ("insta360", "arashi vision")
 
+# Only Insta360's older cameras (ONE X2/X3/RS, GO 2) record local time: their
+# CreateDate sits seconds from the filename's clock. The X5 (Nov 2025 on)
+# records UTC, and its filename carries the clock in whatever zone the camera
+# was set to, so the two differ by that zone: −10 h in Tahiti, +4 h in Corsica
+# with the camera still on Mauritius time. 2,000+ library files, 2026-10-22.
+INSTA360_LOCAL_SLACK_S = 15 * 60
+# Known to record UTC whatever the filename says (a camera set to UTC+0, a
+# renamed file): the model settles it before the filename comparison.
+INSTA360_UTC_CLOCK_MODELS = ("x5",)
+
+
+def insta360_clock_is_local(path: Path | str, create_date: datetime | None,
+                            model: str | None = None) -> bool:
+    """An Insta360 file's QuickTime CreateDate is its local wall clock (older
+    cameras) unless the model is known to record UTC, or it is a zone away
+    from the clock in its filename (X5: UTC). With nothing to go on, local,
+    as these cameras were assumed."""
+    if model and any(m in model.lower().split() for m in INSTA360_UTC_CLOCK_MODELS):
+        return False
+    from .filenames import parse_date, parse_insta360
+    key = parse_insta360(Path(path))           # VID_/LRV_/PRO_ names; parse_date skips LRV_
+    try:
+        clock = datetime.strptime(key.timestamp, "%Y%m%d_%H%M%S") if key else None
+    except ValueError:
+        clock = None
+    if clock is None:
+        fn = parse_date(Path(path))
+        clock = fn.dt if fn else None
+    if clock is None or create_date is None:
+        return True
+    return abs((clock - create_date.replace(tzinfo=None)).total_seconds()) < INSTA360_LOCAL_SLACK_S
+
 
 def _quicktime_clock_is_local(row: ExifRow) -> bool:
     make = _str(row.get("EXIF:Make", "QuickTime:Make"))
-    if make is not None and make.lower().startswith(QUICKTIME_LOCAL_CLOCK_MAKES):
-        return True
     # Insta360 headers carry no Make (it lives in a vendor trailer exif.py
     # only reads for .insv/.lrv/.insp); a GO 2 `.mp4` is known by its name.
-    return insta360_mod.classify(row.path) is not None
+    if (make is not None and make.lower().startswith(QUICKTIME_LOCAL_CLOCK_MAKES)) \
+            or insta360_mod.classify(row.path) is not None:
+        return insta360_clock_is_local(row.path, _parse_exif_datetime(row.get("QuickTime:CreateDate")),
+                                       _str(row.get("EXIF:Model", "QuickTime:Model")))
+    return False
 
 
 def _offset_tag(raw: Any) -> timezone | None:

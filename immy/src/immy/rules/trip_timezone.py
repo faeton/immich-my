@@ -14,10 +14,11 @@ pass picks them up after dji-date-from-srt writes the date.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
+from ..capture import _quicktime_clock_is_local
 from ..exif import ExifRow
 from ..notes import parse_frontmatter, resolve
 from .registry import Finding, Rule, register
@@ -76,6 +77,15 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
         # crossed a border mid-trip still has the right offset per file).
         if row.get("EXIF:OffsetTimeOriginal", "XMP:OffsetTimeOriginal"):
             continue
+        if row.get("XMP:DateTimeOriginal", "EXIF:DateTimeOriginal") is None:
+            # Only a video's QuickTime CreateDate: UTC on most cameras. Labelling
+            # it with the trip offset put DJI, iPhone and Insta360 X5 videos
+            # hours early (Transfăgărășan, Socotra, Corsica; 2026-10-22).
+            if any(_has_offset_suffix(str(row.get(k) or ""))
+                   for k in ("QuickTime:CreationDate", "Keys:CreationDate")):
+                continue                     # Apple: the file has its local time
+            if not _quicktime_clock_is_local(row):
+                dt = dt.replace(tzinfo=timezone.utc).astimezone(zone).replace(tzinfo=None)
         offset = dt.replace(tzinfo=zone).utcoffset()
         if offset is None:
             continue
