@@ -101,7 +101,10 @@ def _propose(rows: list[ExifRow], folder: Path) -> list[Finding]:
             path=row.path,
             action="write_xmp",
             patch={
-                "HierarchicalSubject": per_file,
+                # Lightroom's separator is `|`: Immich builds its tag folders
+                # from it and reads a `/` as part of the name, so
+                # `Gear/Camera/X` became one flat tag `Gear|Camera|X`.
+                "HierarchicalSubject": [t.replace("/", "|") for t in per_file],
                 "Subject": subjects,
             },
             reason=f"{len(per_file)} tag(s) from {notes.name} front-matter",

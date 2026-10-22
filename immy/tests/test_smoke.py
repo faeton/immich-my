@@ -293,7 +293,8 @@ def test_tags_from_notes_written_to_xmp(dji_fixture: Path):
     h = tags.get("XMP:HierarchicalSubject")
     s = tags.get("XMP:Subject")
     assert isinstance(h, list)
-    assert set(h) == {"Events/MyTrip", "Gear/Camera/DJI Mini", "Source/DJI"}
+    # Lightroom's `|` between levels, so Immich nests them (Gear → Camera → …).
+    assert set(h) == {"Events|MyTrip", "Gear|Camera|DJI Mini", "Source|DJI"}
     assert isinstance(s, list)
     assert "MyTrip" in s and "DJI" in s
 
@@ -443,8 +444,8 @@ def test_tag_suggest_yes_medium_merges_into_notes_and_cascades_to_xmp(tag_sugges
     tags = _xmp_tags(tag_suggest_fixture / "DSC_0001.xmp")
     h = tags.get("XMP:HierarchicalSubject")
     assert isinstance(h, list)
-    assert "Gear/Camera/NIKON CORPORATION NIKON Z50_2" in h
-    assert "Source/DSC" in h
+    assert "Gear|Camera|NIKON CORPORATION NIKON Z50_2" in h
+    assert "Source|DSC" in h
 
 
 def test_tag_suggest_respects_opt_out(tag_suggest_fixture: Path):

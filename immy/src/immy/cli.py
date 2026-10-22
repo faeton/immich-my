@@ -257,8 +257,8 @@ def _fmt_make_model(row) -> str:
     hier = row.get("XMP:HierarchicalSubject")
     if isinstance(hier, list):
         for item in hier:
-            if isinstance(item, str) and item.startswith("Gear/Camera/"):
-                camera = item.removeprefix("Gear/Camera/").strip()
+            if isinstance(item, str) and item.replace("|", "/").startswith("Gear/Camera/"):
+                camera = item.replace("|", "/").removeprefix("Gear/Camera/").strip()
                 if camera:
                     return f"{camera} (xmp)"
 
@@ -1148,6 +1148,57 @@ def tags_sync(
         )
         if folder_errors:
             raise typer.Exit(code=1)
+
+
+@tags_app.command("model")
+def tags_model(
+    match: list[str] = typer.Option(..., "--match",
+        help="Camera models to tag, matched case-insensitively anywhere in the name "
+             "(repeatable): --match meta --match ray-ban."),
+    owner: str = typer.Option(None, "--owner", help="Immich user email (required with several users)."),
+    write: bool = typer.Option(False, "--write", help="Apply (default: dry-run report)."),
+    config_path: Path = typer.Option(None, "--config", help="immy config path."),
+) -> None:
+    """Tag every asset of these camera models `Gear/Camera/<model>`, wherever it
+    lives — for devices with no trip notes, like Meta glasses shots from the
+    Photos import. Model from Immich's own `asset_exif.model`; tags created via
+    the API, linked by SQL with the list locked (`trips.link_tags`)."""
+    from . import trips as trips_mod
+    config = load_config(config_path)
+    if config.pg is None or config.immich is None:
+        console.print("[red]needs pg: and immich: in immy config[/red]")
+        raise typer.Exit(code=2)
+    conn = pg_mod.connect(config.pg)
+    cur = conn.cursor()
+    cur.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL')
+    users = [u for u in cur.fetchall() if not owner or u[1] == owner]
+    if len(users) != 1:
+        console.print("[red]pass --owner <email>[/red]")
+        conn.close()
+        raise typer.Exit(code=2)
+    cur.execute(
+        """SELECT a.id::text, trim(e.model) FROM asset a JOIN asset_exif e ON e."assetId" = a.id
+           WHERE a."ownerId" = %s AND a."deletedAt" IS NULL AND e.model ILIKE ANY(%s)""",
+        (users[0][0], [f"%{m}%" for m in match]))
+    by_tag: dict[str, list[str]] = {}
+    for aid, model in cur.fetchall():
+        by_tag.setdefault(f"Gear/Camera/{model.strip()}", []).append(aid)
+    for tag, ids in sorted(by_tag.items(), key=lambda kv: -len(kv[1])):
+        console.print(f"  {len(ids):6} {tag}")
+    if not write:
+        conn.close()
+        console.print(f"[yellow]dry-run[/yellow] — pass --write to tag "
+                      f"{sum(map(len, by_tag.values()))} asset(s).")
+        return
+    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key,
+                          ssh_host=config.immich.ssh_host)
+    tag_ids = client.upsert_tags(list(by_tag))
+    links = [(a, tag_ids[t], t) for t, ids in by_tag.items() if t in tag_ids for a in ids]
+    missing = [t for t in by_tag if t not in tag_ids]
+    trips_mod.link_tags(conn, links)
+    conn.close()
+    console.print(f"[green]✓[/green] {len(links)} asset-tag link(s)"
+                  + (f"; [red]no tag id for {missing}[/red]" if missing else ""))
 
 
 @tags_app.command("camera")
@@ -5818,6 +5869,139 @@ def sidecars_check(
                   + (f", {dated} video(s) dated" if zone_fixes else "")
                   + (f", {registered} registered" if registering else "") + ", metadata refresh queued for "
                   f"{refreshed} asset(s). Undo log: {log_path}")
+
+@sidecars_app.command("locate")
+def sidecars_locate(
+    model: list[str] = typer.Option(..., "--model",
+        help="Camera models to place, matched case-insensitively anywhere in the name "
+             "(repeatable): --model meta --model ray-ban."),
+    since: str = typer.Option(..., "--since", help="Only shots from this date on (YYYY-MM-DD)."),
+    until: str = typer.Option(None, "--until", help="Only shots up to this date (YYYY-MM-DD)."),
+    confidence: str = typer.Option("high,medium", "--confidence",
+        help="Which placements to write: high (a geotagged shot within 5 min), medium "
+             "(a still bracket, or interpolated within 90 min)."),
+    dry_run: bool = typer.Option(True, "--dry-run/--apply", help="Default: report only."),
+    originals: Path = typer.Option(None, "--originals", help="Where the import path is mounted."),
+    import_path: str = typer.Option(None, "--import-path", help="Immich import path, when several."),
+    owner: str = typer.Option(None, "--owner", help="Immich user email (required with several users)."),
+    csv_path: Path = typer.Option(None, "--csv", help="Write every placement here."),
+    config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
+) -> None:
+    """Place shots with no GPS from your own geotagged shots around them.
+
+    For cameras without GPS whose app no longer geotags (Meta glasses since
+    2026-02-26): the phone in your pocket places them. Photos are matched on
+    the wall clock, videos on their instant; a shot with no zone also gets the
+    offset of the shot that placed it. Writes into the asset's sidecar (its
+    registered one, else a new `name.ext.xmp`), registers it, logs the previous
+    text, and refreshes. See `immy/src/immy/locate.py`.
+    """
+    import csv
+    import json as _json
+    from datetime import datetime as _dt, timezone as _tz
+    from . import locate as locate_mod
+    from . import sidecar as sidecar_mod
+    from . import sidecar_check as sc
+
+    tiers = {t.strip() for t in confidence.split(",") if t.strip()}
+    config = load_config(config_path)
+    if config.pg is None or (not dry_run and config.immich is None):
+        console.print("[red]needs pg: (and immich: for --apply) in immy config[/red]")
+        raise typer.Exit(code=2)
+    originals = originals or config.originals_root
+    if originals is None:
+        console.print("[red]pass --originals (or set originals_root)[/red]")
+        raise typer.Exit(code=2)
+    conn = pg_mod.connect(config.pg)
+    if not dry_run:
+        _require_live_schema(conn)
+    cur = conn.cursor()
+    cur.execute('SELECT id, email FROM "user" WHERE "deletedAt" IS NULL')
+    match = [u for u in cur.fetchall() if not owner or u[1] == owner]
+    if len(match) != 1:
+        console.print("[red]pass --owner <email>[/red]" if match else f"[red]no Immich user {owner!r}[/red]")
+        conn.close()
+        raise typer.Exit(code=2)
+    owner_id = str(match[0][0])
+    root = _resolve_import_root(cur, import_path)
+    if root is None:
+        conn.close()
+        raise typer.Exit(code=2)
+
+    def local(path: str) -> Path | None:
+        return originals / path[len(root) + 1:] if path.startswith(root + "/") else None
+
+    lo = _dt.fromisoformat(since).replace(tzinfo=_tz.utc)
+    hi = _dt.fromisoformat(until).replace(tzinfo=_tz.utc) if until else _dt.now(_tz.utc)
+    window = {"owner": owner_id, "since": lo, "until": hi}
+    cur.execute(locate_mod.TARGETS_SQL, {**window, "models": [f"%{m}%" for m in model]})
+    targets = [locate_mod.Target(str(a), o, t == "VIDEO",
+                                 ldt.astimezone(_tz.utc).replace(tzinfo=None), fca, tz, side)
+               for a, o, t, ldt, fca, tz, side in cur.fetchall() if local(o) is not None]
+    cur.execute(locate_mod.POINTS_SQL, window)
+    points = [locate_mod.point(ldt, fca, la, lon) for ldt, fca, la, lon in cur.fetchall()]
+    placed = locate_mod.place(targets, points)
+    chosen = [p for p in placed if p.confidence in tiers]
+    by_tier: dict[str, int] = {}
+    for p in placed:
+        by_tier[p.confidence] = by_tier.get(p.confidence, 0) + 1
+    console.print(f"[bold]sidecars locate[/bold] — {len(targets)} shot(s) with no GPS from "
+                  f"{', '.join(model)} since {since}; {len(points)} geotagged shot(s) to place them by")
+    console.print(f"  placed: " + (", ".join(f"{v} {k}" for k, v in sorted(by_tier.items())) or "none")
+                  + f"; {len(targets) - len(placed)} out of reach, left alone; "
+                  f"{sum(1 for p in chosen if p.dto)} also get their zone")
+    if csv_path:
+        with open(csv_path, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["asset", "original", "kind", "confidence", "basis", "lat", "lon",
+                        "zone_before", "date_after", "write"])
+            for p in placed:
+                t = p.target
+                w.writerow([t.id, t.path, "video" if t.video else "photo", p.confidence, p.basis,
+                            f"{p.lat:.6f}", f"{p.lon:.6f}", t.zone or "", p.dto or "",
+                            "yes" if p in chosen else "no"])
+        console.print(f"wrote {csv_path}")
+    if dry_run:
+        conn.close()
+        console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to write {len(chosen)} placement(s).")
+        return
+
+    client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key,
+                          ssh_host=config.immich.ssh_host)
+    state_root = config.state_root or Path.home() / ".immy"
+    state_root.mkdir(parents=True, exist_ok=True)
+    log_path = state_root / f"sidecar-locate-{_dt.now().strftime('%Y%m%d-%H%M%S-%f')}-{os.getpid()}.jsonl"
+    done: list[str] = []
+    with open(log_path, "x") as log:
+        for p in chosen:
+            t = p.target
+            side = t.sidecar or t.path + ".xmp"
+            side_local, media = local(side), local(t.path)
+            if side_local is None or media is None:
+                continue
+            if not t.sidecar and side_local.exists():
+                console.print(f"  [yellow]skipped[/yellow] {side_local}: exists, unregistered")
+                continue
+            before = sc.sidecar_text(side_local) if side_local.exists() else None
+            log.write(_json.dumps({"sidecar": str(side_local), "assets": [t.id], "before": before,
+                                   "registered_before": t.sidecar, "registered_now": side,
+                                   "patch": locate_mod.patch(p), "basis": p.basis}) + "\n")
+            log.flush()
+            os.fsync(log.fileno())
+            try:
+                sidecar_mod.write(media, locate_mod.patch(p), xmp_path=side_local)
+            except RuntimeError as e:
+                console.print(f"  [red]sidecar failed[/red] {side_local}: {e}")
+                continue
+            if not t.sidecar:
+                cur.execute(sc.REGISTER_SIDECAR_SQL, {"asset": t.id, "path": side})
+                conn.commit()
+            done.append(t.id)
+    conn.close()
+    for i in range(0, len(done), 500):
+        client.refresh_metadata(done[i:i + 500])
+    console.print(f"[green]✓[/green] {len(done)} shot(s) placed, metadata refresh queued. Undo log: {log_path}")
+
 
 app.add_typer(sidecars_app, name="sidecars")
 
