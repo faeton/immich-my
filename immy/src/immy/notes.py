@@ -18,16 +18,23 @@ NOTES_ORDER = ("TRIP.md", "IMMY.md", "README.md")
 DEFAULT_WRITE = "README.md"
 
 
+# Legal names that cameras write as Make, by the brand their models carry:
+# Insta360 writes "Arashi Vision" + "Insta360 X5".
+MAKE_BRANDS = {"arashi vision": "Insta360"}
+
+
 def join_make_model(make: str | None, model: str | None) -> str:
     """Canonical "<Make> <Model>" with no double-brand.
 
     Many vendors put the make inside the model (Canon → "Canon EOS R7",
     Nikon → "NIKON Z 50_2"). Naive concatenation produces "Canon Canon
     EOS R7". If model already begins with the make (case-insensitive),
-    use the model as-is.
+    use the model as-is. A legal-name make (`MAKE_BRANDS`) counts as its
+    brand, so "Arashi Vision" + "Insta360 X5" is "Insta360 X5".
     """
     mk = (make or "").strip()
     md = (model or "").strip()
+    mk = MAKE_BRANDS.get(mk.lower(), mk)
     if not mk:
         return md
     if not md:
@@ -35,6 +42,20 @@ def join_make_model(make: str | None, model: str | None) -> str:
     if md.lower().startswith(mk.lower()):
         return md
     return f"{mk} {md}"
+
+
+def canonical_camera(name: str) -> str:
+    """A camera name as written in older notes, made canonical the way
+    `join_make_model` would have: "Arashi Vision Insta360 X5" → "Insta360
+    X5", "Canon Canon EOS R7" → "Canon EOS R7"."""
+    name = " ".join(name.split())
+    for legal in MAKE_BRANDS:
+        if name.lower().startswith(legal + " "):
+            return join_make_model(legal, name[len(legal) + 1:])
+    words = name.split(" ", 2)
+    if len(words) >= 2 and words[0].lower() == words[1].lower():
+        return " ".join(words[1:])
+    return name
 
 
 def resolve(folder: Path) -> Path | None:

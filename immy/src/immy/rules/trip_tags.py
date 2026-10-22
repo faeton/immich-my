@@ -9,7 +9,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from ..exif import ExifRow
-from ..notes import join_make_model, parse_frontmatter, resolve
+from ..notes import canonical_camera, join_make_model, parse_frontmatter, resolve
 from .registry import Finding, Rule, register
 
 
@@ -54,19 +54,32 @@ def tags_for_file(cam: str | None, tags: list[str]) -> list[str]:
     Gear/Camera/* tags must only land on files whose own camera matches —
     otherwise an Insta360 .insv ends up tagged "Gear/Camera/Canon EOS R7"
     just because a Canon was also on the trip.
+
+    Older notes spell one camera several ways ("Arashi Vision Insta360 X5",
+    "FC220" beside "DJI FC220"): each is made canonical, and of the names
+    that match a file only the most specific is kept, so one camera is one tag.
     """
     gear_tags = [t for t in tags if t.startswith("Gear/Camera/")]
     base_tags = [t for t in tags if not t.startswith("Gear/Camera/")]
     per_file = list(base_tags)
     matched = False
     if cam:
+        names: list[str] = []
         for gt in gear_tags:
-            gt_cam = gt.removeprefix("Gear/Camera/").strip()
+            gt_cam = canonical_camera(gt.removeprefix("Gear/Camera/").strip())
             # Match if either side is a substring of the other —
             # handles "Insta360" vs "Insta360 X3", "Canon EOS R7"
             # vs "Canon Canon EOS R7", etc.
-            if gt_cam and (gt_cam in cam or cam in gt_cam):
-                per_file.append(gt)
+            # Case-blind: Insta360 also writes "insta360 x5".
+            a, b = gt_cam.casefold(), cam.casefold()
+            if a and (a in b or b in a):
+                names.append(gt_cam)
+        for n in names:
+            f = n.casefold()
+            if any(f in o.casefold() and f != o.casefold() for o in names):
+                continue
+            if f not in (p.removeprefix("Gear/Camera/").casefold() for p in per_file):
+                per_file.append(f"Gear/Camera/{n}")
                 matched = True
     # If the file's camera doesn't match any notes-listed gear tag
     # (e.g. notes are stale, or first run after adding a new device),

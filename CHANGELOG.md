@@ -4,6 +4,18 @@ Notable changes and findings, newest first. Format is loosely
 [Keep a Changelog](https://keepachangelog.com); this project ships
 continuously, so entries are dated rather than versioned.
 
+## 2026-10-22 — one camera, one Gear/Camera tag
+
+- Insta360 writes Make "Arashi Vision", so `join_make_model` made "Arashi
+  Vision Insta360 X5" beside the notes' "Insta360 X5"; older notes also carry
+  "FC220" beside "DJI FC220" and "Canon Canon EOS R7". The legal make now
+  counts as its brand (`notes.MAKE_BRANDS`), notes gear tags are made
+  canonical (`notes.canonical_camera`), matching is case-blind ("insta360
+  x5"), and of the names matching a file only the most specific is applied.
+- Merged live: 530 asset links moved to `Insta360 X5` (308), `Insta360 ONE X2`
+  (506), `DJI FC220` (72), `Canon EOS R7` (74); the old tags are left empty
+  for Immich's TagCleanup.
+
 ## 2026-10-22 — sidecars check: restore clocks the old clock-drift rule snapped
 
 ### Found

@@ -32,6 +32,12 @@ def test_file_camera_gopro_filename_fallback():
     assert file_camera(row) == "GoPro"
 
 
+def test_file_camera_insta360_legal_make_is_its_brand():
+    # Insta360 writes Make "Arashi Vision"; the tag is "Insta360 X5", not both.
+    row = _row("VID_1.insv", **{"QuickTime:Make": "Arashi Vision", "QuickTime:Model": "Insta360 X5"})
+    assert file_camera(row) == "Insta360 X5"
+
+
 def test_file_camera_none_when_no_signal():
     row = _row("random.mp4")
     assert file_camera(row) is None
@@ -54,6 +60,20 @@ def test_tags_for_file_matches_gear_camera_substring():
     assert "Gear/Camera/Insta360" not in per_file
     assert "Events/2026-06-corsica-sardinia-yacht" in per_file
     assert "Source/DJI" in per_file
+
+
+def test_tags_for_file_matches_regardless_of_case():
+    # Some X5 files say "insta360 x5": the notes' spelling wins, no new tag.
+    per_file = tags_for_file("insta360 x5", ["Gear/Camera/Insta360 X5"])
+    assert per_file == ["Gear/Camera/Insta360 X5"]
+
+
+def test_tags_for_file_old_spellings_become_one_tag():
+    tags = ["Gear/Camera/Arashi Vision Insta360 X5", "Gear/Camera/Insta360 X5"]
+    assert tags_for_file("Insta360 X5", tags) == ["Gear/Camera/Insta360 X5"]
+    tags = ["Gear/Camera/FC220", "Gear/Camera/DJI FC220", "Gear/Camera/Canon Canon EOS R7"]
+    assert tags_for_file("DJI FC220", tags) == ["Gear/Camera/DJI FC220"]
+    assert tags_for_file("Canon EOS R7", tags) == ["Gear/Camera/Canon EOS R7"]
 
 
 def test_tags_for_file_synthesizes_gear_tag_when_unmatched():
