@@ -20,8 +20,29 @@ continuously, so entries are dated rather than versioned.
 - `2024-03-argentina/DJI_0039`–`0046` are a San Francisco flight (Golden
   Gate, Ocean Beach) that belongs to `2024-03-usa-sf-waymo`.
 
+- **`trip-timezone` labelled a video's UTC clock as local time.** With no
+  other date, it wrote QuickTime `CreateDate` (UTC on DJI, iPhone, Insta360
+  X5) with the trip offset: Transfăgărășan videos 3 h early, Socotra iPhone
+  copies 3 h early, Corsica previews 2 h early.
+- **The Insta360 X5 records UTC.** Older Insta360s record local time (filename
+  clock = CreateDate within seconds, every trip to Oct 2025); from Nov 2025 the
+  two differ by the camera's zone setting (−10 h, +1, +3, +4, +13 h).
+- **Camera clocks left on another zone** (fixed per trip from the camera's own
+  UTC stamp, checked against phone GPS): Vietnam drone on UTC+1 (113, +6 h),
+  mau-whales Insta360 on UTC+1 and drone on UTC+8 (38; 26–27 Feb were the
+  Seychelles), Transfăgărășan drone on UTC+2 (55), Socotra drone on UTC+13
+  (211), Svalbard Nikon videos missing their photos' correction (13).
+- **Sidecars Immich never read.** 173 Socotra sidecars weren't registered in
+  `asset_file`; 187 were lost when 624 duplicate asset rows (two rows per file
+  since the June migration) were merged — re-registered. 2,290 more assets
+  across the library have an unregistered sidecar on disk (1,904 in `2026/`).
+
 ### Changed
 
+- `trip-timezone` converts a video's UTC clock into the trip zone and skips
+  Apple videos that carry their own offset; `capture.insta360_clock_is_local`
+  (X5 by model, then filename vs CreateDate) is shared by ingest, audit and
+  `sidecars check`.
 - `sidecars check` adds `clock-snap` (docs/SIDECARS.md rule 3): a date shared
   by shots whose own clocks differ, > 24 h from the file's clock, goes back to
   the camera clock with the sidecar's offset. Applied on n5 to all 165
