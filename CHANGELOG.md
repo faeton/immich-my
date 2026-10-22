@@ -37,8 +37,25 @@ continuously, so entries are dated rather than versioned.
   since the June migration) were merged — re-registered. 2,290 more assets
   across the library have an unregistered sidecar on disk (1,904 in `2026/`).
 
+- **Meta glasses lost their location on 2026-02-26.** The last geotagged
+  shot is 21 Feb (Mahé); from 26 Feb nothing — in the files and in Photos.app,
+  across the gen-1 glasses and the April/September ones. The Meta AI app writes
+  the phone's position at import and needs its iOS location permission; it
+  came back once the app asked again (Find My setup) and was set to Always
+  (first geotagged shot again 2026-10-22, Adelaide). 1,416 of the 1,782 shots
+  in between placed from the iPhone shots around them (`sidecars locate`), 904
+  also given their zone; 366 had nothing close enough and stay unplaced.
+- **Camera and trip tags were flat.** immy wrote `Gear/Camera/X` into
+  `lr:hierarchicalSubject`; Immich splits that field on `|` and turns a `/`
+  inside a level into `|`, so each became one flat tag `Gear|Camera|X` (91
+  tags, 25,754 links), next to empty nested twins. 8,224 sidecars rewritten
+  with `|`, every link moved to the nested tag (`Gear` → `Camera` → …).
+
 ### Changed
 
+- `sidecars locate`, `tags model` (Gear/Camera/<model> for the 5,027 Meta
+  glasses assets from the Photos import), and `trip-tags-from-notes` writing
+  Lightroom's `|` separator.
 - `trip-timezone` converts a video's UTC clock into the trip zone and skips
   Apple videos that carry their own offset; `capture.insta360_clock_is_local`
   (X5 by model, then filename vs CreateDate) is shared by ingest, audit and
