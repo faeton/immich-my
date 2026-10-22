@@ -119,8 +119,8 @@ def file_facts(exif: dict, path: str) -> FileFacts:
         return FileFacts(read=False)
     video = path.rsplit(".", 1)[-1].lower() in VIDEO_EXTS
     lat, lon = _num(exif.get("GPSLatitude")), _num(exif.get("GPSLongitude"))
-    if lat is not None and lon is not None and abs(lat) < 1e-3 and abs(lon) < 1e-3:
-        lat = lon = None                                     # null island: no fix
+    if lat is None or lon is None or (abs(lat) < 1e-3 and abs(lon) < 1e-3):
+        lat = lon = None                                     # half a fix, or null island: no fix
     local = utc = None
     cd = exif.get("CreationDate")
     if isinstance(cd, str):
@@ -202,6 +202,8 @@ def read_sidecar(text: str) -> SidecarFacts:
         deg, mins, hemi = (g.group(1), g.group(2), g.group(3)) if g.group(1) else (g.group(4), g.group(5), g.group(6))
         v = int(deg) + float(mins) / 60
         coords.append(-v if hemi in "SW" else v)
+    if None in coords:                  # half a position is no position
+        coords = [None, None]
     return SidecarFacts(dto, coords[0], coords[1])
 
 
@@ -472,6 +474,23 @@ INSERT INTO asset_file ("assetId", type, path) VALUES (%(asset)s, 'sidecar', %(p
 ON CONFLICT ("assetId", type, "isEdited") DO UPDATE SET path = EXCLUDED.path
 """
 
+# Assets with no sidecar registered. Immich links one only at import (or on
+# its "discover" job), so one written later (an audit rule, the Photos pull,
+# a repair) is never read until it is registered.
+UNREGISTERED_SQL = """
+SELECT a.id, a."originalPath", a."fileCreatedAt"
+FROM asset a
+WHERE a."ownerId" = %(owner)s AND a."deletedAt" IS NULL
+  AND NOT EXISTS (SELECT 1 FROM asset_file f WHERE f."assetId" = a.id AND f.type = 'sidecar')
+"""
+
+# Another user's assets under this import root: their sidecars sit next to
+# ours, so taking in unregistered ones is left to a run that sees both.
+OTHER_OWNERS_SQL = """
+SELECT count(*) FROM asset
+WHERE "ownerId" <> %(owner)s AND "deletedAt" IS NULL AND "originalPath" LIKE %(prefix)s
+"""
+
 # Sidecar files more than one user's assets point at: repaired by nobody
 # (each run sees one owner; a fix must be right for every asset it touches).
 SHARED_OWNERS_SQL = """
@@ -583,5 +602,5 @@ def sidecar_text(path: Path) -> str | None:
 __all__ = [
     "FileFacts", "SidecarFacts", "Hint", "Repair", "file_facts", "read_sidecar",
     "plan", "agrees", "describes", "split_roles", "own_patch", "correct_patch", "hints", "needs_hint", "sidecar_text", "km",
-    "SIDECARS_SQL", "SHARED_OWNERS_SQL", "HINTS_SQL", "UTC_CLOCK_SQL", "REGISTER_SIDECAR_SQL", "zone_fix", "VIDEO_EXTS", "MIRROR_FAR_KM", "MIRROR_NEAR_KM",
+    "SIDECARS_SQL", "SHARED_OWNERS_SQL", "HINTS_SQL", "UTC_CLOCK_SQL", "REGISTER_SIDECAR_SQL", "UNREGISTERED_SQL", "OTHER_OWNERS_SQL", "zone_fix", "VIDEO_EXTS", "MIRROR_FAR_KM", "MIRROR_NEAR_KM",
 ]

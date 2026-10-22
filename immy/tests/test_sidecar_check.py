@@ -150,6 +150,10 @@ class _Cur:
             self._rows = self.db["sidecars"]
         elif sql is sc.UTC_CLOCK_SQL:
             self._rows = self.db.get("utc", [])
+        elif sql is sc.OTHER_OWNERS_SQL:
+            self._rows = [(self.db.get("others", 0),)]
+        elif sql is sc.UNREGISTERED_SQL:
+            self._rows = self.db.get("unregistered", [])
         elif sql is sc.REGISTER_SIDECAR_SQL:
             self.db.setdefault("registered", []).append((params["asset"], params["path"]))
             self._rows = []
@@ -709,3 +713,101 @@ def test_a_known_x5_clock_is_utc_even_when_it_matches_the_name() -> None:
     f = sc.file_facts({"CreateDate": "2026:06:25 14:07:44", "Model": "Insta360 X5"},
                       "VID_20260625_140744_00_051.insv")
     assert f.utc == datetime(2026, 6, 25, 14, 7, 44, tzinfo=timezone.utc)
+
+
+# --- sidecars Immich never registered ----------------------------------------------
+
+
+def _unregistered(db, folder, name, xmp_name, xmp, meta, aid):
+    root = db["root"]
+    (root / folder).mkdir(exist_ok=True)
+    (root / folder / name).write_bytes(b"")
+    if xmp is not None:
+        (root / folder / xmp_name).write_text(xmp)
+    db.setdefault("unregistered", []).append((aid, f"/lib/{folder}/{name}", datetime(2025, 1, 1, tzinfo=UTC)))
+    db["exif"].append({"SourceFile": str(root / folder / name), **meta})
+
+
+def test_cli_registers_a_sidecar_that_agrees_with_its_file(lib) -> None:
+    args, db, writes, tmp = lib
+    _unregistered(db, "w", "IMG_9.JPG", "IMG_9.JPG.xmp", _xmp("2024-05-01T12:00:00+02:00", 41.9, 12.5),
+                  {"DateTimeOriginal": "2024:05:01 12:00:00", "OffsetTimeOriginal": "+02:00",
+                   "GPSLatitude": 41.9, "GPSLongitude": 12.5}, "u1")
+    res = CliRunner().invoke(cli.app, args)                                      # dry run
+    assert res.exit_code == 0, res.output
+    assert "register 1" in " ".join(res.output.split()) and "registered" not in db
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert ("u1", "/lib/w/IMG_9.JPG.xmp") in db["registered"]
+    assert "IMG_9.JPG" not in dict(writes)                                       # nothing to repair
+    assert "u1" in _Api.refreshed[-1]
+
+
+def test_cli_leaves_a_stem_sidecar_of_another_photo_alone(lib) -> None:
+    # IMG_0577.xmp is a 2026 photo's; the 2015 IMG_0577.MP4 must not take it.
+    args, db, writes, tmp = lib
+    _unregistered(db, "s", "IMG_0577.HEIC", "IMG_0577.xmp", _xmp("2026-06-19T08:58:06+02:00"),
+                  {"DateTimeOriginal": "2026:06:19 08:58:06", "OffsetTimeOriginal": "+02:00"}, "new")
+    _unregistered(db, "s", "IMG_0577.MP4", "IMG_0577.xmp", None,
+                  {"CreateDate": "2015:11:22 00:20:45"}, "old")
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert not any(a == "old" for a, _ in db.get("registered", []))
+    assert not any(a == "new" and p == "/lib/s/IMG_0577.xmp" for a, p in db.get("registered", []))
+
+
+def test_cli_repairs_then_registers_a_contradicting_sidecar(lib) -> None:
+    # A video's UTC clock written as wall time, never registered.
+    args, db, writes, tmp = lib
+    _unregistered(db, "r", "IMG_77.MOV", "IMG_77.MOV.xmp", _xmp("2023-11-30T23:08:04"),
+                  {"CreateDate": "2023:11:30 23:08:04", "CreationDate": "2023:11:30 15:08:04-08:00"}, "r1")
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert dict(writes)["IMG_77.MOV"]["DateTimeOriginal"] == "2023:11:30 15:08:04-08:00"
+    assert ("r1", "/lib/r/IMG_77.MOV.xmp") in db["registered"]
+
+
+def test_cli_no_register_leaves_unregistered_sidecars(lib) -> None:
+    args, db, writes, tmp = lib
+    _unregistered(db, "n", "IMG_5.JPG", "IMG_5.JPG.xmp", _xmp("2024-05-01T12:00:00+02:00"),
+                  {"DateTimeOriginal": "2024:05:01 12:00:00", "OffsetTimeOriginal": "+02:00"}, "n1")
+    res = CliRunner().invoke(cli.app, args + ["--apply", "--no-register"])
+    assert res.exit_code == 0, res.output
+    assert not any(a == "n1" for a, _ in db.get("registered", []))
+
+
+def test_cli_pilot_judges_a_shared_stem_whole(lib) -> None:
+    # --asset on the 2015 video alone must still see the 2026 photo sharing its stem.
+    args, db, writes, tmp = lib
+    _unregistered(db, "p", "IMG_0577.HEIC", "IMG_0577.xmp", _xmp("2026-06-19T08:58:06+02:00"),
+                  {"DateTimeOriginal": "2026:06:19 08:58:06", "OffsetTimeOriginal": "+02:00"}, "new")
+    _unregistered(db, "p", "IMG_0577.MP4", "IMG_0577.xmp", None,
+                  {"CreateDate": "2015:11:22 00:20:45"}, "old")
+    res = CliRunner().invoke(cli.app, args + ["--apply", "--asset", "old"])
+    assert res.exit_code == 0, res.output
+    assert not any(a == "old" for a, _ in db.get("registered", []))
+
+
+def test_cli_a_sidecar_with_nothing_to_compare_is_not_registered(lib) -> None:
+    # The file says nothing about its time or place: "no fix" is not "agrees".
+    args, db, writes, tmp = lib
+    _unregistered(db, "q", "clip.MP4", "clip.MP4.xmp", _xmp("2026-06-19T08:58:06+02:00"), {}, "q1")
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert not any(a == "q1" for a, _ in db.get("registered", []))
+    assert "can't be checked" in " ".join(res.output.split())
+
+
+def test_cli_leaves_unregistered_alone_when_another_user_shares_the_root(lib) -> None:
+    args, db, writes, tmp = lib
+    db["others"] = 3
+    _unregistered(db, "o", "IMG_9.JPG", "IMG_9.JPG.xmp", _xmp("2024-05-01T12:00:00+02:00"),
+                  {"DateTimeOriginal": "2024:05:01 12:00:00", "OffsetTimeOriginal": "+02:00"}, "o1")
+    res = CliRunner().invoke(cli.app, args + ["--apply"])
+    assert res.exit_code == 0, res.output
+    assert not any(a == "o1" for a, _ in db.get("registered", []))
+
+
+def test_half_a_position_is_no_position() -> None:
+    assert sc.read_sidecar("<exif:GPSLatitude>41,54.0N</exif:GPSLatitude>").lat is None
+    assert sc.file_facts({"GPSLatitude": 41.9, "DateTimeOriginal": "2024:05:01 12:00:00"}, "a.JPG").lat is None

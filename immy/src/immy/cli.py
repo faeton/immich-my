@@ -5299,6 +5299,12 @@ def sidecars_check(
              "default: a sidecar can deliberately correct one camera to match another, "
              "so review the reported ones (--csv) first.",
     ),
+    register: bool = typer.Option(
+        True, "--register/--no-register",
+        help="Also take in sidecars on disk that Immich never registered (written after the "
+             "import): checked like registered ones, registered on --apply unless they "
+             "contradict their file.",
+    ),
     csv_path: Path = typer.Option(None, "--csv", help="Write the planned repairs here."),
     config_path: Path = typer.Option(None, "--config", help="Path to immy config."),
 ) -> None:
@@ -5371,6 +5377,38 @@ def sidecars_check(
     members: dict[str, list[tuple[str, str, object]]] = {}
     for aid, orig, side, created in rows:
         members.setdefault(side, []).append((aid, orig, created))
+    # Sidecars on disk Immich never registered: it links one only at import,
+    # so one written later (an audit rule, the Photos pull, a repair) is never
+    # read. Each joins its sidecar's members as if registered — a stem-named
+    # one alongside every file with that stem — so the same rules judge it.
+    to_register: dict[str, str] = {}          # asset → its sidecar (Immich path)
+    if register:
+        cur.execute(sc.OTHER_OWNERS_SQL, {"owner": owner_id, "prefix": root + "/%"})
+        if cur.fetchall()[0][0]:
+            console.print(f"  [yellow]another user's assets are under {root}[/yellow]: "
+                          "unregistered sidecars left alone")
+            register = False
+    if register:
+        cur.execute(sc.UNREGISTERED_SQL, {"owner": owner_id})
+        listing: dict[Path, set[str]] = {}
+        for aid, orig, created in cur.fetchall():
+            aid, lo = str(aid), local(orig)
+            if lo is None:                    # every member, even in a pilot: its
+                continue                      # group is judged whole
+            if lo.parent not in listing:
+                try:
+                    listing[lo.parent] = set(os.listdir(lo.parent))
+                except OSError:
+                    listing[lo.parent] = set()
+            names = listing[lo.parent]
+            if lo.name + ".xmp" in names:
+                side = orig + ".xmp"
+            elif lo.stem + ".xmp" in names:
+                side = orig.rsplit("/", 1)[0] + "/" + lo.stem + ".xmp"
+            else:
+                continue
+            members.setdefault(side, []).append((aid, orig, created))
+            to_register[aid] = side
 
     state_path = (config.state_root or Path.home() / ".immy") / "sidecar-check.json"
     try:
@@ -5430,7 +5468,7 @@ def sidecars_check(
         cur.execute(sc.UTC_CLOCK_SQL, {"owner": owner_id})
         for aid, orig, shown, created in cur.fetchall():
             aid, lo = str(aid), local(orig)
-            if lo is None or (asset and aid not in set(asset)):
+            if lo is None or (asset and aid not in set(asset)) or aid in to_register:
                 continue
             if not all_ and not asset and seen.get(f"zone2:{aid}") == stamp(lo):
                 continue
@@ -5545,6 +5583,25 @@ def sidecars_check(
                   + (f"; {len(unreadable)} with an unreadable original, retried next run" if unreadable else "")
                   + (f"; {len(zone_fixes)} UTC-clock video(s) to date" if zone_fixes else ""))
 
+    # Registered only when its sidecar describes it, or a repair made it agree:
+    # "nothing to fix" can also mean nothing to compare. The rest is reported.
+    not_ours = set(conflicts) | {sp[0] for sp in splits} | set(unreadable)
+    repaired = {r[0] for r in repairs}
+    registering, unverified_reg = [], []
+    for side, (_, sf, fs) in facts.items():
+        for a, _, f, _ in fs:
+            if to_register.get(a) != side:
+                continue
+            if side not in not_ours and (side in repaired or sc.describes(f, sf) is True):
+                registering.append((a, side))
+            elif side not in not_ours:
+                unverified_reg.append((a, side))
+    if to_register:
+        console.print(f"  {len(to_register)} asset(s) with a sidecar Immich never registered; "
+                      f"{len(registering)} to register"
+                      + (f", {len(unverified_reg)} that can't be checked against their file left alone"
+                         if unverified_reg else ""))
+
     if csv_path:
         with open(csv_path, "w", newline="") as fh:
             w = csv.writer(fh)
@@ -5561,13 +5618,20 @@ def sidecars_check(
                     w.writerow([o + ".xmp", a, f"split:{roles[a]}", "", "", "", "", "", ""])
             for a, o, patch in zone_fixes:
                 w.writerow([o + ".xmp", a, "zone", "", patch["DateTimeOriginal"], "", "", "", ""])
+            for kind, items in (("register", registering), ("unverified", unverified_reg)):
+                for a, side in items:
+                    sf = facts[side][1]
+                    w.writerow([side, a, kind, sf.dto or "", "", sf.lat, sf.lon, "", ""])
         console.print(f"wrote {csv_path}")
 
+    # Registered once checked: not when its assets disagree (left alone), split
+    # (each file gets its own), or unreadable.
     if dry_run:
         conn.close()
         console.print(f"\n[yellow]dry-run[/yellow] — pass `--apply` to repair {len(repairs)} sidecar(s)"
                       + (f", split {len(splits)} shared one(s)" if splits else "")
-                      + (f" and date {len(zone_fixes)} video(s)" if zone_fixes else "") + ".")
+                      + (f" and date {len(zone_fixes)} video(s)" if zone_fixes else "")
+                      + (f", register {len(registering)}" if registering else "") + ".")
         return
 
     client = ImmichClient(url=config.immich.url, api_key=config.immich.api_key,
@@ -5638,6 +5702,7 @@ def sidecars_check(
                 sidecar_mod.write(local(members[side][0][1]), patch, xmp_path=local(side))
             except RuntimeError as e:
                 console.print(f"  [red]sidecar failed[/red] {side}: {e}")
+                not_ours.add(side)
                 continue
             written += 1
             pending.extend(ids)
@@ -5675,7 +5740,8 @@ def sidecars_check(
             # 2. Record the whole split (and its undo) before anything moves.
             for it in its:
                 log.write(_json.dumps({"action": "split", "assets": [it["asset"]], "sidecar": it["target"],
-                                       "before": None, "role": it["role"], "registered_before": side,
+                                       "before": None, "role": it["role"],
+                                       "registered_before": None if it["asset"] in to_register else side,
                                        "registered_now": it["immich"], "patch": it["patch"]},
                                       default=str) + "\n")
                 pend.write(it["asset"] + "\n")
@@ -5694,6 +5760,22 @@ def sidecars_check(
             write_intents([it for it in read_intents() if it["asset"] not in done])
             for it in its:
                 Path(it["staged"]).unlink(missing_ok=True)
+        registered = 0
+        for a, side in registering:
+            if side in not_ours:
+                continue
+            log.write(_json.dumps({"action": "register", "assets": [a], "sidecar": str(local(side)),
+                                   "registered_before": None, "registered_now": side}) + "\n")
+            pend.write(a + "\n")
+            cur.execute(sc.REGISTER_SIDECAR_SQL, {"asset": a, "path": side})
+            pending.append(a)
+            registered += 1
+        if registering:
+            log.flush()
+            os.fsync(log.fileno())
+            pend.flush()
+            os.fsync(pend.fileno())
+            conn.commit()
         dated = 0
         for a, o, patch in zone_fixes:
             # A sidecar of its own (`name.ext.xmp`): never shared by accident.
@@ -5733,7 +5815,8 @@ def sidecars_check(
     pending_path.unlink(missing_ok=True)
     console.print(f"[green]✓[/green] {written} sidecar(s) repaired"
                   + (f", {split_done} shared sidecar(s) split" if splits else "")
-                  + (f", {dated} video(s) dated" if zone_fixes else "") + ", metadata refresh queued for "
+                  + (f", {dated} video(s) dated" if zone_fixes else "")
+                  + (f", {registered} registered" if registering else "") + ", metadata refresh queued for "
                   f"{refreshed} asset(s). Undo log: {log_path}")
 
 app.add_typer(sidecars_app, name="sidecars")
